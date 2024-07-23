@@ -1,5 +1,5 @@
 const { MongoClient } = require('mongodb');
-const uri = "mongodb://your_username:your_password@mongodb:14902/?authMechanism=DEFAULT";
+const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 
 async function checkAutoSync() {

@@ -22,8 +22,8 @@ FROM node:18.17.0-alpine
 # Install Python, pip, ffmpeg, and other necessary tools
 RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg
 
-# Install cronie and dos2unix
-RUN apk add --no-cache cronie dos2unix
+# Install dos2unix
+RUN apk add --no-cache dos2unix
 
 # Set the working directory for the application
 WORKDIR /usr/src/app
@@ -45,20 +45,11 @@ RUN /opt/venv/bin/pip install -r /tmp/requirements.txt
 # Install PIL (Pillow) for image processing within the virtual environment
 RUN /opt/venv/bin/pip install Pillow
 
-# Add crontab file in the cron directory
-COPY crontab /etc/crontabs/root
-
-# Ensure cron logs to stdout
-RUN ln -sf /usr/src/app/cron_logs/cron.log /var/log/cron.log
-
 # Grant execution rights on the scripts
 RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
 
 # Convert scripts to Unix format
 RUN dos2unix /usr/src/app/scripts/*.sh
 
-# Set permissions for cron log
-RUN touch /var/log/cron.log && chmod 777 /var/log/cron.log
-
 # Command to run both Node.js app and cron
-CMD ["sh", "-c", "printenv > /etc/environment && crond && node /usr/src/app/node/app.js"]
+CMD ["sh", "-c", "node /usr/src/app/node/app.js"]

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import re
 
 # Pull the TMDB API key from the environment variable
-TMDB_API_KEY = os.environ['TMDB_API_KEY']
+TMDB_API_KEY = os.getenv('TMDB_API_KEY')
 if not TMDB_API_KEY:
     raise ValueError("No TMDB API key found in the environment variables")
 
