@@ -1,0 +1,3 @@
+requests
+Pillow
+# Add any other dependencies your Python scripts require
