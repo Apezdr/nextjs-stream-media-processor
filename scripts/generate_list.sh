@@ -667,7 +667,7 @@ generate_list_tv "$TV_DIR" "$TV_OUTPUT"
 
 echo "Checking autoSync Settings.."
 # Call the Node.js script to check the app autoSync setting
-autoSyncEnabled=$(node -e 'require("/usr/src/app/node/database.js").checkAutoSync()')
+autoSyncEnabled=$(node -e 'require("/usr/src/app/node/database.js").checkAutoSync()' 2>&1)
 if [ "$autoSyncEnabled" = "true" ]; then
   echo "Auto Sync is enabled. Proceeding with sync..."
   
