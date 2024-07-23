@@ -685,7 +685,7 @@ if [ "$autoSyncEnabled" = "true" ]; then
   
   # Update front-end DB with new data
   response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${FRONT_END}/api/authenticated/admin/sync" \
-   -H "X-Webhook-ID: 322fb39e4591514d2b8c1697sbc72c9c" \
+   -H "X-Webhook-ID: ${WEBHOOK_ID}" \
    -H "Content-Type: application/json" \
    -d '{}')
 
