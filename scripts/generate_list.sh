@@ -662,8 +662,20 @@ python3 /usr/src/app/scripts/download_tmdb_images.py
 bash /usr/src/app/scripts/generate_thumbnail_json.sh
 
 # Generate Lists
+echo "Starting movie list generation..."
 generate_list_movies "$MOVIES_DIR" "$MOVIES_OUTPUT"
+if [ $? -ne 0 ]; then
+    echo "Error in generate_list_movies, but continuing..."
+fi
+echo "Movie list generation completed."
+
+echo "Starting TV list generation..."
 generate_list_tv "$TV_DIR" "$TV_OUTPUT"
+if [ $? -ne 0 ]; then
+    echo "Error in generate_list_tv, but continuing..."
+fi
+echo "TV list generation completed."
+
 
 echo "Checking autoSync Settings.."
 # Call the Node.js script to check the app autoSync setting
