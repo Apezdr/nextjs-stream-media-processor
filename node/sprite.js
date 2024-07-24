@@ -96,6 +96,8 @@ async function generateSpriteSheetImage(frames, spriteSheetPath) {
   const sharp = require('sharp');
   const columns = 10;
 
+  console.log(`Sprite sheet generating...: ${spriteSheetPath}`);
+
   const maxWidth = Math.max(...frames.map(frame => frame.width));
   const maxHeight = Math.max(...frames.map(frame => frame.height));
 
