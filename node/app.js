@@ -223,9 +223,9 @@ async function handleSpriteSheetRequest(req, res, type) {
   let spriteSheetFileName;
 
   if (type === "movies") {
-    spriteSheetFileName = `${type}_${movieName}_spritesheet.jpg`;
+    spriteSheetFileName = `movie_${movieName}_spritesheet.jpg`;
   } else if (type === "tv") {
-    spriteSheetFileName = `${type}_${showName}_${season}_${episode}_spritesheet.jpg`;
+    spriteSheetFileName = `tv_${showName}_${season}_${episode}_spritesheet.jpg`;
   }
 
   const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
@@ -322,8 +322,8 @@ async function handleVttRequest(req, res, type) {
       console.log(`VTT file not found in cache: ${vttFileName}`);
 
       const fileKey = type === "movies" 
-        ? `${type}_${movieName}`
-        : `${type}_${showName}_${season}_${episode}`;
+        ? `movie_${movieName}`
+        : `tv_${showName}_${season}_${episode}`;
       if (vttProcessingFiles.has(fileKey)) {
         console.log(
           `VTT file ${fileKey} is already being processed. Adding request to queue.`
