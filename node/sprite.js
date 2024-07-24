@@ -71,9 +71,9 @@ async function generateSpriteSheet({videoPath, type, name, season = null, episod
     // Generate the sprite sheet
     let spriteSheetFileName;
     if (type === 'movies') {
-      spriteSheetFileName = `${type}_${name}_spritesheet.jpg`;
+      spriteSheetFileName = `movie_${name}_spritesheet.jpg`;
     } else if (type === 'tv') {
-      spriteSheetFileName = `${type}_${name}_${season}_${episode}_spritesheet.jpg`;
+      spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.jpg`;
     }
     const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
     await generateSpriteSheetImage(frames, spriteSheetPath);
@@ -81,9 +81,9 @@ async function generateSpriteSheet({videoPath, type, name, season = null, episod
     // Generate the VTT file
     let vttFileName;
     if (type === 'movies') {
-      vttFileName = `${type}_${name}_spritesheet.vtt`;
+      vttFileName = `movie_${name}_spritesheet.vtt`;
     } else if (type === 'tv') {
-      vttFileName = `${type}_${name}_${season}_${episode}_spritesheet.vtt`;
+      vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
     const vttFilePath = path.join(cacheDir, vttFileName);
     await generateVttFile(frames, vttFilePath, interval, type, name, season, episode);
