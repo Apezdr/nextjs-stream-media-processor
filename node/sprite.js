@@ -104,6 +104,7 @@ async function generateSpriteSheetImage(frames, spriteSheetPath) {
   const spriteSheetWidth = maxWidth * columns;
   const spriteSheetHeight = Math.ceil(frames.length / columns) * maxHeight;
 
+  console.time('Prepare composite array');
   const compositeArray = await Promise.all(frames.map(async (frame, i) => {
     const left = (i % columns) * maxWidth;
     const top = Math.floor(i / columns) * maxHeight;
@@ -114,10 +115,12 @@ async function generateSpriteSheetImage(frames, spriteSheetPath) {
     console.warn(`Frame not found: ${frame.framePath}`);
     return null;
   }));
+  console.timeEnd('Prepare composite array');
 
   const validCompositeArray = compositeArray.filter(item => item !== null);
 
   try {
+    console.time('Sharp composite operation');
     await sharp({
       create: {
         width: spriteSheetWidth,
@@ -128,6 +131,7 @@ async function generateSpriteSheetImage(frames, spriteSheetPath) {
     })
     .composite(validCompositeArray)
     .toFile(spriteSheetPath);
+    console.timeEnd('Sharp composite operation');
 
     console.log(`Sprite sheet generated: ${spriteSheetPath}`);
   } catch (error) {
