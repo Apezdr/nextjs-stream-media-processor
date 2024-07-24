@@ -1,6 +1,7 @@
 const express = require("express");
 const schedule = require('node-schedule');
 const { exec } = require("child_process");
+const util = require('util');
 const path = require("path");
 const _fs = require("fs"); // Callback-based version of fs
 const fs = require("fs").promises; // Use the promise-based version of fs
@@ -17,6 +18,7 @@ const {
   findMp4File,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
+const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
 
@@ -646,38 +648,43 @@ setInterval(clearOldCacheFiles, 30 * 60 * 1000);
 //
 
 // Schedule tasks
-function scheduleTasks() {
-  // Check if the DEBUG environment variable is set to TRUE
+async function runGenerateList() {
   const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
+  const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
+  console.log(`Running generate_list.sh job${debugMessage}`);
+  const command = isDebugMode 
+    ? `/usr/src/app/scripts/generate_list.sh >> ${LOG_FILE} 2>&1` 
+    : '/usr/src/app/scripts/generate_list.sh';
+  
+  try {
+    await execAsync(command);
+  } catch (error) {
+    console.error(`Error executing generate_list.sh: ${error}`);
+  }
+}
 
-  // Schedule generate_list.sh to run every 5 minutes
-  schedule.scheduleJob('*/5 * * * *', function() {
-    const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-    console.log(`Running generate_list.sh job${debugMessage}`);
-    const command = isDebugMode 
-      ? `/usr/src/app/scripts/generate_list.sh >> ${LOG_FILE} 2>&1` 
-      : '/usr/src/app/scripts/generate_list.sh';
-    
-    exec(command, (error) => {
-      if (error) {
-        console.error(`Error executing generate_list.sh: ${error}`);
-      }
-    });
+async function runGeneratePosterCollage() {
+  const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
+  const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
+  console.log(`Running generate_poster_collage.py job${debugMessage}`);
+  const command = isDebugMode 
+    ? `python3 /usr/src/app/scripts/generate_poster_collage.py >> ${LOG_FILE} 2>&1` 
+    : 'python3 /usr/src/app/scripts/generate_poster_collage.py';
+
+  try {
+    await execAsync(command);
+  } catch (error) {
+    console.error(`Error executing generate_poster_collage.py: ${error}`);
+  }
+}
+
+function scheduleTasks() {
+  schedule.scheduleJob('*/5 * * * *', () => {
+    runGenerateList().catch(console.error);
   });
 
-  // Schedule generate_poster_collage.py to run on the 3rd, 6th, 9th, etc. day of each month
-  schedule.scheduleJob('0 0 3,6,9,12,15,18,21,24,27,30 * *', function() {
-    const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-    console.log(`Running generate_poster_collage.py job${debugMessage}`);
-    const command = isDebugMode 
-      ? `python3 /usr/src/app/scripts/generate_poster_collage.py >> ${LOG_FILE} 2>&1` 
-      : 'python3 /usr/src/app/scripts/generate_poster_collage.py';
-
-    exec(command, (error) => {
-      if (error) {
-        console.error(`Error executing generate_poster_collage.py: ${error}`);
-      }
-    });
+  schedule.scheduleJob('0 0 3,6,9,12,15,18,21,24,27,30 * *', () => {
+    runGeneratePosterCollage().catch(console.error);
   });
 }
 
