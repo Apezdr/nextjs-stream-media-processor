@@ -76,6 +76,11 @@ async function generateSpriteSheet({videoPath, type, name, season = null, episod
       spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.jpg`;
     }
     const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
+
+    if (await fileExists(spriteSheetPath)) {
+      console.log(`Serving existing sprite sheet: ${spriteSheetPath}`);
+      return spriteSheetPath; // Serve the existing sprite sheet
+    }
     await generateSpriteSheetImage(frames, spriteSheetPath);
 
     // Generate the VTT file
@@ -86,6 +91,10 @@ async function generateSpriteSheet({videoPath, type, name, season = null, episod
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
     const vttFilePath = path.join(cacheDir, vttFileName);
+    if (await fileExists(vttFilePath)) {
+      console.log(`Serving existing VTT file: ${vttFilePath}`);
+      return vttFilePath; // Serve the existing VTT file
+    }    
     await generateVttFile(frames, vttFilePath, interval, type, name, season, episode);
   } catch (error) {
     console.error(`Error in generateSpriteSheet: ${error}`);
