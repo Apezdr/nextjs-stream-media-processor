@@ -305,9 +305,9 @@ async function handleVttRequest(req, res, type) {
   let vttFileName;
 
   if (type === "movies") {
-    vttFileName = `${type}_${movieName}_spritesheet.vtt`;
+    vttFileName = `movie_${movieName}_spritesheet.vtt`;
   } else if (type === "tv") {
-    vttFileName = `${type}_${showName}_${season}_${episode}_spritesheet.vtt`;
+    vttFileName = `tv_${showName}_${season}_${episode}_spritesheet.vtt`;
   }
 
   const vttFilePath = path.join(cacheDir, vttFileName);
