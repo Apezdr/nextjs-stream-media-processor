@@ -94,47 +94,40 @@ async function generateSpriteSheet({videoPath, type, name, season = null, episod
 
 async function generateSpriteSheetImage(frames, spriteSheetPath) {
   const sharp = require('sharp');
-  const columns = 10; // Adjust the number of columns as needed
+  const columns = 10;
 
-  // Find the maximum width and height among all frames
   const maxWidth = Math.max(...frames.map(frame => frame.width));
   const maxHeight = Math.max(...frames.map(frame => frame.height));
 
-  const spriteSheet = sharp({
-    create: {
-      width: maxWidth * columns,
-      height: Math.ceil(frames.length / columns) * maxHeight,
-      channels: 4, // Use 4 channels for RGBA, or 3 for RGB
-      background: { r: 0, g: 0, b: 0, alpha: 0 }, // Added alpha for transparency, adjust if using RGB
-    },
-  });
+  const spriteSheetWidth = maxWidth * columns;
+  const spriteSheetHeight = Math.ceil(frames.length / columns) * maxHeight;
 
-  const compositeArray = [];
-
-  for (let i = 0; i < frames.length; i++) {
-    const frame = frames[i];
+  const compositeArray = await Promise.all(frames.map(async (frame, i) => {
     const left = (i % columns) * maxWidth;
     const top = Math.floor(i / columns) * maxHeight;
 
-    try {
-      // Check if the frame file exists
-      if (await fileExists(frame.framePath)) {
-        compositeArray.push({ input: frame.framePath, left, top });
-      } else {
-        console.warn(`Frame not found: ${frame.framePath}`);
-        // You can add a placeholder image here if desired
-      }
-    } catch (error) {
-      console.error(`Error loading frame: ${frame.framePath}`, error);
-      // You can add a placeholder image here if desired
+    if (await fileExists(frame.framePath)) {
+      return { input: frame.framePath, left, top };
     }
-  }
+    console.warn(`Frame not found: ${frame.framePath}`);
+    return null;
+  }));
 
-  // Now composite the array of images onto the sprite sheet
-  spriteSheet.composite(compositeArray);
+  const validCompositeArray = compositeArray.filter(item => item !== null);
 
   try {
-    await spriteSheet.toFile(spriteSheetPath);
+    await sharp({
+      create: {
+        width: spriteSheetWidth,
+        height: spriteSheetHeight,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      }
+    })
+    .composite(validCompositeArray)
+    .toFile(spriteSheetPath);
+
+    console.log(`Sprite sheet generated: ${spriteSheetPath}`);
   } catch (error) {
     console.error(`Error generating sprite sheet: ${error}`);
     throw error;
