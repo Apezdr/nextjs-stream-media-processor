@@ -52,4 +52,4 @@ RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
 RUN dos2unix /usr/src/app/scripts/*.sh
 
 # Command to run both Node.js app and cron
-CMD ["sh", "-c", "node /usr/src/app/node/app.js"]
+CMD ["sh", "-c", "node /usr/src/app/node/app.js --max-old-space-size=2048"]
