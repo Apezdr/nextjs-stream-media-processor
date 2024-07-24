@@ -321,7 +321,9 @@ async function handleVttRequest(req, res, type) {
     } else {
       console.log(`VTT file not found in cache: ${vttFileName}`);
 
-      const fileKey = `${type}_${movieName || showName}_${season}_${episode}`;
+      const fileKey = type === "movies" 
+        ? `${type}_${movieName}`
+        : `${type}_${showName}_${season}_${episode}`;
       if (vttProcessingFiles.has(fileKey)) {
         console.log(
           `VTT file ${fileKey} is already being processed. Adding request to queue.`
