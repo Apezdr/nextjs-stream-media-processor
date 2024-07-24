@@ -120,6 +120,7 @@ async function generateSpriteSheetImage(frames, spriteSheetPath) {
   const validCompositeArray = compositeArray.filter(item => item !== null);
 
   try {
+    console.log('Starting Sharp composite operation');
     console.time('Sharp composite operation');
     await sharp({
       create: {
