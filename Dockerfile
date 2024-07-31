@@ -20,7 +20,7 @@ COPY node ./
 FROM node:18.17.0-alpine
 
 # Install Python, pip, ffmpeg, and other necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo
 
 # Install dos2unix
 RUN apk add --no-cache dos2unix
