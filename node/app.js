@@ -1021,10 +1021,17 @@ async function generateListMovies(db, dirPath) {
         }
       }
 
+      let mp4Filename = fileNames.filter((e) => e.indexOf('.mp4') > -1 && e.indexOf('mp4.info') === -1)[0];
+      mp4Filename = mp4Filename?.replace('.mp4', '');
+
       // Add chapter information
       const chaptersPath = path.join(dirPath, dirName, 'chapters', `${dirName}_chapters.vtt`);
+      const chaptersPath2 = path.join(dirPath, dirName, 'chapters', `${mp4Filename}_chapters.vtt`);
       if (await fileExists(chaptersPath)) {
         urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
+      }
+      else if (await fileExists(chaptersPath2)) {
+        urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${mp4Filename}_chapters.vtt`)}`;
       }
 
       // Remove empty sections
@@ -1213,6 +1220,7 @@ async function initialize() {
       runDownloadTmdbImages().catch(console.error);
       runGenerateThumbnailJson().catch(console.error);
       console.log(`Server running on port ${port}`);
+      runGenerateList().catch(console.error);
   });
 }
 
