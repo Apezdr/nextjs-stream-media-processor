@@ -946,6 +946,7 @@ app.get('/media/tv', async (req, res) => {
 
 async function generateListMovies(db, dirPath) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
+
   for (const dir of dirs) {
     if (dir.isDirectory()) {
       const dirName = dir.name;
@@ -989,6 +990,7 @@ async function generateListMovies(db, dirPath) {
           const langCode = isHearingImpaired ? parts[srtIndex - 2] : parts[srtIndex - 1];
           const langName = langMap[langCode] || langCode;
           const subtitleKey = isHearingImpaired ? `${langName} Hearing Impaired` : langName;
+
           subtitles[subtitleKey] = {
             url: `/movies/${encodedDirName}/${encodedFilePath}`,
             srcLang: langCode,
@@ -1019,6 +1021,12 @@ async function generateListMovies(db, dirPath) {
         }
       }
 
+      // Add chapter information
+      const chaptersPath = path.join(dirPath, dirName, 'chapters', `${dirName}_chapters.vtt`);
+      if (await fileExists(chaptersPath)) {
+        urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
+      }
+
       // Remove empty sections
       if (Object.keys(subtitles).length === 0) {
         delete urls["subtitles"];
@@ -1034,6 +1042,7 @@ async function generateListMovies(db, dirPath) {
     }
   }
 }
+
 
 app.get('/media/movies', async (req, res) => {
   try {
