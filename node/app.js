@@ -312,6 +312,7 @@ app.get("/vtt/tv/:showName/:season/:episode", (req, res) => {
 });
 
 async function handleSpriteSheetRequest(req, res, type) {
+  const db = await initializeDatabase();
   const { movieName, showName, season, episode } = req.params;
   let spriteSheetFileName;
 
@@ -331,20 +332,23 @@ async function handleSpriteSheetRequest(req, res, type) {
       console.log(`Sprite sheet not found in cache: ${spriteSheetFileName}`);
 
       // Generate the sprite sheet
-      let videoPath;
+      let videoPath, videoMp4;
       if (type === "movies") {
-        const directoryPath = path.join("/var/www/html/movies", movieName);
-        videoPath = await findMp4File(directoryPath);
-      } else if (type === "tv") {
-        const showsDataRaw = _fs.readFileSync(
-          "/var/www/html/tv_list.json",
-          "utf8"
+        const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
+        if (!movie) {
+          return res.status(404).send(`Movie not found: ${movieName}`);
+        }
+        videoMp4 = JSON.parse(movie.urls).mp4;
+        videoMp4 = decodeURIComponent(videoMp4);
+        videoPath = path.join(
+          "/var/www/html",
+          videoMp4,
         );
-        const showsData = JSON.parse(showsDataRaw);
-        const showData = showsData[showName];
+      } else if (type === "tv") {
+        const shows = await getTVShows(db);
+        const showData = shows.find(show => show.name === showName);
         if (showData) {
-          const _season = showData.seasons[`Season ${season}`];
-
+          const _season = showData.metadata.seasons[`Season ${season}`];
           if (_season) {
             const _episode = _season.fileNames.find((e) => {
               const episodeNumber = episode.padStart(2, "0");
@@ -362,7 +366,7 @@ async function handleSpriteSheetRequest(req, res, type) {
                 showName,
                 `Season ${season}`
               );
-              videoPath = await findMp4File(directoryPath, _episode);
+              videoPath = path.join(directoryPath, _episode);
             } else {
               throw new Error(
                 `Episode not found: ${showName} - Season ${season} Episode ${episode}`
@@ -386,6 +390,9 @@ async function handleSpriteSheetRequest(req, res, type) {
         episode,
         cacheDir,
       });
+
+      // After generating the sprite sheet, send it to the client
+      res.sendFile(spriteSheetPath);
     }
   } catch (error) {
     console.error(error);
@@ -394,6 +401,7 @@ async function handleSpriteSheetRequest(req, res, type) {
 }
 
 async function handleVttRequest(req, res, type) {
+  const db = await initializeDatabase();
   const { movieName, showName, season, episode } = req.params;
   let vttFileName;
 
@@ -432,8 +440,12 @@ async function handleVttRequest(req, res, type) {
       // Generate the VTT file
       let videoPath;
       if (type === "movies") {
-        const directoryPath = path.join("/var/www/html/movies", movieName);
-        videoPath = await findMp4File(directoryPath);
+        const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
+        if (!movie) {
+          vttProcessingFiles.delete(fileKey);
+          return res.status(404).send(`Movie not found: ${movieName}`);
+        }
+        videoPath = movie.file_names[0]; // Assuming the first file is the main movie file
         await generateSpriteSheet({
           videoPath,
           type,
@@ -442,17 +454,10 @@ async function handleVttRequest(req, res, type) {
         });
       } else if (type === "tv") {
         try {
-          // Load the showsData only for TV show requests
-          // Read the tv_list.json file synchronously
-          const showsDataRaw = _fs.readFileSync(
-            "/var/www/html/tv_list.json",
-            "utf8"
-          );
-          const showsData = JSON.parse(showsDataRaw);
-
-          const showData = showsData[showName];
+          const shows = await getTVShows(db);
+          const showData = shows.find(show => show.name === showName);
           if (showData) {
-            const _season = showData.seasons[`Season ${season}`];
+            const _season = showData.metadata.seasons[`Season ${season}`];
             if (_season) {
               const _episode = _season.fileNames.find((e) => {
                 const episodeNumber = episode.padStart(2, "0");
@@ -469,7 +474,7 @@ async function handleVttRequest(req, res, type) {
                   showName,
                   `Season ${season}`
                 );
-                videoPath = await findMp4File(directoryPath, _episode);
+                videoPath = path.join(directoryPath, _episode);
               } else {
                 throw new Error(
                   `Episode not found: ${showName} - Season ${season} Episode ${episode}`
@@ -485,7 +490,7 @@ async function handleVttRequest(req, res, type) {
           }
         } catch (error) {
           console.error(
-            `Error accessing tv_list.json or its contents: ${error.message}`
+            `Error accessing tv db data: ${error.message}`
           );
           vttProcessingFiles.delete(fileKey);
           return res.status(500).send("Internal server error");
@@ -542,30 +547,29 @@ async function handleChapterRequest(
   type,
   generateAllChapters = false
 ) {
+  const db = await initializeDatabase();
   const { movieName, showName, season, episode } = req.params;
   let chapterFileName, mediaPath, chapterFilePath;
 
   if (type === "movies") {
-    const directoryPath = path.join("/var/www/html/movies", movieName);
-    const movieFile = await findMp4File(directoryPath);
+    const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
+    if (!movie) {
+      return res.status(404).send(`Movie not found: ${movieName}`);
+    }
+    const movieFile = movie.file_names[0]; // Assuming the first file is the main movie file
     const movieFileName = path.basename(movieFile, path.extname(movieFile));
     chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = path.join(directoryPath, `${movieFileName}.mp4`);
-    chapterFilePath = path.join(directoryPath, "chapters", chapterFileName);
+    mediaPath = path.join("/var/www/html/movies", movieName, `${movieFileName}.mp4`);
+    chapterFilePath = path.join("/var/www/html/movies", movieName, "chapters", chapterFileName);
     await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
   } else if (type === "tv") {
     if (generateAllChapters) {
-      // Generate chapter files for all episodes of the show
-      const showsDataRaw = _fs.readFileSync(
-        "/var/www/html/tv_list.json",
-        "utf8"
-      );
-      const showsData = JSON.parse(showsDataRaw);
-      const showData = showsData[showName];
+      const shows = await getTVShows(db);
+      const showData = shows.find(show => show.name === showName);
 
       if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
+        for (const seasonName in showData.metadata.seasons) {
+          const season = showData.metadata.seasons[seasonName];
           for (const episodeFileName of season.fileNames) {
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
@@ -596,17 +600,12 @@ async function handleChapterRequest(
       }
     }
     if (!season && !episode) {
-      // Generate chapter files for all episodes of the show
-      const showsDataRaw = _fs.readFileSync(
-        "/var/www/html/tv_list.json",
-        "utf8"
-      );
-      const showsData = JSON.parse(showsDataRaw);
-      const showData = showsData[showName];
+      const shows = await getTVShows(db);
+      const showData = shows.find(show => show.name === showName);
 
       if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
+        for (const seasonName in showData.metadata.seasons) {
+          const season = showData.metadata.seasons[seasonName];
           for (const episodeFileName of season.fileNames) {
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
@@ -636,7 +635,6 @@ async function handleChapterRequest(
         return res.status(404).send(`Show not found: ${showName}`);
       }
     } else {
-      // Generate chapter file for a specific episode
       const directoryPath = path.join(
         "/var/www/html/tv",
         showName,
@@ -648,7 +646,6 @@ async function handleChapterRequest(
       chapterFilePath = path.join(directoryPath, "chapters", chapterFileName);
 
       try {
-        // Find the associated MP4 file
         const mp4Files = await fs.readdir(directoryPath);
         const mp4File = mp4Files.find(
           (file) =>
@@ -688,13 +685,9 @@ function getEpisodeNumber(episodeFileName) {
 async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
   try {
     if (await fileExists(chapterFilePath)) {
-      console.log(
-        `Serving chapter file from cache: ${path.basename(chapterFilePath)}`
-      );
+      console.log(`Serving chapter file from cache: ${path.basename(chapterFilePath)}`);
     } else {
-      console.log(
-        `Chapter file not found in cache: ${path.basename(chapterFilePath)}`
-      );
+      console.log(`Chapter file not found in cache: ${path.basename(chapterFilePath)}`);
 
       // Check if the media file has chapter information
       const hasChapters = await hasChapterInfo(mediaPath);
@@ -707,22 +700,19 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
         const chapterContent = await generateChapters(mediaPath);
 
         // Save the generated chapter content to the file
-        _fs.writeFile(chapterFilePath, chapterContent, (err) => {
-          if (err) throw err;
-          console.log("The file has been saved!");
-        });
+        await fs.writeFile(chapterFilePath, chapterContent);
+        console.log("The file has been saved!");
       } else {
         // If the media file doesn't have chapter information, send a 404 response
-        console.warn(
-          `Chapter information not found for ${path.basename(mediaPath)}`
-        );
+        console.warn(`Chapter information not found for ${path.basename(mediaPath)}`);
       }
     }
   } catch (error) {
-    console.error(
-      `Error generating chapter file for ${path.basename(mediaPath)}:`,
-      error
-    );
+    if (error.code === 'EACCES') {
+      console.error(`Permission denied while accessing ${chapterFilePath}.\nPlease check the directory permissions.`,error);
+    } else {
+      console.error(`Error generating chapter file for ${path.basename(mediaPath)}:`, error);
+    }
   }
 }
 
