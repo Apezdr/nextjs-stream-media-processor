@@ -1,7 +1,12 @@
+const util = require('util');
 const { exec } = require('child_process');
+const execAsync = util.promisify(exec);
 const fs = require('fs').promises; // Use the promise-based version of fs
 const path = require('path');
 const cacheDir = path.join(__dirname, 'cache');
+const scriptsDir = path.resolve(__dirname, '../scripts');
+const blurhashCli = path.join(scriptsDir, 'blurhash-cli.py');
+const LOG_FILE = '/var/log/blurhash.log';
 
 let limit;
 
@@ -110,6 +115,45 @@ async function findMp4File(directory, specificFileName = null) {
   }
 }
 
+async function getStoredBlurhash(imagePath, basePath) {
+  const blurhashFile = `${imagePath}.blurhash`;
+  const relativePath = path.relative(basePath, blurhashFile);
+  const encodedRelativePath = relativePath.split(path.sep).map(encodeURIComponent).join(path.sep);
+  const relativeUrl = `/${encodedRelativePath}`;
+
+  if (await fileExists(blurhashFile)) {
+    return relativeUrl;
+  }
+
+  // Determine if debug mode is enabled
+  const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
+  const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
+  console.log(`Running blurhash-cli.py job${debugMessage}`);
+
+  // Construct the command based on debug mode
+  const command = isDebugMode 
+    ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} python3 ${blurhashCli} "${imagePath}" >> ${LOG_FILE} 2>&1'` 
+    : `sudo bash -c 'python3 ${blurhashCli} "${imagePath}"'`;
+
+  try {
+    // Execute the command
+    const blurhashOutput = await execAsync(command);
+    const exitStatus = blurhashOutput.stderr ? blurhashOutput.stderr : null;
+
+    if (exitStatus) {
+      console.error(`Error generating blurhash: ${blurhashOutput.stderr}`);
+      return null;
+    }
+
+    // Write the generated blurhash to a file
+    await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
+    return relativeUrl;
+  } catch (error) {
+    console.error(`Error executing blurhash-cli.py: ${error}`);
+    return null;
+  }
+}
+
 module.exports = {
   generateFrame: async (videoPath, timestamp, framePath) => {
     await loadPLimit();
@@ -120,4 +164,5 @@ module.exports = {
   ensureCacheDir,
   cacheDir,
   findMp4File,
+  getStoredBlurhash,
 };

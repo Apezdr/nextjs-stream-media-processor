@@ -3,6 +3,7 @@ const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 
 async function checkAutoSync() {
+    let autoSyncResponse = false
     try {
         await client.connect();
         const database = client.db("app_config");
@@ -20,15 +21,16 @@ async function checkAutoSync() {
 
         // Check the value of autoSync
         if (autoSyncSetting && autoSyncSetting.value) {
-            console.log("true");
+            autoSyncResponse = true;
         } else {
-            console.log("false");
+            autoSyncResponse = false;
         }
     } catch (error) {
         console.error("An error occurred:", error);
         process.exit(1); // Exit with error
     } finally {
         await client.close();
+        return autoSyncResponse;
     }
 }
 

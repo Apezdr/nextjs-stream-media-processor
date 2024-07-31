@@ -20,7 +20,7 @@ COPY node ./
 FROM node:18.17.0-alpine
 
 # Install Python, pip, ffmpeg, and other necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite
 
 # Install dos2unix
 RUN apk add --no-cache dos2unix
@@ -50,6 +50,9 @@ RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
 
 # Convert scripts to Unix format
 RUN dos2unix /usr/src/app/scripts/*.sh
+
+# Source the .env.local file if it exists
+RUN if [ -f .env.local ]; then export $(cat .env.local | xargs); fi
 
 # Command to run both Node.js app and cron
 CMD ["sh", "-c", "node /usr/src/app/node/app.js --max-old-space-size=2048"]
