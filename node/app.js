@@ -445,7 +445,12 @@ async function handleVttRequest(req, res, type) {
           vttProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
-        videoPath = movie.file_names[0]; // Assuming the first file is the main movie file
+        videoMp4 = JSON.parse(movie.urls).mp4;
+        videoMp4 = decodeURIComponent(videoMp4);
+        videoPath = path.join(
+          "/var/www/html",
+          videoMp4,
+        );
         await generateSpriteSheet({
           videoPath,
           type,
@@ -556,8 +561,13 @@ async function handleChapterRequest(
     if (!movie) {
       return res.status(404).send(`Movie not found: ${movieName}`);
     }
-    const movieFile = movie.file_names[0]; // Assuming the first file is the main movie file
-    const movieFileName = path.basename(movieFile, path.extname(movieFile));
+    videoMp4 = JSON.parse(movie.urls).mp4;
+    videoMp4 = decodeURIComponent(videoMp4);
+    videoPath = path.join(
+      "/var/www/html",
+      videoMp4,
+    );
+    const movieFileName = path.basename(videoPath, path.extname(videoPath));
     chapterFileName = `${movieFileName}_chapters.vtt`;
     mediaPath = path.join("/var/www/html/movies", movieName, `${movieFileName}.mp4`);
     chapterFilePath = path.join("/var/www/html/movies", movieName, "chapters", chapterFileName);
