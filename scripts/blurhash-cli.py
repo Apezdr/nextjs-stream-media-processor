@@ -7,8 +7,7 @@ import base64
 
 def generate_blurhash(image_path, x_components=4, y_components=3):
     try:
-        image = Image.open(image_path)
-        hash = blurhash.encode(image, x_components, y_components)
+        hash = blurhash.encode(image_path, x_components, y_components)
         return hash
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

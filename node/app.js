@@ -10,7 +10,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMovie, getMissingDataMovies } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -27,10 +27,12 @@ const execAsync = util.promisify(exec);
 const LOG_FILE = '/var/log/cron.log';
 const BASE_PATH = "/var/www/html";
 const scriptsDir = path.resolve(__dirname, '../scripts');
+// Moderately spaced out interval to check for missing data
+const RETRY_INTERVAL_HOURS = 24; // Interval to retry downloading missing tmdb data
 
 const generatePosterCollageScript = path.join(scriptsDir, 'generate_poster_collage.py');
 const downloadTmdbImagesScript = path.join(scriptsDir, 'download_tmdb_images.py');
-const generateThumbnailJsonScript = path.join(scriptsDir, 'generate_thumbnail_json.sh');
+//const generateThumbnailJsonScript = path.join(scriptsDir, 'generate_thumbnail_json.sh');
 
 const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
 const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
@@ -946,17 +948,22 @@ app.get('/media/tv', async (req, res) => {
 
 async function generateListMovies(db, dirPath) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
+  const missingDataMovies = await getMissingDataMovies(db);
+  const now = new Date();
 
   for (const dir of dirs) {
     if (dir.isDirectory()) {
       const dirName = dir.name;
       const encodedDirName = encodeURIComponent(dirName);
       const files = await fs.readdir(path.join(dirPath, dirName));
+      const fileSet = new Set(files); // Create a set of filenames for quick lookup
       const fileNames = files.filter(file => file.endsWith('.mp4') || file.endsWith('.srt') || file.endsWith('.json') || file.endsWith('.info') || file.endsWith('.nfo') || file.endsWith('.jpg') || file.endsWith('.png'));
       const fileLengths = {};
       const fileDimensions = {};
       const urls = {};
       const subtitles = {};
+
+      let runDownloadTmdbImagesFlag = false;
 
       for (const file of fileNames) {
         const filePath = path.join(dirPath, dirName, file);
@@ -997,27 +1004,80 @@ async function generateListMovies(db, dirPath) {
             lastModified: (await fs.stat(filePath)).mtime.toISOString()
           };
         }
+      }
 
-        if (file === 'backdrop.jpg') {
-          urls["backdrop"] = `/movies/${encodedDirName}/${encodedFilePath}`;
-          if (await fileExists(`${filePath}.blurhash`)) {
-            urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodedFilePath}.blurhash`;
+      // Check for required files using the set
+      if (fileSet.has('backdrop.jpg')) {
+        const backdropPath = path.join(dirPath, dirName, 'backdrop.jpg');
+        urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
+        if (await fileExists(`${backdropPath}.blurhash`)) {
+          urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
+        }
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      if (fileSet.has('poster.jpg')) {
+        const posterPath = path.join(dirPath, dirName, 'poster.jpg');
+        urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
+        if (await fileExists(`${posterPath}.blurhash`)) {
+          urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
+        }
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      if (fileSet.has('movie_logo.png')) {
+        urls["logo"] = `/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      if (fileSet.has('metadata.json')) {
+        urls["metadata"] = `/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Check if the movie is in the missing data table and if it should be retried
+      const missingDataMovie = missingDataMovies.find(movie => movie.name === dirName);
+      if (missingDataMovie) {
+        const lastAttempt = new Date(missingDataMovie.lastAttempt);
+        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
+        if (hoursSinceLastAttempt < RETRY_INTERVAL_HOURS) {
+          runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
+        }
+      }
+
+      if (runDownloadTmdbImagesFlag) {
+        await runDownloadTmdbImages(null,dirName);
+        await insertOrUpdateMissingDataMovie(db, dirName); // Update the last attempt timestamp
+        // Retry fetching the data after running the script
+        const retryFiles = await fs.readdir(path.join(dirPath, dirName));
+        const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
+
+        if (retryFileSet.has('backdrop.jpg')) {
+          const backdropPath = path.join(dirPath, dirName, 'backdrop.jpg');
+          urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
+          if (await fileExists(`${backdropPath}.blurhash`)) {
+            urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
           }
         }
 
-        if (file === 'poster.jpg') {
-          urls["poster"] = `/movies/${encodedDirName}/${encodedFilePath}`;
-          if (await fileExists(`${filePath}.blurhash`)) {
-            urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodedFilePath}.blurhash`;
+        if (retryFileSet.has('poster.jpg')) {
+          const posterPath = path.join(dirPath, dirName, 'poster.jpg');
+          urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
+          if (await fileExists(`${posterPath}.blurhash`)) {
+            urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
           }
         }
 
-        if (file === 'movie_logo.png') {
-          urls["logo"] = `/movies/${encodedDirName}/${encodedFilePath}`;
+        if (retryFileSet.has('movie_logo.png')) {
+          urls["logo"] = `/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
         }
 
-        if (file === 'metadata.json') {
-          urls["metadata"] = `/movies/${encodedDirName}/${encodedFilePath}`;
+        if (retryFileSet.has('metadata.json')) {
+          urls["metadata"] = `/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
         }
       }
 
@@ -1049,7 +1109,6 @@ async function generateListMovies(db, dirPath) {
     }
   }
 }
-
 
 app.get('/media/movies', async (req, res) => {
   try {
@@ -1103,31 +1162,46 @@ async function runGeneratePosterCollage() {
   }
 }
 
-async function runDownloadTmdbImages() {
-  console.log(`Running download_tmdb_images.py job${debugMessage}`);
-  const command = isDebugMode 
-    ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript} >> ${LOG_FILE} 2>&1'` 
-    : `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}'`;
+async function runDownloadTmdbImages(specificShow = null, specificMovie = null) {
+  console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+  let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}'`;
+
+  if (specificShow) {
+    command += ` --show "${specificShow}"`;
+  } else if (specificMovie) {
+    command += ` --movie "${specificMovie}"`;
+  }
+
+  if (isDebugMode) {
+    command += ` >> ${LOG_FILE} 2>&1`;
+  }
 
   try {
-    await execAsync(command);
+    //console.log(`Executing command: ${command}`); // Log the command being executed
+    const { stdout, stderr } = await execAsync(command);
+    console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+    //console.log(`Command output: ${stdout}`);
+    if (stderr) {
+      console.error(`download_tmdb_images.py error: ${stderr}`);
+    }
+    console.log(`Finished running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
   } catch (error) {
     console.error(`Error executing download_tmdb_images.py: ${error}`);
   }
 }
 
-async function runGenerateThumbnailJson() {
-  console.log(`Running generate_thumbnail_json.sh job${debugMessage}`);
-  const command = isDebugMode 
-    ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript} >> ${LOG_FILE} 2>&1'` 
-    : `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript}'`;
+// async function runGenerateThumbnailJson() {
+//   console.log(`Running generate_thumbnail_json.sh job${debugMessage}`);
+//   const command = isDebugMode 
+//     ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript} >> ${LOG_FILE} 2>&1'` 
+//     : `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript}'`;
 
-  try {
-    await execAsync(command);
-  } catch (error) {
-    console.error(`Error executing generate_thumbnail_json.sh: ${error}`);
-  }
-}
+//   try {
+//     await execAsync(command);
+//   } catch (error) {
+//     console.error(`Error executing generate_thumbnail_json.sh: ${error}`);
+//   }
+// }
 
 async function runGenerateList() {
   try {
@@ -1189,9 +1263,12 @@ async function autoSync() {
 function scheduleTasks() {
   // Schedule for generate_thumbnail_json.sh
   // Scheduled to run every 6 minutes.
-  schedule.scheduleJob('*/6 * * * *', () => {
-    runGenerateThumbnailJson().catch(console.error);
-  });
+  // schedule.scheduleJob('*/6 * * * *', () => {
+  //   runGenerateThumbnailJson().catch(console.error);
+  // });
+  // Disabled because this was the old way of generating
+  // a thumbnail seek option. Instead we now use
+  // a spritesheet for slider previews.
 
   // Schedule for download_tmdb_images.py
   // Scheduled to run every 7 minutes.
@@ -1217,8 +1294,7 @@ async function initialize() {
   const port = 3000;
   app.listen(port, () => {
       scheduleTasks();
-      runDownloadTmdbImages().catch(console.error);
-      runGenerateThumbnailJson().catch(console.error);
+      //runGenerateThumbnailJson().catch(console.error);
       console.log(`Server running on port ${port}`);
       runGenerateList().catch(console.error);
   });

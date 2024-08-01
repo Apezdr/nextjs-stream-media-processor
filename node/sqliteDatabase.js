@@ -25,6 +25,13 @@ async function initializeDatabase() {
             urls TEXT
         );
     `);
+    await db.exec(`
+        CREATE TABLE IF NOT EXISTS missing_data_movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            last_attempt TIMESTAMP
+        );
+    `);
     return db;
 }
 
@@ -69,6 +76,20 @@ async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, url
     }
 }
 
+async function insertOrUpdateMissingDataMovie(db, name) {
+  const now = new Date().toISOString();
+  try {
+      await db.run('INSERT INTO missing_data_movies (name, last_attempt) VALUES (?, ?)', [name, now]);
+  } catch (error) {
+      if (error.code === 'SQLITE_CONSTRAINT') {
+          // If the entry already exists, update the last_attempt timestamp
+          await db.run('UPDATE missing_data_movies SET last_attempt = ? WHERE name = ?', [now, name]);
+      } else {
+          throw error; // Re-throw the error if it's not a unique constraint error
+      }
+  }
+}
+
 async function getTVShows(db) {
   const shows = await db.all('SELECT * FROM tv_shows');
   return shows.map(show => ({
@@ -92,6 +113,15 @@ async function getMovies(db) {
     }));
 }
 
+async function getMissingDataMovies(db) {
+    const movies = await db.all('SELECT * FROM missing_data_movies');
+    return movies.map(movie => ({
+        id: movie.id,
+        name: movie.name,
+        lastAttempt: movie.last_attempt
+    }));
+}
+
 async function isDatabaseEmpty(db, tableName = 'movies') {
     const row = await db.get(`SELECT COUNT(*) as count FROM ${tableName}`);
     return row.count === 0;
@@ -101,7 +131,9 @@ module.exports = {
     initializeDatabase,
     insertOrUpdateTVShow,
     insertOrUpdateMovie,
+    insertOrUpdateMissingDataMovie,
     getMovies,
     getTVShows,
+    getMissingDataMovies,
     isDatabaseEmpty
 };

@@ -1,3 +1,4 @@
+import argparse
 import os
 import requests
 import json
@@ -5,6 +6,11 @@ import time
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import re
+
+parser = argparse.ArgumentParser(description='Download TMDB images for TV shows and movies.')
+parser.add_argument('--show', type=str, help='Specific TV show to scan')
+parser.add_argument('--movie', type=str, help='Specific movie to scan')
+args = parser.parse_args()
 
 # Pull the TMDB API key from the environment variable
 TMDB_API_KEY = os.getenv('TMDB_API_KEY')
@@ -181,8 +187,10 @@ def get_file_extension(url):
     parsed_url = urlparse(url)
     return os.path.splitext(parsed_url.path)[1]
 
-def process_shows():
+def process_shows(specific_show=None):
     for show_name in os.listdir(SHOWS_DIR):
+        if specific_show and show_name != specific_show:
+            continue
         show_dir = os.path.join(SHOWS_DIR, show_name)
         tmdb_config_path = os.path.join(show_dir, 'tmdb.config')
         metadata_file = os.path.join(show_dir, 'metadata.json')
@@ -278,8 +286,10 @@ def process_shows():
                 # Season directory does not exist, skip processing for this season
                 print(f"Skipping Season {season_number} for '{show_name}' as the directory does not exist.")
 
-def process_movies():
+def process_movies(specific_movie=None):
     for movie_name in os.listdir(MOVIES_DIR):
+        if specific_movie and movie_name != specific_movie:
+            continue
         movie_dir = os.path.join(MOVIES_DIR, movie_name)
         if not os.path.isdir(movie_dir):  # Skip if not a directory
             continue
@@ -322,7 +332,16 @@ def process_movies():
                         download_image(logo_url, logo_file_path)
 
 print("Processing TMDB Updates")
-# Process updates
-process_movies()
-process_shows()
+
+# Main execution
+if args.show:
+    print("--Processing Show", args.show)
+    process_shows(specific_show=args.show)
+elif args.movie:
+    print("--Processing Movie", args.movie)
+    process_movies(specific_movie=args.movie)
+else:
+    process_shows()
+    process_movies()
+
 print("Finished TMDB Updates")
