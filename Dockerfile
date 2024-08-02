@@ -20,7 +20,7 @@ COPY node ./
 FROM node:18.17.0-alpine
 
 # Install Python, pip, ffmpeg, and other necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo gcc musl-dev linux-headers
 
 # Install dos2unix
 RUN apk add --no-cache dos2unix
@@ -44,6 +44,9 @@ RUN /opt/venv/bin/pip install -r /tmp/requirements.txt
 
 # Install PIL (Pillow) for image processing within the virtual environment
 RUN /opt/venv/bin/pip install Pillow
+
+# Remove build dependencies to reduce image size
+RUN apk del gcc musl-dev linux-headers
 
 # Grant execution rights on the scripts
 RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
