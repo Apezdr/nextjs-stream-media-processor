@@ -1090,6 +1090,8 @@ async function generateListMovies(db, dirPath) {
         urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
         if (await fileExists(`${backdropPath}.blurhash`)) {
           urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
+        } else {
+          await getStoredBlurhash(backdropPath, BASE_PATH);
         }
       } else {
         runDownloadTmdbImagesFlag = true;
@@ -1100,6 +1102,8 @@ async function generateListMovies(db, dirPath) {
         urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
         if (await fileExists(`${posterPath}.blurhash`)) {
           urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
+        } else {
+          await getStoredBlurhash(posterPath, BASE_PATH);
         }
       } else {
         runDownloadTmdbImagesFlag = true;
@@ -1131,7 +1135,7 @@ async function generateListMovies(db, dirPath) {
 
       if (runDownloadTmdbImagesFlag) {
         await insertOrUpdateMissingDataMedia(db, dirName); // Update the last attempt timestamp
-        await runDownloadTmdbImages(null,dirName);
+        await runDownloadTmdbImages(null, dirName);
         // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(path.join(dirPath, dirName));
         const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
@@ -1141,6 +1145,8 @@ async function generateListMovies(db, dirPath) {
           urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
           if (await fileExists(`${backdropPath}.blurhash`)) {
             urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
+          } else {
+            await getStoredBlurhash(backdropPath, BASE_PATH);
           }
         }
 
@@ -1149,6 +1155,8 @@ async function generateListMovies(db, dirPath) {
           urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
           if (await fileExists(`${posterPath}.blurhash`)) {
             urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
+          } else {
+            await getStoredBlurhash(posterPath, BASE_PATH);
           }
         }
 
@@ -1169,8 +1177,7 @@ async function generateListMovies(db, dirPath) {
       const chaptersPath2 = path.join(dirPath, dirName, 'chapters', `${mp4Filename}_chapters.vtt`);
       if (await fileExists(chaptersPath)) {
         urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
-      }
-      else if (await fileExists(chaptersPath2)) {
+      } else if (await fileExists(chaptersPath2)) {
         urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${mp4Filename}_chapters.vtt`)}`;
       }
 
@@ -1189,6 +1196,7 @@ async function generateListMovies(db, dirPath) {
     }
   }
 }
+
 
 app.get('/media/movies', async (req, res) => {
   try {
