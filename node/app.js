@@ -835,8 +835,8 @@ async function generateListTV(db, dirPath) {
       }
 
       if (runDownloadTmdbImagesFlag) {
-        await runDownloadTmdbImages(showName);
         await insertOrUpdateMissingDataMedia(db, showName); // Update the last attempt timestamp
+        await runDownloadTmdbImages(showName);
         // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(showPath);
         const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
@@ -1130,8 +1130,8 @@ async function generateListMovies(db, dirPath) {
       }
 
       if (runDownloadTmdbImagesFlag) {
-        await runDownloadTmdbImages(null,dirName);
         await insertOrUpdateMissingDataMedia(db, dirName); // Update the last attempt timestamp
+        await runDownloadTmdbImages(null,dirName);
         // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(path.join(dirPath, dirName));
         const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
