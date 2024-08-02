@@ -26,7 +26,7 @@ async function initializeDatabase() {
         );
     `);
     await db.exec(`
-        CREATE TABLE IF NOT EXISTS missing_data_movies (
+        CREATE TABLE IF NOT EXISTS missing_data_media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
             last_attempt TIMESTAMP
@@ -76,14 +76,14 @@ async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, url
     }
 }
 
-async function insertOrUpdateMissingDataMovie(db, name) {
+async function insertOrUpdateMissingDataMedia(db, name) {
   const now = new Date().toISOString();
   try {
-      await db.run('INSERT INTO missing_data_movies (name, last_attempt) VALUES (?, ?)', [name, now]);
+      await db.run('INSERT INTO missing_data_media (name, last_attempt) VALUES (?, ?)', [name, now]);
   } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT') {
           // If the entry already exists, update the last_attempt timestamp
-          await db.run('UPDATE missing_data_movies SET last_attempt = ? WHERE name = ?', [now, name]);
+          await db.run('UPDATE missing_data_media SET last_attempt = ? WHERE name = ?', [now, name]);
       } else {
           throw error; // Re-throw the error if it's not a unique constraint error
       }
@@ -113,13 +113,13 @@ async function getMovies(db) {
     }));
 }
 
-async function getMissingDataMovies(db) {
-    const movies = await db.all('SELECT * FROM missing_data_movies');
-    return movies.map(movie => ({
-        id: movie.id,
-        name: movie.name,
-        lastAttempt: movie.last_attempt
-    }));
+async function getMissingDataMedia(db) {
+  const media = await db.all('SELECT * FROM missing_data_media');
+  return media.map(item => ({
+      id: item.id,
+      name: item.name,
+      lastAttempt: item.last_attempt
+  }));
 }
 
 async function isDatabaseEmpty(db, tableName = 'movies') {
@@ -131,9 +131,9 @@ module.exports = {
     initializeDatabase,
     insertOrUpdateTVShow,
     insertOrUpdateMovie,
-    insertOrUpdateMissingDataMovie,
+    insertOrUpdateMissingDataMedia,
     getMovies,
     getTVShows,
-    getMissingDataMovies,
+    getMissingDataMedia,
     isDatabaseEmpty
 };

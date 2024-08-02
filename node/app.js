@@ -10,7 +10,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMovie, getMissingDataMovies } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -746,6 +746,8 @@ setInterval(clearOldCacheFiles, 30 * 60 * 1000);
 //
 async function generateListTV(db, dirPath) {
   const shows = await fs.readdir(dirPath, { withFileTypes: true });
+  const missingDataMedia = await getMissingDataMedia(db);
+  const now = new Date();
 
   for (const show of shows) {
     if (show.isDirectory()) {
@@ -759,6 +761,9 @@ async function generateListTV(db, dirPath) {
         seasons: {}
       };
 
+      // Initialize runDownloadTmdbImagesFlag
+      let runDownloadTmdbImagesFlag = false;
+
       // Handle show poster
       const posterPath = path.join(showPath, 'show_poster.jpg');
       if (await fileExists(posterPath)) {
@@ -767,10 +772,13 @@ async function generateListTV(db, dirPath) {
         if (posterBlurhash) {
           showMetadata.posterBlurhash = posterBlurhash;
         }
+      } else {
+        runDownloadTmdbImagesFlag = true;
       }
 
       // Handle show logo with various extensions
       const logoExtensions = ['svg', 'jpg', 'png', 'gif'];
+      let logoFound = false;
       for (const ext of logoExtensions) {
         const logoPath = path.join(showPath, `show_logo.${ext}`);
         if (await fileExists(logoPath)) {
@@ -781,12 +789,17 @@ async function generateListTV(db, dirPath) {
               showMetadata.logoBlurhash = logoBlurhash;
             }
           }
+          logoFound = true;
           break;
         }
+      }
+      if (!logoFound) {
+        runDownloadTmdbImagesFlag = true;
       }
 
       // Handle show backdrop with various extensions
       const backdropExtensions = ['jpg', 'png', 'gif'];
+      let backdropFound = false;
       for (const ext of backdropExtensions) {
         const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
         if (await fileExists(backdropPath)) {
@@ -795,7 +808,71 @@ async function generateListTV(db, dirPath) {
           if (backdropBlurhash) {
             showMetadata.backdropBlurhash = backdropBlurhash;
           }
+          backdropFound = true;
           break;
+        }
+      }
+      if (!backdropFound) {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Handle metadata
+      const metadataPath = path.join(showPath, 'metadata.json');
+      if (!await fileExists(metadataPath)) {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Check if the show is in the missing data table and if it should be retried
+      const missingDataShow = missingDataMedia.find(media => media.name === showName);
+      if (missingDataShow) {
+        const lastAttempt = new Date(missingDataShow.lastAttempt);
+        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
+        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
+          runDownloadTmdbImagesFlag = true; // Retry if it was more than RETRY_INTERVAL_HOURS
+        } else {
+          runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
+        }
+      }
+
+      if (runDownloadTmdbImagesFlag) {
+        await runDownloadTmdbImages(showName);
+        await insertOrUpdateMissingDataMedia(db, showName); // Update the last attempt timestamp
+        // Retry fetching the data after running the script
+        const retryFiles = await fs.readdir(showPath);
+        const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
+
+        if (retryFileSet.has('show_poster.jpg')) {
+          showMetadata.poster = `/tv/${encodedShowName}/show_poster.jpg`;
+          const posterBlurhash = await getStoredBlurhash(path.join(showPath, 'show_poster.jpg'), BASE_PATH);
+          if (posterBlurhash) {
+            showMetadata.posterBlurhash = posterBlurhash;
+          }
+        }
+
+        for (const ext of logoExtensions) {
+          const logoPath = path.join(showPath, `show_logo.${ext}`);
+          if (retryFileSet.has(`show_logo.${ext}`)) {
+            showMetadata.logo = `/tv/${encodedShowName}/show_logo.${ext}`;
+            if (ext !== 'svg') {
+              const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
+              if (logoBlurhash) {
+                showMetadata.logoBlurhash = logoBlurhash;
+              }
+            }
+            break;
+          }
+        }
+
+        for (const ext of backdropExtensions) {
+          const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
+          if (retryFileSet.has(`show_backdrop.${ext}`)) {
+            showMetadata.backdrop = `/tv/${encodedShowName}/show_backdrop.${ext}`;
+            const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
+            if (backdropBlurhash) {
+              showMetadata.backdropBlurhash = backdropBlurhash;
+            }
+            break;
+          }
         }
       }
 
@@ -915,6 +992,7 @@ async function generateListTV(db, dirPath) {
   }
 }
 
+
 app.get('/media/tv', async (req, res) => {
   try {
     const db = await initializeDatabase();
@@ -948,7 +1026,7 @@ app.get('/media/tv', async (req, res) => {
 
 async function generateListMovies(db, dirPath) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
-  const missingDataMovies = await getMissingDataMovies(db);
+  const missingDataMovies = await getMissingDataMedia(db);
   const now = new Date();
 
   for (const dir of dirs) {
@@ -1044,14 +1122,16 @@ async function generateListMovies(db, dirPath) {
       if (missingDataMovie) {
         const lastAttempt = new Date(missingDataMovie.lastAttempt);
         const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-        if (hoursSinceLastAttempt < RETRY_INTERVAL_HOURS) {
+        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
+          runDownloadTmdbImagesFlag = true; // Retry if it was more than RETRY_INTERVAL_HOURS
+        } else {
           runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
         }
       }
 
       if (runDownloadTmdbImagesFlag) {
         await runDownloadTmdbImages(null,dirName);
-        await insertOrUpdateMissingDataMovie(db, dirName); // Update the last attempt timestamp
+        await insertOrUpdateMissingDataMedia(db, dirName); // Update the last attempt timestamp
         // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(path.join(dirPath, dirName));
         const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup

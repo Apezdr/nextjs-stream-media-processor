@@ -1,3 +1,4 @@
+import json
 import argparse
 import os
 import requests
@@ -19,6 +20,12 @@ if not TMDB_API_KEY:
 
 SHOWS_DIR = '/var/www/html/tv'
 MOVIES_DIR = '/var/www/html/movies'
+
+def read_tmdb_config(config_path):
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return {}
 
 def get_tmdb_data(name, tmdb_id=None, type='tv'):
     """Fetch data from TMDB for both TV shows and movies, including trailers and logos."""
@@ -197,11 +204,9 @@ def process_shows(specific_show=None):
         
         print('TV: ' + show_name)
 
-        # Read TMDB ID from config if available
-        tmdb_id = None
-        if os.path.exists(tmdb_config_path):
-            with open(tmdb_config_path, 'r') as f:
-                tmdb_id = f.read().strip()
+        # Read TMDB config
+        tmdb_config = read_tmdb_config(tmdb_config_path)
+        tmdb_id = tmdb_config.get('tmdb_id')
 
         # Determine need for metadata refresh
         need_refresh = True
@@ -221,20 +226,22 @@ def process_shows(specific_show=None):
 
         # Iterate over specified image types to check and download necessary images
         for image_type in ['backdrop_path', 'poster_path', 'logo_path']:
-            # Check if the current image type exists in the show's data
             if image_type in show_data:
-                # Construct the full image URL using the TMDB base URL and the specific image path from the show's data
-                image_url = f'https://image.tmdb.org/t/p/original{show_data[image_type]}'
-                # Determine the file extension of the image (e.g., .jpg, .png) by parsing the image URL
+                override_key = f'override_{image_type.split("_")[0]}'
+                if override_key in tmdb_config:
+                    # Use the override image
+                    override_image = tmdb_config[override_key]
+                    image_url = f'https://image.tmdb.org/t/p/original{override_image}'
+                else:
+                    # Use the TMDB image
+                    image_url = f'https://image.tmdb.org/t/p/original{show_data[image_type]}'
+
                 file_extension = get_file_extension(image_url)
-                # Construct the full local path where the image will be saved,
-                # using a naming convention that includes the type of the image (e.g., "show_backdrop.jpg")
                 image_path = os.path.join(show_dir, f'show_{image_type.split("_")[0]}{file_extension}')
-                # Check if the image file does not exist or if the metadata was recently refreshed,
-                # indicating a potential update to the image
+
+                # Check if the image file does not exist or if the metadata was recently refreshed
                 if not os.path.exists(image_path) or need_refresh:
                     # If the image doesn't exist or needs to be refreshed, download the image from the URL
-                    # and save it to the constructed local path
                     download_image(image_url, image_path)
 
 
@@ -298,38 +305,33 @@ def process_movies(specific_movie=None):
         
         print('Movie: ' + movie_name)
 
-        tmdb_id = None
-        # If there is a tmdb.config file in the movie directory, use that TMDB ID
-        if os.path.exists(tmdb_config_path):
-            with open(tmdb_config_path, 'r') as f:
-                tmdb_id = f.read().strip()
+        # If there is a tmdb.config file in the movie directory, use that TMDB config
+        tmdb_config = read_tmdb_config(tmdb_config_path)
+        tmdb_id = tmdb_config.get('tmdb_id')
 
         # Check for existing metadata and its freshness
         refresh_metadata = not os.path.exists(metadata_file) or datetime.now() - datetime.fromtimestamp(os.path.getmtime(metadata_file)) > timedelta(days=1)
 
-        # Comment out the line below to force metadata to refresh
         if refresh_metadata:
             movie_data = get_tmdb_data(movie_name, tmdb_id=tmdb_id, type='movie')
             if movie_data:
                 with open(metadata_file, 'w') as f:
                     json.dump(movie_data, f, indent=4, sort_keys=True)
 
-                # Download and save poster and backdrop images
-                for image_key in ['poster_path', 'backdrop_path']:
+                # Download and save poster, backdrop, and logo images
+                for image_key in ['poster_path', 'backdrop_path', 'logo_path']:
                     if image_key in movie_data:
-                        image_url = f'https://image.tmdb.org/t/p/original{movie_data[image_key]}'
-                        file_extension = get_file_extension(image_url)
-                        file_path = os.path.join(movie_dir, f'{image_key.replace("_path", "")}{file_extension}')
-                        if not os.path.exists(file_path):  # Download only if the file doesn't exist
-                            download_image(image_url, file_path)
-
-                # If the movie has a logo path, download the logo image
-                if 'logo_path' in movie_data:
-                    logo_url = movie_data['logo_path']
-                    logo_extension = get_file_extension(logo_url)
-                    logo_file_path = os.path.join(movie_dir, f'movie_logo{logo_extension}')
-                    if not os.path.exists(logo_file_path):  # Download only if the file doesn't exist
-                        download_image(logo_url, logo_file_path)
+                        override_key = f'override_{image_key.split("_")[0]}'
+                        if override_key in tmdb_config:
+                            # Use the override image
+                            file_path = tmdb_config[override_key]
+                        else:
+                            # Use the TMDB image
+                            image_url = f'https://image.tmdb.org/t/p/original{movie_data[image_key]}'
+                            file_extension = get_file_extension(image_url)
+                            file_path = os.path.join(movie_dir, f'{image_key.replace("_path", "")}{file_extension}')
+                            if not os.path.exists(file_path):  # Download only if the file doesn't exist
+                                download_image(image_url, file_path)
 
 print("Processing TMDB Updates")
 
