@@ -1,3 +1,4 @@
 requests
 Pillow
+blurhash
 # Add any other dependencies your Python scripts require
