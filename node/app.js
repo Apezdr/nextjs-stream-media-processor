@@ -1067,7 +1067,7 @@ async function generateListMovies(db, dirPath) {
 
           fileLengths[file] = parseInt(fileLength, 10);
           fileDimensions[file] = fileDimensionsStr;
-          urls["mp4"] = `/movies/${encodedDirName}/${encodedFilePath}`;
+          urls["mp4"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodedFilePath}`;
         }
 
         if (file.endsWith('.srt')) {
@@ -1079,7 +1079,7 @@ async function generateListMovies(db, dirPath) {
           const subtitleKey = isHearingImpaired ? `${langName} Hearing Impaired` : langName;
 
           subtitles[subtitleKey] = {
-            url: `/movies/${encodedDirName}/${encodedFilePath}`,
+            url: `${PREFIX_PATH}/movies/${encodedDirName}/${encodedFilePath}`,
             srcLang: langCode,
             lastModified: (await fs.stat(filePath)).mtime.toISOString()
           };
