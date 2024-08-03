@@ -784,7 +784,7 @@ async function generateListTV(db, dirPath) {
       for (const ext of logoExtensions) {
         const logoPath = path.join(showPath, `show_logo.${ext}`);
         if (await fileExists(logoPath)) {
-          showMetadata.logo = `/tv/${encodedShowName}/show_logo.${ext}`;
+          showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
           if (ext !== 'svg') {
             const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
             if (logoBlurhash) {
