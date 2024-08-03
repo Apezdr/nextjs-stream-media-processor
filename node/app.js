@@ -1101,7 +1101,7 @@ async function generateListMovies(db, dirPath) {
 
       if (fileSet.has('poster.jpg')) {
         const posterPath = path.join(dirPath, dirName, 'poster.jpg');
-        urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
+        urls["poster"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
         if (await fileExists(`${posterPath}.blurhash`)) {
           urls["posterBlurhash"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
         } else {
