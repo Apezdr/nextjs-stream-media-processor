@@ -8,6 +8,9 @@ const scriptsDir = path.resolve(__dirname, '../scripts');
 const blurhashCli = path.join(scriptsDir, 'blurhash-cli.py');
 const LOG_FILE = '/var/log/blurhash.log';
 
+// PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
+const PREFIX_PATH = process.env.PREFIX_PATH || '';
+
 let limit;
 
 async function loadPLimit() {
@@ -119,7 +122,7 @@ async function getStoredBlurhash(imagePath, basePath) {
   const blurhashFile = `${imagePath}.blurhash`;
   const relativePath = path.relative(basePath, blurhashFile);
   const encodedRelativePath = relativePath.split(path.sep).map(encodeURIComponent).join(path.sep);
-  const relativeUrl = `/${encodedRelativePath}`;
+  const relativeUrl = `${PREFIX_PATH}/${encodedRelativePath}`;
 
   if (await fileExists(blurhashFile)) {
     return relativeUrl;

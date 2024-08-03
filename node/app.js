@@ -26,6 +26,8 @@ const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
 const BASE_PATH = "/var/www/html";
+// PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
+const PREFIX_PATH = process.env.PREFIX_PATH || '';
 const scriptsDir = path.resolve(__dirname, '../scripts');
 // Moderately spaced out interval to check for missing data
 const RETRY_INTERVAL_HOURS = 24; // Interval to retry downloading missing tmdb data
@@ -757,7 +759,7 @@ async function generateListTV(db, dirPath) {
       const seasons = await fs.readdir(showPath, { withFileTypes: true });
 
       const showMetadata = {
-        metadata: `/tv/${encodedShowName}/metadata.json`,
+        metadata: `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`,
         seasons: {}
       };
 
@@ -767,7 +769,7 @@ async function generateListTV(db, dirPath) {
       // Handle show poster
       const posterPath = path.join(showPath, 'show_poster.jpg');
       if (await fileExists(posterPath)) {
-        showMetadata.poster = `/tv/${encodedShowName}/show_poster.jpg`;
+        showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
         const posterBlurhash = await getStoredBlurhash(posterPath, BASE_PATH);
         if (posterBlurhash) {
           showMetadata.posterBlurhash = posterBlurhash;
@@ -803,7 +805,7 @@ async function generateListTV(db, dirPath) {
       for (const ext of backdropExtensions) {
         const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
         if (await fileExists(backdropPath)) {
-          showMetadata.backdrop = `/tv/${encodedShowName}/show_backdrop.${ext}`;
+          showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
           const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
           if (backdropBlurhash) {
             showMetadata.backdropBlurhash = backdropBlurhash;
@@ -842,7 +844,7 @@ async function generateListTV(db, dirPath) {
         const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
 
         if (retryFileSet.has('show_poster.jpg')) {
-          showMetadata.poster = `/tv/${encodedShowName}/show_poster.jpg`;
+          showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
           const posterBlurhash = await getStoredBlurhash(path.join(showPath, 'show_poster.jpg'), BASE_PATH);
           if (posterBlurhash) {
             showMetadata.posterBlurhash = posterBlurhash;
@@ -852,7 +854,7 @@ async function generateListTV(db, dirPath) {
         for (const ext of logoExtensions) {
           const logoPath = path.join(showPath, `show_logo.${ext}`);
           if (retryFileSet.has(`show_logo.${ext}`)) {
-            showMetadata.logo = `/tv/${encodedShowName}/show_logo.${ext}`;
+            showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
             if (ext !== 'svg') {
               const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
               if (logoBlurhash) {
@@ -866,7 +868,7 @@ async function generateListTV(db, dirPath) {
         for (const ext of backdropExtensions) {
           const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
           if (retryFileSet.has(`show_backdrop.${ext}`)) {
-            showMetadata.backdrop = `/tv/${encodedShowName}/show_backdrop.${ext}`;
+            showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
             const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
             if (backdropBlurhash) {
               showMetadata.backdropBlurhash = backdropBlurhash;
@@ -899,7 +901,7 @@ async function generateListTV(db, dirPath) {
           // Handle season poster
           const seasonPosterPath = path.join(seasonPath, 'season_poster.jpg');
           if (await fileExists(seasonPosterPath)) {
-            seasonData.season_poster = `/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
+            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
             const seasonPosterBlurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
             if (seasonPosterBlurhash) {
               seasonData.seasonPosterBlurhash = seasonPosterBlurhash;
@@ -930,7 +932,7 @@ async function generateListTV(db, dirPath) {
             seasonData.dimensions[episode] = fileDimensions;
 
             const episodeData = {
-              videourl: `/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
+              videourl: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
               mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString()
             };
 
@@ -939,7 +941,7 @@ async function generateListTV(db, dirPath) {
             if (episodeNumber) {
               const thumbnailPath = path.join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
               if (await fileExists(thumbnailPath)) {
-                episodeData.thumbnail = `/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber} - Thumbnail.jpg`)}`;
+                episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber} - Thumbnail.jpg`)}`;
                 const thumbnailBlurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
                 if (thumbnailBlurhash) {
                   episodeData.thumbnailBlurhash = thumbnailBlurhash;
@@ -948,14 +950,14 @@ async function generateListTV(db, dirPath) {
 
               const metadataPath = path.join(seasonPath, `${episodeNumber}_metadata.json`);
               if (await fileExists(metadataPath)) {
-                episodeData.metadata = `/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber}_metadata.json`)}`;
+                episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber}_metadata.json`)}`;
               }
 
               const seasonNumber = seasonName.match(/\d+/)?.[0]?.padStart(2, '0');
               const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
               const chaptersPath = path.join(seasonPath, 'chapters', `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`);
               if (await fileExists(chaptersPath)) {
-                episodeData.chapters = `/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(`${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`)}`;
+                episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(`${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`)}`;
               }
 
               const subtitleFiles = await fs.readdir(seasonPath);
@@ -969,7 +971,7 @@ async function generateListTV(db, dirPath) {
                   const langName = langMap[langCode] || langCode;
                   const subtitleKey = isHearingImpaired ? `${langName} Hearing Impaired` : langName;
                   subtitles[subtitleKey] = {
-                    url: `/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(subtitleFile)}`,
+                    url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(subtitleFile)}`,
                     srcLang: langCode,
                     lastModified: (await fs.stat(path.join(seasonPath, subtitleFile))).mtime.toISOString()
                   };
@@ -1087,9 +1089,9 @@ async function generateListMovies(db, dirPath) {
       // Check for required files using the set
       if (fileSet.has('backdrop.jpg')) {
         const backdropPath = path.join(dirPath, dirName, 'backdrop.jpg');
-        urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
+        urls["backdrop"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
         if (await fileExists(`${backdropPath}.blurhash`)) {
-          urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
+          urls["backdropBlurhash"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
         } else {
           await getStoredBlurhash(backdropPath, BASE_PATH);
         }
@@ -1101,7 +1103,7 @@ async function generateListMovies(db, dirPath) {
         const posterPath = path.join(dirPath, dirName, 'poster.jpg');
         urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
         if (await fileExists(`${posterPath}.blurhash`)) {
-          urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
+          urls["posterBlurhash"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
         } else {
           await getStoredBlurhash(posterPath, BASE_PATH);
         }
@@ -1110,13 +1112,13 @@ async function generateListMovies(db, dirPath) {
       }
 
       if (fileSet.has('movie_logo.png')) {
-        urls["logo"] = `/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
+        urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
       } else {
         runDownloadTmdbImagesFlag = true;
       }
 
       if (fileSet.has('metadata.json')) {
-        urls["metadata"] = `/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
+        urls["metadata"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
       } else {
         runDownloadTmdbImagesFlag = true;
       }
@@ -1142,9 +1144,9 @@ async function generateListMovies(db, dirPath) {
 
         if (retryFileSet.has('backdrop.jpg')) {
           const backdropPath = path.join(dirPath, dirName, 'backdrop.jpg');
-          urls["backdrop"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
+          urls["backdrop"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}`;
           if (await fileExists(`${backdropPath}.blurhash`)) {
-            urls["backdropBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
+            urls["backdropBlurhash"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('backdrop.jpg')}.blurhash`;
           } else {
             await getStoredBlurhash(backdropPath, BASE_PATH);
           }
@@ -1152,20 +1154,20 @@ async function generateListMovies(db, dirPath) {
 
         if (retryFileSet.has('poster.jpg')) {
           const posterPath = path.join(dirPath, dirName, 'poster.jpg');
-          urls["poster"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
+          urls["poster"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}`;
           if (await fileExists(`${posterPath}.blurhash`)) {
-            urls["posterBlurhash"] = `/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
+            urls["posterBlurhash"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('poster.jpg')}.blurhash`;
           } else {
             await getStoredBlurhash(posterPath, BASE_PATH);
           }
         }
 
         if (retryFileSet.has('movie_logo.png')) {
-          urls["logo"] = `/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
+          urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
         }
 
         if (retryFileSet.has('metadata.json')) {
-          urls["metadata"] = `/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
+          urls["metadata"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
         }
       }
 
@@ -1176,9 +1178,9 @@ async function generateListMovies(db, dirPath) {
       const chaptersPath = path.join(dirPath, dirName, 'chapters', `${dirName}_chapters.vtt`);
       const chaptersPath2 = path.join(dirPath, dirName, 'chapters', `${mp4Filename}_chapters.vtt`);
       if (await fileExists(chaptersPath)) {
-        urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
+        urls["chapters"] = `${PREFIX_PATH}/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
       } else if (await fileExists(chaptersPath2)) {
-        urls["chapters"] = `/movies/${encodedDirName}/chapters/${encodeURIComponent(`${mp4Filename}_chapters.vtt`)}`;
+        urls["chapters"] = `${PREFIX_PATH}/movies/${encodedDirName}/chapters/${encodeURIComponent(`${mp4Filename}_chapters.vtt`)}`;
       }
 
       // Remove empty sections
