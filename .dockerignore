@@ -1,0 +1,2 @@
+# Ignore the media.db file in the /node/ directory
+node/media.db
