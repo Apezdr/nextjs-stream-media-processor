@@ -10,7 +10,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -752,9 +752,14 @@ async function generateListTV(db, dirPath) {
   const missingDataMedia = await getMissingDataMedia(db);
   const now = new Date();
 
+  // Get the list of TV shows currently in the database
+  const existingShows = await getTVShows(db);
+  const existingShowNames = new Set(existingShows.map(show => show.name));
+
   for (const show of shows) {
     if (show.isDirectory()) {
       const showName = show.name;
+      existingShowNames.delete(showName); // Remove from the set of existing shows
       const encodedShowName = encodeURIComponent(showName);
       const showPath = path.join(dirPath, showName);
       const seasons = await fs.readdir(showPath, { withFileTypes: true });
@@ -993,8 +998,14 @@ async function generateListTV(db, dirPath) {
         }
       }
 
+      // Always update the database with the latest data
       await insertOrUpdateTVShow(db, showName, showMetadata, '{}');
     }
+  }
+
+  // Remove TV shows from the database that no longer exist in the file system
+  for (const showName of existingShowNames) {
+    await deleteTVShow(db, showName);
   }
 }
 

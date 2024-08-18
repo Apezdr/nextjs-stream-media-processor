@@ -128,6 +128,10 @@ async function deleteMovie(db, name) {
   await db.run('DELETE FROM movies WHERE name = ?', [name]);
 }
 
+async function deleteTVShow(db, name) {
+  await db.run('DELETE FROM tv_shows WHERE name = ?', [name]);
+}
+
 module.exports = {
     initializeDatabase,
     insertOrUpdateTVShow,
@@ -137,5 +141,6 @@ module.exports = {
     getTVShows,
     getMissingDataMedia,
     isDatabaseEmpty,
-    deleteMovie
+    deleteMovie,
+    deleteTVShow
 };
