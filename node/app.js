@@ -10,7 +10,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -21,11 +21,12 @@ const {
   getStoredBlurhash,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
-const { checkAutoSync, updateLastSyncTime } = require("./database");
+const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
-const BASE_PATH = "/var/www/html";
+// Define the base path to the tv/movie folders
+const BASE_PATH = process.env.BASE_PATH ? process.env.BASE_PATH : "/var/www/html";
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || '';
 const scriptsDir = path.resolve(__dirname, '../scripts');
@@ -146,7 +147,7 @@ async function handleFrameRequest(req, res, type) {
     const movieName = req.params.movieName
       ? req.params.movieName.replace(/%20/g, " ")
       : ""; // Replace %20 with space
-    directoryPath = path.join("/var/www/html/movies", movieName);
+    directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
     frameFileName = `movie_${movieName}_${timestamp}.jpg`;
   } else {
     // For TV shows, adjust this logic to fit your directory structure
@@ -165,7 +166,7 @@ async function handleFrameRequest(req, res, type) {
       episodeString.match(/E(\d{2})/i) || episodeString.match(/^(\d{2}) -/);
     const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
-    directoryPath = path.join("/var/www/html/tv", showName, `Season ${season}`);
+    directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
     frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${timestamp}.jpg`;
     specificFileName = `${episodeString}.mp4`;
   }
@@ -345,7 +346,7 @@ async function handleSpriteSheetRequest(req, res, type) {
         videoMp4 = JSON.parse(movie.urls).mp4;
         videoMp4 = decodeURIComponent(videoMp4);
         videoPath = path.join(
-          "/var/www/html",
+          BASE_PATH,
           videoMp4,
         );
       } else if (type === "tv") {
@@ -366,7 +367,7 @@ async function handleSpriteSheetRequest(req, res, type) {
 
             if (_episode) {
               const directoryPath = path.join(
-                "/var/www/html/tv",
+                `${BASE_PATH}/tv`,
                 showName,
                 `Season ${season}`
               );
@@ -452,7 +453,7 @@ async function handleVttRequest(req, res, type) {
         videoMp4 = JSON.parse(movie.urls).mp4;
         videoMp4 = decodeURIComponent(videoMp4);
         videoPath = path.join(
-          "/var/www/html",
+          BASE_PATH,
           videoMp4,
         );
         await generateSpriteSheet({
@@ -479,7 +480,7 @@ async function handleVttRequest(req, res, type) {
               });
               if (_episode) {
                 const directoryPath = path.join(
-                  "/var/www/html/tv",
+                  `${BASE_PATH}/tv`,
                   showName,
                   `Season ${season}`
                 );
@@ -568,13 +569,13 @@ async function handleChapterRequest(
     videoMp4 = JSON.parse(movie.urls).mp4;
     videoMp4 = decodeURIComponent(videoMp4);
     videoPath = path.join(
-      "/var/www/html",
+      BASE_PATH,
       videoMp4,
     );
     const movieFileName = path.basename(videoPath, path.extname(videoPath));
     chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = path.join("/var/www/html/movies", movieName, `${movieFileName}.mp4`);
-    chapterFilePath = path.join("/var/www/html/movies", movieName, "chapters", chapterFileName);
+    mediaPath = path.join(`${BASE_PATH}/movies`, movieName, `${movieFileName}.mp4`);
+    chapterFilePath = path.join(`${BASE_PATH}/movies`, movieName, "chapters", chapterFileName);
     await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
   } else if (type === "tv") {
     if (generateAllChapters) {
@@ -588,7 +589,7 @@ async function handleChapterRequest(
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
             const chapterFilePath = path.join(
-              "/var/www/html/tv",
+              `${BASE_PATH}/tv`,
               showName,
               seasonName,
               "chapters",
@@ -598,7 +599,7 @@ async function handleChapterRequest(
               )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
             );
             const directoryPath = path.join(
-              "/var/www/html/tv",
+              `${BASE_PATH}/tv`,
               showName,
               seasonName
             );
@@ -624,7 +625,7 @@ async function handleChapterRequest(
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
             const chapterFilePath = path.join(
-              "/var/www/html/tv",
+              `${BASE_PATH}/tv`,
               showName,
               seasonName,
               "chapters",
@@ -634,7 +635,7 @@ async function handleChapterRequest(
               )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
             );
             const directoryPath = path.join(
-              "/var/www/html/tv",
+              `${BASE_PATH}/tv`,
               showName,
               seasonName
             );
@@ -650,7 +651,7 @@ async function handleChapterRequest(
       }
     } else {
       const directoryPath = path.join(
-        "/var/www/html/tv",
+        `${BASE_PATH}/tv`,
         showName,
         `Season ${season}`
       );
@@ -766,7 +767,7 @@ async function generateListTV(db, dirPath) {
       // Initialize runDownloadTmdbImagesFlag
       let runDownloadTmdbImagesFlag = false;
 
-      // Handle show poster
+      // Handle show poster, logo, and backdrop
       const posterPath = path.join(showPath, 'show_poster.jpg');
       if (await fileExists(posterPath)) {
         showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
@@ -778,7 +779,6 @@ async function generateListTV(db, dirPath) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      // Handle show logo with various extensions
       const logoExtensions = ['svg', 'jpg', 'png', 'gif'];
       let logoFound = false;
       for (const ext of logoExtensions) {
@@ -799,7 +799,6 @@ async function generateListTV(db, dirPath) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      // Handle show backdrop with various extensions
       const backdropExtensions = ['jpg', 'png', 'gif'];
       let backdropFound = false;
       for (const ext of backdropExtensions) {
@@ -818,30 +817,27 @@ async function generateListTV(db, dirPath) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      // Handle metadata
       const metadataPath = path.join(showPath, 'metadata.json');
       if (!await fileExists(metadataPath)) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      // Check if the show is in the missing data table and if it should be retried
       const missingDataShow = missingDataMedia.find(media => media.name === showName);
       if (missingDataShow) {
         const lastAttempt = new Date(missingDataShow.lastAttempt);
         const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
         if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-          runDownloadTmdbImagesFlag = true; // Retry if it was more than RETRY_INTERVAL_HOURS
+          runDownloadTmdbImagesFlag = true;
         } else {
-          runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
+          runDownloadTmdbImagesFlag = false;
         }
       }
 
       if (runDownloadTmdbImagesFlag) {
-        await insertOrUpdateMissingDataMedia(db, showName); // Update the last attempt timestamp
+        await insertOrUpdateMissingDataMedia(db, showName);
         await runDownloadTmdbImages(showName);
-        // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(showPath);
-        const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
+        const retryFileSet = new Set(retryFiles);
 
         if (retryFileSet.has('show_poster.jpg')) {
           showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
@@ -885,10 +881,9 @@ async function generateListTV(db, dirPath) {
           const seasonPath = path.join(showPath, seasonName);
           const episodes = await fs.readdir(seasonPath);
 
-          // Check if there are any valid episodes in the season
           const validEpisodes = episodes.filter(episode => episode.endsWith('.mp4') && !episode.includes('-TdarrCacheFile-'));
           if (validEpisodes.length === 0) {
-            continue; // Skip this season if there are no valid episodes
+            continue;
           }
 
           const seasonData = {
@@ -898,7 +893,6 @@ async function generateListTV(db, dirPath) {
             dimensions: {}
           };
 
-          // Handle season poster
           const seasonPosterPath = path.join(seasonPath, 'season_poster.jpg');
           if (await fileExists(seasonPosterPath)) {
             seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
@@ -985,6 +979,16 @@ async function generateListTV(db, dirPath) {
             seasonData.urls[episode] = episodeData;
           }
 
+          // Process all thumbnails in the season directory
+          const thumbnailFiles = episodes.filter(file => file.endsWith(' - Thumbnail.jpg'));
+          for (const thumbnailFile of thumbnailFiles) {
+            const thumbnailPath = path.join(seasonPath, thumbnailFile);
+            const episodeNumber = thumbnailFile.match(/S\d+E(\d+)/i)?.[1] || thumbnailFile.match(/\d+/)?.[0];
+            if (episodeNumber) {
+              await getStoredBlurhash(thumbnailPath, BASE_PATH);
+            }
+          }
+
           showMetadata.seasons[seasonName] = seasonData;
         }
       }
@@ -999,7 +1003,7 @@ app.get('/media/tv', async (req, res) => {
   try {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty(db, 'tv_shows')) {
-      await generateListTV(db, "/var/www/html/tv");
+      await generateListTV(db, `${BASE_PATH}/tv`);
     }
     const shows = await getTVShows(db);
     await db.close();
@@ -1031,9 +1035,14 @@ async function generateListMovies(db, dirPath) {
   const missingDataMovies = await getMissingDataMedia(db);
   const now = new Date();
 
+  // Get the list of movies currently in the database
+  const existingMovies = await getMovies(db);
+  const existingMovieNames = new Set(existingMovies.map(movie => movie.name));
+  
   for (const dir of dirs) {
     if (dir.isDirectory()) {
       const dirName = dir.name;
+      existingMovieNames.delete(dirName); // Remove from the set of existing movies
       const encodedDirName = encodeURIComponent(dirName);
       const files = await fs.readdir(path.join(dirPath, dirName));
       const fileSet = new Set(files); // Create a set of filenames for quick lookup
@@ -1111,8 +1120,8 @@ async function generateListMovies(db, dirPath) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      if (fileSet.has('movie_logo.png')) {
-        urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
+      if (fileSet.has('movie_logo.png')||fileSet.has('logo.png')) {
+        urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(fileSet.has('movie_logo.png') ? 'movie_logo.png' : 'logo.png')}`;
       } else {
         runDownloadTmdbImagesFlag = true;
       }
@@ -1162,8 +1171,8 @@ async function generateListMovies(db, dirPath) {
           }
         }
 
-        if (retryFileSet.has('movie_logo.png')) {
-          urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('movie_logo.png')}`;
+        if (retryFileSet.has('movie_logo.png')||fileSet.has('logo.png')) {
+          urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(encodeURIComponent(fileSet.has('movie_logo.png') ? 'movie_logo.png' : 'logo.png'))}`;
         }
 
         if (retryFileSet.has('metadata.json')) {
@@ -1194,8 +1203,14 @@ async function generateListMovies(db, dirPath) {
         delete urls;
       }
 
+      // Always update the database with the latest data
       await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "");
     }
+  }
+
+  // Remove movies from the database that no longer exist in the file system
+  for (const movieName of existingMovieNames) {
+    await deleteMovie(db, movieName);
   }
 }
 
@@ -1204,7 +1219,7 @@ app.get('/media/movies', async (req, res) => {
   try {
       const db = await initializeDatabase();
       if (await isDatabaseEmpty(db)) {
-          await generateListMovies(db, "/var/www/html/movies");
+          await generateListMovies(db, `${BASE_PATH}/movies`);
       }
       const movies = await getMovies(db);
       await db.close();
@@ -1215,7 +1230,6 @@ app.get('/media/movies', async (req, res) => {
               length: movie.lengths,
               dimensions: movie.dimensions,
               urls: movie.urls,
-              metadata: movie.metadataUrl
           };
           return acc;
       }, {});
@@ -1230,7 +1244,7 @@ app.get('/media/movies', async (req, res) => {
 app.post('/media/scan', async (req, res) => {
   try {
       const db = await initializeDatabase();
-      await generateListMovies(db, "/var/www/html/movies");
+      await generateListMovies(db, `${BASE_PATH}/movies`);
       await db.close();
       res.status(200).send('Library scan completed');
   } catch (error) {
@@ -1292,15 +1306,29 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null) 
 //     console.error(`Error executing generate_thumbnail_json.sh: ${error}`);
 //   }
 // }
+let isScanning = false;
 
 async function runGenerateList() {
+  if (isScanning) {
+    console.warn(`[${new Date().toISOString()}] Previous scan is still running. Skipping this iteration.`);
+    return;
+  } else {
+    console.log(`[${new Date().toISOString()}] Generating media list`);
+  }
+
+  isScanning = true;
+
   try {
     const db = await initializeDatabase();
-    await generateListMovies(db, "/var/www/html/movies");
-    await generateListTV(db, "/var/www/html/tv");
+    await generateListMovies(db, `${BASE_PATH}/movies`);
+    await generateListTV(db, `${BASE_PATH}/tv`);
+    console.log(`[${new Date().toISOString()}] Finished generating media list`);
     await db.close();
   } catch (error) {
     console.error(`Error generating media list: ${error}`);
+  } finally {
+    isScanning = false;
+    autoSync().catch(console.error); // Add autoSync to the scheduled tasks
   }
 }
 
@@ -1330,8 +1358,9 @@ async function autoSync() {
       }
     } catch (error) {
       const prefix = 'Sync request failed: ';
+
       if (error.response && error.response.data) {
-        console.error(`${prefix}${error.response.data}`);
+        console.error(`${prefix}${JSON.stringify(error.response.data)}`);
         errorMessage = error.response.data;
       } else if (error.response && error.response.status === 404) {
         const unavailableMessage = `${process.env.FRONT_END}/api/authenticated/admin/sync is unavailable`;
@@ -1339,12 +1368,11 @@ async function autoSync() {
         errorMessage = unavailableMessage;
       } else if (error.code === 'ECONNRESET') {
         const connectionResetMessage = 'Connection was reset. Please try again later.';
-        console.error(`${prefix}${connectionResetMessage}`, error);
+        console.error(`${prefix}${connectionResetMessage}`, JSON.stringify(error));
         errorMessage = connectionResetMessage;
       } else {
-        console.error(`${prefix}An unexpected error occurred.`, error);
-      }
-    }
+        console.error(`${prefix}An unexpected error occurred.`, JSON.stringify(error));
+      }}
   } else {
     console.log("Auto Sync is disabled. Skipping sync...");
   }
@@ -1374,7 +1402,6 @@ function scheduleTasks() {
   // Schedule for runGenerateList and autoSync
   schedule.scheduleJob('*/1 * * * *', () => {
     runGenerateList().catch(console.error);
-    autoSync().catch(console.error); // Add autoSync to the scheduled tasks
   });
 }
 
@@ -1382,11 +1409,22 @@ function scheduleTasks() {
 async function initialize() {
   await ensureCacheDir();
   const port = 3000;
-  app.listen(port, () => {
+  app.listen(port, async () => {
       scheduleTasks();
       //runGenerateThumbnailJson().catch(console.error);
       console.log(`Server running on port ${port}`);
+      initializeMongoDatabase()
+            .then(() => {
+                return initializeIndexes();
+            })
+            .then(() => {
+                console.log("Database and indexes initialized successfully.");
+            })
+            .catch((error) => {
+                console.error("Error during initialization:", error);
+            });
       runGenerateList().catch(console.error);
+      runGeneratePosterCollage().catch(console.error);
   });
 }
 

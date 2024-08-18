@@ -5,17 +5,17 @@ const _fs = require("fs");
 const os = require("os");
 const { findMp4File } = require("./utils");
 
-async function handleVideoRequest(req, res, type) {
+async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
   const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
 
   try {
     let videoPath;
     if (type === "movies") {
-	  const directoryPath = path.join("/var/www/html/movies", movieName);
+	  const directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
 	  videoPath = await findMp4File(directoryPath);
 	} else if (type === "tv") {
-	  const showsDataRaw = _fs.readFileSync("/var/www/html/tv_list.json", "utf8");
+	  const showsDataRaw = _fs.readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
 	  const showsData = JSON.parse(showsDataRaw);
 	  const showData = showsData[showName];
 
@@ -41,7 +41,7 @@ async function handleVideoRequest(req, res, type) {
 		throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
 	  }
 
-	  const directoryPath = path.join("/var/www/html/tv", showName, `Season ${season}`);
+	  const directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
 	  videoPath = await findMp4File(directoryPath, _episode);
 	}
 

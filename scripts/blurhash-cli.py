@@ -7,7 +7,11 @@ import base64
 
 def generate_blurhash(image_path, x_components=4, y_components=3):
     try:
-        hash = blurhash.encode(image_path, x_components, y_components)
+        with Image.open(image_path) as img:
+            # Convert to RGBA if the image has transparency
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                img = img.convert('RGBA')
+            hash = blurhash.encode(img, x_components, y_components)
         return hash
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -44,14 +44,13 @@ async function insertOrUpdateTVShow(db, showName, metadata, urls) {
     }
 }
 
-async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, urls, metadataUrl) {
+async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, urls) {
     const movie = {
       name,
       file_names: JSON.stringify(fileNames),
       lengths: JSON.stringify(lengths),
       dimensions: JSON.stringify(dimensions),
       urls: JSON.stringify(urls),
-      metadata_url: metadataUrl
     };
   
     const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name]);
@@ -61,7 +60,6 @@ async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, url
         movie.lengths,
         movie.dimensions,
         movie.urls,
-        movie.metadata_url,
         name
       ]);
     } else {
@@ -71,7 +69,6 @@ async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, url
         movie.lengths,
         movie.dimensions,
         movie.urls,
-        movie.metadata_url
       ]);
     }
 }
@@ -127,6 +124,10 @@ async function isDatabaseEmpty(db, tableName = 'movies') {
     return row.count === 0;
 }
 
+async function deleteMovie(db, name) {
+  await db.run('DELETE FROM movies WHERE name = ?', [name]);
+}
+
 module.exports = {
     initializeDatabase,
     insertOrUpdateTVShow,
@@ -135,5 +136,6 @@ module.exports = {
     getMovies,
     getTVShows,
     getMissingDataMedia,
-    isDatabaseEmpty
+    isDatabaseEmpty,
+    deleteMovie
 };

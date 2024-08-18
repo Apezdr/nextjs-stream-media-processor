@@ -134,9 +134,7 @@ async function getStoredBlurhash(imagePath, basePath) {
   console.log(`Running blurhash-cli.py job${debugMessage}`);
 
   // Construct the command based on debug mode
-  const command = isDebugMode 
-    ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} python3 ${blurhashCli} "${imagePath}" >> ${LOG_FILE} 2>&1'` 
-    : `sudo bash -c 'python3 ${blurhashCli} "${imagePath}"'`;
+  const command = `sudo bash -c "python3 ${blurhashCli} \\"${imagePath.replace(/"/g, '\\"')}\\""`;
 
   try {
     // Execute the command
