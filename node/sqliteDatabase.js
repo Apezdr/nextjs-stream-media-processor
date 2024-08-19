@@ -14,7 +14,8 @@ async function initializeDatabase() {
             lengths TEXT,
             dimensions TEXT,
             urls TEXT,
-            metadata_url TEXT
+            metadata_url TEXT,
+            directory_hash TEXT
         );
     `);
     await db.exec(`
@@ -22,7 +23,8 @@ async function initializeDatabase() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             metadata TEXT,
-            urls TEXT
+            urls TEXT,
+            directory_hash TEXT
         );
     `);
     await db.exec(`
@@ -44,33 +46,40 @@ async function insertOrUpdateTVShow(db, showName, metadata, urls) {
     }
 }
 
-async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, urls) {
-    const movie = {
-      name,
-      file_names: JSON.stringify(fileNames),
-      lengths: JSON.stringify(lengths),
-      dimensions: JSON.stringify(dimensions),
-      urls: JSON.stringify(urls),
-    };
-  
-    const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name]);
-    if (existingMovie) {
-      await db.run('UPDATE movies SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ? WHERE name = ?', [
+async function insertOrUpdateMovie(db, name, fileNames, lengths, dimensions, urls, metadata_url, hash) {
+  const movie = {
+    name,
+    file_names: JSON.stringify(fileNames),
+    lengths: JSON.stringify(lengths),
+    dimensions: JSON.stringify(dimensions),
+    urls: JSON.stringify(urls),
+    hash
+  };
+
+  const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name]);
+  if (existingMovie) {
+    if (existingMovie.directory_hash !== hash) {
+      await db.run('UPDATE movies SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ? WHERE name = ?', [
         movie.file_names,
         movie.lengths,
         movie.dimensions,
         movie.urls,
+        metadata_url,
+        hash,
         name
       ]);
-    } else {
-      await db.run('INSERT INTO movies (name, file_names, lengths, dimensions, urls, metadata_url) VALUES (?, ?, ?, ?, ?, ?)', [
-        name,
-        movie.file_names,
-        movie.lengths,
-        movie.dimensions,
-        movie.urls,
-      ]);
     }
+  } else {
+    await db.run('INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, name) VALUES (?, ?, ?, ?, ?, ?, ?)', [
+      movie.file_names,
+      movie.lengths,
+      movie.dimensions,
+      movie.urls,
+      metadata_url,
+      hash,
+      name
+    ]);
+  }
 }
 
 async function insertOrUpdateMissingDataMedia(db, name) {
@@ -106,7 +115,8 @@ async function getMovies(db) {
         lengths: JSON.parse(movie.lengths),
         dimensions: JSON.parse(movie.dimensions),
         urls: JSON.parse(movie.urls),
-        metadataUrl: movie.metadata_url
+        metadataUrl: movie.metadata_url,
+        directory_hash: movie.directory_hash
     }));
 }
 

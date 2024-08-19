@@ -6,6 +6,7 @@ const path = require('path');
 const cacheDir = path.join(__dirname, 'cache');
 const scriptsDir = path.resolve(__dirname, '../scripts');
 const blurhashCli = path.join(scriptsDir, 'blurhash-cli.py');
+const crypto = require('crypto');
 const LOG_FILE = '/var/log/blurhash.log';
 
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
@@ -155,6 +156,14 @@ async function getStoredBlurhash(imagePath, basePath) {
   }
 }
 
+function calculateDirectoryHash(files) {
+  const hash = crypto.createHash('sha256');
+  files.forEach(file => {
+    hash.update(file.name + file.size + file.mtimeMs);
+  });
+  return hash.digest('hex');
+}
+
 module.exports = {
   generateFrame: async (videoPath, timestamp, framePath) => {
     await loadPLimit();
@@ -166,4 +175,5 @@ module.exports = {
   cacheDir,
   findMp4File,
   getStoredBlurhash,
+  calculateDirectoryHash,
 };

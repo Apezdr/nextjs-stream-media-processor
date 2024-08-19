@@ -19,6 +19,7 @@ const {
   cacheDir,
   findMp4File,
   getStoredBlurhash,
+  calculateDirectoryHash,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
@@ -1053,9 +1054,24 @@ async function generateListMovies(db, dirPath) {
   for (const dir of dirs) {
     if (dir.isDirectory()) {
       const dirName = dir.name;
-      existingMovieNames.delete(dirName); // Remove from the set of existing movies
-      const encodedDirName = encodeURIComponent(dirName);
       const files = await fs.readdir(path.join(dirPath, dirName));
+      const filesWithStats = await Promise.all(files.map(async file => {
+        const stats = await fs.stat(path.join(dirPath, dirName, file));
+        return { name: file, stats };
+      }));
+      const hash = calculateDirectoryHash(filesWithStats);
+
+      const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [dirName]);
+      existingMovieNames.delete(dirName); // Remove from the set of existing movies
+      
+      if (existingMovie && existingMovie.directory_hash === hash) {
+        // If the hash is the same, skip detailed processing and use the existing data.
+        if (isDebugMode) {
+          console.log(`No changes detected in ${dirName}, skipping processing.`);
+        }
+        continue;
+      }
+      const encodedDirName = encodeURIComponent(dirName);
       const fileSet = new Set(files); // Create a set of filenames for quick lookup
       const fileNames = files.filter(file => file.endsWith('.mp4') || file.endsWith('.srt') || file.endsWith('.json') || file.endsWith('.info') || file.endsWith('.nfo') || file.endsWith('.jpg') || file.endsWith('.png'));
       const fileLengths = {};
@@ -1215,7 +1231,7 @@ async function generateListMovies(db, dirPath) {
       }
 
       // Always update the database with the latest data
-      await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "");
+      await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "", hash);
     }
   }
 
@@ -1224,7 +1240,6 @@ async function generateListMovies(db, dirPath) {
     await deleteMovie(db, movieName);
   }
 }
-
 
 app.get('/media/movies', async (req, res) => {
   try {
