@@ -23,6 +23,7 @@ const {
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
+const { handleVideoRequest } = require("./videoHandler");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
@@ -40,6 +41,9 @@ const downloadTmdbImagesScript = path.join(scriptsDir, 'download_tmdb_images.py'
 
 const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
 const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
+
+// Enable compression for all responses
+app.use(compression());
 
 ensureCacheDir();
 
@@ -333,6 +337,7 @@ async function handleSpriteSheetRequest(req, res, type) {
   try {
     if (await fileExists(spriteSheetPath)) {
       console.log(`Serving sprite sheet from cache: ${spriteSheetPath}`);
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       res.sendFile(spriteSheetPath);
     } else {
       console.log(`Sprite sheet not found in cache: ${spriteSheetFileName}`);
@@ -398,6 +403,7 @@ async function handleSpriteSheetRequest(req, res, type) {
       });
 
       // After generating the sprite sheet, send it to the client
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       res.sendFile(spriteSheetPath);
     }
   } catch (error) {
@@ -734,13 +740,13 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
 
 //
 // Handle MP4 Audio requests
-//app.get("/video/movie/:movieName", async (req, res) => {
-//  await handleVideoRequest(req, res, "movies");
-//});
+app.get("/video/movie/:movieName", async (req, res) => {
+ await handleVideoRequest(req, res, "movies", BASE_PATH);
+});
 
-//app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
+// app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
 //  await handleVideoRequest(req, res, "tv");
-//});
+// });
 
 // Schedule cache clearing every 30 minutes
 setInterval(clearOldCacheFiles, 30 * 60 * 1000);

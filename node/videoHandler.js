@@ -12,44 +12,57 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
   try {
     let videoPath;
     if (type === "movies") {
-	  const directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
-	  videoPath = await findMp4File(directoryPath);
-	} else if (type === "tv") {
-	  const showsDataRaw = _fs.readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
-	  const showsData = JSON.parse(showsDataRaw);
-	  const showData = showsData[showName];
+      const directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
+      videoPath = await findMp4File(directoryPath);
+    } else if (type === "tv") {
+      const showsDataRaw = _fs.readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
+      const showsData = JSON.parse(showsDataRaw);
+      const showData = showsData[showName];
 
-	  if (!showData) {
-		throw new Error(`Show not found: ${showName}`);
-	  }
+      if (!showData) {
+        throw new Error(`Show not found: ${showName}`);
+      }
 
-	  const _season = showData.seasons[`Season ${season}`];
-	  if (!_season) {
-		throw new Error(`Season not found: ${showName} - Season ${season}`);
-	  }
+      const _season = showData.seasons[`Season ${season}`];
+      if (!_season) {
+        throw new Error(`Season not found: ${showName} - Season ${season}`);
+      }
 
-	  // Filter out transcoded audio channel files
-	  const originalEpisodeFiles = _season.fileNames.filter(
-		(fileName) => !fileName.includes("_") && !fileName.includes("ch.mp4")
-	  );
+      // Filter out transcoded audio channel files
+      const originalEpisodeFiles = _season.fileNames.filter(
+        (fileName) => !fileName.includes("_") && !fileName.includes("ch.mp4")
+      );
 
-	  const _episode = originalEpisodeFiles.find((e) =>
-		e.includes(`S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`)
-	  );
+      const _episode = originalEpisodeFiles.find((e) =>
+        e.includes(`S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`)
+      );
 
-	  if (!_episode) {
-		throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
-	  }
+      if (!_episode) {
+        throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
+      }
 
-	  const directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
-	  videoPath = await findMp4File(directoryPath, _episode);
-	}
+      const directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
+      videoPath = await findMp4File(directoryPath, _episode);
+    }
 
     // Get the available audio tracks
     const audioTracks = await getAudioTracks(videoPath);
 
     // Determine the selected audio track
-    const selectedAudioTrack = audioTrackParam === "max" ? getHighestChannelTrack(audioTracks) : parseInt(audioTrackParam);
+    let selectedAudioTrack;
+    if (audioTrackParam === "max") {
+      selectedAudioTrack = getHighestChannelTrack(audioTracks);
+    } else if (audioTrackParam === "stereo") {
+      selectedAudioTrack = audioTracks.findIndex(track => track.channels === 2);
+      if (selectedAudioTrack === -1) {
+        throw new Error("Stereo track not found");
+      }
+    } else {
+      selectedAudioTrack = parseInt(audioTrackParam);
+      if (isNaN(selectedAudioTrack) || selectedAudioTrack < 0 || selectedAudioTrack >= audioTracks.length) {
+        throw new Error("Invalid audio track specified");
+      }
+    }
 
     // Get the channel count of the selected audio track
     const channelCount = audioTracks[selectedAudioTrack].channels;
@@ -65,7 +78,6 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
       modifiedVideoPath = await generateModifiedMp4(videoPath, selectedAudioTrack, channelCount);
     }
 
-
     // Serve the video file (either modified or original) with support for range requests
     const stat = await fs.stat(modifiedVideoPath);
     const fileSize = stat.size;
@@ -76,7 +88,7 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
       const chunkSize = (end - start) + 1;
-      const fileStream = _fs.createReadStream(modifiedVideoPath, {start, end});
+      const fileStream = _fs.createReadStream(modifiedVideoPath, { start, end });
 
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
@@ -171,7 +183,6 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
     });
   });
 }
-
 
 module.exports = {
   handleVideoRequest,
