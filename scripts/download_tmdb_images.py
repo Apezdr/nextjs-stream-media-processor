@@ -218,6 +218,9 @@ def process_shows(specific_show=None):
         if need_refresh:
             show_data = get_tmdb_data(show_name, tmdb_id=tmdb_id, type='tv')
             if show_data:
+                # Apply hard-coded replacements from tmdb.config
+                if 'metadata' in tmdb_config:
+                    show_data.update(tmdb_config['metadata'])
                 with open(metadata_file, 'w') as f:
                     json.dump(show_data, f, indent=4, sort_keys=True)
         else:
@@ -315,6 +318,9 @@ def process_movies(specific_movie=None):
         if refresh_metadata:
             movie_data = get_tmdb_data(movie_name, tmdb_id=tmdb_id, type='movie')
             if movie_data:
+                # Apply hard-coded replacements from tmdb.config
+                if 'metadata' in tmdb_config:
+                    movie_data.update(tmdb_config['metadata'])
                 with open(metadata_file, 'w') as f:
                     json.dump(movie_data, f, indent=4, sort_keys=True)
 
