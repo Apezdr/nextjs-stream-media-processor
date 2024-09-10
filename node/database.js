@@ -64,9 +64,8 @@ async function initializeIndexes() {
         await ensureIndex(tvCollection, { "seasons.episodes.videoURL": -1 }, { name: "episodes_videoURL_index" });
 
         // Ensure index on PlaybackStatus collection
-        const playbackStatusDb = client.db("PlaybackStatus");
-        const playbackStatusCollection = playbackStatusDb.collection("PlaybackStatus");
-        await ensureIndex(playbackStatusCollection, { userId: 1 }, { name: "userId_index" });
+        const playbackStatusCollection = mediaDb.collection("PlaybackStatus");
+        await ensureIndex(playbackStatusCollection, { userId: 1 }, { name: "userId_1" });
 
         console.log("Indexes have been initialized successfully.");
     } catch (error) {
