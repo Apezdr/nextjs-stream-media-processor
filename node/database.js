@@ -17,7 +17,6 @@ async function initializeMongoDatabase() {
     try {
         await client.connect();
         const mediaDb = client.db("Media");
-        const playbackStatusDb = client.db("PlaybackStatus");
 
         // Ensure collections in Media database
         const collections = await mediaDb.listCollections().toArray();
@@ -34,11 +33,11 @@ async function initializeMongoDatabase() {
         }
 
         // Ensure collections in PlaybackStatus database
-        const playbackCollections = await playbackStatusDb.listCollections().toArray();
-        const playbackCollectionNames = playbackCollections.map(col => col.name);
+        const mediaCollection = await mediaDb.listCollections().toArray();
+        const mediaCollectionNames = mediaCollection.map(col => col.name);
 
-        if (!playbackCollectionNames.includes("PlaybackStatus")) {
-            await playbackStatusDb.createCollection("PlaybackStatus");
+        if (!mediaCollectionNames.includes("PlaybackStatus")) {
+            await mediaDb.createCollection("PlaybackStatus");
             console.log("Created collection: PlaybackStatus");
         }
 
