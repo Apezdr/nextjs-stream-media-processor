@@ -28,7 +28,7 @@ def read_tmdb_config(config_path):
     return {}
 
 def get_tmdb_data(name, tmdb_id=None, type='tv'):
-    """Fetch data from TMDB for both TV shows and movies, including trailers and logos."""
+    """Fetch data from TMDB for both TV shows and movies, including trailers, logos, and cast."""
     base_url = 'https://api.themoviedb.org/3'
     if tmdb_id:
         details_url = f'{base_url}/{type}/{tmdb_id}?api_key={TMDB_API_KEY}'
@@ -63,6 +63,11 @@ def get_tmdb_data(name, tmdb_id=None, type='tv'):
 
     details_resp = requests.get(details_url)
     media_details = details_resp.json()
+
+    # Fetch and integrate the cast data only if available
+    cast_details = get_media_cast(tmdb_id, type)
+    if cast_details:  # Only add 'cast' to metadata if there is cast information
+        media_details['cast'] = cast_details
 
     # Reintegrate fetching trailer URL and logo file path using separate functions
     trailer_url = get_media_trailer_url(tmdb_id, type)
@@ -188,6 +193,24 @@ def get_media_logo_path(tmdb_id, type):
             if image['iso_639_1'] == 'en':
                 return f"https://image.tmdb.org/t/p/original{image['file_path']}"
     return None
+
+def get_media_cast(tmdb_id, type):
+    """Fetch the cast for a show or movie from TMDB."""
+    credits_url = f'https://api.themoviedb.org/3/{type}/{tmdb_id}/credits?api_key={TMDB_API_KEY}'
+    credits_resp = requests.get(credits_url)
+    credits_data = credits_resp.json().get('cast', [])
+
+    cast_details = []
+    for member in credits_data:
+        # Only include essential information to keep the metadata compact
+        cast_details.append({
+            'id': member['id'],
+            'name': member['name'],
+            'character': member.get('character', ''),
+            'profile_path': f'https://image.tmdb.org/t/p/original{member["profile_path"]}' if member.get('profile_path') else None
+        })
+
+    return cast_details
 
 def get_file_extension(url):
     """Extracts and returns the file extension from a URL."""

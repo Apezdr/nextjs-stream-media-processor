@@ -2,6 +2,7 @@ const express = require("express");
 const schedule = require('node-schedule');
 const { exec } = require("child_process");
 const util = require('util');
+const os = require("os");
 const path = require("path");
 const _fs = require("fs"); // Callback-based version of fs
 const fs = require("fs").promises; // Use the promise-based version of fs
@@ -763,7 +764,10 @@ async function generateListTV(db, dirPath) {
   const existingShows = await getTVShows(db);
   const existingShowNames = new Set(existingShows.map(show => show.name));
 
-  for (const show of shows) {
+  await Promise.all(shows.map(async (show, index) => {
+    if (isDebugMode) {
+      console.log(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
+    }
     if (show.isDirectory()) {
       const showName = show.name;
       existingShowNames.delete(showName); // Remove from the set of existing shows
@@ -1008,7 +1012,7 @@ async function generateListTV(db, dirPath) {
       // Always update the database with the latest data
       await insertOrUpdateTVShow(db, showName, showMetadata, '{}');
     }
-  }
+  }))
 
   // Remove TV shows from the database that no longer exist in the file system
   for (const showName of existingShowNames) {
@@ -1047,7 +1051,6 @@ app.get('/media/tv', async (req, res) => {
   }
 });
 
-
 async function generateListMovies(db, dirPath) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMovies = await getMissingDataMedia(db);
@@ -1056,8 +1059,11 @@ async function generateListMovies(db, dirPath) {
   // Get the list of movies currently in the database
   const existingMovies = await getMovies(db);
   const existingMovieNames = new Set(existingMovies.map(movie => movie.name));
-  
-  for (const dir of dirs) {
+
+  await Promise.all(dirs.map(async (dir, index) => {
+    if (isDebugMode) {
+      console.log(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
+    }
     if (dir.isDirectory()) {
       const dirName = dir.name;
       const files = await fs.readdir(path.join(dirPath, dirName));
@@ -1069,14 +1075,15 @@ async function generateListMovies(db, dirPath) {
 
       const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [dirName]);
       existingMovieNames.delete(dirName); // Remove from the set of existing movies
-      
+
       if (existingMovie && existingMovie.directory_hash === hash) {
         // If the hash is the same, skip detailed processing and use the existing data.
         if (isDebugMode) {
           console.log(`No changes detected in ${dirName}, skipping processing.`);
         }
-        continue;
+        return; // Use return instead of continue
       }
+
       const encodedDirName = encodeURIComponent(dirName);
       const fileSet = new Set(files); // Create a set of filenames for quick lookup
       const fileNames = files.filter(file => file.endsWith('.mp4') || file.endsWith('.srt') || file.endsWith('.json') || file.endsWith('.info') || file.endsWith('.nfo') || file.endsWith('.jpg') || file.endsWith('.png'));
@@ -1110,6 +1117,7 @@ async function generateListMovies(db, dirPath) {
           fileLengths[file] = parseInt(fileLength, 10);
           fileDimensions[file] = fileDimensionsStr;
           urls["mp4"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodedFilePath}`;
+          urls["mediaLastModified"] = (await fs.stat(filePath)).mtime.toISOString();
         }
 
         if (file.endsWith('.srt')) {
@@ -1153,7 +1161,7 @@ async function generateListMovies(db, dirPath) {
         runDownloadTmdbImagesFlag = true;
       }
 
-      if (fileSet.has('movie_logo.png')||fileSet.has('logo.png')) {
+      if (fileSet.has('movie_logo.png') || fileSet.has('logo.png')) {
         urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(fileSet.has('movie_logo.png') ? 'movie_logo.png' : 'logo.png')}`;
       } else {
         runDownloadTmdbImagesFlag = true;
@@ -1204,8 +1212,8 @@ async function generateListMovies(db, dirPath) {
           }
         }
 
-        if (retryFileSet.has('movie_logo.png')||fileSet.has('logo.png')) {
-          urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(encodeURIComponent(fileSet.has('movie_logo.png') ? 'movie_logo.png' : 'logo.png'))}`;
+        if (retryFileSet.has('movie_logo.png') || retryFileSet.has('logo.png')) {
+          urls["logo"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(retryFileSet.has('movie_logo.png') ? 'movie_logo.png' : 'logo.png')}`;
         }
 
         if (retryFileSet.has('metadata.json')) {
@@ -1213,7 +1221,7 @@ async function generateListMovies(db, dirPath) {
         }
       }
 
-      let mp4Filename = fileNames.filter((e) => e.indexOf('.mp4') > -1 && e.indexOf('mp4.info') === -1)[0];
+      let mp4Filename = fileNames.find((e) => e.endsWith('.mp4') && !e.endsWith('.mp4.info'));
       mp4Filename = mp4Filename?.replace('.mp4', '');
 
       // Add chapter information
@@ -1239,8 +1247,7 @@ async function generateListMovies(db, dirPath) {
       // Always update the database with the latest data
       await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "", hash);
     }
-  }
-
+  }))
   // Remove movies from the database that no longer exist in the file system
   for (const movieName of existingMovieNames) {
     await deleteMovie(db, movieName);
@@ -1299,7 +1306,7 @@ async function runGeneratePosterCollage() {
 }
 
 async function runDownloadTmdbImages(specificShow = null, specificMovie = null) {
-  console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+  console.log(`Download tmdb request ${specificShow ? `for show ${specificShow}` : ''}${specificMovie ? `for movie ${specificMovie}` : ''}`);
   let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}'`;
 
   if (specificShow) {
@@ -1314,8 +1321,8 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null) 
 
   try {
     //console.log(`Executing command: ${command}`); // Log the command being executed
-    const { stdout, stderr } = await execAsync(command);
     console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+    const { stdout, stderr } = await execAsync(command);
     //console.log(`Command output: ${stdout}`);
     if (stderr) {
       console.error(`download_tmdb_images.py error: ${stderr}`);
@@ -1325,7 +1332,6 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null) 
     console.error(`Error executing download_tmdb_images.py: ${error}`);
   }
 }
-
 // async function runGenerateThumbnailJson() {
 //   console.log(`Running generate_thumbnail_json.sh job${debugMessage}`);
 //   const command = isDebugMode 
