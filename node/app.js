@@ -1305,8 +1305,8 @@ async function runGeneratePosterCollage() {
   }
 }
 
-async function runDownloadTmdbImages(specificShow = null, specificMovie = null) {
-  console.log(`Download tmdb request ${specificShow ? `for show ${specificShow}` : ''}${specificMovie ? `for movie ${specificMovie}` : ''}`);
+async function runDownloadTmdbImages(specificShow = null, specificMovie = null, fullScan = false) {
+  console.log(`Download tmdb request ${specificShow ? `for show ${specificShow}` : ''}${specificMovie ? `for movie ${specificMovie}` : ''}${fullScan ? 'with full scan' : ''}`);
   let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}'`;
 
   if (specificShow) {
@@ -1321,13 +1321,13 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null) 
 
   try {
     //console.log(`Executing command: ${command}`); // Log the command being executed
-    console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+    console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}${fullScan ? ' with full scan' : ''}`);
     const { stdout, stderr } = await execAsync(command);
     //console.log(`Command output: ${stdout}`);
     if (stderr) {
       console.error(`download_tmdb_images.py error: ${stderr}`);
     }
-    console.log(`Finished running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}`);
+    console.log(`Finished running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}${fullScan ? ' with full scan' : ''}` : ''}`);
   } catch (error) {
     console.error(`Error executing download_tmdb_images.py: ${error}`);
   }
@@ -1429,7 +1429,7 @@ function scheduleTasks() {
   // Schedule for download_tmdb_images.py
   // Scheduled to run every 7 minutes.
   schedule.scheduleJob('*/7 * * * *', () => {
-    runDownloadTmdbImages().catch(console.error);
+    runDownloadTmdbImages(null, null, true).catch(console.error);
   });
 
   // Schedule for generate_poster_collage.py
