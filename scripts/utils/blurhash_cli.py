@@ -11,6 +11,10 @@ def generate_blurhash(image_path, x_components=4, y_components=3):
             # Convert to RGBA if the image has transparency
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                 img = img.convert('RGBA')
+                
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
 
             # Convert the image to a file-like object
             buffered = io.BytesIO()
