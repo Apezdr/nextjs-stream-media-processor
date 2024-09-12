@@ -1,5 +1,6 @@
 # Ignore the media.db file in the /node/ directory
 node/db/media.db
+node/db/media.db-journal
 
 # Ignore node_modules
 node/node_modules
