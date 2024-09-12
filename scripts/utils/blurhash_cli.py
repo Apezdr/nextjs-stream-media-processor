@@ -11,7 +11,14 @@ def generate_blurhash(image_path, x_components=4, y_components=3):
             # Convert to RGBA if the image has transparency
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                 img = img.convert('RGBA')
-            hash = blurhash.encode(img, x_components, y_components)
+
+            # Convert the image to a file-like object
+            buffered = io.BytesIO()
+            img.save(buffered, format="JPEG")  # Save image to buffer as JPEG
+            buffered.seek(0)
+
+            # Now use this buffer with blurhash
+            hash = blurhash.encode(buffered, x_components, y_components)
         return hash
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -28,12 +35,22 @@ def blurhash_to_base64(hash, width=400, height=300):
         print(f"Error converting blurhash to base64: {e}", file=sys.stderr)
         return None
 
+def process_image(image_path):
+    blurhash_string = generate_blurhash(image_path)
+    if blurhash_string:
+        base64_image = blurhash_to_base64(blurhash_string)
+        return base64_image
+    return None
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: blurhash-cli <image_path>")
         sys.exit(1)
+    
+    result = process_image(sys.argv[1])
+    if result:
+        print(result)
 
-    blurhash_string = generate_blurhash(sys.argv[1])
-    if blurhash_string:
-        base64_image = blurhash_to_base64(blurhash_string)
-        print(base64_image)
+else:
+    # Export functions for use in other Python scripts
+    __all__ = ['generate_blurhash', 'blurhash_to_base64', 'process_image']

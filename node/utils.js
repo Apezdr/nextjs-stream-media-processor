@@ -4,8 +4,8 @@ const execAsync = util.promisify(exec);
 const fs = require('fs').promises; // Use the promise-based version of fs
 const path = require('path');
 const cacheDir = path.join(__dirname, 'cache');
-const scriptsDir = path.resolve(__dirname, '../scripts');
-const blurhashCli = path.join(scriptsDir, 'blurhash-cli.py');
+const scriptsDir = path.resolve(__dirname, '../scripts/utils');
+const blurhashCli = path.join(scriptsDir, 'blurhash_cli.py');
 const crypto = require('crypto');
 const LOG_FILE = '/var/log/blurhash.log';
 
@@ -132,7 +132,7 @@ async function getStoredBlurhash(imagePath, basePath) {
   // Determine if debug mode is enabled
   const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
   const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-  console.log(`Running blurhash-cli.py job${debugMessage}`);
+  console.log(`Running blurhash_cli.py job${debugMessage}`);
 
   // Construct the command based on debug mode
   const command = `sudo bash -c "python3 ${blurhashCli} \\"${imagePath.replace(/"/g, '\\"')}\\""`;
@@ -151,7 +151,7 @@ async function getStoredBlurhash(imagePath, basePath) {
     await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
     return relativeUrl;
   } catch (error) {
-    console.error(`Error executing blurhash-cli.py: ${error}`);
+    console.error(`Error executing blurhash_cli.py: ${error}`);
     return null;
   }
 }
@@ -162,6 +162,15 @@ function calculateDirectoryHash(files) {
     hash.update(file.name + file.size + file.mtimeMs);
   });
   return hash.digest('hex');
+}
+
+async function getLastModifiedTime(filePath) {
+  try {
+    const stats = await fs.stat(filePath);
+    return stats.mtime; // Modification time
+  } catch {
+    return null;
+  }
 }
 
 module.exports = {
@@ -176,4 +185,5 @@ module.exports = {
   findMp4File,
   getStoredBlurhash,
   calculateDirectoryHash,
+  getLastModifiedTime,
 };

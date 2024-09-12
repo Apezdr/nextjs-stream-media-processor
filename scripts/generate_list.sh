@@ -105,7 +105,7 @@ get_stored_blurhash() {
         echo "$relative_path"
     else
         # Generate a new blurhash using the full image path
-        local blurhash_output=$(python3 /usr/src/app/blurhash-cli.py "$image_path" 2>&1)
+        local blurhash_output=$(python3 /usr/src/app/blurhash_cli.py "$image_path" 2>&1)
         local exit_status=$?
 
         if [[ $exit_status -ne 0 ]]; then

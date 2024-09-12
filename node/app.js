@@ -21,6 +21,7 @@ const {
   findMp4File,
   getStoredBlurhash,
   calculateDirectoryHash,
+  getLastModifiedTime,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
@@ -1094,6 +1095,14 @@ async function generateListMovies(db, dirPath) {
 
       let runDownloadTmdbImagesFlag = false;
 
+      const tmdbConfigPath = path.join(dirPath, dirName, 'tmdb.config');
+      let tmdbConfigLastModified = null;
+
+      // Check if tmdb.config exists before getting its last modified time
+      if (await fileExists(tmdbConfigPath)) {
+        tmdbConfigLastModified = await getLastModifiedTime(tmdbConfigPath);
+      }
+
       for (const file of fileNames) {
         const filePath = path.join(dirPath, dirName, file);
         const encodedFilePath = encodeURIComponent(file);
@@ -1145,6 +1154,13 @@ async function generateListMovies(db, dirPath) {
         } else {
           await getStoredBlurhash(backdropPath, BASE_PATH);
         }
+
+        // Check if tmdb.config has been updated more recently
+        const backdropLastModified = await getLastModifiedTime(backdropPath);
+        if (tmdbConfigLastModified && backdropLastModified && tmdbConfigLastModified > backdropLastModified) {
+          runDownloadTmdbImagesFlag = true;
+        }
+
       } else {
         runDownloadTmdbImagesFlag = true;
       }
@@ -1157,6 +1173,13 @@ async function generateListMovies(db, dirPath) {
         } else {
           await getStoredBlurhash(posterPath, BASE_PATH);
         }
+
+        // Check if tmdb.config has been updated more recently
+        const posterLastModified = await getLastModifiedTime(posterPath);
+        if (tmdbConfigLastModified && posterLastModified && tmdbConfigLastModified > posterLastModified) {
+          runDownloadTmdbImagesFlag = true;
+        }
+
       } else {
         runDownloadTmdbImagesFlag = true;
       }
@@ -1169,9 +1192,17 @@ async function generateListMovies(db, dirPath) {
 
       if (fileSet.has('metadata.json')) {
         urls["metadata"] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
-      } else {
-        runDownloadTmdbImagesFlag = true;
-      }
+
+        // Check if tmdb.config has been updated more recently
+        const metadataPath = path.join(dirPath, dirName, 'metadata.json');
+        const metadataLastModified = await getLastModifiedTime(metadataPath);
+        if (tmdbConfigLastModified && metadataLastModified && tmdbConfigLastModified > metadataLastModified) {
+          runDownloadTmdbImagesFlag = true;
+        }
+
+  } else {
+    runDownloadTmdbImagesFlag = true;
+  }
 
       // Check if the movie is in the missing data table and if it should be retried
       const missingDataMovie = missingDataMovies.find(movie => movie.name === dirName);
@@ -1428,8 +1459,12 @@ function scheduleTasks() {
 
   // Schedule for download_tmdb_images.py
   // Scheduled to run every 7 minutes.
-  schedule.scheduleJob('*/7 * * * *', () => {
-    runDownloadTmdbImages(null, null, true).catch(console.error);
+  schedule.scheduleJob('*/7 * * * *', async () => {
+    try {
+      await runDownloadTmdbImages(null, null, true);
+    } catch (error) {
+      console.error(error);
+    }
   });
 
   // Schedule for generate_poster_collage.py

@@ -7,6 +7,8 @@ import time
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import re
+# Import the generate_blurhash function
+from utils.blurhash_cli import process_image
 
 parser = argparse.ArgumentParser(description='Download TMDB images for TV shows and movies.')
 parser.add_argument('--show', type=str, help='Specific TV show to scan')
@@ -82,15 +84,46 @@ def get_tmdb_data(name, tmdb_id=None, type='tv'):
 
     return media_details
 
-def download_image(image_url, file_path):
-    """Download an image from the given URL to the specified file path."""
-    if os.path.exists(file_path):
-        return  # Skip download if file already exists
+def download_image(image_url, file_path, force_download=False):
+    """
+    Download an image from the given URL to the specified file path.
+    
+    :param image_url: The URL of the image to download.
+    :param file_path: The local file path where the image will be saved.
+    :param force_download: If True, download the image even if the file already exists.
+    """
+    # Check if the file exists and download only if needed
+    if os.path.exists(file_path) and not force_download:
+        return  # Skip download if the file exists and force_download is not set
+    
+    # Delete any accompanying blurhash file before downloading the new image
+    blurhash_file_path = file_path + '.blurhash'
+    if os.path.exists(blurhash_file_path):
+        os.remove(blurhash_file_path)
+        print(f"Deleted accompanying blurhash file: {blurhash_file_path}")
+
+    # Attempt to download the image
     response = requests.get(image_url, stream=True)
     if response.status_code == 200:
         with open(file_path, 'wb') as file:
             for chunk in response.iter_content(1024):
                 file.write(chunk)
+        print(f"Image downloaded and saved to {file_path}")
+
+        # Generate blurhash for the downloaded image
+        try:
+            blurhash_string = process_image(file_path)
+            if blurhash_string:  # Check if the blurhash_string is valid (not None or empty)
+                # Save the blurhash to a file
+                with open(blurhash_file_path, 'w') as blurhash_file:
+                    blurhash_file.write(blurhash_string)
+                print(f"Blurhash saved to {blurhash_file_path}")
+            else:
+                print("No valid blurhash generated for the image.")
+        except Exception as e:
+            print(f"Error generating blurhash: {e}")
+    else:
+        print(f"Failed to download image from {image_url}. Status code: {response.status_code}")
 
 def get_tmdb_episode_data(show_id, season_number, episode_number, max_retries=3, retry_delay=2):
     """Fetch episode data from TMDB with error handling."""
@@ -234,8 +267,11 @@ def process_shows(specific_show=None):
         # Determine need for metadata refresh
         need_refresh = True
         if os.path.exists(metadata_file):
-            last_modified = datetime.fromtimestamp(os.path.getmtime(metadata_file))
-            need_refresh = datetime.now() - last_modified >= timedelta(days=1)
+            metadata_last_modified = datetime.fromtimestamp(os.path.getmtime(metadata_file))
+            config_last_modified = datetime.fromtimestamp(os.path.getmtime(tmdb_config_path)) if tmdb_config else None
+            
+            # Check if the metadata file is older than 1 day or if the config file was updated more recently
+            need_refresh = (datetime.now() - metadata_last_modified >= timedelta(days=1)) or (config_last_modified and config_last_modified > metadata_last_modified)
 
         # Refresh or load metadata as necessary
         if need_refresh:
@@ -266,10 +302,9 @@ def process_shows(specific_show=None):
                 image_path = os.path.join(show_dir, f'show_{image_type.split("_")[0]}{file_extension}')
 
                 # Check if the image file does not exist or if the metadata was recently refreshed
-                if not os.path.exists(image_path) or need_refresh:
+                if need_refresh or not os.path.exists(image_path):
                     # If the image doesn't exist or needs to be refreshed, download the image from the URL
-                    download_image(image_url, image_path)
-
+                    download_image(image_url, image_path, True)
 
         # Update season and episode metadata with a condition based on last modification
         for season in show_data.get('seasons', []):
@@ -318,7 +353,6 @@ def process_shows(specific_show=None):
             else:
                 # Season directory does not exist, skip processing for this season
                 print(f"Skipping Season {season_number} for '{show_name}' as the directory does not exist.")
-
 def process_movies(specific_movie=None):
     for movie_name in os.listdir(MOVIES_DIR):
         if specific_movie and movie_name != specific_movie:
@@ -335,9 +369,25 @@ def process_movies(specific_movie=None):
         tmdb_config = read_tmdb_config(tmdb_config_path)
         tmdb_id = tmdb_config.get('tmdb_id')
 
-        # Check for existing metadata and its freshness
-        refresh_metadata = not os.path.exists(metadata_file) or datetime.now() - datetime.fromtimestamp(os.path.getmtime(metadata_file)) > timedelta(days=1)
+        # Determine need for metadata refresh
+        refresh_metadata = True
+        if os.path.exists(metadata_file):
+            metadata_last_modified = datetime.fromtimestamp(os.path.getmtime(metadata_file))
+            if os.path.exists(tmdb_config_path):
+                config_last_modified = datetime.fromtimestamp(os.path.getmtime(tmdb_config_path))
+                # Check if metadata file is older than 1 day or if the config file was updated more recently
+                refresh_metadata = (datetime.now() - metadata_last_modified >= timedelta(days=1)) or (config_last_modified > metadata_last_modified)
+            else:
+                # Only check if metadata is older than 1 day if there is no TMDB config
+                refresh_metadata = datetime.now() - metadata_last_modified >= timedelta(days=1)
 
+        # Load the existing metadata for comparison
+        existing_metadata = {}
+        if os.path.exists(metadata_file):
+            with open(metadata_file, 'r') as f:
+                existing_metadata = json.load(f)
+
+        # Refresh metadata or update if necessary
         if refresh_metadata:
             movie_data = get_tmdb_data(movie_name, tmdb_id=tmdb_id, type='movie')
             if movie_data:
@@ -352,15 +402,23 @@ def process_movies(specific_movie=None):
                     if image_key in movie_data:
                         override_key = f'override_{image_key.split("_")[0]}'
                         if override_key in tmdb_config:
-                            # Use the override image
+                            # Use the override image path directly
                             file_path = tmdb_config[override_key]
                         else:
-                            # Use the TMDB image
+                            # Use the TMDB image URL
                             image_url = f'https://image.tmdb.org/t/p/original{movie_data[image_key]}'
                             file_extension = get_file_extension(image_url)
                             file_path = os.path.join(movie_dir, f'{image_key.replace("_path", "")}{file_extension}')
-                            if not os.path.exists(file_path):  # Download only if the file doesn't exist
-                                download_image(image_url, file_path)
+
+                        # Check if the image needs to be updated
+                        if image_key in existing_metadata and existing_metadata.get(image_key) != movie_data[image_key]:
+                            # Image path is different, download and replace the existing file
+                            print(f"Updating {image_key} for {movie_name}...")
+                            download_image(image_url, file_path, True)
+                        elif not os.path.exists(file_path):  # Download only if the file doesn't exist
+                            print(f"Downloading {image_key} for {movie_name}...")
+                            download_image(image_url, file_path)
+
 
 print("Processing TMDB Updates")
 
@@ -372,7 +430,7 @@ elif args.movie:
     print("--Processing Movie", args.movie)
     process_movies(specific_movie=args.movie)
 else:
-    process_shows()
     process_movies()
+    process_shows()
 
 print("Finished TMDB Updates")
