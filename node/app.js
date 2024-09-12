@@ -765,108 +765,47 @@ async function generateListTV(db, dirPath) {
   const existingShows = await getTVShows(db);
   const existingShowNames = new Set(existingShows.map(show => show.name));
 
-  await Promise.all(shows.map(async (show, index) => {
-    if (isDebugMode) {
-      console.log(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
-    }
-    if (show.isDirectory()) {
-      const showName = show.name;
-      existingShowNames.delete(showName); // Remove from the set of existing shows
-      const encodedShowName = encodeURIComponent(showName);
-      const showPath = path.join(dirPath, showName);
-      const seasons = await fs.readdir(showPath, { withFileTypes: true });
+  // Start a transaction for batch updates
+  await db.run('BEGIN TRANSACTION');
 
-      const showMetadata = {
-        metadata: `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`,
-        seasons: {}
-      };
-
-      // Initialize runDownloadTmdbImagesFlag
-      let runDownloadTmdbImagesFlag = false;
-
-      // Handle show poster, logo, and backdrop
-      const posterPath = path.join(showPath, 'show_poster.jpg');
-      if (await fileExists(posterPath)) {
-        showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
-        const posterBlurhash = await getStoredBlurhash(posterPath, BASE_PATH);
-        if (posterBlurhash) {
-          showMetadata.posterBlurhash = posterBlurhash;
-        }
-      } else {
-        runDownloadTmdbImagesFlag = true;
+  try {
+    for (let index = 0; index < shows.length; index++) {
+      const show = shows[index]
+      if (isDebugMode) {
+        console.log(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
       }
+      if (show.isDirectory()) {
+        const showName = show.name;
+        existingShowNames.delete(showName); // Remove from the set of existing shows
+        const encodedShowName = encodeURIComponent(showName);
+        const showPath = path.join(dirPath, showName);
+        const seasons = await fs.readdir(showPath, { withFileTypes: true });
 
-      const logoExtensions = ['svg', 'jpg', 'png', 'gif'];
-      let logoFound = false;
-      for (const ext of logoExtensions) {
-        const logoPath = path.join(showPath, `show_logo.${ext}`);
-        if (await fileExists(logoPath)) {
-          showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
-          if (ext !== 'svg') {
-            const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-            if (logoBlurhash) {
-              showMetadata.logoBlurhash = logoBlurhash;
-            }
-          }
-          logoFound = true;
-          break;
-        }
-      }
-      if (!logoFound) {
-        runDownloadTmdbImagesFlag = true;
-      }
+        const showMetadata = {
+          metadata: `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`,
+          seasons: {}
+        };
 
-      const backdropExtensions = ['jpg', 'png', 'gif'];
-      let backdropFound = false;
-      for (const ext of backdropExtensions) {
-        const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
-        if (await fileExists(backdropPath)) {
-          showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
-          const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
-          if (backdropBlurhash) {
-            showMetadata.backdropBlurhash = backdropBlurhash;
-          }
-          backdropFound = true;
-          break;
-        }
-      }
-      if (!backdropFound) {
-        runDownloadTmdbImagesFlag = true;
-      }
+        // Initialize runDownloadTmdbImagesFlag
+        let runDownloadTmdbImagesFlag = false;
 
-      const metadataPath = path.join(showPath, 'metadata.json');
-      if (!await fileExists(metadataPath)) {
-        runDownloadTmdbImagesFlag = true;
-      }
-
-      const missingDataShow = missingDataMedia.find(media => media.name === showName);
-      if (missingDataShow) {
-        const lastAttempt = new Date(missingDataShow.lastAttempt);
-        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-          runDownloadTmdbImagesFlag = true;
-        } else {
-          runDownloadTmdbImagesFlag = false;
-        }
-      }
-
-      if (runDownloadTmdbImagesFlag) {
-        await insertOrUpdateMissingDataMedia(db, showName);
-        await runDownloadTmdbImages(showName);
-        const retryFiles = await fs.readdir(showPath);
-        const retryFileSet = new Set(retryFiles);
-
-        if (retryFileSet.has('show_poster.jpg')) {
+        // Handle show poster, logo, and backdrop
+        const posterPath = path.join(showPath, 'show_poster.jpg');
+        if (await fileExists(posterPath)) {
           showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
-          const posterBlurhash = await getStoredBlurhash(path.join(showPath, 'show_poster.jpg'), BASE_PATH);
+          const posterBlurhash = await getStoredBlurhash(posterPath, BASE_PATH);
           if (posterBlurhash) {
             showMetadata.posterBlurhash = posterBlurhash;
           }
+        } else {
+          runDownloadTmdbImagesFlag = true;
         }
 
+        const logoExtensions = ['svg', 'jpg', 'png', 'gif'];
+        let logoFound = false;
         for (const ext of logoExtensions) {
           const logoPath = path.join(showPath, `show_logo.${ext}`);
-          if (retryFileSet.has(`show_logo.${ext}`)) {
+          if (await fileExists(logoPath)) {
             showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
             if (ext !== 'svg') {
               const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
@@ -874,150 +813,224 @@ async function generateListTV(db, dirPath) {
                 showMetadata.logoBlurhash = logoBlurhash;
               }
             }
+            logoFound = true;
             break;
           }
         }
+        if (!logoFound) {
+          runDownloadTmdbImagesFlag = true;
+        }
 
+        const backdropExtensions = ['jpg', 'png', 'gif'];
+        let backdropFound = false;
         for (const ext of backdropExtensions) {
           const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
-          if (retryFileSet.has(`show_backdrop.${ext}`)) {
+          if (await fileExists(backdropPath)) {
             showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
             const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
             if (backdropBlurhash) {
               showMetadata.backdropBlurhash = backdropBlurhash;
             }
+            backdropFound = true;
             break;
           }
         }
-      }
+        if (!backdropFound) {
+          runDownloadTmdbImagesFlag = true;
+        }
 
-      for (const season of seasons) {
-        if (season.isDirectory()) {
-          const seasonName = season.name;
-          const encodedSeasonName = encodeURIComponent(seasonName);
-          const seasonPath = path.join(showPath, seasonName);
-          const episodes = await fs.readdir(seasonPath);
+        const metadataPath = path.join(showPath, 'metadata.json');
+        if (!await fileExists(metadataPath)) {
+          runDownloadTmdbImagesFlag = true;
+        }
 
-          const validEpisodes = episodes.filter(episode => episode.endsWith('.mp4') && !episode.includes('-TdarrCacheFile-'));
-          if (validEpisodes.length === 0) {
-            continue;
+        const missingDataShow = missingDataMedia.find(media => media.name === showName);
+        if (missingDataShow) {
+          const lastAttempt = new Date(missingDataShow.lastAttempt);
+          const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
+          if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
+            runDownloadTmdbImagesFlag = true;
+          } else {
+            runDownloadTmdbImagesFlag = false;
           }
+        }
 
-          const seasonData = {
-            fileNames: [],
-            urls: {},
-            lengths: {},
-            dimensions: {}
-          };
+        if (runDownloadTmdbImagesFlag) {
+          await insertOrUpdateMissingDataMedia(db, showName);
+          await runDownloadTmdbImages(showName);
+          const retryFiles = await fs.readdir(showPath);
+          const retryFileSet = new Set(retryFiles);
 
-          const seasonPosterPath = path.join(seasonPath, 'season_poster.jpg');
-          if (await fileExists(seasonPosterPath)) {
-            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
-            const seasonPosterBlurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
-            if (seasonPosterBlurhash) {
-              seasonData.seasonPosterBlurhash = seasonPosterBlurhash;
+          if (retryFileSet.has('show_poster.jpg')) {
+            showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
+            const posterBlurhash = await getStoredBlurhash(path.join(showPath, 'show_poster.jpg'), BASE_PATH);
+            if (posterBlurhash) {
+              showMetadata.posterBlurhash = posterBlurhash;
             }
           }
 
-          for (const episode of validEpisodes) {
-            const episodePath = path.join(seasonPath, episode);
-            const encodedEpisodePath = encodeURIComponent(episode);
-            const infoFile = `${episodePath}.info`;
+          for (const ext of logoExtensions) {
+            const logoPath = path.join(showPath, `show_logo.${ext}`);
+            if (retryFileSet.has(`show_logo.${ext}`)) {
+              showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
+              if (ext !== 'svg') {
+                const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
+                if (logoBlurhash) {
+                  showMetadata.logoBlurhash = logoBlurhash;
+                }
+              }
+              break;
+            }
+          }
 
-            let fileLength;
-            let fileDimensions;
+          for (const ext of backdropExtensions) {
+            const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
+            if (retryFileSet.has(`show_backdrop.${ext}`)) {
+              showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
+              const backdropBlurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
+              if (backdropBlurhash) {
+                showMetadata.backdropBlurhash = backdropBlurhash;
+              }
+              break;
+            }
+          }
+        }
 
-            if (await fileExists(infoFile)) {
-              const fileInfo = await fs.readFile(infoFile, 'utf-8');
-              [fileLength, fileDimensions] = fileInfo.trim().split(' ');
-            } else {
-              const { stdout: length } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${episodePath}"`);
-              const { stdout: dimensions } = await execAsync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${episodePath}"`);
-              fileLength = Math.floor(parseFloat(length.trim()) * 1000);
-              fileDimensions = dimensions.trim();
-              await fs.writeFile(infoFile, `${fileLength} ${fileDimensions}`);
+        await Promise.all(seasons.map(async (season, index) => {
+          if (season.isDirectory()) {
+            const seasonName = season.name;
+            const encodedSeasonName = encodeURIComponent(seasonName);
+            const seasonPath = path.join(showPath, seasonName);
+            const episodes = await fs.readdir(seasonPath);
+
+            const validEpisodes = episodes.filter(episode => episode.endsWith('.mp4') && !episode.includes('-TdarrCacheFile-'));
+            if (validEpisodes.length === 0) {
+              return;
             }
 
-            seasonData.fileNames.push(episode);
-            seasonData.lengths[episode] = parseInt(fileLength, 10);
-            seasonData.dimensions[episode] = fileDimensions;
-
-            const episodeData = {
-              videourl: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-              mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString()
+            const seasonData = {
+              fileNames: [],
+              urls: {},
+              lengths: {},
+              dimensions: {}
             };
 
-            const episodeNumber = episode.match(/S\d+E(\d+)/i)?.[1] || episode.match(/\d+/)?.[0];
-
-            if (episodeNumber) {
-              const thumbnailPath = path.join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
-              if (await fileExists(thumbnailPath)) {
-                episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber} - Thumbnail.jpg`)}`;
-                const thumbnailBlurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
-                if (thumbnailBlurhash) {
-                  episodeData.thumbnailBlurhash = thumbnailBlurhash;
-                }
-              }
-
-              const metadataPath = path.join(seasonPath, `${episodeNumber}_metadata.json`);
-              if (await fileExists(metadataPath)) {
-                episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber}_metadata.json`)}`;
-              }
-
-              const seasonNumber = seasonName.match(/\d+/)?.[0]?.padStart(2, '0');
-              const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
-              const chaptersPath = path.join(seasonPath, 'chapters', `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`);
-              if (await fileExists(chaptersPath)) {
-                episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(`${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`)}`;
-              }
-
-              const subtitleFiles = await fs.readdir(seasonPath);
-              const subtitles = {};
-              for (const subtitleFile of subtitleFiles) {
-                if (subtitleFile.startsWith(episode.replace('.mp4', '')) && subtitleFile.endsWith('.srt')) {
-                  const parts = subtitleFile.split('.');
-                  const srtIndex = parts.lastIndexOf('srt');
-                  const isHearingImpaired = parts[srtIndex - 1] === 'hi';
-                  const langCode = isHearingImpaired ? parts[srtIndex - 2] : parts[srtIndex - 1];
-                  const langName = langMap[langCode] || langCode;
-                  const subtitleKey = isHearingImpaired ? `${langName} Hearing Impaired` : langName;
-                  subtitles[subtitleKey] = {
-                    url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(subtitleFile)}`,
-                    srcLang: langCode,
-                    lastModified: (await fs.stat(path.join(seasonPath, subtitleFile))).mtime.toISOString()
-                  };
-                }
-              }
-              if (Object.keys(subtitles).length > 0) {
-                episodeData.subtitles = subtitles;
+            const seasonPosterPath = path.join(seasonPath, 'season_poster.jpg');
+            if (await fileExists(seasonPosterPath)) {
+              seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
+              const seasonPosterBlurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
+              if (seasonPosterBlurhash) {
+                seasonData.seasonPosterBlurhash = seasonPosterBlurhash;
               }
             }
 
-            seasonData.urls[episode] = episodeData;
-          }
+            for (const episode of validEpisodes) {
+              const episodePath = path.join(seasonPath, episode);
+              const encodedEpisodePath = encodeURIComponent(episode);
+              const infoFile = `${episodePath}.info`;
 
-          // Process all thumbnails in the season directory
-          const thumbnailFiles = episodes.filter(file => file.endsWith(' - Thumbnail.jpg'));
-          for (const thumbnailFile of thumbnailFiles) {
-            const thumbnailPath = path.join(seasonPath, thumbnailFile);
-            const episodeNumber = thumbnailFile.match(/S\d+E(\d+)/i)?.[1] || thumbnailFile.match(/\d+/)?.[0];
-            if (episodeNumber) {
-              await getStoredBlurhash(thumbnailPath, BASE_PATH);
+              let fileLength;
+              let fileDimensions;
+
+              if (await fileExists(infoFile)) {
+                const fileInfo = await fs.readFile(infoFile, 'utf-8');
+                [fileLength, fileDimensions] = fileInfo.trim().split(' ');
+              } else {
+                const { stdout: length } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${episodePath}"`);
+                const { stdout: dimensions } = await execAsync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${episodePath}"`);
+                fileLength = Math.floor(parseFloat(length.trim()) * 1000);
+                fileDimensions = dimensions.trim();
+                await fs.writeFile(infoFile, `${fileLength} ${fileDimensions}`);
+              }
+
+              seasonData.fileNames.push(episode);
+              seasonData.lengths[episode] = parseInt(fileLength, 10);
+              seasonData.dimensions[episode] = fileDimensions;
+
+              const episodeData = {
+                videourl: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
+                mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString()
+              };
+
+              const episodeNumber = episode.match(/S\d+E(\d+)/i)?.[1] || episode.match(/\d+/)?.[0];
+
+              if (episodeNumber) {
+                const thumbnailPath = path.join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
+                if (await fileExists(thumbnailPath)) {
+                  episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber} - Thumbnail.jpg`)}`;
+                  const thumbnailBlurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
+                  if (thumbnailBlurhash) {
+                    episodeData.thumbnailBlurhash = thumbnailBlurhash;
+                  }
+                }
+
+                const metadataPath = path.join(seasonPath, `${episodeNumber}_metadata.json`);
+                if (await fileExists(metadataPath)) {
+                  episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(`${episodeNumber}_metadata.json`)}`;
+                }
+
+                const seasonNumber = seasonName.match(/\d+/)?.[0]?.padStart(2, '0');
+                const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
+                const chaptersPath = path.join(seasonPath, 'chapters', `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`);
+                if (await fileExists(chaptersPath)) {
+                  episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(`${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`)}`;
+                }
+
+                const subtitleFiles = await fs.readdir(seasonPath);
+                const subtitles = {};
+                for (const subtitleFile of subtitleFiles) {
+                  if (subtitleFile.startsWith(episode.replace('.mp4', '')) && subtitleFile.endsWith('.srt')) {
+                    const parts = subtitleFile.split('.');
+                    const srtIndex = parts.lastIndexOf('srt');
+                    const isHearingImpaired = parts[srtIndex - 1] === 'hi';
+                    const langCode = isHearingImpaired ? parts[srtIndex - 2] : parts[srtIndex - 1];
+                    const langName = langMap[langCode] || langCode;
+                    const subtitleKey = isHearingImpaired ? `${langName} Hearing Impaired` : langName;
+                    subtitles[subtitleKey] = {
+                      url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(subtitleFile)}`,
+                      srcLang: langCode,
+                      lastModified: (await fs.stat(path.join(seasonPath, subtitleFile))).mtime.toISOString()
+                    };
+                  }
+                }
+                if (Object.keys(subtitles).length > 0) {
+                  episodeData.subtitles = subtitles;
+                }
+              }
+
+              seasonData.urls[episode] = episodeData;
             }
-          }
 
-          showMetadata.seasons[seasonName] = seasonData;
-        }
+            // Process all thumbnails in the season directory
+            const thumbnailFiles = episodes.filter(file => file.endsWith(' - Thumbnail.jpg'));
+            for (const thumbnailFile of thumbnailFiles) {
+              const thumbnailPath = path.join(seasonPath, thumbnailFile);
+              const episodeNumber = thumbnailFile.match(/S\d+E(\d+)/i)?.[1] || thumbnailFile.match(/\d+/)?.[0];
+              if (episodeNumber) {
+                await getStoredBlurhash(thumbnailPath, BASE_PATH);
+              }
+            }
+
+            showMetadata.seasons[seasonName] = seasonData;
+          }
+        }))
+
+        // Always update the database with the latest data
+        await insertOrUpdateTVShow(db, showName, showMetadata, '{}');
       }
-
-      // Always update the database with the latest data
-      await insertOrUpdateTVShow(db, showName, showMetadata, '{}');
     }
-  }))
 
-  // Remove TV shows from the database that no longer exist in the file system
-  for (const showName of existingShowNames) {
-    await deleteTVShow(db, showName);
+    // Remove TV shows from the database that no longer exist in the file system
+    for (const showName of existingShowNames) {
+      await deleteTVShow(db, showName);
+    }
+
+    // Commit the transaction after all operations are done
+    await db.run('COMMIT');
+  } catch (error) {
+    // Rollback the transaction in case of error
+    await db.run('ROLLBACK');
+    console.error('Error during database update:', error);
   }
 }
 
