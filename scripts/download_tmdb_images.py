@@ -4,11 +4,16 @@ import os
 import requests
 import json
 import time
+import threading
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import re
 # Import the generate_blurhash function
 from utils.blurhash_cli import process_image
+
+# Set UID and GID to the current user
+os.setgid(os.getgid())  # Set GID
+os.setuid(os.getuid())  # Set UID
 
 parser = argparse.ArgumentParser(description='Download TMDB images for TV shows and movies.')
 parser.add_argument('--show', type=str, help='Specific TV show to scan')
@@ -26,8 +31,16 @@ MOVIES_DIR = '/var/www/html/movies'
 def read_tmdb_config(config_path):
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON from {config_path}: {e}")
+                return {}  # Return an empty dict in case of error
     return {}
+
+def should_update_metadata(tmdb_config):
+    # Check if the 'update_metadata' key exists and is explicitly set to false
+    return tmdb_config.get('update_metadata', True)
 
 def get_tmdb_data(name, tmdb_id=None, type='tv'):
     """Fetch data from TMDB for both TV shows and movies, including trailers, logos, and cast."""
@@ -84,6 +97,24 @@ def get_tmdb_data(name, tmdb_id=None, type='tv'):
 
     return media_details
 
+def generate_and_save_blurhash(file_path, blurhash_file_path):
+    """
+    Generate the blurhash for the given image file and save it to the blurhash file.
+    
+    :param file_path: The local file path of the image.
+    :param blurhash_file_path: The local file path where the blurhash will be saved.
+    """
+    try:
+        blurhash_string = process_image(file_path)
+        if blurhash_string:  # Check if the blurhash_string is valid (not None or empty)
+            with open(blurhash_file_path, 'w') as blurhash_file:
+                blurhash_file.write(blurhash_string)
+            print(f"Blurhash saved to {blurhash_file_path}")
+        else:
+            print("No valid blurhash generated for the image.")
+    except Exception as e:
+        print(f"Error generating blurhash: {e}")
+
 def download_image(image_url, file_path, force_download=False):
     """
     Download an image from the given URL to the specified file path.
@@ -99,8 +130,11 @@ def download_image(image_url, file_path, force_download=False):
     # Delete any accompanying blurhash file before downloading the new image
     blurhash_file_path = file_path + '.blurhash'
     if os.path.exists(blurhash_file_path):
-        os.remove(blurhash_file_path)
-        print(f"Deleted accompanying blurhash file: {blurhash_file_path}")
+        try:
+            os.remove(blurhash_file_path)
+            print(f"Deleted accompanying blurhash file: {blurhash_file_path}")
+        except FileNotFoundError:
+            print(f"Blurhash file not found: {blurhash_file_path}")
 
     # Attempt to download the image
     response = requests.get(image_url, stream=True)
@@ -110,18 +144,10 @@ def download_image(image_url, file_path, force_download=False):
                 file.write(chunk)
         print(f"Image downloaded and saved to {file_path}")
 
-        # Generate blurhash for the downloaded image
-        try:
-            blurhash_string = process_image(file_path)
-            if blurhash_string:  # Check if the blurhash_string is valid (not None or empty)
-                # Save the blurhash to a file
-                with open(blurhash_file_path, 'w') as blurhash_file:
-                    blurhash_file.write(blurhash_string)
-                print(f"Blurhash saved to {blurhash_file_path}")
-            else:
-                print("No valid blurhash generated for the image.")
-        except Exception as e:
-            print(f"Error generating blurhash: {e}")
+        # Start the blurhash generation in a separate thread
+        blurhash_thread = threading.Thread(target=generate_and_save_blurhash, args=(file_path, blurhash_file_path))
+        blurhash_thread.start()
+
     else:
         print(f"Failed to download image from {image_url}. Status code: {response.status_code}")
 
@@ -251,9 +277,12 @@ def get_file_extension(url):
     return os.path.splitext(parsed_url.path)[1]
 
 def process_shows(specific_show=None):
-    for show_name in os.listdir(SHOWS_DIR):
-        if specific_show and show_name != specific_show:
-            continue
+    shows = (
+        show_name for show_name in os.listdir(SHOWS_DIR)
+        if os.path.isdir(os.path.join(SHOWS_DIR, show_name)) and 
+        (not specific_show or show_name == specific_show)
+    )
+    for show_name in shows:
         show_dir = os.path.join(SHOWS_DIR, show_name)
         tmdb_config_path = os.path.join(show_dir, 'tmdb.config')
         metadata_file = os.path.join(show_dir, 'metadata.json')
@@ -263,6 +292,21 @@ def process_shows(specific_show=None):
         # Read TMDB config
         tmdb_config = read_tmdb_config(tmdb_config_path)
         tmdb_id = tmdb_config.get('tmdb_id')
+
+        # Check if metadata updates are allowed based on the config
+        if not should_update_metadata(tmdb_config):
+            print(f"Updates are disabled for {show_name}. Skipping periodic metadata refresh.")
+            if not os.path.exists(metadata_file):
+                # Perform initial metadata retrieval if metadata file doesn't exist
+                print(f"Initial metadata retrieval for {show_name}.")
+                show_data = get_tmdb_data(show_name, tmdb_id=tmdb_id, type='tv')
+                if show_data:
+                    if 'metadata' in tmdb_config:
+                        show_data.update(tmdb_config['metadata'])
+                    with open(metadata_file, 'w') as f:
+                        json.dump(show_data, f, indent=4, sort_keys=True)
+            else:
+                continue  # Skip further processing
 
         # Determine need for metadata refresh
         need_refresh = True
@@ -340,11 +384,10 @@ def process_shows(specific_show=None):
                         print(f"{episode_thumbnail_path} date:{datetime.fromtimestamp(os.path.getmtime(episode_thumbnail_path))}")
                         refresh_episode_thumbnail = datetime.now() - datetime.fromtimestamp(os.path.getmtime(episode_thumbnail_path)) > timedelta(days=3)
                     else:
-                        print(f"{episode_thumbnail_path} does not exist. Downloading thumbnail.")
                         refresh_episode_thumbnail = True
                     
                     if refresh_episode_thumbnail:
-                        print(f"Processing show {show_name}")
+                        print(f"{episode_thumbnail_path} does not exist. Downloading thumbnail. Processing show {show_name}")
                         episode_thumbnail_url = get_episode_thumbnail_url(show_data["id"], season_number, episode_number)
                         if episode_thumbnail_url:
                             download_image(episode_thumbnail_url, episode_thumbnail_path)
@@ -354,12 +397,14 @@ def process_shows(specific_show=None):
                 # Season directory does not exist, skip processing for this season
                 print(f"Skipping Season {season_number} for '{show_name}' as the directory does not exist.")
 def process_movies(specific_movie=None):
-    for movie_name in os.listdir(MOVIES_DIR):
-        if specific_movie and movie_name != specific_movie:
-            continue
+    movies = (
+        movie_name for movie_name in os.listdir(MOVIES_DIR)
+        if os.path.isdir(os.path.join(MOVIES_DIR, movie_name)) and 
+        (not specific_movie or movie_name == specific_movie)
+    )
+
+    for movie_name in movies:
         movie_dir = os.path.join(MOVIES_DIR, movie_name)
-        if not os.path.isdir(movie_dir):  # Skip if not a directory
-            continue
         tmdb_config_path = os.path.join(movie_dir, 'tmdb.config')
         metadata_file = os.path.join(movie_dir, 'metadata.json')
         
