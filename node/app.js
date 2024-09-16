@@ -746,6 +746,16 @@ app.get("/video/movie/:movieName", async (req, res) => {
  await handleVideoRequest(req, res, "movies", BASE_PATH);
 });
 
+app.get("/rescan/tmdb", async (req, res) => {
+  try {
+    await runDownloadTmdbImages(null, null, true);
+    res.status(200).send("Rescan initiated");
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Rescan Failed: Internal server error");
+  }
+})
+
 // app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
 //  await handleVideoRequest(req, res, "tv");
 // });
@@ -952,6 +962,9 @@ async function generateListTV(db, dirPath) {
                 mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString()
               };
 
+              // ex. values
+              // 01, 02, 03, 04, etc.
+              // 2 digit string
               const episodeNumber = episode.match(/S\d+E(\d+)/i)?.[1] || episode.match(/\d+/)?.[0];
 
               if (episodeNumber) {
@@ -1080,23 +1093,23 @@ async function generateListMovies(db, dirPath) {
     }
     if (dir.isDirectory()) {
       const dirName = dir.name;
+      const fullDirPath = path.join(dirPath, dirName);
       const files = await fs.readdir(path.join(dirPath, dirName));
-      const filesWithStats = await Promise.all(files.map(async file => {
-        const stats = await fs.stat(path.join(dirPath, dirName, file));
-        return { name: file, stats };
-      }));
-      const hash = calculateDirectoryHash(filesWithStats);
+      const hash = await calculateDirectoryHash(fullDirPath);
 
       const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [dirName]);
       existingMovieNames.delete(dirName); // Remove from the set of existing movies
+      const dirHashChanged = existingMovie && existingMovie.directory_hash !== hash
 
-      if (existingMovie && existingMovie.directory_hash === hash) {
+      if (!dirHashChanged && existingMovie) {
         // If the hash is the same, skip detailed processing and use the existing data.
         if (isDebugMode) {
           console.log(`No changes detected in ${dirName}, skipping processing.`);
         }
         return; // Use return instead of continue
       }
+
+      console.log('Directory Hash invalidated for', dirName);
 
       const encodedDirName = encodeURIComponent(dirName);
       const fileSet = new Set(files); // Create a set of filenames for quick lookup
@@ -1212,14 +1225,14 @@ async function generateListMovies(db, dirPath) {
         if (tmdbConfigLastModified && metadataLastModified && tmdbConfigLastModified > metadataLastModified) {
           runDownloadTmdbImagesFlag = true;
         }
-
-  } else {
-    runDownloadTmdbImagesFlag = true;
-  }
+        
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
 
       // Check if the movie is in the missing data table and if it should be retried
       const missingDataMovie = missingDataMovies.find(movie => movie.name === dirName);
-      if (missingDataMovie) {
+      if (missingDataMovie && !dirHashChanged) {
         const lastAttempt = new Date(missingDataMovie.lastAttempt);
         const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
         if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
@@ -1227,6 +1240,8 @@ async function generateListMovies(db, dirPath) {
         } else {
           runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
         }
+      } else if (dirHashChanged) {
+        runDownloadTmdbImagesFlag = true; // Retry if the directory hash changed
       }
 
       if (runDownloadTmdbImagesFlag) {
@@ -1288,8 +1303,10 @@ async function generateListMovies(db, dirPath) {
         delete urls;
       }
 
+      const final_hash = await calculateDirectoryHash(fullDirPath);
+
       // Always update the database with the latest data
-      await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "", hash);
+      await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "", final_hash);
     }
   }))
   // Remove movies from the database that no longer exist in the file system
@@ -1360,7 +1377,12 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null, 
   }
 
   if (isDebugMode) {
-    command += ` >> ${LOG_FILE} 2>&1`;
+    try {
+      await fs.access(LOG_FILE, fs.constants.W_OK);
+      command += ` >> ${LOG_FILE} 2>&1`;
+    } catch (err) {
+      console.warn(`No write access to ${LOG_FILE}. Logging to console instead.`);
+    }
   }
 
   try {

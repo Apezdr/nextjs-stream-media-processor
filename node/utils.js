@@ -156,11 +156,31 @@ async function getStoredBlurhash(imagePath, basePath) {
   }
 }
 
-function calculateDirectoryHash(files) {
+async function calculateDirectoryHash(dirPath, maxDepth = 5) {
   const hash = crypto.createHash('sha256');
-  files.forEach(file => {
-    hash.update(file.name + file.size + file.mtimeMs);
-  });
+
+  async function processDirectory(currentPath, currentDepth) {
+    if (currentDepth > maxDepth) return;
+
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      const stats = await fs.stat(fullPath);
+
+      if (entry.isDirectory()) {
+        // Add directory name and stats to the hash
+        hash.update(`D:${entry.name}:${stats.size}:${stats.mtimeMs}`);
+        // Recursively process subdirectory
+        await processDirectory(fullPath, currentDepth + 1);
+      } else if (entry.isFile()) {
+        // Add file name and stats to the hash
+        hash.update(`F:${entry.name}:${stats.size}:${stats.mtimeMs}`);
+      }
+    }
+  }
+
+  await processDirectory(dirPath, 0);
   return hash.digest('hex');
 }
 

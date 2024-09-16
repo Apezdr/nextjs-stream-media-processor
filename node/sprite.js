@@ -1,157 +1,73 @@
 const { exec } = require('child_process');
 const path = require('path');
-const { fork } = require('child_process');
-const fs = require('fs').promises; // Use the promise-based version of fs
-const { generateFrame, getVideoDuration, fileExists } = require('./utils');
+const fs = require('fs').promises;
+const { getVideoDuration, fileExists } = require('./utils');
+const sharp = require('sharp');
 
-async function generateSpriteSheet({videoPath, type, name, season = null, episode = null, cacheDir}) {
+async function generateSpriteSheet({ videoPath, type, name, season = null, episode = null, cacheDir }) {
   try {
     const duration = await getVideoDuration(videoPath);
     const floorDuration = Math.floor(duration);
     console.log(`Total Duration: ${floorDuration} seconds`);
 
     const interval = 5; // Adjust if needed
-    const frames = [];
-    const timestamps = [];
 
-    for (let currentTime = 0; currentTime <= floorDuration; currentTime += interval) {
-      let timestamp = new Date(currentTime * 1000).toISOString().substr(11, 8);
-      timestamps.push(timestamp);
-    }
+    // Calculate the total number of frames
+    const totalFrames = Math.floor(floorDuration / interval) + 1; // Add 1 to include the last frame
+    const columns = 10; // Number of columns in the sprite sheet
+    const rows = Math.ceil(totalFrames / columns); // Calculate the number of rows
 
-    try {
-      // Parallelize the snapshot generation using child processes
-      const numWorkers = 13; // Adjust the number of worker processes based on your system's capabilities
-      const workerPromises = [];
-
-      console.log(`Creating ${numWorkers} worker processes...`);
-
-      for (let i = 0; i < numWorkers; i++) {
-        const worker = fork(path.join(__dirname, 'snapshotWorker.js'));
-        const workerPromise = new Promise((resolve, reject) => {
-          worker.on('message', (result) => {
-            frames.push(...result.frames);
-            console.log(`Worker ${worker.pid} completed. Received ${result.frames.length} frames.`);
-            resolve();
-          });
-          worker.on('error', (error) => {
-            console.log('Worker Error', error);
-            reject(error);
-          });
-        });
-
-        const startIndex = i * Math.ceil(timestamps.length / numWorkers);
-        const endIndex = Math.min((i + 1) * Math.ceil(timestamps.length / numWorkers), timestamps.length);
-        const workerTimestamps = timestamps.slice(startIndex, endIndex);
-
-        if (type === 'movies') {
-          worker.send({ videoPath, type, name, cacheDir, timestamps: workerTimestamps });
-        } else if (type === 'tv') {
-          worker.send({ videoPath, type, name, season, episode, cacheDir, timestamps: workerTimestamps });
-        }
-        workerPromises.push(workerPromise);
-      }
-
-      await Promise.all(workerPromises);
-      console.log('All workers completed.');
-	  // Sort the frames array based on timestamps or file names
-	  frames.sort((a, b) => {
-		// Extract the timestamp from the frame file names
-		const timestampRegex = /_(\d{2}:\d{2}:\d{2})/;
-		const timestampA = a.framePath.match(timestampRegex)[1];
-		const timestampB = b.framePath.match(timestampRegex)[1];
-
-		// Compare the timestamps
-		return timestampA.localeCompare(timestampB);
-	  });
-	} catch (error) {
-      console.error(`Error in generateSpriteSheet: ${error}`);
-    }
-
-    // Generate the sprite sheet
-    let spriteSheetFileName;
+    // Define output file names
+    let spriteSheetFileName, vttFileName;
     if (type === 'movies') {
       spriteSheetFileName = `movie_${name}_spritesheet.jpg`;
-    } else if (type === 'tv') {
-      spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.jpg`;
-    }
-    const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
-
-    if (await fileExists(spriteSheetPath)) {
-      console.log(`Serving existing sprite sheet: ${spriteSheetPath}`);
-      return spriteSheetPath; // Serve the existing sprite sheet
-    }
-    await generateSpriteSheetImage(frames, spriteSheetPath);
-
-    // Generate the VTT file
-    let vttFileName;
-    if (type === 'movies') {
       vttFileName = `movie_${name}_spritesheet.vtt`;
     } else if (type === 'tv') {
+      spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.jpg`;
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
+
+    const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
     const vttFilePath = path.join(cacheDir, vttFileName);
-    if (await fileExists(vttFilePath)) {
-      console.log(`Serving existing VTT file: ${vttFilePath}`);
-      return vttFilePath; // Serve the existing VTT file
-    }    
-    await generateVttFile(frames, vttFilePath, interval, type, name, season, episode);
+
+    // Check if sprite sheet and VTT already exist
+    if (await fileExists(spriteSheetPath) && await fileExists(vttFilePath)) {
+      console.log(`Serving existing sprite sheet and VTT files.`);
+      return { spriteSheetPath, vttFilePath };
+    }
+
+    // Use FFmpeg to generate the sprite sheet
+    await generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows);
+
+    // Generate the VTT file
+    await generateVttFileFFmpeg(spriteSheetPath, vttFilePath, floorDuration, interval, columns, rows, type, name, season, episode);
+
+    console.log('Sprite sheet and VTT file generated successfully.');
+    return { spriteSheetPath, vttFilePath };
   } catch (error) {
     console.error(`Error in generateSpriteSheet: ${error}`);
   }
 }
 
-async function generateSpriteSheetImage(frames, spriteSheetPath) {
-  const sharp = require('sharp');
-  const columns = 10;
+async function generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows) {
+  const command = `ffmpeg -y -i "${videoPath}" -vf "fps=1/${interval},scale=320:-1,tile=${columns}x${rows}" "${spriteSheetPath}"`;
+  console.log(`Executing FFmpeg command: ${command}`);
 
-  console.log(`Sprite sheet generating...: ${spriteSheetPath}`);
-
-  const maxWidth = Math.max(...frames.map(frame => frame.width));
-  const maxHeight = Math.max(...frames.map(frame => frame.height));
-
-  const spriteSheetWidth = maxWidth * columns;
-  const spriteSheetHeight = Math.ceil(frames.length / columns) * maxHeight;
-
-  console.time(`Prepare composite array for ${spriteSheetPath}`);
-  const compositeArray = await Promise.all(frames.map(async (frame, i) => {
-    const left = (i % columns) * maxWidth;
-    const top = Math.floor(i / columns) * maxHeight;
-
-    if (await fileExists(frame.framePath)) {
-      return { input: frame.framePath, left, top };
-    }
-    console.warn(`Frame not found: ${frame.framePath}`);
-    return null;
-  }));
-  console.timeEnd(`Prepare composite array for ${spriteSheetPath}`);
-
-  const validCompositeArray = compositeArray.filter(item => item !== null);
-
-  try {
-    console.log('Starting Sharp composite operation');
-    console.time(`Sharp composite operation for ${spriteSheetPath}`);
-    await sharp({
-      create: {
-        width: spriteSheetWidth,
-        height: spriteSheetHeight,
-        channels: 4,
-        background: { r: 0, g: 0, b: 0, alpha: 0 },
+  return new Promise((resolve, reject) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`FFmpeg error: ${stderr}`);
+        reject(error);
+      } else {
+        console.log(`Sprite sheet created at ${spriteSheetPath}`);
+        resolve();
       }
-    })
-    .composite(validCompositeArray)
-    .toFile(spriteSheetPath);
-    console.timeEnd(`Sharp composite operation for ${spriteSheetPath}`);
-
-    console.log(`Sprite sheet generated: ${spriteSheetPath}`);
-  } catch (error) {
-    console.error(`Error generating sprite sheet: ${error}`);
-    throw error;
-  }
+    });
+  });
 }
 
-async function generateVttFile(frames, vttFilePath, interval, type, name, season = null, episode = null) {
-  let vttContent = 'WEBVTT\n\n';
+async function generateVttFileFFmpeg(spriteSheetPath, vttFilePath, duration, interval, columns, rows, type, name, season = null, episode = null) {
+  const vttContent = ['WEBVTT', ''];
 
   const baseUrl = process.env.FILE_SERVER_NODE_URL;
   let spriteSheetUrl;
@@ -162,22 +78,29 @@ async function generateVttFile(frames, vttFilePath, interval, type, name, season
     spriteSheetUrl = `${baseUrl}/spritesheet/tv/${encodeURIComponent(name)}/${season}/${episode}`;
   }
 
-  const frameWidth = frames[0].width; // Use the width of the first frame
-  const frameHeight = frames[0].height; // Use the height of the first frame
-  const columns = 10; // Adjust the number of columns as needed
+  // Get sprite sheet dimensions
+  const { width: spriteWidth, height: spriteHeight } = await getImageDimensions(spriteSheetPath);
+  const thumbWidth = spriteWidth / columns;
+  const thumbHeight = spriteHeight / rows;
 
-  for (let i = 0; i < frames.length; i++) {
-    const frame = frames[i];
-    const startTime = formatTime(i * interval);
-    const endTime = formatTime((i + 1) * interval);
-    const left = (i % columns) * frame.width;
-    const top = Math.floor(i / columns) * frame.height;
+  let timestamp = 0;
+  let index = 0;
 
-    vttContent += `${startTime} --> ${endTime}\n`;
-    vttContent += `${spriteSheetUrl}#xywh=${left},${top},${frame.width},${frame.height}\n\n`;
+  while (timestamp <= duration) {
+    const startTime = formatTime(timestamp);
+    const endTime = formatTime(Math.min(timestamp + interval, duration)); // Ensure endTime doesn't exceed duration
+
+    const x = (index % columns) * thumbWidth;
+    const y = Math.floor(index / columns) * thumbHeight;
+
+    vttContent.push(`${startTime} --> ${endTime}`);
+    vttContent.push(`${spriteSheetUrl}#xywh=${x},${y},${thumbWidth},${thumbHeight}`, '');
+
+    timestamp += interval;
+    index++;
   }
 
-  await fs.writeFile(vttFilePath, vttContent);
+  await fs.writeFile(vttFilePath, vttContent.join('\n'));
 }
 
 function formatTime(seconds) {
@@ -187,6 +110,11 @@ function formatTime(seconds) {
   const secs = date.getUTCSeconds().toString().padStart(2, '0');
   const ms = date.getUTCMilliseconds().toString().padStart(3, '0');
   return `${hours}:${minutes}:${secs}.${ms}`;
+}
+
+async function getImageDimensions(imagePath) {
+  const metadata = await sharp(imagePath).metadata();
+  return { width: metadata.width, height: metadata.height };
 }
 
 module.exports = {
