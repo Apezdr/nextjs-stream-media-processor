@@ -175,6 +175,7 @@ def process_shows(specific_show=None):
                 # Apply hard-coded replacements from tmdb.config
                 if 'metadata' in tmdb_config:
                     show_data.update(tmdb_config['metadata'])
+                
                 with open(metadata_file, 'w') as f:
                     json.dump(show_data, f, indent=4, sort_keys=True)
         else:
@@ -226,7 +227,7 @@ def process_movies(specific_movie=None):
                     movie_data.update(tmdb_config['metadata'])
                 with open(metadata_file, 'w') as f:
                     json.dump(movie_data, f, indent=4, sort_keys=True)
-                
+                    
                 # Update tmdb.config if necessary
                 update_tmdb_config(tmdb_config_path, tmdb_config, movie_data['id'], movie_name)
 

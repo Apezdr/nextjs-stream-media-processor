@@ -19,7 +19,15 @@ if not TMDB_API_KEY:
     raise ValueError("No TMDB API key found in the environment variables")
 
 # Initialize requests cache
-requests_cache.install_cache('tmdb_cache', expire_after=timedelta(days=1))
+requests_cache.install_cache(
+    cache_name='tmdb_cache',
+    backend='sqlite',
+    expire_after=86400,
+    allowed_methods=('GET', 'POST'),
+    stale_if_error=True,
+    sqlite_max_connections=5,  # Increase if necessary
+    sqlite_backend_kwargs={'timeout': 30}  # Wait up to 30 seconds
+)
 
 # Create a session object
 session = requests.Session()
@@ -86,9 +94,31 @@ def fetch_tmdb_media_details(
     media_details['cast'] = fetch_tmdb_cast_details(tmdb_id, media_type)
     media_details['trailer_url'] = fetch_tmdb_trailer_url(tmdb_id, media_type)
     media_details['logo_path'] = fetch_tmdb_logo_path(tmdb_id, media_type)
+    media_details['rating'] = fetch_tmdb_rating(tmdb_id, media_type)
     media_details['last_updated'] = datetime.now().isoformat()
 
     return media_details
+
+def fetch_tmdb_rating(tmdb_id: int, media_type: str) -> Optional[str]:
+    if media_type == 'movie':
+        release_dates_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/release_dates'
+    else:  # media_type == 'tv'
+        release_dates_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/content_ratings'
+    params = {'api_key': TMDB_API_KEY}
+    release_dates_data = make_tmdb_api_request(release_dates_url, params)
+
+    if release_dates_data:
+        if media_type == 'movie' and 'results' in release_dates_data:
+            for country in release_dates_data['results']:
+                if country['iso_3166_1'] == 'US':
+                    for release in country['release_dates']:
+                        if release.get('certification'):
+                            return release['certification']
+        elif media_type == 'tv' and 'results' in release_dates_data:
+            for rating_info in release_dates_data['results']:
+                if rating_info['iso_3166_1'] == 'US' and rating_info.get('rating'):
+                    return rating_info['rating']
+    return None
 
 def fetch_tmdb_cast_details(tmdb_id: int, media_type: str) -> Optional[Dict]:
     credits_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/credits'
