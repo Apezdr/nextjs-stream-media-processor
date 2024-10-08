@@ -1,11 +1,4 @@
 const fs = require('fs');
-const util = require('util');
-/* const logFile = fs.createWriteStream('worker.log', { flags: 'a' });
-console.log = function(message) {
-  logFile.write(util.format(message) + '\n');
-  process.stdout.write(util.format(message) + '\n');
-}; */
-
 const path = require('path');
 const { exec } = require('child_process');
 const { generateFrame, fileExists } = require('./utils');
@@ -17,37 +10,40 @@ process.on('message', async (data) => {
     const frames = [];
 
     for (const timestamp of timestamps) {
-      let frameFileName;
+      let baseFileName;
       if (type === 'movies') {
-        frameFileName = `movie_${name}_${timestamp}.jpg`;
+        baseFileName = `movie_${name}_${timestamp}`;
       } else if (type === 'tv') {
-        frameFileName = `${type}_${name}_${season}_${episode}_${timestamp}.jpg`;
+        baseFileName = `${type}_${name}_${season}_${episode}_${timestamp}`;
       }
 
+      // Ensure the frame file name ends with .png
+      let frameFileName = `${baseFileName}.png`;
       let framePath = path.join(cacheDir, frameFileName);
-      console.log(framePath);
 
+      // Check if the frame already exists
       if (await fileExists(framePath)) {
         console.log(`Worker ${process.pid} using cached frame: ${frameFileName}`);
-        // Get the dimensions of the cached frame using ffprobe
-        const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${framePath}"`;
-        const ffprobePromise = new Promise((resolve, reject) => {
-          exec(ffprobeCommand, (error, stdout, stderr) => {
-            if (error) {
-              console.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
-              reject(error);
-            } else {
-              const [width, height] = stdout.trim().split('x');
-              resolve({ framePath, width: parseInt(width), height: parseInt(height) });
-            }
-          });
-        });
-        frames.push(await ffprobePromise);
       } else {
         console.log(`Worker ${process.pid} generating new frame: ${frameFileName}`);
-        const frameData = await generateFrame(videoPath, timestamp, framePath);
-        frames.push(frameData);
+        // Generate the frame
+        await generateFrame(videoPath, timestamp, framePath);
       }
+
+      // Get the dimensions of the frame using ffprobe
+      const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${framePath}"`;
+      const ffprobePromise = new Promise((resolve, reject) => {
+        exec(ffprobeCommand, (error, stdout, stderr) => {
+          if (error) {
+            console.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
+            reject(error);
+          } else {
+            const [width, height] = stdout.trim().split('x');
+            resolve({ framePath, width: parseInt(width), height: parseInt(height) });
+          }
+        });
+      });
+      frames.push(await ffprobePromise);
     }
 
     console.log(`Worker ${process.pid} completed processing. Generated ${frames.length} frames.`);

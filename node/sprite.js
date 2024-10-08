@@ -20,10 +20,10 @@ async function generateSpriteSheet({ videoPath, type, name, season = null, episo
     // Define output file names
     let spriteSheetFileName, vttFileName;
     if (type === 'movies') {
-      spriteSheetFileName = `movie_${name}_spritesheet.jpg`;
+      spriteSheetFileName = `movie_${name}_spritesheet.avif`;
       vttFileName = `movie_${name}_spritesheet.vtt`;
     } else if (type === 'tv') {
-      spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.jpg`;
+      spriteSheetFileName = `tv_${name}_${season}_${episode}_spritesheet.avif`;
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
 
@@ -36,11 +36,14 @@ async function generateSpriteSheet({ videoPath, type, name, season = null, episo
       return { spriteSheetPath, vttFilePath };
     }
 
-    // Use FFmpeg to generate the sprite sheet
-    await generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows);
-
-    // Generate the VTT file
-    await generateVttFileFFmpeg(spriteSheetPath, vttFilePath, floorDuration, interval, columns, rows, type, name, season, episode);
+    if (!await fileExists(spriteSheetPath)) {
+      // Use FFmpeg to generate the sprite sheet
+      await generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows);
+    }
+    if (!await fileExists(vttFilePath)) {
+      // Generate the VTT file
+      await generateVttFileFFmpeg(spriteSheetPath, vttFilePath, floorDuration, interval, columns, rows, type, name, season, episode);
+    }
 
     console.log('Sprite sheet and VTT file generated successfully.');
     return { spriteSheetPath, vttFilePath };
@@ -50,17 +53,42 @@ async function generateSpriteSheet({ videoPath, type, name, season = null, episo
 }
 
 async function generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows) {
-  const command = `ffmpeg -y -i "${videoPath}" -vf "fps=1/${interval},scale=320:-1,tile=${columns}x${rows}" "${spriteSheetPath}"`;
+  // Generate a temporary PNG spritesheet
+  const tempSpriteSheetPath = spriteSheetPath.replace(/\.[^/.]+$/, '.png');
+
+  const command = `ffmpeg -y -i "${videoPath}" -frames:v 1 -vf "fps=1/${interval},scale=320:-1,tile=${columns}x${rows}" "${tempSpriteSheetPath}"`;
   console.log(`Executing FFmpeg command: ${command}`);
 
   return new Promise((resolve, reject) => {
-    exec(command, (error, stdout, stderr) => {
+    exec(command, async (error, stdout, stderr) => {
       if (error) {
         console.error(`FFmpeg error: ${stderr}`);
         reject(error);
       } else {
-        console.log(`Sprite sheet created at ${spriteSheetPath}`);
-        resolve();
+        console.log(`Sprite sheet created at ${tempSpriteSheetPath}`);
+
+        try {
+          // Convert the PNG spritesheet to AVIF using sharp
+          await sharp(tempSpriteSheetPath)
+            .avif({ quality: 60 }) // Adjust quality as needed
+            .toFile(spriteSheetPath);
+
+          console.log(`Converted spritesheet to AVIF at ${spriteSheetPath}`);
+
+          // Optionally delete the temporary PNG file
+          fs.unlink(tempSpriteSheetPath, (err) => {
+            if (err) {
+              console.error(`Error deleting temporary PNG file: ${err}`);
+            } else {
+              console.log(`Deleted temporary PNG file: ${tempSpriteSheetPath}`);
+            }
+          });
+
+          resolve();
+        } catch (conversionError) {
+          console.error(`Error converting spritesheet to AVIF: ${conversionError}`);
+          reject(conversionError);
+        }
       }
     });
   });

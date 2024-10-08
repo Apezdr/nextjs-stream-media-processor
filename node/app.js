@@ -16,12 +16,19 @@ const {
   generateFrame,
   getVideoDuration,
   fileExists,
-  ensureCacheDir,
-  cacheDir,
+  ensureCacheDirs,
+  mainCacheDir,
+  generalCacheDir,
+  spritesheetCacheDir,
+  framesCacheDir,
   findMp4File,
   getStoredBlurhash,
   calculateDirectoryHash,
   getLastModifiedTime,
+  clearSpritesheetCache,
+  clearFramesCache,
+  clearGeneralCache,
+  clearVideoClipsCache,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
@@ -47,7 +54,7 @@ const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
 // Enable compression for all responses
 app.use(compression());
 
-ensureCacheDir();
+ensureCacheDirs();
 
 const langMap = {
   "en": "English",
@@ -133,6 +140,9 @@ const langMap = {
 // creating too many workers
 const vttProcessingFiles = new Set();
 const vttRequestQueues = new Map();
+//
+const spriteSheetProcessingFiles = new Set();
+const spriteSheetRequestQueues = new Map();
 
 app.get("/frame/movie/:movieName/:timestamp.:ext?", (req, res) => {
   handleFrameRequest(req, res, "movies");
@@ -155,7 +165,7 @@ async function handleFrameRequest(req, res, type) {
       ? req.params.movieName.replace(/%20/g, " ")
       : ""; // Replace %20 with space
     directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
-    frameFileName = `movie_${movieName}_${timestamp}.jpg`;
+    frameFileName = `movie_${movieName}_${timestamp}.avif`;
   } else {
     // For TV shows, adjust this logic to fit your directory structure
     const showName = req.params.showName
@@ -174,11 +184,11 @@ async function handleFrameRequest(req, res, type) {
     const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
     directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
-    frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${timestamp}.jpg`;
+    frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${timestamp}.avif`;
     specificFileName = `${episodeString}.mp4`;
   }
 
-  const framePath = path.join(cacheDir, frameFileName);
+  const framePath = path.join(framesCacheDir, frameFileName);
 
   try {
     if (await fileExists(framePath)) {
@@ -196,113 +206,80 @@ async function handleFrameRequest(req, res, type) {
 
     res.sendFile(framePath);
 
+    //
+    // Historic usage where it would generate
+    // all frames for a given media file, this
+    // is no longer necessary.
+    //
     // Check if thumbnail generation is in progress to avoid duplication
-    if (!thumbnailGenerationInProgress.has(videoPath) && videoPath) {
-      thumbnailGenerationInProgress.add(videoPath);
-      generateAllThumbnails(
-        videoPath,
-        type,
-        req.params.movieName ||
-          (req.params.showName ? req.params.showName.replace(/%20/g, " ") : ""),
-        req.params.season ? req.params.season.replace(/%20/g, " ") : "",
-        req.params.episode
-      )
-        .then(() => {
-          console.log("Processing complete show generation");
-          thumbnailGenerationInProgress.delete(videoPath);
-        })
-        .catch((error) => {
-          console.error(error);
-          thumbnailGenerationInProgress.delete(videoPath);
-        });
-    }
+    // if (!thumbnailGenerationInProgress.has(videoPath) && videoPath) {
+    //   thumbnailGenerationInProgress.add(videoPath);
+    //   generateAllThumbnails(
+    //     videoPath,
+    //     type,
+    //     req.params.movieName ||
+    //       (req.params.showName ? req.params.showName.replace(/%20/g, " ") : ""),
+    //     req.params.season ? req.params.season.replace(/%20/g, " ") : "",
+    //     req.params.episode
+    //   )
+    //     .then(() => {
+    //       console.log("Processing complete show generation");
+    //       thumbnailGenerationInProgress.delete(videoPath);
+    //     })
+    //     .catch((error) => {
+    //       console.error(error);
+    //       thumbnailGenerationInProgress.delete(videoPath);
+    //     });
+    // }
   } catch (error) {
     console.error(error);
     return res.status(404).send("Video file not found");
   }
 }
 
-async function generateAllThumbnails(
-  videoPath,
-  type,
-  name,
-  season = null,
-  episode = null
-) {
-  try {
-    const duration = await getVideoDuration(videoPath);
-    const floorDuration = Math.floor(duration);
-    console.log(`Total Duration: ${floorDuration} seconds`);
-
-    const interval = 5; // Adjust if needed for debugging
-    for (
-      let currentTime = 0;
-      currentTime <= floorDuration;
-      currentTime += interval
-    ) {
-      let timestamp = new Date(currentTime * 1000).toISOString().substr(11, 8);
-      console.log(`Processing timestamp: ${timestamp}`); // Debugging log
-
-      let frameFileName;
-      if (type === "movies") {
-        frameFileName = `movie_${name}_${timestamp}.jpg`;
-      } else if (type === "tv") {
-        frameFileName = `${type}_${name}_${season}_${episode}_${timestamp}.jpg`;
-      }
-
-      let framePath = path.join(cacheDir, frameFileName);
-
-      if (!(await fileExists(framePath))) {
-        console.log(`Generating new frame: ${frameFileName}`);
-        await generateFrame(videoPath, timestamp, framePath);
-      } else {
-        console.log(`Frame already exists: ${frameFileName}, skipping...`);
-      }
-    }
-  } catch (error) {
-    console.error(`Error in generateAllThumbnails: ${error}`);
-  }
-}
-
+// Historic, no longer necessary
 //
-// Cache management
-//
-//
-const CACHE_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // Max age for cache files in milliseconds, e.g., 1 month (30 days)
+// async function generateAllThumbnails(
+//   videoPath,
+//   type,
+//   name,
+//   season = null,
+//   episode = null
+// ) {
+//   try {
+//     const duration = await getVideoDuration(videoPath);
+//     const floorDuration = Math.floor(duration);
+//     console.log(`Total Duration: ${floorDuration} seconds`);
 
-function clearOldCacheFiles() {
-  const now = new Date().getTime();
+//     const interval = 5; // Adjust if needed for debugging
+//     for (
+//       let currentTime = 0;
+//       currentTime <= floorDuration;
+//       currentTime += interval
+//     ) {
+//       let timestamp = new Date(currentTime * 1000).toISOString().substr(11, 8);
+//       console.log(`Processing timestamp: ${timestamp}`); // Debugging log
 
-  fs.readdir(cacheDir, (err, files) => {
-    if (err) {
-      console.error("Error reading cache directory:", err);
-      return;
-    }
+//       let frameFileName;
+//       if (type === "movies") {
+//         frameFileName = `movie_${name}_${timestamp}.jpg`;
+//       } else if (type === "tv") {
+//         frameFileName = `${type}_${name}_${season}_${episode}_${timestamp}.jpg`;
+//       }
 
-    files.forEach((file) => {
-      const filePath = path.join(cacheDir, file);
-      fs.stat(filePath, (err, stats) => {
-        if (err) {
-          console.error("Error getting file stats:", err);
-          return;
-        }
+//       let framePath = path.join(framesCacheDir, frameFileName);
 
-        const lastAccessed = stats.atimeMs; // atimeMs is the file last accessed time
-        const age = now - lastAccessed;
-
-        if (age > CACHE_MAX_AGE) {
-          fs.unlink(filePath, (err) => {
-            if (err) {
-              console.error(`Error deleting file ${file}:`, err);
-            } else {
-              console.log(`Deleted old cache file: ${file}`);
-            }
-          });
-        }
-      });
-    });
-  });
-}
+//       if (!(await fileExists(framePath))) {
+//         console.log(`Generating new frame: ${frameFileName}`);
+//         await generateFrame(videoPath, timestamp, framePath);
+//       } else {
+//         console.log(`Frame already exists: ${frameFileName}, skipping...`);
+//       }
+//     }
+//   } catch (error) {
+//     console.error(`Error in generateAllThumbnails: ${error}`);
+//   }
+// }
 
 //
 // Sprite
@@ -329,12 +306,12 @@ async function handleSpriteSheetRequest(req, res, type) {
   let spriteSheetFileName;
 
   if (type === "movies") {
-    spriteSheetFileName = `movie_${movieName}_spritesheet.jpg`;
+    spriteSheetFileName = `movie_${movieName}_spritesheet.avif`;
   } else if (type === "tv") {
-    spriteSheetFileName = `tv_${showName}_${season}_${episode}_spritesheet.jpg`;
+    spriteSheetFileName = `tv_${showName}_${season}_${episode}_spritesheet.avif`;
   }
 
-  const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
+  const spriteSheetPath = path.join(spritesheetCacheDir, spriteSheetFileName);
 
   try {
     if (await fileExists(spriteSheetPath)) {
@@ -344,11 +321,28 @@ async function handleSpriteSheetRequest(req, res, type) {
     } else {
       console.log(`Sprite sheet not found in cache: ${spriteSheetFileName}`);
 
+      const fileKey = type === "movies" 
+        ? `movie_${movieName}`
+        : `tv_${showName}_${season}_${episode}`;
+
+      if (spriteSheetProcessingFiles.has(fileKey)) {
+        console.log(
+          `Sprite sheet ${fileKey} is already being processed. Adding request to queue.`
+        );
+        if (!spriteSheetRequestQueues.has(fileKey)) {
+          spriteSheetRequestQueues.set(fileKey, []);
+        }
+        spriteSheetRequestQueues.get(fileKey).push(res);
+        return;
+      }
+      spriteSheetProcessingFiles.add(fileKey);
+
       // Generate the sprite sheet
       let videoPath, videoMp4;
       if (type === "movies") {
         const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
         if (!movie) {
+          spriteSheetProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
         videoMp4 = JSON.parse(movie.urls).mp4;
@@ -358,40 +352,46 @@ async function handleSpriteSheetRequest(req, res, type) {
           videoMp4,
         );
       } else if (type === "tv") {
-        const shows = await getTVShows(db);
-        const showData = shows.find(show => show.name === showName);
-        if (showData) {
-          const _season = showData.metadata.seasons[`Season ${season}`];
-          if (_season) {
-            const _episode = _season.fileNames.find((e) => {
-              const episodeNumber = episode.padStart(2, "0");
-              return (
-                e.includes(` - `) &&
-                (e.startsWith(episodeNumber) ||
-                  e.includes(` ${episodeNumber} - `) ||
-                  e.includes(`S${season.padStart(2, "0")}E${episodeNumber}`))
-              );
-            });
+        try {
+          const shows = await getTVShows(db);
+          const showData = shows.find(show => show.name === showName);
+          if (showData) {
+            const _season = showData.metadata.seasons[`Season ${season}`];
+            if (_season) {
+              const _episode = _season.fileNames.find((e) => {
+                const episodeNumber = episode.padStart(2, "0");
+                return (
+                  e.includes(` - `) &&
+                  (e.startsWith(episodeNumber) ||
+                    e.includes(` ${episodeNumber} - `) ||
+                    e.includes(`S${season.padStart(2, "0")}E${episodeNumber}`))
+                );
+              });
 
-            if (_episode) {
-              const directoryPath = path.join(
-                `${BASE_PATH}/tv`,
-                showName,
-                `Season ${season}`
-              );
-              videoPath = path.join(directoryPath, _episode);
+              if (_episode) {
+                const directoryPath = path.join(
+                  `${BASE_PATH}/tv`,
+                  showName,
+                  `Season ${season}`
+                );
+                videoPath = path.join(directoryPath, _episode);
+              } else {
+                throw new Error(
+                  `Episode not found: ${showName} - Season ${season} Episode ${episode}`
+                );
+              }
             } else {
               throw new Error(
-                `Episode not found: ${showName} - Season ${season} Episode ${episode}`
+                `Season not found: ${showName} - Season ${season} Episode ${episode}`
               );
             }
           } else {
-            throw new Error(
-              `Season not found: ${showName} - Season ${season} Episode ${episode}`
-            );
+            throw new Error(`Show not found: ${showName}`);
           }
-        } else {
-          throw new Error(`Show not found: ${showName}`);
+        } catch (error) {
+          console.error(`Error accessing tv db data: ${error.message}`);
+          spriteSheetProcessingFiles.delete(fileKey);
+          return res.status(500).send("Internal server error");
         }
       }
 
@@ -401,10 +401,20 @@ async function handleSpriteSheetRequest(req, res, type) {
         name: movieName || showName,
         season,
         episode,
-        cacheDir,
+        cacheDir: spritesheetCacheDir,
       });
 
-      // After generating the sprite sheet, send it to the client
+      spriteSheetProcessingFiles.delete(fileKey);
+
+      // Process queued requests
+      const queuedRequests = spriteSheetRequestQueues.get(fileKey) || [];
+      spriteSheetRequestQueues.delete(fileKey);
+      queuedRequests.forEach((queuedRes) => {
+        queuedRes.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        queuedRes.sendFile(spriteSheetPath);
+      });
+
+      // Send the generated sprite sheet to the current request
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       res.sendFile(spriteSheetPath);
     }
@@ -425,7 +435,7 @@ async function handleVttRequest(req, res, type) {
     vttFileName = `tv_${showName}_${season}_${episode}_spritesheet.vtt`;
   }
 
-  const vttFilePath = path.join(cacheDir, vttFileName);
+  const vttFilePath = path.join(spritesheetCacheDir, vttFileName);
 
   try {
     if (await fileExists(vttFilePath)) {
@@ -469,7 +479,7 @@ async function handleVttRequest(req, res, type) {
           videoPath,
           type,
           name: movieName,
-          cacheDir,
+          cacheDir: spritesheetCacheDir,
         });
       } else if (type === "tv") {
         try {
@@ -522,7 +532,7 @@ async function handleVttRequest(req, res, type) {
         name: movieName || showName,
         season,
         episode,
-        cacheDir,
+        cacheDir: spritesheetCacheDir,
       });
 
       vttProcessingFiles.delete(fileKey);
@@ -760,12 +770,56 @@ app.get("/rescan/tmdb", async (req, res) => {
 //  await handleVideoRequest(req, res, "tv");
 // });
 
-// Schedule cache clearing every 30 minutes
-setInterval(clearOldCacheFiles, 30 * 60 * 1000);
+//
+// Clear General Cache every 30 minutes
+setInterval(() => {
+  console.log('Running General Cache Cleanup...');
+  clearGeneralCache()
+    .then(() => {
+      console.log('General Cache Cleanup Completed.');
+    })
+    .catch((error) => {
+      console.error(`General Cache Cleanup Error: ${error.message}`);
+    });
+}, 30 * 60 * 1000); // 30 minutes
+
+// Clear Video Clips Cache every 5 minutes
+setInterval(() => {
+  console.log('Running Video Clips Cache Cleanup...');
+  clearVideoClipsCache()
+    .then(() => {
+      console.log('Video Clips Cache Cleanup Completed.');
+    })
+    .catch((error) => {
+      console.error(`Video Clips Cache Cleanup Error: ${error.message}`);
+    });
+}, 5 * 60 * 1000); // 5 minutes
+
+//Clear Spritesheet Cache every hour
+setInterval(() => {
+  console.log('Running Spritesheet Cache Cleanup...');
+  clearSpritesheetCache()
+    .then(() => {
+      console.log('Spritesheet Cache Cleanup Completed.');
+    })
+    .catch((error) => {
+      console.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
+    });
+}, 60 * 60 * 1000); // 1 hour
+
+//Clear Frames Cache every day
+setInterval(() => {
+  console.log('Running Frames Cache Cleanup...');
+  clearFramesCache()
+    .then(() => {
+      console.log('Frames Cache Cleanup Completed.');
+    })
+    .catch((error) => {
+      console.error(`Frames Cache Cleanup Error: ${error.message}`);
+    });
+}, 24 * 60 * 60 * 1000); // 24 hours
 //
 // End Cache Management
-//
-//
 async function generateListTV(db, dirPath) {
   const shows = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMedia = await getMissingDataMedia(db);
@@ -1524,11 +1578,17 @@ function scheduleTasks() {
   schedule.scheduleJob('*/1 * * * *', () => {
     runGenerateList().catch(console.error);
   });
+
+  
+  // Schedule to clear cache
+  schedule.scheduleJob('*/1 * * * *', () => {
+    runGenerateList().catch(console.error);
+  });
 }
 
 
 async function initialize() {
-  await ensureCacheDir();
+  await ensureCacheDirs();
   const port = 3000;
   app.listen(port, async () => {
       scheduleTasks();

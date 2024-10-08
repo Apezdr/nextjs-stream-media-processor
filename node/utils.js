@@ -3,11 +3,19 @@ const { exec } = require('child_process');
 const execAsync = util.promisify(exec);
 const fs = require('fs').promises; // Use the promise-based version of fs
 const path = require('path');
-const cacheDir = path.join(__dirname, 'cache');
 const scriptsDir = path.resolve(__dirname, '../scripts/utils');
 const blurhashCli = path.join(scriptsDir, 'blurhash_cli.py');
 const crypto = require('crypto');
 const LOG_FILE = '/var/log/blurhash.log';
+
+// Define the main cache directory
+const mainCacheDir = path.join(__dirname, 'cache');
+
+// Define subdirectories for different cache types
+const generalCacheDir = path.join(mainCacheDir, 'general');
+const spritesheetCacheDir = path.join(mainCacheDir, 'spritesheet');
+const framesCacheDir = path.join(mainCacheDir, 'frames');
+const videoClipsCacheDir = path.join(mainCacheDir, 'video_clips');
 
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || '';
@@ -27,22 +35,48 @@ async function generateFrame(videoPath, timestamp, framePath) {
 
   // Use the limit to control concurrency
   return limit(() => new Promise((resolve, reject) => {
-    const ffmpegCommand = `ffmpeg -ss ${timestamp} -i "${videoPath}" -frames:v 1 -vf scale=-1:140 -q:v 4 "${framePath}" -y`;
-    exec(ffmpegCommand, (error) => {
+    // First, detect if the video is HDR
+    const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
+    exec(ffprobeCommand, (error, stdout, stderr) => {
       if (error) {
-        console.error(`Worker ${process.pid} error generating frame at ${timestamp}: ${error.message}`);
+        console.error(`Worker ${process.pid} error detecting HDR: ${error.message}`);
         reject(error);
       } else {
-        console.log(`Worker ${process.pid} frame generated successfully: ${framePath}`);
-        // Get the dimensions of the generated frame using ffprobe
-        const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${framePath}"`;
-        exec(ffprobeCommand, (error, stdout, stderr) => {
+        const colorTransfer = stdout.trim();
+        console.log(`Worker ${process.pid} color_transfer: ${colorTransfer}`);
+        // Determine if the video is HDR
+        const isHDR = (colorTransfer === 'smpte2084' || colorTransfer === 'arib-std-b67');
+        // Ensure the framePath has a .avif extension
+        framePath = framePath.replace(/\.[^/.]+$/, '.avif');
+        // Build the ffmpeg command accordingly
+        let ffmpegCommand;
+        if (isHDR) {
+          console.log(`Worker ${process.pid} detected HDR video`);
+          // For HDR video, output 16-bit PNG with appropriate pixel format
+          ffmpegCommand = `ffmpeg -ss ${timestamp} -i "${videoPath}" -frames:v 1 -vf "scale=-1:140" -pix_fmt rgb48le "${framePath}" -y`;
+        } else {
+          console.log(`Worker ${process.pid} detected SDR video`);
+          // For SDR video, output standard 8-bit PNG
+          ffmpegCommand = `ffmpeg -ss ${timestamp} -i "${videoPath}" -frames:v 1 -vf "scale=-1:140" -pix_fmt rgb24 "${framePath}" -y`;
+        }
+        // Now execute the ffmpeg command
+        exec(ffmpegCommand, (error) => {
           if (error) {
-            console.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
+            console.error(`Worker ${process.pid} error generating frame at ${timestamp}: ${error.message}`);
             reject(error);
           } else {
-            const [width, height] = stdout.trim().split('x');
-            resolve({ framePath, width: parseInt(width), height: parseInt(height) });
+            console.log(`Worker ${process.pid} frame generated successfully: ${framePath}`);
+            // Get the dimensions of the generated frame using ffprobe
+            const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${framePath}"`;
+            exec(ffprobeCommand, (error, stdout, stderr) => {
+              if (error) {
+                console.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
+                reject(error);
+              } else {
+                const [width, height] = stdout.trim().split('x');
+                resolve({ framePath, width: parseInt(width), height: parseInt(height) });
+              }
+            });
           }
         });
       }
@@ -79,12 +113,166 @@ async function fileExists(filePath) {
   }
 }
 
-// Ensure cache directory exists asynchronously
-async function ensureCacheDir() {
+// Ensure cache directory exists
+async function ensureCacheDirs() {
   try {
-    await fs.access(cacheDir);
+    await fs.mkdir(mainCacheDir, { recursive: true });
+    await fs.mkdir(generalCacheDir, { recursive: true });
+    await fs.mkdir(videoClipsCacheDir, { recursive: true });
+    await fs.mkdir(spritesheetCacheDir, { recursive: true });
+    await fs.mkdir(framesCacheDir, { recursive: true });
+    console.log(`Cache directories are ready.`);
   } catch (error) {
-    await fs.mkdir(cacheDir, { recursive: true });
+    console.error(`Error creating cache directories: ${error.message}`);
+    throw error;
+  }
+}
+
+// Generate a unique cache key based on input parameters
+function generateCacheKey(...args) {
+  const hash = crypto.createHash('sha1');
+  hash.update(args.join('-'));
+  return hash.digest('hex');
+}
+
+// Get the cached clip path based on the cache key
+function getCachedClipPath(cacheKey) {
+  return path.join(videoClipsCacheDir, `${cacheKey}.mp4`);
+}
+
+// Check if a cached clip exists and is still valid (within 5 minutes)
+async function isCacheValid(cachedClipPath) {
+  try {
+    const stats = await fs.stat(cachedClipPath);
+    const now = Date.now();
+    const fileAge = (now - stats.mtimeMs) / 1000; // Age in seconds
+    return fileAge < 300; // 300 seconds = 5 minutes
+  } catch (error) {
+    return false;
+  }
+}
+
+// Set to track ongoing cache generations
+const ongoingCacheGenerations = new Set();
+
+// Cleanup cache files based on their cache type
+/**
+ * Clears expired files from the General Cache.
+ * Max Age: 30 days
+ */
+async function clearGeneralCache() {
+  const now = Date.now();
+  const cacheType = 'general';
+  const maxAge = 30 * 24 * 60 * 60; // 30 days in seconds
+  const dir = generalCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const filePath = path.join(dir, file);
+      try {
+        const stats = await fs.stat(filePath);
+        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
+        if (age > maxAge) {
+          await fs.unlink(filePath);
+          console.log(`Deleted expired cache file (${cacheType}): ${file}`);
+        }
+      } catch (err) {
+        console.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+      }
+    }
+  } catch (err) {
+    console.error(`Error reading ${cacheType} cache directory:`, err);
+  }
+}
+
+/**
+ * Clears expired files from the Video Clips Cache.
+ * Max Age: 5 minutes
+ */
+async function clearVideoClipsCache() {
+  const now = Date.now();
+  const cacheType = 'video_clips';
+  const maxAge = 5 * 60; // 5 minutes in seconds
+  const dir = videoClipsCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const filePath = path.join(dir, file);
+      try {
+        const stats = await fs.stat(filePath);
+        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
+        if (age > maxAge) {
+          await fs.unlink(filePath);
+          console.log(`Deleted expired cache file (${cacheType}): ${file}`);
+        }
+      } catch (err) {
+        console.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+      }
+    }
+  } catch (err) {
+    console.error(`Error reading ${cacheType} cache directory:`, err);
+  }
+}
+
+/**
+ * Clears expired files from the Spritesheet Cache.
+ * Adjust the maxAge as per your requirement.
+ */
+async function clearSpritesheetCache() {
+  const now = Date.now();
+  const cacheType = 'spritesheet';
+  const maxAge = 7 * 24 * 60 * 60; // Example: 7 days in seconds
+  const dir = spritesheetCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const filePath = path.join(dir, file);
+      try {
+        const stats = await fs.stat(filePath);
+        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
+        if (age > maxAge) {
+          await fs.unlink(filePath);
+          console.log(`Deleted expired cache file (${cacheType}): ${file}`);
+        }
+      } catch (err) {
+        console.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+      }
+    }
+  } catch (err) {
+    console.error(`Error reading ${cacheType} cache directory:`, err);
+  }
+}
+
+/**
+ * Clears expired files from the Frames Cache.
+ * Adjust the maxAge as per your requirement.
+ */
+async function clearFramesCache() {
+  const now = Date.now();
+  const cacheType = 'frames';
+  const maxAge = 7 * 24 * 60 * 60; // Example: 7 days in seconds
+  const dir = framesCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const filePath = path.join(dir, file);
+      try {
+        const stats = await fs.stat(filePath);
+        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
+        if (age > maxAge) {
+          await fs.unlink(filePath);
+          console.log(`Deleted expired cache file (${cacheType}): ${file}`);
+        }
+      } catch (err) {
+        console.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+      }
+    }
+  } catch (err) {
+    console.error(`Error reading ${cacheType} cache directory:`, err);
   }
 }
 
@@ -200,8 +388,19 @@ module.exports = {
   },
   getVideoDuration,
   fileExists,
-  ensureCacheDir,
-  cacheDir,
+  ensureCacheDirs,
+  clearGeneralCache,
+  clearVideoClipsCache,
+  clearSpritesheetCache,
+  clearFramesCache,
+  mainCacheDir,
+  generalCacheDir,
+  spritesheetCacheDir,
+  framesCacheDir,
+  generateCacheKey,
+  getCachedClipPath,
+  isCacheValid,
+  ongoingCacheGenerations,
   findMp4File,
   getStoredBlurhash,
   calculateDirectoryHash,
