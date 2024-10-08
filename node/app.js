@@ -25,7 +25,7 @@ const {
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
-const { handleVideoRequest } = require("./videoHandler");
+const { handleVideoRequest, handleVideoClipRequest } = require("./videoHandler");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
@@ -1410,6 +1410,19 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null, 
 //     console.error(`Error executing generate_thumbnail_json.sh: ${error}`);
 //   }
 // }
+
+// Clipping routes for movies and TV shows
+app.get('/videoClip/movie/:movieName', async (req, res) => {
+  const db = await initializeDatabase();
+  await handleVideoClipRequest(req, res, 'movies', BASE_PATH, db);
+});
+
+app.get('/videoClip/tv/:showName/:season/:episode', async (req, res) => {
+  const db = await initializeDatabase();
+  await handleVideoClipRequest(req, res, 'tv', BASE_PATH, db);
+});
+
+
 let isScanning = false;
 
 async function runGenerateList() {

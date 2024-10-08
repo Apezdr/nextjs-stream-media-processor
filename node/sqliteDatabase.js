@@ -129,6 +129,68 @@ async function getMissingDataMedia(db) {
   }));
 }
 
+async function getMovieById(db, id) {
+  const movie = await db.get('SELECT * FROM movies WHERE id = ?', [id]);
+  if (movie) {
+      return {
+          id: movie.id,
+          name: movie.name,
+          fileNames: JSON.parse(movie.file_names),
+          lengths: JSON.parse(movie.lengths),
+          dimensions: JSON.parse(movie.dimensions),
+          urls: JSON.parse(movie.urls),
+          metadataUrl: movie.metadata_url,
+          directory_hash: movie.directory_hash
+      };
+  }
+  return null;
+}
+
+async function getMovieByName(db, name) {
+  const movie = await db.get('SELECT * FROM movies WHERE name = ?', [name]);
+  if (movie) {
+      return {
+          id: movie.id,
+          name: movie.name,
+          fileNames: JSON.parse(movie.file_names),
+          lengths: JSON.parse(movie.lengths),
+          dimensions: JSON.parse(movie.dimensions),
+          urls: JSON.parse(movie.urls),
+          metadataUrl: movie.metadata_url,
+          directory_hash: movie.directory_hash
+      };
+  }
+  return null;
+}
+
+async function getTVShowById(db, id) {
+  const show = await db.get('SELECT * FROM tv_shows WHERE id = ?', [id]);
+  if (show) {
+      return {
+          id: show.id,
+          name: show.name,
+          metadata: JSON.parse(show.metadata),
+          urls: JSON.parse(show.urls),
+          directory_hash: show.directory_hash
+      };
+  }
+  return null;
+}
+
+async function getTVShowByName(db, name) {
+  const show = await db.get('SELECT * FROM tv_shows WHERE name = ?', [name]);
+  if (show) {
+      return {
+          id: show.id,
+          name: show.name,
+          metadata: JSON.parse(show.metadata),
+          urls: JSON.parse(show.urls),
+          directory_hash: show.directory_hash
+      };
+  }
+  return null;
+}
+
 async function isDatabaseEmpty(db, tableName = 'movies') {
     const row = await db.get(`SELECT COUNT(*) as count FROM ${tableName}`);
     return row.count === 0;
@@ -150,6 +212,10 @@ module.exports = {
     getMovies,
     getTVShows,
     getMissingDataMedia,
+    getMovieById,
+    getMovieByName,
+    getTVShowById,
+    getTVShowByName,
     isDatabaseEmpty,
     deleteMovie,
     deleteTVShow

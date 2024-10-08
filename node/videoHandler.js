@@ -1,9 +1,12 @@
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs").promises;
 const _fs = require("fs");
 const os = require("os");
-const { findMp4File } = require("./utils");
+const { findMp4File, fileExists } = require("./utils");
+const util = require('util');
+const { getTVShowByName } = require("./sqliteDatabase");
+const execAsync = util.promisify(exec);
 
 async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
@@ -184,6 +187,150 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
   });
 }
 
+/**
+ * Handles video clip requests by streaming a specific segment of the video.
+ * @param {Object} req - Express request object.
+ * @param {Object} res - Express response object.
+ * @param {string} type - Type of media ('movies' or 'tv').
+ * @param {string} basePath - Base path to media files.
+ */
+async function handleVideoClipRequest(req, res, type, basePath, db) {
+  try {
+    let videoPath;
+
+    if (type === "movies") {
+      const { movieName } = req.params;
+      const directoryPath = path.join(`${basePath}/movies`, movieName);
+      videoPath = await findMp4File(directoryPath);
+    } else if (type === "tv") {
+      const { showName, season, episode } = req.params;
+      //const showsDataRaw = await fs.readFile(`${basePath}/tv_list.json`, "utf8");
+      //const showsData = JSON.parse(showsDataRaw);
+      const showData = await getTVShowByName(db, showName);
+      //const showData = showsData[showName];
+
+      if (!showData) {
+        throw new Error(`Show not found: ${showName}`);
+      }
+
+      const _season = showData.metadata.seasons[`Season ${season}`];
+      if (!_season) {
+        throw new Error(`Season not found: ${showName} - Season ${season}`);
+      }
+
+      const _episode = _season.fileNames.find((e) =>
+        e.includes(`S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`)
+      );
+
+      if (!_episode) {
+        throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
+      }
+
+      const directoryPath = path.join(`${basePath}/tv`, showName, `Season ${season}`);
+      videoPath = await findMp4File(directoryPath, _episode);
+    }
+
+    // Parse and validate start and end parameters
+    const start = parseFloat(req.query.start);
+    const end = parseFloat(req.query.end);
+    const MAX_CLIP_DURATION = 300; // 5 minutes
+
+    if (isNaN(start) || isNaN(end) || start < 0 || end <= start) {
+      return res.status(400).send('Invalid start or end parameters.');
+    }
+
+    if ((end - start) > MAX_CLIP_DURATION) {
+      return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
+    }
+
+    // Check if the video file exists
+    if (!await fileExists(videoPath)) {
+      return res.status(404).send('Video not found.');
+    }
+
+    // Get video duration to validate end time
+    let videoDuration = 0;
+    try {
+      const { stdout: durationStdout } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`);
+      videoDuration = parseFloat(durationStdout);
+    } catch (err) {
+      console.error('Error getting video duration:', err);
+      return res.status(500).send('Error processing video.');
+    }
+
+    if (end > videoDuration) {
+      return res.status(400).send('End time exceeds video duration.');
+    }
+
+    // Generate cache key and path (optional for later)
+    // const cacheKey = generateCacheKey(videoPath, start, end);
+    // const cacheDir = path.join(os.tmpdir(), 'video_clips');
+    // await fs.mkdir(cacheDir, { recursive: true });
+    // const cachedClipPath = path.join(cacheDir, `${cacheKey}.mp4`);
+
+    // Uncomment and implement caching logic as needed
+
+    // FFmpeg command to extract the segment
+    const ffmpegArgs = [
+      '-ss', start.toString(),
+      '-to', end.toString(),
+      '-i', videoPath,
+      '-c', 'copy',
+      '-movflags', 'frag_keyframe+empty_moov',
+      '-f', 'mp4',
+      'pipe:1'
+    ];
+
+    // Spawn FFmpeg process
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+    // Handle FFmpeg errors
+    let ffmpegError;
+    /* ffmpeg.stderr.on('data', (data) => {
+      console.error(`FFmpeg stderr: ${data}`);
+    }); */
+
+    ffmpeg.on('error', (err) => {
+      console.error('FFmpeg error:', err);
+      ffmpegError = err;
+      if (!res.headersSent) {
+        res.status(500).send('Error processing video.');
+      } else {
+        res.end();
+      }
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`FFmpeg exited with code ${code}`);
+        if (!res.headersSent) {
+          res.status(500).send('Error processing video.');
+        } else {
+          res.end();
+        }
+      }
+    });
+
+    // Set appropriate headers before streaming
+    res.writeHead(200, {
+      'Content-Type': 'video/mp4',
+      'Content-Disposition': `inline; filename="${type === 'movies' ? req.params.movieName : req.params.episode}_clip_${start}-${end}.mp4"`
+    });
+
+    // Stream FFmpeg output to response
+    ffmpeg.stdout.pipe(res);
+
+  } catch (error) {
+    console.error(error);
+    if (!res.headersSent) {
+      res.status(500).send("Internal server error");
+    } else {
+      res.end();
+    }
+  }
+}
+
 module.exports = {
   handleVideoRequest,
+  handleVideoClipRequest,
 };
