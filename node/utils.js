@@ -1,5 +1,5 @@
 const util = require('util');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const execAsync = util.promisify(exec);
 const fs = require('fs').promises; // Use the promise-based version of fs
 const path = require('path');
@@ -16,6 +16,9 @@ const generalCacheDir = path.join(mainCacheDir, 'general');
 const spritesheetCacheDir = path.join(mainCacheDir, 'spritesheet');
 const framesCacheDir = path.join(mainCacheDir, 'frames');
 const videoClipsCacheDir = path.join(mainCacheDir, 'video_clips');
+
+// Map to track ongoing conversions: key = pngPath, value = Promise
+const conversionQueue = new Map();
 
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || '';
@@ -278,7 +281,7 @@ async function clearFramesCache() {
 
 //
 // Function to find an MP4 file in a directory, optionally looking for a specific file
-async function findMp4File(directory, specificFileName = null) {
+async function findMp4File(directory, specificFileName = null, extraData = false) {
   try {
     const files = await fs.readdir(directory);
     let targetFile;
@@ -291,7 +294,7 @@ async function findMp4File(directory, specificFileName = null) {
       }
       // If the specific file is not found, you can either throw an error or fall back to finding any MP4 file
       console.log(
-        `Specific file ${specificFileName} not found, looking for any .mp4 file.`
+        `Specific file ${specificFileName} not found, looking for any .mp4 file.`, directory, extraData
       );
     }
 
@@ -381,6 +384,102 @@ async function getLastModifiedTime(filePath) {
   }
 }
 
+/**
+ * Converts a PNG file to AVIF using avifenc with a per-file queue to prevent duplicate conversions.
+ *
+ * @param {string} pngPath - The file path of the input PNG image.
+ * @param {string} avifPath - The desired file path for the output AVIF image.
+ * @param {number} quality - The quality setting for AVIF encoding (0-100).
+ * @param {number} speed - The speed setting for AVIF encoding (0-10).
+ * @param {boolean} deleteOriginal - Whether to delete the original PNG after successful conversion.
+ * @returns {Promise<void>}
+ */
+async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, deleteOriginal = true) {
+  console.log('Request to convert PNG to AVIF:', pngPath);
+
+  // If a conversion for this pngPath is already in progress, return the existing Promise
+  if (conversionQueue.has(pngPath)) {
+    console.log('Conversion already in progress for:', pngPath);
+    return conversionQueue.get(pngPath);
+  }
+
+  // Create a new Promise for the conversion process
+  const conversionPromise = new Promise((resolve, reject) => {
+    console.log('Starting new conversion for:', pngPath);
+
+    const args = [
+      '--min', '0',
+      '--max', `${quality}`,
+      '-s', `${speed}`,
+      `"${pngPath}"`,
+      `"${avifPath}"`
+    ];
+
+    // Spawn the avifenc process
+    const avifencProcess = spawn('avifenc', args, {
+      shell: true, // Use shell to handle quoted paths with spaces
+      stdio: ['ignore', 'pipe', 'pipe'] // Ignore stdin, capture stdout and stderr
+    });
+
+    // Collect stdout data
+    avifencProcess.stdout.on('data', (data) => {
+      console.log(`avifenc stdout: ${data}`);
+    });
+
+    // Collect stderr data
+    avifencProcess.stderr.on('data', (data) => {
+      console.error(`avifenc stderr: ${data}`);
+    });
+
+    // Handle process exit
+    avifencProcess.on('close', async (code) => {
+      if (code === 0) {
+        console.log(`avifenc completed successfully for: ${pngPath}`);
+        
+        // If deletion is enabled, attempt to delete the original PNG
+        if (deleteOriginal) {
+          try {
+            await fs.unlink(pngPath);
+            console.log(`Deleted original PNG file: ${pngPath}`);
+          } catch (unlinkError) {
+            console.error(`Failed to delete original PNG file (${pngPath}): ${unlinkError}`);
+            // Depending on requirements, you might choose to reject here
+            // For now, we'll resolve even if deletion fails
+          }
+        }
+
+        resolve();
+      } else {
+        const errorMsg = `avifenc exited with code ${code} for: ${pngPath}`;
+        console.error(errorMsg);
+        reject(new Error(errorMsg));
+      }
+    });
+
+    // Handle process errors
+    avifencProcess.on('error', (err) => {
+      const errorMsg = `Failed to start avifenc for: ${pngPath} - ${err.message}`;
+      console.error(errorMsg);
+      reject(new Error(errorMsg));
+    });
+  });
+
+  // Store the Promise in the conversionQueue Map
+  conversionQueue.set(pngPath, conversionPromise);
+
+  try {
+    // Await the conversion Promise
+    await conversionPromise;
+  } catch (error) {
+    // On error, remove the entry from the Map and propagate the error
+    conversionQueue.delete(pngPath);
+    throw error;
+  }
+
+  // After successful conversion, remove the entry from the Map
+  conversionQueue.delete(pngPath);
+}
+
 module.exports = {
   generateFrame: async (videoPath, timestamp, framePath) => {
     await loadPLimit();
@@ -405,4 +504,5 @@ module.exports = {
   getStoredBlurhash,
   calculateDirectoryHash,
   getLastModifiedTime,
+  convertToAvif,
 };

@@ -11,7 +11,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -29,10 +29,12 @@ const {
   clearFramesCache,
   clearGeneralCache,
   clearVideoClipsCache,
+  convertToAvif,
 } = require("./utils");
 const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
 const { handleVideoRequest, handleVideoClipRequest } = require("./videoHandler");
+const sharp = require("sharp");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
@@ -180,12 +182,36 @@ async function handleFrameRequest(req, res, type) {
 
     // Extract episode number
     const episodeMatch =
-      episodeString.match(/E(\d{2})/i) || episodeString.match(/^(\d{2}) -/);
+      episodeString.match(/E(\d{1,2})/i) || episodeString.match(/^(\d{1,2})( -)?/);
     const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
     directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
     frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${timestamp}.avif`;
-    specificFileName = `${episodeString}.mp4`;
+
+    const db = await initializeDatabase();
+    const showData = await getTVShowByName(db, showName);
+    if (showData) {
+      const _season = showData.metadata.seasons[`Season ${season}`];
+      if (_season) {
+        const _episode = _season.fileNames.find((e) => {
+          const match = e.match(/S(\d{2})E(\d{2})/i);
+          if (match) {
+            const seasonNum = match[1].padStart(2, '0');
+            const episodeNum = match[2].padStart(2, '0');
+            return seasonNum === season.padStart(2, '0') && episodeNum === episodeNumber.padStart(2, '0');
+          }
+          return false;
+        });
+
+        if (_episode) {
+          specificFileName = _episode;
+        } else {
+          throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
+        }
+      } else {
+        throw new Error(`Season not found: ${showName} - Season ${season} Episode ${episode}`);
+      }
+    }
   }
 
   const framePath = path.join(framesCacheDir, frameFileName);
@@ -197,7 +223,7 @@ async function handleFrameRequest(req, res, type) {
     } else {
       wasCached = false;
       // Find the MP4 file dynamically
-      videoPath = await findMp4File(directoryPath, specificFileName);
+      videoPath = await findMp4File(directoryPath, specificFileName, framePath);
 
       // Generate the frame
       await generateFrame(videoPath, timestamp, framePath);
@@ -300,24 +326,74 @@ app.get("/vtt/tv/:showName/:season/:episode", (req, res) => {
   handleVttRequest(req, res, "tv");
 });
 
+/**
+ * Handles HTTP requests for sprite sheets, serving cached files and managing conversions.
+ *
+ * @param {Object} req - Express request object.
+ * @param {Object} res - Express response object.
+ * @param {string} type - 'movies' or 'tv'.
+ * @returns {Promise<void>}
+ */
 async function handleSpriteSheetRequest(req, res, type) {
-  const db = await initializeDatabase();
-  const { movieName, showName, season, episode } = req.params;
-  let spriteSheetFileName;
-
-  if (type === "movies") {
-    spriteSheetFileName = `movie_${movieName}_spritesheet.avif`;
-  } else if (type === "tv") {
-    spriteSheetFileName = `tv_${showName}_${season}_${episode}_spritesheet.avif`;
-  }
-
-  const spriteSheetPath = path.join(spritesheetCacheDir, spriteSheetFileName);
-
   try {
-    if (await fileExists(spriteSheetPath)) {
+    const db = await initializeDatabase();
+    const { movieName, showName, season, episode } = req.params;
+    let spriteSheetFileName;
+
+    if (type === "movies") {
+      spriteSheetFileName = `movie_${movieName}_spritesheet`;
+    } else if (type === "tv") {
+      spriteSheetFileName = `tv_${showName}_${season}_${episode}_spritesheet`;
+    }
+
+    const possibleExtensions = ['.avif', '.jpg', '.png'];
+    let spriteSheetPath;
+    let spriteSheetExt;
+
+    // Try to find the spritesheet file with any of the possible extensions, prioritizing AVIF
+    for (const ext of possibleExtensions) {
+      const filePath = path.join(spritesheetCacheDir, spriteSheetFileName + ext);
+      if (await fileExists(filePath)) {
+        spriteSheetPath = filePath;
+        spriteSheetExt = ext;
+        break;
+      }
+    }
+
+    if (spriteSheetPath) {
       console.log(`Serving sprite sheet from cache: ${spriteSheetPath}`);
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-      res.sendFile(spriteSheetPath);
+
+      if (spriteSheetExt === '.avif' || spriteSheetExt === '.jpg') {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        return res.sendFile(spriteSheetPath);
+      }
+
+      if (spriteSheetExt === '.png') {
+        const avifPath = path.join(spritesheetCacheDir, spriteSheetFileName + '.avif');
+
+        if (await fileExists(avifPath)) {
+          console.log(`Serving converted AVIF sprite sheet from cache: ${avifPath}`);
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          return res.sendFile(avifPath);
+        }
+
+        res.setHeader("Cache-Control", "public, max-age=60");
+        res.sendFile(spriteSheetPath, async (err) => {
+          if (err) {
+            console.error(`Error sending sprite sheet: ${err}`);
+            // Do not send another response here
+          } else {
+            console.log(`Served PNG sprite sheet: ${spriteSheetPath}`);
+            try {
+              await convertToAvif(spriteSheetPath, avifPath, 60, 4, true);
+              console.log(`Converted PNG to AVIF using avifenc: ${avifPath}`);
+            } catch (conversionError) {
+              console.error(`Error converting PNG to AVIF using avifenc: ${conversionError}`);
+            }
+          }
+        });
+        return;
+      }
     } else {
       console.log(`Sprite sheet not found in cache: ${spriteSheetFileName}`);
 
@@ -326,9 +402,7 @@ async function handleSpriteSheetRequest(req, res, type) {
         : `tv_${showName}_${season}_${episode}`;
 
       if (spriteSheetProcessingFiles.has(fileKey)) {
-        console.log(
-          `Sprite sheet ${fileKey} is already being processed. Adding request to queue.`
-        );
+        console.log(`Sprite sheet ${fileKey} is already being processed. Adding request to queue.`);
         if (!spriteSheetRequestQueues.has(fileKey)) {
           spriteSheetRequestQueues.set(fileKey, []);
         }
@@ -337,24 +411,20 @@ async function handleSpriteSheetRequest(req, res, type) {
       }
       spriteSheetProcessingFiles.add(fileKey);
 
-      // Generate the sprite sheet
+      // Retrieve videoPath based on type
       let videoPath, videoMp4;
       if (type === "movies") {
-        const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
+        const movie = await getMovieByName(db, movieName);
         if (!movie) {
           spriteSheetProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
         videoMp4 = JSON.parse(movie.urls).mp4;
         videoMp4 = decodeURIComponent(videoMp4);
-        videoPath = path.join(
-          BASE_PATH,
-          videoMp4,
-        );
+        videoPath = path.join(BASE_PATH, videoMp4);
       } else if (type === "tv") {
         try {
-          const shows = await getTVShows(db);
-          const showData = shows.find(show => show.name === showName);
+          const showData = await getTVShowByName(db, showName);
           if (showData) {
             const _season = showData.metadata.seasons[`Season ${season}`];
             if (_season) {
@@ -369,32 +439,25 @@ async function handleSpriteSheetRequest(req, res, type) {
               });
 
               if (_episode) {
-                const directoryPath = path.join(
-                  `${BASE_PATH}/tv`,
-                  showName,
-                  `Season ${season}`
-                );
+                const directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
                 videoPath = path.join(directoryPath, _episode);
               } else {
-                throw new Error(
-                  `Episode not found: ${showName} - Season ${season} Episode ${episode}`
-                );
+                throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
               }
             } else {
-              throw new Error(
-                `Season not found: ${showName} - Season ${season} Episode ${episode}`
-              );
+              throw new Error(`Season not found: ${showName} - Season ${season} Episode ${episode}`);
             }
           } else {
             throw new Error(`Show not found: ${showName}`);
           }
         } catch (error) {
-          console.error(`Error accessing tv db data: ${error.message}`);
+          console.error(`Error accessing TV database: ${error.message}`);
           spriteSheetProcessingFiles.delete(fileKey);
           return res.status(500).send("Internal server error");
         }
       }
 
+      // Generate the sprite sheet
       await generateSpriteSheet({
         videoPath,
         type,
@@ -404,7 +467,51 @@ async function handleSpriteSheetRequest(req, res, type) {
         cacheDir: spritesheetCacheDir,
       });
 
+      // Determine the actual sprite sheet path
+      spriteSheetPath = null;
+      spriteSheetExt = null;
+      for (const ext of possibleExtensions) {
+        const filePath = path.join(spritesheetCacheDir, spriteSheetFileName + ext);
+        if (await fileExists(filePath)) {
+          spriteSheetPath = filePath;
+          spriteSheetExt = ext;
+          break;
+        }
+      }
+
       spriteSheetProcessingFiles.delete(fileKey);
+
+      if (!spriteSheetPath) {
+        console.error(`Failed to generate sprite sheet: ${spriteSheetFileName}`);
+        return res.status(500).send("Failed to generate sprite sheet");
+      }
+
+      if (spriteSheetExt === '.png') {
+        const avifPath = path.join(spritesheetCacheDir, spriteSheetFileName + '.avif');
+
+        if (await fileExists(avifPath)) {
+          console.log(`Serving converted AVIF sprite sheet from cache: ${avifPath}`);
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          return res.sendFile(avifPath);
+        }
+
+        res.setHeader("Cache-Control", "public, max-age=60");
+        res.sendFile(spriteSheetPath, async (err) => {
+          if (err) {
+            console.error(`Error sending sprite sheet: ${err}`);
+            // Do not send another response here
+          } else {
+            console.log(`Served PNG sprite sheet: ${spriteSheetPath}`);
+            try {
+              await convertToAvif(spriteSheetPath, avifPath, 60, 4, true);
+              console.log(`Converted PNG to AVIF using avifenc: ${avifPath}`);
+            } catch (conversionError) {
+              console.error(`Error converting PNG to AVIF using avifenc: ${conversionError}`);
+            }
+          }
+        });
+        return;
+      }
 
       // Process queued requests
       const queuedRequests = spriteSheetRequestQueues.get(fileKey) || [];
@@ -414,15 +521,18 @@ async function handleSpriteSheetRequest(req, res, type) {
         queuedRes.sendFile(spriteSheetPath);
       });
 
-      // Send the generated sprite sheet to the current request
+      // Serve the generated sprite sheet to the current request
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-      res.sendFile(spriteSheetPath);
+      return res.sendFile(spriteSheetPath);
     }
   } catch (error) {
     console.error(error);
-    res.status(500).send("Internal server error");
+    if (!res.headersSent) {
+      res.status(500).send("Internal server error");
+    }
   }
 }
+
 
 async function handleVttRequest(req, res, type) {
   const db = await initializeDatabase();
@@ -464,7 +574,7 @@ async function handleVttRequest(req, res, type) {
       // Generate the VTT file
       let videoPath;
       if (type === "movies") {
-        const movie = await db.get('SELECT * FROM movies WHERE name = ?', [movieName]);
+        const movie = await getMovieByName(db, movieName);
         if (!movie) {
           vttProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
@@ -1575,12 +1685,6 @@ function scheduleTasks() {
     runGeneratePosterCollage().catch(console.error);
   });
   // Schedule for runGenerateList and autoSync
-  schedule.scheduleJob('*/1 * * * *', () => {
-    runGenerateList().catch(console.error);
-  });
-
-  
-  // Schedule to clear cache
   schedule.scheduleJob('*/1 * * * *', () => {
     runGenerateList().catch(console.error);
   });

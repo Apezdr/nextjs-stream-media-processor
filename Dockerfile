@@ -2,7 +2,7 @@
 FROM node:18.17.0-alpine AS builder
 
 # Install necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg libavif libavif-apps
 
 # Set the working directory for Node.js dependencies
 WORKDIR /usr/src/app/node
