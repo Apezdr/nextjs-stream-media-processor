@@ -155,41 +155,30 @@ app.get("/frame/tv/:showName/:season/:episode/:timestamp.:ext?", (req, res) => {
 });
 
 async function handleFrameRequest(req, res, type) {
-  const timestamp = req.params.timestamp;
   let frameFileName,
     directoryPath,
     videoPath,
     specificFileName = null,
     wasCached = true;
+  
+  const { movieName, showName, season, episode, timestamp } = req.params;
+  let movie_name = decodeURIComponent(movieName);
+  let show_name = decodeURIComponent(showName);
 
   if (type === "movies") {
-    const movieName = req.params.movieName
-      ? req.params.movieName.replace(/%20/g, " ")
-      : ""; // Replace %20 with space
-    directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
-    frameFileName = `movie_${movieName}_${timestamp}.avif`;
+    directoryPath = path.join(`${BASE_PATH}/movies`, movie_name);
+    frameFileName = `movie_${movie_name}_${timestamp}.avif`;
   } else {
-    // For TV shows, adjust this logic to fit your directory structure
-    const showName = req.params.showName
-      ? req.params.showName.replace(/%20/g, " ")
-      : "";
-    const season = req.params.season
-      ? req.params.season.replace(/%20/g, " ")
-      : "";
-    const episodeString = req.params.episode
-      ? req.params.episode.replace(/%20/g, " ")
-      : "";
-
     // Extract episode number
     const episodeMatch =
-      episodeString.match(/E(\d{1,2})/i) || episodeString.match(/^(\d{1,2})( -)?/);
+      episode.match(/E(\d{1,2})/i) || episode.match(/^(\d{1,2})( -)?/);
     const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
-    directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
-    frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${timestamp}.avif`;
+    directoryPath = path.join(`${BASE_PATH}/tv`, show_name, `Season ${season}`);
+    frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${timestamp}.avif`;
 
     const db = await initializeDatabase();
-    const showData = await getTVShowByName(db, showName);
+    const showData = await getTVShowByName(db, show_name);
     if (showData) {
       const _season = showData.metadata.seasons[`Season ${season}`];
       if (_season) {
@@ -206,10 +195,10 @@ async function handleFrameRequest(req, res, type) {
         if (_episode) {
           specificFileName = _episode;
         } else {
-          throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
+          throw new Error(`Episode not found: ${show_name} - Season ${season} Episode ${episode}`);
         }
       } else {
-        throw new Error(`Season not found: ${showName} - Season ${season} Episode ${episode}`);
+        throw new Error(`Season not found: ${show_name} - Season ${season} Episode ${episode}`);
       }
     }
   }
@@ -579,18 +568,18 @@ async function handleVttRequest(req, res, type) {
           vttProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
-        videoMp4 = JSON.parse(movie.urls).mp4;
+        videoMp4 = movie.urls.mp4;
         videoMp4 = decodeURIComponent(videoMp4);
         videoPath = path.join(
           BASE_PATH,
           videoMp4,
         );
-        await generateSpriteSheet({
-          videoPath,
-          type,
-          name: movieName,
-          cacheDir: spritesheetCacheDir,
-        });
+        // await generateSpriteSheet({
+        //   videoPath,
+        //   type,
+        //   name: movieName,
+        //   cacheDir: spritesheetCacheDir,
+        // });
       } else if (type === "tv") {
         try {
           const shows = await getTVShows(db);
@@ -600,11 +589,12 @@ async function handleVttRequest(req, res, type) {
             if (_season) {
               const _episode = _season.fileNames.find((e) => {
                 const episodeNumber = episode.padStart(2, "0");
+                const seasonNumber = season.padStart(2, "0");
                 return (
                   e.includes(` - `) &&
                   (e.startsWith(episodeNumber) ||
                     e.includes(` ${episodeNumber} - `) ||
-                    e.includes(`S${season.padStart(2, "0")}E${episodeNumber}`))
+                    e.includes(`S${seasonNumber.padStart(2, "0")}E${episodeNumber}`))
                 );
               });
               if (_episode) {
@@ -635,7 +625,6 @@ async function handleVttRequest(req, res, type) {
           return res.status(500).send("Internal server error");
         }
       }
-
       await generateSpriteSheet({
         videoPath,
         type,
@@ -647,19 +636,21 @@ async function handleVttRequest(req, res, type) {
 
       vttProcessingFiles.delete(fileKey);
 
-      // Process queued requests
-      const queuedRequests = vttRequestQueues.get(fileKey) || [];
-      vttRequestQueues.delete(fileKey);
-      queuedRequests.forEach((queuedRes) => {
-        queuedRes.setHeader("Content-Type", "text/vtt");
-        const fileStream = _fs.createReadStream(vttFilePath);
-        fileStream.pipe(queuedRes);
-      });
+      if (await fileExists(vttFilePath)) {
+        // Process queued requests
+        const queuedRequests = vttRequestQueues.get(fileKey) || [];
+        vttRequestQueues.delete(fileKey);
+        queuedRequests.forEach((queuedRes) => {
+          queuedRes.setHeader("Content-Type", "text/vtt");
+          const fileStream = _fs.createReadStream(vttFilePath);
+          fileStream.pipe(queuedRes);
+        });
 
-      // Stream the generated VTT file
-      res.setHeader("Content-Type", "text/vtt");
-      const fileStream = _fs.createReadStream(vttFilePath);
-      fileStream.pipe(res);
+        // Stream the generated VTT file
+        res.setHeader("Content-Type", "text/vtt");
+        const fileStream = _fs.createReadStream(vttFilePath);
+        fileStream.pipe(res);
+      }
     }
   } catch (error) {
     console.error(error);
@@ -905,7 +896,7 @@ setInterval(() => {
     });
 }, 5 * 60 * 1000); // 5 minutes
 
-//Clear Spritesheet Cache every hour
+//Clear Spritesheet Cache every day
 setInterval(() => {
   console.log('Running Spritesheet Cache Cleanup...');
   clearSpritesheetCache()
@@ -915,7 +906,7 @@ setInterval(() => {
     .catch((error) => {
       console.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
     });
-}, 60 * 60 * 1000); // 1 hour
+}, 24 * 60 * 60 * 1000); // 24 hours
 
 //Clear Frames Cache every day
 setInterval(() => {

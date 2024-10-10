@@ -26,7 +26,7 @@ RUN rm -f .env.local
 FROM node:18.17.0-alpine
 
 # Install Python, pip, ffmpeg, and other necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo gcc musl-dev linux-headers python3-dev
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo gcc musl-dev linux-headers python3-dev libavif libavif-apps
 
 # Install dos2unix
 RUN apk add --no-cache dos2unix
@@ -63,5 +63,5 @@ RUN dos2unix /usr/src/app/scripts/*.sh
 # Source the .env.local file if it exists (this step is not needed anymore as .env.local is removed in the builder stage)
 # RUN if [ -f .env.local ]; then export $(cat .env.local | xargs); fi
 
-# Command to run both Node.js app and cron
+# Command to run Node.js app
 CMD ["sh", "-c", "node /usr/src/app/node/app.js --max-old-space-size=2048"]

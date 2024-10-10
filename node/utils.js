@@ -226,7 +226,7 @@ async function clearVideoClipsCache() {
 async function clearSpritesheetCache() {
   const now = Date.now();
   const cacheType = 'spritesheet';
-  const maxAge = 7 * 24 * 60 * 60; // Example: 7 days in seconds
+  const maxAge = 240 * 24 * 60 * 60; // 8 months in seconds
   const dir = spritesheetCacheDir;
 
   try {
@@ -235,8 +235,9 @@ async function clearSpritesheetCache() {
       const filePath = path.join(dir, file);
       try {
         const stats = await fs.stat(filePath);
-        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
-        if (age > maxAge) {
+        const lastAccessTime = stats.atimeMs;
+        const timeSinceLastAccess = (now - lastAccessTime) / 1000; // Time since last access in seconds
+        if (timeSinceLastAccess > maxAge) {
           await fs.unlink(filePath);
           console.log(`Deleted expired cache file (${cacheType}): ${file}`);
         }
@@ -248,7 +249,6 @@ async function clearSpritesheetCache() {
     console.error(`Error reading ${cacheType} cache directory:`, err);
   }
 }
-
 /**
  * Clears expired files from the Frames Cache.
  * Adjust the maxAge as per your requirement.
@@ -265,8 +265,9 @@ async function clearFramesCache() {
       const filePath = path.join(dir, file);
       try {
         const stats = await fs.stat(filePath);
-        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
-        if (age > maxAge) {
+        const lastAccessTime = stats.atimeMs;
+        const timeSinceLastAccess = (now - lastAccessTime) / 1000; // Time since last access in seconds
+        if (timeSinceLastAccess > maxAge) {
           await fs.unlink(filePath);
           console.log(`Deleted expired cache file (${cacheType}): ${file}`);
         }
@@ -409,15 +410,14 @@ async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, deleteO
 
     const args = [
       '--min', '0',
-      '--max', `${quality}`,
-      '-s', `${speed}`,
-      `"${pngPath}"`,
-      `"${avifPath}"`
+      '--max', quality,
+      '-s', speed,
+      pngPath,
+      avifPath
     ];
 
     // Spawn the avifenc process
     const avifencProcess = spawn('avifenc', args, {
-      shell: true, // Use shell to handle quoted paths with spaces
       stdio: ['ignore', 'pipe', 'pipe'] // Ignore stdin, capture stdout and stderr
     });
 
