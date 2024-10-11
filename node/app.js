@@ -354,6 +354,12 @@ async function handleSpriteSheetRequest(req, res, type) {
 
       if (spriteSheetExt === '.avif' || spriteSheetExt === '.jpg') {
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        
+        if (spriteSheetExt === '.avif') {
+          res.setHeader("Content-Type", "image/avif");
+        } else if (spriteSheetExt === '.jpg') {
+          res.setHeader("Content-Type", "image/jpeg");
+        }
         return res.sendFile(spriteSheetPath);
       }
 
