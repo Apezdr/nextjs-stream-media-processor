@@ -1,5 +1,8 @@
-requests
-requests-cache
+#requests
+#requests-cache
 Pillow
 blurhash-python
+aiohttp
+aiohttp_client_cache
+aiofiles
 # Add any other dependencies your Python scripts require

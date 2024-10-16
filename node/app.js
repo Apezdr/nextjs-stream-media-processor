@@ -11,7 +11,7 @@ const axios = require('axios');
 const app = express();
 const thumbnailGenerationInProgress = new Set();
 const { generateSpriteSheet } = require("./sprite");
-const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName } = require("./sqliteDatabase");
+const { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } = require("./sqliteDatabase");
 const {
   generateFrame,
   getVideoDuration,
@@ -179,6 +179,7 @@ async function handleFrameRequest(req, res, type) {
 
     const db = await initializeDatabase();
     const showData = await getTVShowByName(db, show_name);
+    await releaseDatabase(db);
     if (showData) {
       const _season = showData.metadata.seasons[`Season ${season}`];
       if (_season) {
@@ -357,6 +358,7 @@ async function handleSpriteSheetRequest(req, res, type) {
         
         if (spriteSheetExt === '.avif') {
           res.setHeader("Content-Type", "image/avif");
+          res.setHeader("Accept-Ranges", "bytes"); // Ensure byte-range requests are supported
         } else if (spriteSheetExt === '.jpg') {
           res.setHeader("Content-Type", "image/jpeg");
         }
@@ -452,6 +454,7 @@ async function handleSpriteSheetRequest(req, res, type) {
         }
       }
 
+      await releaseDatabase(db);
       // Generate the sprite sheet
       await generateSpriteSheet({
         videoPath,
@@ -631,6 +634,7 @@ async function handleVttRequest(req, res, type) {
           return res.status(500).send("Internal server error");
         }
       }
+      await releaseDatabase(db);
       await generateSpriteSheet({
         videoPath,
         type,
@@ -812,6 +816,7 @@ async function handleChapterRequest(
     }
   }
 
+  await releaseDatabase(db);
   await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
 
   res.setHeader("Content-Type", "text/vtt");
@@ -950,7 +955,15 @@ async function generateListTV(db, dirPath) {
         existingShowNames.delete(showName); // Remove from the set of existing shows
         const encodedShowName = encodeURIComponent(showName);
         const showPath = path.join(dirPath, showName);
-        const seasons = await fs.readdir(showPath, { withFileTypes: true });
+        const allItems = await fs.readdir(showPath, { withFileTypes: true });
+        const seasonFolders = allItems.filter(item => item.isDirectory() && item.name.startsWith('Season'));
+        const sortedSeasonFolders = seasonFolders.sort((a, b) => {
+          const aNum = parseInt(a.name.replace('Season', ''));
+          const bNum = parseInt(b.name.replace('Season', ''));
+          return aNum - bNum;
+        });
+        const otherItems = allItems.filter(item => !seasonFolders.includes(item));
+        const seasons = [...sortedSeasonFolders, ...otherItems];
 
         const showMetadata = {
           metadata: `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`,
@@ -1216,7 +1229,7 @@ app.get('/media/tv', async (req, res) => {
       await generateListTV(db, `${BASE_PATH}/tv`);
     }
     const shows = await getTVShows(db);
-    await db.close();
+    await releaseDatabase(db);
 
     const tvData = shows.reduce((acc, show) => {
       acc[show.name] = {
@@ -1483,7 +1496,7 @@ app.get('/media/movies', async (req, res) => {
           await generateListMovies(db, `${BASE_PATH}/movies`);
       }
       const movies = await getMovies(db);
-      await db.close();
+      await releaseDatabase(db);
 
       const movieData = movies.reduce((acc, movie) => {
           acc[movie.name] = {
@@ -1506,7 +1519,7 @@ app.post('/media/scan', async (req, res) => {
   try {
       const db = await initializeDatabase();
       await generateListMovies(db, `${BASE_PATH}/movies`);
-      await db.close();
+      await releaseDatabase(db);
       res.status(200).send('Library scan completed');
   } catch (error) {
       console.error(`Error scanning library: ${error}`);
@@ -1528,15 +1541,23 @@ async function runGeneratePosterCollage() {
 }
 
 async function runDownloadTmdbImages(specificShow = null, specificMovie = null, fullScan = false) {
-  console.log(`Download tmdb request ${specificShow ? `for show ${specificShow}` : ''}${specificMovie ? `for movie ${specificMovie}` : ''}${fullScan ? 'with full scan' : ''}`);
-  let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}'`;
+  const debugMessage = isDebugMode ? ' with debug' : '';
+  console.log(`Download tmdb request${specificShow ? ` for show "${specificShow}"` : ''}${specificMovie ? ` for movie "${specificMovie}"` : ''}${fullScan ? ' with full scan' : ''}`);
 
+  // Start constructing the command within single quotes
+  let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}`;
+
+  // Append arguments inside the single quotes
   if (specificShow) {
     command += ` --show "${specificShow}"`;
   } else if (specificMovie) {
     command += ` --movie "${specificMovie}"`;
   }
 
+  // Close the single quotes after all arguments are appended
+  command += `'`;
+
+  // Handle logging if in debug mode
   if (isDebugMode) {
     try {
       await fs.access(LOG_FILE, fs.constants.W_OK);
@@ -1547,14 +1568,13 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null, 
   }
 
   try {
-    //console.log(`Executing command: ${command}`); // Log the command being executed
-    console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}` : ''}${fullScan ? ' with full scan' : ''}`);
+    console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show "${specificShow}"` : ''}${specificMovie ? ` for movie "${specificMovie}"` : ''}${fullScan ? ' with full scan' : ''}`);
     const { stdout, stderr } = await execAsync(command);
-    //console.log(`Command output: ${stdout}`);
+    
     if (stderr) {
       console.error(`download_tmdb_images.py error: ${stderr}`);
     }
-    console.log(`Finished running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show ${specificShow}` : ''}${specificMovie ? ` for movie ${specificMovie}${fullScan ? ' with full scan' : ''}` : ''}`);
+    console.log(`Finished running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show "${specificShow}"` : ''}${specificMovie ? ` for movie "${specificMovie}"${fullScan ? ' with full scan' : ''}` : ''}`);
   } catch (error) {
     console.error(`Error executing download_tmdb_images.py: ${error}`);
   }
@@ -1576,11 +1596,13 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null, 
 app.get('/videoClip/movie/:movieName', async (req, res) => {
   const db = await initializeDatabase();
   await handleVideoClipRequest(req, res, 'movies', BASE_PATH, db);
+  await releaseDatabase(db);
 });
 
 app.get('/videoClip/tv/:showName/:season/:episode', async (req, res) => {
   const db = await initializeDatabase();
   await handleVideoClipRequest(req, res, 'tv', BASE_PATH, db);
+  await releaseDatabase(db);
 });
 
 
@@ -1601,7 +1623,7 @@ async function runGenerateList() {
     await generateListMovies(db, `${BASE_PATH}/movies`);
     await generateListTV(db, `${BASE_PATH}/tv`);
     console.log(`[${new Date().toISOString()}] Finished generating media list`);
-    await db.close();
+    await releaseDatabase(db);
   } catch (error) {
     console.error(`Error generating media list: ${error}`);
   } finally {
@@ -1682,6 +1704,7 @@ function scheduleTasks() {
     runGeneratePosterCollage().catch(console.error);
   });
   // Schedule for runGenerateList and autoSync
+  // Scheduled to run every 1 minute
   schedule.scheduleJob('*/1 * * * *', () => {
     runGenerateList().catch(console.error);
   });

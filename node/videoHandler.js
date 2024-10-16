@@ -201,6 +201,7 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
  * @param {string} basePath - Base path to media files.
  */
 async function handleVideoClipRequest(req, res, type, basePath, db) {
+  let cacheKey; // Declare cacheKey in the outer scope
   try {
     let videoPath;
 
@@ -236,7 +237,7 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     // Parse and validate start and end parameters
     const start = parseFloat(req.query.start);
     const end = parseFloat(req.query.end);
-    const MAX_CLIP_DURATION = 300; // 5 minutes
+    const MAX_CLIP_DURATION = 600; // 10 minutes
 
     if (isNaN(start) || isNaN(end) || start < 0 || end <= start) {
       return res.status(400).send('Invalid start or end parameters.');
@@ -244,6 +245,16 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     if ((end - start) > MAX_CLIP_DURATION) {
       return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
+    }
+
+    // Generate cache key and cached clip path
+    cacheKey = generateCacheKey(videoPath, start, end); // Assign to the outer scoped variable
+    const cachedClipPath = getCachedClipPath(cacheKey);
+
+    // Check if cached clip exists and is valid
+    if (await fileExists(cachedClipPath)) {
+      // Serve cached clip directly
+      return serveCachedClip(res, cachedClipPath, type, req);
     }
 
     // Check if the video file exists
@@ -265,22 +276,12 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
       return res.status(400).send('End time exceeds video duration.');
     }
 
-    // Generate cache key and cached clip path
-    const cacheKey = generateCacheKey(videoPath, start, end);
-    const cachedClipPath = getCachedClipPath(cacheKey);
-
-    // Check if cached clip exists and is valid
-    if (await fileExists(cachedClipPath)) {
-      console.log(`Serving cached clip: ${cachedClipPath}`);
-      return serveCachedClip(res, cachedClipPath, type, req, start, end);
-    }
-
     // Check if another request is already generating this clip
     if (ongoingCacheGenerations.has(cacheKey)) {
       console.log(`Waiting for ongoing generation of cache key: ${cacheKey}`);
 
       // Poll until the cached clip becomes available
-      await waitForCache(cachedClipPath, 500, 10000); // Poll every 500ms, timeout after 10 seconds
+      await waitForCache(cachedClipPath, 500, 45000); // Poll every 500ms, timeout after 45 seconds
 
       console.log(`Serving cached clip after waiting: ${cachedClipPath}`);
       return serveCachedClip(res, cachedClipPath, type, req, start, end);
@@ -289,10 +290,15 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     // Add to ongoing generations
     ongoingCacheGenerations.add(cacheKey);
 
-    // If not cached, generate the clip and cache it
-    console.log(`Generating new clip for caching: ${cacheKey}`);
+    try {
+      // If not cached, generate the clip and cache it
+      console.log(`Generating new clip for caching: ${cacheKey}`);
 
-    await generateAndCacheClip(videoPath, start, end, cachedClipPath);
+      await generateAndCacheClip(videoPath, start, end, cachedClipPath);
+    } finally {
+      // Ensure the cacheKey is removed regardless of success or failure
+      ongoingCacheGenerations.delete(cacheKey);
+    }
 
     // Serve the newly cached clip
     return serveCachedClip(res, cachedClipPath, type, req, start, end);
@@ -300,7 +306,9 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
   } catch (error) {
     console.error(error);
     // Ensure the cache key is removed from ongoing generations in case of error
-    ongoingCacheGenerations.delete(cacheKey);
+    if (cacheKey) { // Check if cacheKey is defined
+      ongoingCacheGenerations.delete(cacheKey);
+    }
     if (!res.headersSent) {
       res.status(500).send("Internal server error");
     } else {
@@ -308,6 +316,8 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     }
   }
 }
+
+
 
 // Function to generate the clip and save it to the cache
 async function generateAndCacheClip(videoPath, start, end, cachedClipPath) {
@@ -318,9 +328,10 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath) {
       '-i', videoPath,
       '-c', 'copy',
       '-movflags', 'frag_keyframe+empty_moov',
+      '-strict', 'unofficial',
       '-f', 'mp4',
       cachedClipPath
-    ];
+  ];
 
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
@@ -345,19 +356,50 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath) {
   });
 }
 
-// Function to serve the cached clip with appropriate headers and range support
-async function serveCachedClip(res, cachedClipPath, type, req, start, end) {
+// Function to serve the cached clip with enhanced headers and robust range support
+async function serveCachedClip(res, cachedClipPath, type, req) {
   try {
     const stat = await fs.stat(cachedClipPath);
     const fileSize = stat.size;
     const range = req.headers.range;
 
+    // Generate ETag and Last-Modified
+    const etag = `${stat.size}-${stat.mtime.getTime()}`;
+    const lastModified = stat.mtime.toUTCString();
+
+    // Set caching headers
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', lastModified);
+    res.setHeader('Cache-Control', 'public, max-age=31536000'); // 1 year
+
+    // Handle conditional requests
+    if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === lastModified) {
+      res.writeHead(304);
+      return res.end();
+    }
+
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const startByte = parseInt(parts[0], 10);
       const endByte = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+      // Validate range
+      if (isNaN(startByte) || isNaN(endByte) || startByte > endByte || endByte >= fileSize) {
+        res.writeHead(416, {
+          "Content-Range": `bytes */${fileSize}`,
+          "Content-Type": "video/mp4",
+        });
+        return res.end();
+      }
+
       const chunkSize = (endByte - startByte) + 1;
       const fileStream = _fs.createReadStream(cachedClipPath, { start: startByte, end: endByte });
+
+      // Handle stream errors
+      fileStream.on('error', (streamErr) => {
+        console.error(`Stream error: ${streamErr.message}`);
+        res.status(500).send('Error streaming video.');
+      });
 
       res.writeHead(206, {
         "Content-Range": `bytes ${startByte}-${endByte}/${fileSize}`,
@@ -367,17 +409,26 @@ async function serveCachedClip(res, cachedClipPath, type, req, start, end) {
       });
       fileStream.pipe(res);
     } else {
+      const fileStream = _fs.createReadStream(cachedClipPath);
+
+      // Handle stream errors
+      fileStream.on('error', (streamErr) => {
+        console.error(`Stream error: ${streamErr.message}`);
+        res.status(500).send('Error streaming video.');
+      });
+
       res.writeHead(200, {
         "Content-Length": fileSize,
         "Content-Type": "video/mp4",
       });
-      _fs.createReadStream(cachedClipPath).pipe(res);
+      fileStream.pipe(res);
     }
   } catch (error) {
     console.error(`Error serving cached clip: ${error.message}`);
     res.status(500).send('Error serving cached video.');
   }
 }
+
 
 // Utility function to wait for cache to be generated
 async function waitForCache(cachedClipPath, intervalMs, timeoutMs) {

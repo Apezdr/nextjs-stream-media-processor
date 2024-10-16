@@ -64,8 +64,9 @@ temp/
 
 # Local DB
 *.sqlite
+*.sqlite-journal
 *.db
 *.db-journal
 
 # Cache for Node
-/node/cache
+node/cache

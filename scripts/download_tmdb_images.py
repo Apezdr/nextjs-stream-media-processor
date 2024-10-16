@@ -1,6 +1,9 @@
 import json
 import argparse
 import os
+import aiohttp
+import asyncio
+import sys
 from datetime import datetime, timedelta
 from utils.tmdb_utils import (
     fetch_tmdb_media_details,
@@ -11,16 +14,51 @@ from utils.tmdb_utils import (
 from utils.file_utils import (
     load_tmdb_config_file,
     update_tmdb_config,
-    should_refresh_metadata
+    should_refresh_metadata,
+    read_json_file,
+    write_json_file
 )
 from utils.image_utils import (
     download_image_file,
     extract_file_extension
 )
+import logging
+
+# Configure logging with timestamps, logger names, and clear messages
+logging.basicConfig(
+    level=logging.INFO,  # Set the default logging level
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  # Define the log message format
+    datefmt='%Y-%m-%d %H:%M:%S',  # Specify the date format
+)
+# Configure logging with separate handlers for stdout and stderr
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Capture all levels of logs
+
+# Handler for stdout (INFO and DEBUG)
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.DEBUG)
+stdout_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+                                    datefmt='%Y-%m-%d %H:%M:%S')
+stdout_handler.setFormatter(stdout_formatter)
+
+# Handler for stderr (WARNING and above)
+stderr_handler = logging.StreamHandler(sys.stderr)
+stderr_handler.setLevel(logging.WARNING)
+stderr_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+                                    datefmt='%Y-%m-%d %H:%M:%S')
+stderr_handler.setFormatter(stderr_formatter)
+
+# Add handlers to the logger
+logger.addHandler(stdout_handler)
+logger.addHandler(stderr_handler)
 
 # Set UID and GID to the current user
-os.setgid(os.getgid())  # Set GID
-os.setuid(os.getuid())  # Set UID
+try:
+    os.setgid(os.getgid())  # Set GID
+    os.setuid(os.getuid())  # Set UID
+except AttributeError:
+    # os.setgid and os.setuid may not be available on some systems (e.g., Windows)
+    logger.warning("UID and GID setting is not supported on this platform.")
 
 parser = argparse.ArgumentParser(description='Download TMDB images for TV shows and movies.')
 parser.add_argument('--show', type=str, help='Specific TV show to scan')
@@ -30,7 +68,7 @@ args = parser.parse_args()
 SHOWS_DIR = '/var/www/html/tv'
 MOVIES_DIR = '/var/www/html/movies'
 
-def process_seasons_and_episodes(show_data, show_dir, show_name):
+async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
     """
     Processes seasons and episodes for a TV show, including metadata and images.
     """
@@ -39,38 +77,37 @@ def process_seasons_and_episodes(show_data, show_dir, show_name):
         season_dir = os.path.join(show_dir, f'Season {season_number}')
 
         if not os.path.exists(season_dir):
-            print(f"Skipping Season {season_number} for '{show_name}' as the directory does not exist.")
+            logger.info(f"Skipping Season {season_number} for '{show_name}' as the directory does not exist.")
             continue
 
         season_poster_path = os.path.join(season_dir, 'season_poster.jpg')
-        refresh_season_poster = not os.path.exists(season_poster_path) or datetime.now() - datetime.fromtimestamp(os.path.getmtime(season_poster_path)) > timedelta(days=1)
+        refresh_season_poster = not os.path.exists(season_poster_path) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(season_poster_path)) > timedelta(days=1))
         if refresh_season_poster:
-            season_poster_url = f'https://image.tmdb.org/t/p/original{season["poster_path"]}'
-            download_image_file(season_poster_url, season_poster_path)
+            season_poster_url = f'https://image.tmdb.org/t/p/original{season.get("poster_path", "")}'
+            await download_image_file(session, season_poster_url, season_poster_path)
 
-        for episode_number in range(1, season['episode_count'] + 1):
+        for episode_number in range(1, season.get('episode_count', 0) + 1):
             episode_metadata_file = os.path.join(season_dir, f'{episode_number:02d}_metadata.json')
-            refresh_episode_metadata = not os.path.exists(episode_metadata_file) or datetime.now() - datetime.fromtimestamp(os.path.getmtime(episode_metadata_file)) > timedelta(days=1)
+            refresh_episode_metadata = not os.path.exists(episode_metadata_file) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(episode_metadata_file)) > timedelta(days=1))
 
             if refresh_episode_metadata:
-                episode_data = fetch_tmdb_episode_details(show_data["id"], season_number, episode_number)
+                episode_data = await fetch_tmdb_episode_details(session, show_data["id"], season_number, episode_number)
                 if episode_data:
-                    with open(episode_metadata_file, 'w') as ep_file:
-                        json.dump(episode_data, ep_file, indent=4, sort_keys=True)
+                    await write_json_file(episode_metadata_file, episode_data)
 
             episode_thumbnail_path = os.path.join(season_dir, f'{episode_number:02d} - Thumbnail.jpg')
             if os.path.exists(episode_thumbnail_path):
-                refresh_episode_thumbnail = datetime.now() - datetime.fromtimestamp(os.path.getmtime(episode_thumbnail_path)) > timedelta(days=3)
+                refresh_episode_thumbnail = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(episode_thumbnail_path)) > timedelta(days=3))
             else:
                 refresh_episode_thumbnail = True
 
             if refresh_episode_thumbnail:
-                episode_thumbnail_url = fetch_episode_thumbnail_url(show_data["id"], season_number, episode_number)
+                episode_thumbnail_url = await fetch_episode_thumbnail_url(session, show_data["id"], season_number, episode_number)
                 if episode_thumbnail_url:
-                    download_image_file(episode_thumbnail_url, episode_thumbnail_path)
-                    os.utime(episode_thumbnail_path, None)
+                    await download_image_file(session, episode_thumbnail_url, episode_thumbnail_path)
+                    await asyncio.to_thread(os.utime, episode_thumbnail_path, None)
 
-def process_media_images(media_data, media_dir, tmdb_config, existing_metadata, media_type):
+async def process_media_images(session, media_data, media_dir, tmdb_config, existing_metadata, media_type):
     """
     Processes and downloads images (backdrop, poster, logo) for the media.
     """
@@ -91,7 +128,7 @@ def process_media_images(media_data, media_dir, tmdb_config, existing_metadata, 
                 new_image_url = f'https://image.tmdb.org/t/p/original{override_image}'
             else:
                 # Use the TMDB image
-                new_image_url = f'https://image.tmdb.org/t/p/original{media_data[image_key]}'
+                new_image_url = f'https://image.tmdb.org/t/p/original{media_data.get(image_key, "")}'
 
             file_extension = extract_file_extension(new_image_url)
             image_filename = f'{image_filename_map[image_key]}{file_extension}'
@@ -103,7 +140,7 @@ def process_media_images(media_data, media_dir, tmdb_config, existing_metadata, 
             # Check if the image file does not exist
             if not os.path.exists(image_path):
                 image_needs_update = True
-                print(f"Image {image_filename} does not exist and will be downloaded.")
+                logger.info(f"Image {image_filename} does not exist and will be downloaded.")
             else:
                 # Load the existing image URL from existing metadata or tmdb.config
                 existing_image_url = None
@@ -114,20 +151,23 @@ def process_media_images(media_data, media_dir, tmdb_config, existing_metadata, 
                         existing_override_image = tmdb_config[f'override_{image_key.split("_")[0]}']
                         existing_image_url = f'https://image.tmdb.org/t/p/original{existing_override_image}'
                     else:
-                        existing_image_url = f'https://image.tmdb.org/t/p/original{existing_metadata[image_key]}'
+                        existing_image_url = f'https://image.tmdb.org/t/p/original{existing_metadata.get(image_key, "")}'
 
                 # Compare the new image URL with the existing one
                 if existing_image_url != new_image_url:
                     image_needs_update = True
-                    print(f"Image {image_filename} has changed and will be updated.")
+                    logger.info(f"Image {image_filename} has changed and will be updated.")
 
-            if image_needs_update:
+            if image_needs_update and new_image_url:
                 # Download the new image
-                download_image_file(new_image_url, image_path, True)
+                await download_image_file(session, new_image_url, image_path, force_download=True)
         else:
-            print(f"{image_key} not found in media data for {media_type}.")
+            logger.warning(f"{image_key} not found in media data for {media_type}.")
 
-def process_shows(specific_show=None):
+async def process_shows(session, specific_show=None):
+    """
+    Processes TV shows: updates metadata, downloads images, and handles seasons and episodes.
+    """
     shows = (
         show_name for show_name in os.listdir(SHOWS_DIR)
         if os.path.isdir(os.path.join(SHOWS_DIR, show_name)) and 
@@ -138,60 +178,57 @@ def process_shows(specific_show=None):
         tmdb_config_path = os.path.join(show_dir, 'tmdb.config')
         metadata_file = os.path.join(show_dir, 'metadata.json')
         
-        print('TV: ' + show_name)
+        logger.info('TV: ' + show_name)
 
         # Read TMDB config
-        tmdb_config = load_tmdb_config_file(tmdb_config_path)
+        tmdb_config = await load_tmdb_config_file(tmdb_config_path)
         tmdb_id = tmdb_config.get('tmdb_id')
 
         # Check if metadata updates are allowed based on the config
         if not is_metadata_update_allowed(tmdb_config):
-            print(f"Updates are disabled for {show_name}. Skipping periodic metadata refresh.")
+            logger.info(f"Updates are disabled for {show_name}. Skipping periodic metadata refresh.")
             if not os.path.exists(metadata_file):
                 # Perform initial metadata retrieval if metadata file doesn't exist
-                print(f"Initial metadata retrieval for {show_name}.")
-                show_data = fetch_tmdb_media_details(show_name, tmdb_id=tmdb_id, media_type='tv')
+                logger.info(f"Initial metadata retrieval for {show_name}.")
+                show_data = await fetch_tmdb_media_details(session, show_name, tmdb_id=tmdb_id, media_type='tv')
                 if show_data:
                     if 'metadata' in tmdb_config:
                         show_data.update(tmdb_config['metadata'])
-                    with open(metadata_file, 'w') as f:
-                        json.dump(show_data, f, indent=4, sort_keys=True)
+                    await write_json_file(metadata_file, show_data)
             else:
                 continue  # Skip further processing
 
         # Determine need for metadata refresh
-        need_refresh = should_refresh_metadata(metadata_file, tmdb_config_path)
+        need_refresh = await should_refresh_metadata(metadata_file, tmdb_config_path)
         
         # Load the existing metadata for comparison
-        existing_metadata = {}
-        if os.path.exists(metadata_file):
-            with open(metadata_file, 'r') as f:
-                existing_metadata = json.load(f)
+        existing_metadata = await read_json_file(metadata_file)
 
         # Refresh or load metadata as necessary
         if need_refresh:
-            show_data = fetch_tmdb_media_details(show_name, tmdb_id=tmdb_id, media_type='tv')
+            show_data = await fetch_tmdb_media_details(session, show_name, tmdb_id=tmdb_id, media_type='tv')
             if show_data:
                 # Apply hard-coded replacements from tmdb.config
                 if 'metadata' in tmdb_config:
                     show_data.update(tmdb_config['metadata'])
                 
-                with open(metadata_file, 'w') as f:
-                    json.dump(show_data, f, indent=4, sort_keys=True)
+                await write_json_file(metadata_file, show_data)
         else:
-            with open(metadata_file, 'r') as f:
-                show_data = json.load(f)
+            show_data = existing_metadata
 
         # Update tmdb.config if necessary
-        update_tmdb_config(tmdb_config_path, tmdb_config, show_data['id'], show_name)
+        await update_tmdb_config(tmdb_config_path, tmdb_config, show_data['id'], show_name)
 
         # Process images
-        process_media_images(show_data, show_dir, tmdb_config, existing_metadata, 'tv')
+        await process_media_images(session, show_data, show_dir, tmdb_config, existing_metadata, 'tv')
 
         # Process seasons and episodes
-        process_seasons_and_episodes(show_data, show_dir, show_name)
+        await process_seasons_and_episodes(session, show_data, show_dir, show_name)
 
-def process_movies(specific_movie=None):
+async def process_movies(session, specific_movie=None):
+    """
+    Processes movies: updates metadata and downloads images.
+    """
     movies = (
         movie_name for movie_name in os.listdir(MOVIES_DIR)
         if os.path.isdir(os.path.join(MOVIES_DIR, movie_name)) and 
@@ -203,52 +240,56 @@ def process_movies(specific_movie=None):
         tmdb_config_path = os.path.join(movie_dir, 'tmdb.config')
         metadata_file = os.path.join(movie_dir, 'metadata.json')
         
-        print('Processing Movie: ' + movie_name)
+        logger.info('Processing Movie: ' + movie_name)
 
         # Read TMDB config
-        tmdb_config = load_tmdb_config_file(tmdb_config_path)
+        tmdb_config = await load_tmdb_config_file(tmdb_config_path)
         tmdb_id = tmdb_config.get('tmdb_id')
 
         # Determine need for metadata refresh
-        need_refresh = should_refresh_metadata(metadata_file, tmdb_config_path)
+        need_refresh = await should_refresh_metadata(metadata_file, tmdb_config_path)
 
         # Load the existing metadata for comparison
-        existing_metadata = {}
-        if os.path.exists(metadata_file):
-            with open(metadata_file, 'r') as f:
-                existing_metadata = json.load(f)
+        existing_metadata = await read_json_file(metadata_file)
 
         # Refresh metadata or update if necessary
         if need_refresh:
-            movie_data = fetch_tmdb_media_details(movie_name, tmdb_id=tmdb_id, media_type='movie')
+            movie_data = await fetch_tmdb_media_details(session, movie_name, tmdb_id=tmdb_id, media_type='movie')
             if movie_data:
                 # Apply hard-coded replacements from tmdb.config
                 if 'metadata' in tmdb_config:
                     movie_data.update(tmdb_config['metadata'])
-                with open(metadata_file, 'w') as f:
-                    json.dump(movie_data, f, indent=4, sort_keys=True)
+                await write_json_file(metadata_file, movie_data)
                     
                 # Update tmdb.config if necessary
-                update_tmdb_config(tmdb_config_path, tmdb_config, movie_data['id'], movie_name)
+                await update_tmdb_config(tmdb_config_path, tmdb_config, movie_data['id'], movie_name)
 
         else:
             # Use existing metadata if no refresh is needed
             movie_data = existing_metadata
 
         # Process images
-        process_media_images(movie_data, movie_dir, tmdb_config, existing_metadata, 'movie')
+        await process_media_images(session, movie_data, movie_dir, tmdb_config, existing_metadata, 'movie')
 
 print("Processing TMDB Updates")
 
 # Main execution
-if args.show:
-    print("--Processing Show", args.show)
-    process_shows(specific_show=args.show)
-elif args.movie:
-    print("--Processing Movie", args.movie)
-    process_movies(specific_movie=args.movie)
-else:
-    process_movies()
-    process_shows()
+async def main():
+    async with aiohttp.ClientSession() as session:
+        if args.show:
+            logger.info(f"--Processing Show: {args.show}")
+            await process_shows(session, specific_show=args.show)
+        elif args.movie:
+            logger.info(f"--Processing Movie: {args.movie}")
+            await process_movies(session, specific_movie=args.movie)
+        else:
+            # Use asyncio.gather to run both concurrently
+            await asyncio.gather(
+                process_movies(session),
+                process_shows(session)
+            )
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 print("Finished TMDB Updates")
