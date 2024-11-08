@@ -26,7 +26,7 @@ RUN rm -f .env.local
 FROM node:18.17.0-alpine
 
 # Install Python, pip, ffmpeg, and other necessary tools
-RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg sqlite sudo gcc musl-dev linux-headers python3-dev libavif libavif-apps
+RUN apk add --no-cache python3 py3-pip curl jq bash ffmpeg mediainfo sqlite sudo gcc musl-dev linux-headers python3-dev libavif libavif-apps
 
 # Install dos2unix
 RUN apk add --no-cache dos2unix

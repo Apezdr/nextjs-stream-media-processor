@@ -35,6 +35,7 @@ const { generateChapters, hasChapterInfo } = require("./chapter-generator");
 const { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } = require("./database");
 const { handleVideoRequest, handleVideoClipRequest } = require("./videoHandler");
 const sharp = require("sharp");
+const { getInfo } = require("./infoManager");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
 const LOG_FILE = '/var/log/cron.log';
@@ -1111,20 +1112,20 @@ async function generateListTV(db, dirPath) {
             for (const episode of validEpisodes) {
               const episodePath = path.join(seasonPath, episode);
               const encodedEpisodePath = encodeURIComponent(episode);
-              const infoFile = `${episodePath}.info`;
 
               let fileLength;
               let fileDimensions;
+              let hdrInfo;
+              let additionalMetadata;
 
-              if (await fileExists(infoFile)) {
-                const fileInfo = await fs.readFile(infoFile, 'utf-8');
-                [fileLength, fileDimensions] = fileInfo.trim().split(' ');
-              } else {
-                const { stdout: length } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${episodePath}"`);
-                const { stdout: dimensions } = await execAsync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${episodePath}"`);
-                fileLength = Math.floor(parseFloat(length.trim()) * 1000);
-                fileDimensions = dimensions.trim();
-                await fs.writeFile(infoFile, `${fileLength} ${fileDimensions}`);
+              try {
+                const info = await getInfo(episodePath);
+                fileLength = info.length;
+                fileDimensions = info.dimensions;
+                hdrInfo = info.hdr;
+                additionalMetadata = info.additionalMetadata; // Use additional metadata as needed
+              } catch (error) {
+                console.error(`Failed to retrieve info for ${episodePath}:`, error);
               }
 
               seasonData.fileNames.push(episode);
@@ -1133,7 +1134,9 @@ async function generateListTV(db, dirPath) {
 
               const episodeData = {
                 videourl: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-                mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString()
+                mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
+                hdr: hdrInfo || null,
+                additionalMetadata: additionalMetadata || {}
               };
 
               // ex. values
@@ -1290,6 +1293,8 @@ async function generateListMovies(db, dirPath) {
       const fileNames = files.filter(file => file.endsWith('.mp4') || file.endsWith('.srt') || file.endsWith('.json') || file.endsWith('.info') || file.endsWith('.nfo') || file.endsWith('.jpg') || file.endsWith('.png'));
       const fileLengths = {};
       const fileDimensions = {};
+      let hdrInfo;
+      let additionalMetadata;
       const urls = {};
       const subtitles = {};
 
@@ -1306,21 +1311,19 @@ async function generateListMovies(db, dirPath) {
       for (const file of fileNames) {
         const filePath = path.join(dirPath, dirName, file);
         const encodedFilePath = encodeURIComponent(file);
-        const infoFile = `${filePath}.info`;
 
         if (file.endsWith('.mp4')) {
           let fileLength;
           let fileDimensionsStr;
 
-          if (await fileExists(infoFile)) {
-            const fileInfo = await fs.readFile(infoFile, 'utf-8');
-            [fileLength, fileDimensionsStr] = fileInfo.trim().split(' ');
-          } else {
-            const { stdout: length } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
-            const { stdout: dimensions } = await execAsync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${filePath}"`);
-            fileLength = Math.floor(parseFloat(length.trim()) * 1000);
-            fileDimensionsStr = dimensions.trim();
-            await fs.writeFile(infoFile, `${fileLength} ${fileDimensionsStr}`);
+          try {
+            const info = await getInfo(filePath);
+            fileLength = info.length;
+            fileDimensionsStr = info.dimensions;
+            hdrInfo = info.hdr;
+            additionalMetadata = info.additionalMetadata;
+          } catch (error) {
+            console.error(`Failed to retrieve info for ${filePath}:`, error);
           }
 
           fileLengths[file] = parseInt(fileLength, 10);
@@ -1480,7 +1483,18 @@ async function generateListMovies(db, dirPath) {
       const final_hash = await calculateDirectoryHash(fullDirPath);
 
       // Always update the database with the latest data
-      await insertOrUpdateMovie(db, dirName, fileNames, fileLengths, fileDimensions, urls, urls["metadata"] || "", final_hash);
+      await insertOrUpdateMovie(
+        db,
+        dirName,
+        fileNames, // Array of filenames
+        fileLengths, // Object mapping filenames to lengths
+        fileDimensions, // Object mapping filenames to dimensions
+        urls, // URLs and related data
+        urls["metadata"] || "", // metadata_url
+        final_hash, // directory_hash
+        hdrInfo,
+        additionalMetadata
+      );
     }
   }))
   // Remove movies from the database that no longer exist in the file system
@@ -1504,6 +1518,8 @@ app.get('/media/movies', async (req, res) => {
               length: movie.lengths,
               dimensions: movie.dimensions,
               urls: movie.urls,
+              hdr: movie.hdr,
+              additional_metadata: movie.additional_metadata,
           };
           return acc;
       }, {});

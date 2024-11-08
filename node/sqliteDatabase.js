@@ -1,12 +1,16 @@
 const sqlite3 = require('sqlite3').verbose()
 const { open } = require('sqlite')
 const path = require('path')
+const fs = require('fs').promises
 
-const dbFilePath = path.join(__dirname, 'db', 'media.db')
+const dbDirectory = path.join(__dirname, 'db')
+const dbFilePath = path.join(dbDirectory, 'media.db')
 
 var hasInitialized = false
 
 async function initializeDatabase() {
+  // Create the db directory if it doesn't exist
+  await fs.mkdir(dbDirectory, { recursive: true })
   const db = await open({ filename: dbFilePath, driver: sqlite3.Database })
   if (!hasInitialized) {
     await db.exec(`
@@ -18,7 +22,9 @@ async function initializeDatabase() {
             dimensions TEXT,
             urls TEXT,
             metadata_url TEXT,
-            directory_hash TEXT
+            directory_hash TEXT,
+            hdr TEXT,
+            additional_metadata TEXT
         );
     `)
     await db.exec(`
@@ -70,7 +76,9 @@ async function insertOrUpdateMovie(
   dimensions,
   urls,
   metadata_url,
-  hash
+  hash,
+  hdr,
+  additionalMetadata
 ) {
   const movie = {
     name,
@@ -79,20 +87,45 @@ async function insertOrUpdateMovie(
     dimensions: JSON.stringify(dimensions),
     urls: JSON.stringify(urls),
     hash,
+    hdr,
+    additional_metadata: JSON.stringify(additionalMetadata)
   }
 
   const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name])
   if (existingMovie) {
     if (existingMovie.directory_hash !== hash) {
       await db.run(
-        'UPDATE movies SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ? WHERE name = ?',
-        [movie.file_names, movie.lengths, movie.dimensions, movie.urls, metadata_url, hash, name]
+        `UPDATE movies 
+         SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ? 
+         WHERE name = ?`,
+        [
+          movie.file_names,
+          movie.lengths,
+          movie.dimensions,
+          movie.urls,
+          metadata_url,
+          hash,
+          movie.hdr,
+          movie.additional_metadata,
+          name
+        ]
       )
     }
   } else {
     await db.run(
-      'INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, name) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [movie.file_names, movie.lengths, movie.dimensions, movie.urls, metadata_url, hash, name]
+      `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, name) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        movie.file_names,
+        movie.lengths,
+        movie.dimensions,
+        movie.urls,
+        metadata_url,
+        hash,
+        movie.hdr,
+        movie.additional_metadata,
+        name
+      ]
     )
   }
 }
@@ -132,6 +165,8 @@ async function getMovies(db) {
     urls: JSON.parse(movie.urls),
     metadataUrl: movie.metadata_url,
     directory_hash: movie.directory_hash,
+    hdr: movie.hdr,
+    additional_metadata: JSON.parse(movie.additional_metadata)
   }))
 }
 
