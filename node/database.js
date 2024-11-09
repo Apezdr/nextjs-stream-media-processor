@@ -53,18 +53,44 @@ async function initializeIndexes() {
         await client.connect();
         const mediaDb = client.db("Media");
 
-        // Ensure index on Media.Movies collection
+        // Ensure indexes on Media.Movies collection
         const moviesCollection = mediaDb.collection("Movies");
-        await ensureIndex(moviesCollection, { videoURL: -1 }, { name: "videoURL_index" });
+        await ensureIndex(moviesCollection, 
+            { videoURL: 1 }, 
+            { name: "video_lookup" }
+        );
 
         // Ensure indexes on Media.TV collection
         const tvCollection = mediaDb.collection("TV");
-        await ensureIndex(tvCollection, { title: -1 }, { name: "title_index" });
-        await ensureIndex(tvCollection, { "seasons.episodes.videoURL": -1 }, { name: "episodes_videoURL_index" });
+        await ensureIndex(tvCollection, 
+            { "seasons.episodes.videoURL": 1 }, 
+            { name: "episode_lookup" }
+        );
+        // Keep the title index as it might be useful for other queries
+        await ensureIndex(tvCollection, 
+            { title: -1 }, 
+            { name: "title_index" }
+        );
 
-        // Ensure index on PlaybackStatus collection
+        // Ensure indexes on PlaybackStatus collection
         const playbackStatusCollection = mediaDb.collection("PlaybackStatus");
-        await ensureIndex(playbackStatusCollection, { userId: 1 }, { name: "userId_1" });
+        // Replace the simple userId index with the compound index
+        await ensureIndex(playbackStatusCollection, 
+            { 
+                userId: 1,
+                "videosWatched.lastUpdated": -1 
+            }, 
+            { name: "user_watchHistory" }
+        );
+
+        // Optionally, add a TTL index for cleanup if needed
+        // await ensureIndex(playbackStatusCollection,
+        //     { "videosWatched.lastUpdated": 1 },
+        //     { 
+        //         name: "cleanup_old_records",
+        //         expireAfterSeconds: 30 * 24 * 60 * 60  // 30 days
+        //     }
+        // );
 
         console.log("Indexes have been initialized successfully.");
     } catch (error) {
