@@ -328,9 +328,7 @@ async function getStoredBlurhash(imagePath, basePath) {
 
   // Construct the command in a cross-platform way
   const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
-  const escapedImagePath = process.platform === 'win32' 
-    ? imagePath.replace(/"/g, '\\"')
-    : imagePath.replace(/(["\s'$`\\])/g, '\\$1');
+  const escapedImagePath = imagePath.replace(/"/g, '\\"');
   const command = `${pythonExecutable} ${blurhashCli} "${escapedImagePath}"`;
 
   try {
