@@ -10,8 +10,15 @@ WORKDIR /usr/src/app/node
 # Copy package.json and package-lock.json to the working directory
 COPY node/package*.json ./
 
-# Copy .env.local to the working directory if it exists
-COPY .env.local .env.local
+# Use build arguments for environment variables
+ARG NODE_ENV
+ARG API_KEY
+# Add other necessary build arguments here
+
+# Set environment variables
+ENV NODE_ENV=${NODE_ENV}
+ENV API_KEY=${API_KEY}
+# Set other environment variables here
 
 # Install Node.js dependencies including sharp with optional dependencies
 RUN npm install --include=optional
@@ -59,9 +66,6 @@ RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
 
 # Convert scripts to Unix format
 RUN dos2unix /usr/src/app/scripts/*.sh
-
-# Source the .env.local file if it exists (this step is not needed anymore as .env.local is removed in the builder stage)
-# RUN if [ -f .env.local ]; then export $(cat .env.local | xargs); fi
 
 # Command to run Node.js app
 CMD ["sh", "-c", "node /usr/src/app/node/app.js --max-old-space-size=2048"]

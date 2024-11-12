@@ -38,7 +38,7 @@ const sharp = require("sharp");
 const { getInfo } = require("./infoManager");
 const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
-const LOG_FILE = '/var/log/cron.log';
+const LOG_FILE = process.env.LOG_PATH ? path.join(process.env.LOG_PATH, 'cron.log') : '/var/log/cron.log';
 // Define the base path to the tv/movie folders
 const BASE_PATH = process.env.BASE_PATH ? process.env.BASE_PATH : "/var/www/html";
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
@@ -1545,39 +1545,45 @@ app.post('/media/scan', async (req, res) => {
 
 async function runGeneratePosterCollage() {
   console.log(`Running generate_poster_collage.py job${debugMessage}`);
+  const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
+  const escapedScript = process.platform === 'win32' 
+    ? generatePosterCollageScript.replace(/"/g, '\\"')
+    : generatePosterCollageScript.replace(/(["\s'\\])/g, '\\$1');
   const command = isDebugMode 
-    ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${generatePosterCollageScript} >> ${LOG_FILE} 2>&1'` 
-    : `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${generatePosterCollageScript}'`;
+    ? `${pythonExecutable} "${escapedScript}" >> "${LOG_FILE}" 2>&1` 
+    : `${pythonExecutable} "${escapedScript}"`;
 
   try {
-    await execAsync(command);
+    const env = {
+      ...process.env,
+      DEBUG: process.env.DEBUG,
+      TMDB_API_KEY: process.env.TMDB_API_KEY
+    };
+    await execAsync(command, { env });
   } catch (error) {
     console.error(`Error executing generate_poster_collage.py: ${error}`);
   }
 }
-
 async function runDownloadTmdbImages(specificShow = null, specificMovie = null, fullScan = false) {
   const debugMessage = isDebugMode ? ' with debug' : '';
   console.log(`Download tmdb request${specificShow ? ` for show "${specificShow}"` : ''}${specificMovie ? ` for movie "${specificMovie}"` : ''}${fullScan ? ' with full scan' : ''}`);
 
-  // Start constructing the command within single quotes
-  let command = `sudo bash -c 'env DEBUG=${process.env.DEBUG} TMDB_API_KEY=${process.env.TMDB_API_KEY} python3 ${downloadTmdbImagesScript}`;
+  // Construct the command using cross-platform path handling
+  let command = `python "${downloadTmdbImagesScript}"`;
 
-  // Append arguments inside the single quotes
+  // Append arguments
   if (specificShow) {
     command += ` --show "${specificShow}"`;
   } else if (specificMovie) {
     command += ` --movie "${specificMovie}"`;
   }
 
-  // Close the single quotes after all arguments are appended
-  command += `'`;
-
   // Handle logging if in debug mode
+  let logRedirect = '';
   if (isDebugMode) {
     try {
       await fs.access(LOG_FILE, fs.constants.W_OK);
-      command += ` >> ${LOG_FILE} 2>&1`;
+      logRedirect = process.platform === 'win32' ? ` >> "${LOG_FILE}" 2>&1` : ` >> "${LOG_FILE}" 2>&1`;
     } catch (err) {
       console.warn(`No write access to ${LOG_FILE}. Logging to console instead.`);
     }
@@ -1585,7 +1591,13 @@ async function runDownloadTmdbImages(specificShow = null, specificMovie = null, 
 
   try {
     console.log(`Running download_tmdb_images.py job${debugMessage}${specificShow ? ` for show "${specificShow}"` : ''}${specificMovie ? ` for movie "${specificMovie}"` : ''}${fullScan ? ' with full scan' : ''}`);
-    const { stdout, stderr } = await execAsync(command);
+    const { stdout, stderr } = await execAsync(command + logRedirect, {
+      env: {
+        ...process.env,
+        DEBUG: process.env.DEBUG,
+        TMDB_API_KEY: process.env.TMDB_API_KEY
+      }
+    });
     
     if (stderr) {
       console.error(`download_tmdb_images.py error: ${stderr}`);

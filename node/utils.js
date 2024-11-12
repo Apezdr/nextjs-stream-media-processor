@@ -6,7 +6,7 @@ const path = require('path');
 const scriptsDir = path.resolve(__dirname, '../scripts/utils');
 const blurhashCli = path.join(scriptsDir, 'blurhash_cli.py');
 const crypto = require('crypto');
-const LOG_FILE = '/var/log/blurhash.log';
+const LOG_FILE = process.env.LOG_PATH ? path.join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
 
 // Define the main cache directory
 const mainCacheDir = path.join(__dirname, 'cache');
@@ -326,8 +326,12 @@ async function getStoredBlurhash(imagePath, basePath) {
   const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
   console.log(`Running blurhash_cli.py job${debugMessage}`);
 
-  // Construct the command based on debug mode
-  const command = `sudo bash -c "python3 ${blurhashCli} \\"${imagePath.replace(/"/g, '\\"')}\\""`;
+  // Construct the command in a cross-platform way
+  const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
+  const escapedImagePath = process.platform === 'win32' 
+    ? imagePath.replace(/"/g, '\\"')
+    : imagePath.replace(/(["\s'$`\\])/g, '\\$1');
+  const command = `${pythonExecutable} ${blurhashCli} "${escapedImagePath}"`;
 
   try {
     // Execute the command
@@ -347,7 +351,6 @@ async function getStoredBlurhash(imagePath, basePath) {
     return null;
   }
 }
-
 async function calculateDirectoryHash(dirPath, maxDepth = 5) {
   const hash = crypto.createHash('sha256');
 

@@ -23,6 +23,8 @@ from utils.image_utils import (
     extract_file_extension
 )
 import logging
+from dotenv import load_dotenv
+from pathlib import Path
 
 # Configure logging with timestamps, logger names, and clear messages
 logging.basicConfig(
@@ -65,8 +67,16 @@ parser.add_argument('--show', type=str, help='Specific TV show to scan')
 parser.add_argument('--movie', type=str, help='Specific movie to scan')
 args = parser.parse_args()
 
-SHOWS_DIR = '/var/www/html/tv'
-MOVIES_DIR = '/var/www/html/movies'
+# Load environment variables from .env.local in parent directory
+env_path = Path(__file__).parent.parent / '.env.local'
+load_dotenv(env_path)
+
+# Get base path from environment variable with default fallback
+BASE_PATH = os.getenv('BASE_PATH', '/var/www/html')
+
+# Update the path definitions
+SHOWS_DIR = os.path.join(BASE_PATH, 'tv')
+MOVIES_DIR = os.path.join(BASE_PATH, 'movies')
 
 async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
     """

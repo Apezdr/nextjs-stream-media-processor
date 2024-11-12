@@ -5,11 +5,9 @@ import aiohttp
 from urllib.parse import urlparse
 from datetime import datetime
 import re
-from utils.blurhash_cli import process_image
 import logging
 from typing import Optional, Dict
 import asyncio
-import aiofiles
 
 logger = logging.getLogger(__name__)
 
@@ -187,21 +185,6 @@ async def fetch_episode_thumbnail_url(
     if images_data and 'stills' in images_data and images_data['stills']:
         return f'https://image.tmdb.org/t/p/original{images_data["stills"][0]["file_path"]}'
     return None
-
-async def generate_blurhash_for_image(file_path: str, blurhash_file_path: str):
-    """
-    Generates the blurhash for the given image file and saves it to the blurhash file.
-    """
-    try:
-        blurhash_string = await asyncio.to_thread(process_image, file_path)
-        if blurhash_string:  # Check if the blurhash_string is valid (not None or empty)
-            async with aiofiles.open(blurhash_file_path, 'w') as blurhash_file:
-                await blurhash_file.write(blurhash_string)
-            print(f"Blurhash saved to {blurhash_file_path}")
-        else:
-            print("No valid blurhash generated for the image.")
-    except Exception as e:
-        print(f"Error generating blurhash: {e}")
 
 def extract_file_extension(url: str) -> str:
     """

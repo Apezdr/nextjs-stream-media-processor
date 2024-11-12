@@ -82,6 +82,13 @@ async function initializeIndexes() {
             }, 
             { name: "user_watchHistory" }
         );
+        
+        await ensureIndex(playbackStatusCollection, 
+            { 
+                userId: 1,
+            }, 
+            { name: "userId_1" }
+        );
 
         // Optionally, add a TTL index for cleanup if needed
         // await ensureIndex(playbackStatusCollection,
@@ -126,7 +133,7 @@ async function checkAutoSync() {
         }
     } catch (error) {
         console.error("An error occurred:", error);
-        process.exit(1); // Exit with error
+        //process.exit(1); // Exit with error
     } finally {
         await client.close();
         return autoSyncResponse;

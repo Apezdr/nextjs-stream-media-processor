@@ -1,6 +1,15 @@
 from PIL import Image
 import os
 import math
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load environment variables from .env.local in parent directory
+env_path = Path(__file__).parent.parent / '.env.local'
+load_dotenv(env_path)
+
+# Get base path from environment variable with default fallback
+BASE_PATH = os.getenv('BASE_PATH', '/var/www/html')
 
 def create_collage(width, height, list_of_images):
     collage = Image.new('RGB', (width, height))
@@ -33,8 +42,9 @@ def repeat_images_to_fill(total_images_needed, images):
     return repeated_images[:total_images_needed]
 
 # Paths
-movies_dir = '/var/www/html/movies'
-tv_dir = '/var/www/html/tv'
+movies_dir = os.path.join(BASE_PATH, 'movies')
+tv_dir = os.path.join(BASE_PATH, 'tv')
+output_path = os.path.join(BASE_PATH, 'poster_collage.jpg')
 
 # Collect posters
 movie_posters = get_posters(movies_dir, 'poster.jpg')
@@ -66,4 +76,4 @@ all_posters = repeat_images_to_fill(total_images_needed, all_posters)
 collage = create_collage(collage_width, collage_height, all_posters)
 
 # Save collage
-collage.save('/var/www/html/poster_collage.jpg')
+collage.save(output_path)
