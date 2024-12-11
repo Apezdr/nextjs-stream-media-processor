@@ -24,7 +24,8 @@ async function initializeDatabase() {
             metadata_url TEXT,
             directory_hash TEXT,
             hdr TEXT,
-            additional_metadata TEXT
+            additional_metadata TEXT,
+            _id TEXT
         );
     `)
     await db.exec(`
@@ -78,7 +79,8 @@ async function insertOrUpdateMovie(
   metadata_url,
   hash,
   hdr,
-  additionalMetadata
+  additionalMetadata,
+  _id,
 ) {
   const movie = {
     name,
@@ -88,7 +90,8 @@ async function insertOrUpdateMovie(
     urls: JSON.stringify(urls),
     hash,
     hdr,
-    additional_metadata: JSON.stringify(additionalMetadata)
+    additional_metadata: JSON.stringify(additionalMetadata),
+    _id,
   }
 
   const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name])
@@ -96,7 +99,7 @@ async function insertOrUpdateMovie(
     if (existingMovie.directory_hash !== hash) {
       await db.run(
         `UPDATE movies 
-         SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ? 
+         SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ?, _id = ?
          WHERE name = ?`,
         [
           movie.file_names,
@@ -107,14 +110,15 @@ async function insertOrUpdateMovie(
           hash,
           movie.hdr,
           movie.additional_metadata,
+          _id,
           name
         ]
       )
     }
   } else {
     await db.run(
-      `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, name) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, _id, name) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         movie.file_names,
         movie.lengths,
@@ -124,6 +128,7 @@ async function insertOrUpdateMovie(
         hash,
         movie.hdr,
         movie.additional_metadata,
+        _id,
         name
       ]
     )
@@ -166,7 +171,8 @@ async function getMovies(db) {
     metadataUrl: movie.metadata_url,
     directory_hash: movie.directory_hash,
     hdr: movie.hdr,
-    additional_metadata: JSON.parse(movie.additional_metadata)
+    additional_metadata: JSON.parse(movie.additional_metadata),
+    _id: movie._id
   }))
 }
 
@@ -191,6 +197,7 @@ async function getMovieById(db, id) {
       urls: JSON.parse(movie.urls),
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
+      _id: movie._id,
     }
   }
   return null
@@ -208,6 +215,7 @@ async function getMovieByName(db, name) {
       urls: JSON.parse(movie.urls),
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
+      _id: movie._id,
     }
   }
   return null

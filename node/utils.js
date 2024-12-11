@@ -138,21 +138,14 @@ function generateCacheKey(...args) {
   return hash.digest('hex');
 }
 
-// Get the cached clip path based on the cache key
-function getCachedClipPath(cacheKey) {
-  return path.join(videoClipsCacheDir, `${cacheKey}.mp4`);
-}
-
-// Check if a cached clip exists and is still valid (within 5 minutes)
-async function isCacheValid(cachedClipPath) {
-  try {
-    const stats = await fs.stat(cachedClipPath);
-    const now = Date.now();
-    const fileAge = (now - stats.mtimeMs) / 1000; // Age in seconds
-    return fileAge < 300; // 300 seconds = 5 minutes
-  } catch (error) {
-    return false;
-  }
+/**
+ * Generates the cached clip path based on the cache key and desired extension.
+ * @param {string} cacheKey - Unique key for the cached clip.
+ * @param {string} [extension='.mp4'] - Desired file extension (e.g., '.webm', '.mp4').
+ * @returns {string} - Full path to the cached clip.
+ */
+function getCachedClipPath(cacheKey, extension = '.mp4') {
+  return path.join(videoClipsCacheDir, `${cacheKey}${extension}`);
 }
 
 // Set to track ongoing cache generations
@@ -191,12 +184,12 @@ async function clearGeneralCache() {
 
 /**
  * Clears expired files from the Video Clips Cache.
- * Max Age: 5 minutes
+ * Max Age: 1 month
  */
 async function clearVideoClipsCache() {
   const now = Date.now();
   const cacheType = 'video_clips';
-  const maxAge = 5 * 60; // 5 minutes in seconds
+  const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
   const dir = videoClipsCacheDir;
 
   try {
@@ -218,7 +211,6 @@ async function clearVideoClipsCache() {
     console.error(`Error reading ${cacheType} cache directory:`, err);
   }
 }
-
 /**
  * Clears expired files from the Spritesheet Cache.
  * Adjust the maxAge as per your requirement.
@@ -314,7 +306,8 @@ async function findMp4File(directory, specificFileName = null, extraData = false
 async function getStoredBlurhash(imagePath, basePath) {
   const blurhashFile = `${imagePath}.blurhash`;
   const relativePath = path.relative(basePath, blurhashFile);
-  const encodedRelativePath = relativePath.split(path.sep).map(encodeURIComponent).join(path.sep);
+  const urlFriendlyPath = relativePath.split(path.sep).join('/');
+  const encodedRelativePath = urlFriendlyPath.split('/').map(encodeURIComponent).join('/');
   const relativeUrl = `${PREFIX_PATH}/${encodedRelativePath}`;
 
   if (await fileExists(blurhashFile)) {
@@ -499,7 +492,6 @@ module.exports = {
   framesCacheDir,
   generateCacheKey,
   getCachedClipPath,
-  isCacheValid,
   ongoingCacheGenerations,
   findMp4File,
   getStoredBlurhash,

@@ -36,23 +36,134 @@ async function checkSpriteSheetTypeAvailablePath(avifSpriteSheetPath, pngSpriteS
   return false;
 }
 
-async function generateSpriteSheet({ videoPath, type, name, season = null, episode = null, cacheDir }) {
+/**
+ * Optimizes a PNG spritesheet using Sharp with configurable options
+ * @param {string} inputPath - Path to the input PNG file
+ * @param {string} outputPath - Path for the optimized output PNG
+ * @param {Object} options - Optimization options
+ * @returns {Promise<void>}
+ */
+async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
+  const {
+    quality = 65,          // Balanced quality
+    compressionLevel = 9,  // Maximum compression
+    colors = 256,         // Maximum allowed colors in palette
+    dither = 0.9,         // Dithering amount for color reduction
+    enableBlur = false,   // Optional blur
+    blur = 0.3,          // Minimum valid blur value
+    usePalette = true    // Whether to use palette-based optimization
+  } = options;
+
+  try {
+    console.log('Starting PNG optimization...');
+    console.log('Input path:', inputPath);
+    console.log('Output path:', outputPath);
+
+    const originalStats = await fs.stat(inputPath);
+    console.log(`Original file size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB`);
+
+    // Create optimization temp path (distinct from input)
+    const optimizationTempPath = outputPath.replace('.png', '_optimization.png');
+
+    // Ensure colors is within valid range for palette mode
+    const validColors = usePalette ? Math.min(Math.max(2, colors), 256) : undefined;
+    
+    // Step 1: Initial optimization
+    console.log('Step 1: Initial optimization...');
+    let sharpInstance = sharp(inputPath, {
+      limitInputPixels: false,
+      sequentialRead: true,
+    });
+
+    if (enableBlur) {
+      sharpInstance = sharpInstance.blur(blur);
+    }
+
+    const pngOptions = {
+      quality,
+      compressionLevel,
+      effort: 10,
+      adaptiveFiltering: true,
+    };
+
+    if (usePalette) {
+      pngOptions.palette = true;
+      pngOptions.colors = validColors;
+      pngOptions.dither = dither;
+      console.log(`Using palette mode with ${validColors} colors and ${dither} dither`);
+    } else {
+      console.log('Using standard PNG compression without palette');
+    }
+
+    // Single optimization pass to temp file
+    await sharpInstance
+      .png(pngOptions)
+      .toFile(optimizationTempPath);
+
+    // Move optimized file to final destination
+    await fs.rename(optimizationTempPath, outputPath);
+
+    // Get final results
+    const optimizedStats = await fs.stat(outputPath);
+    const savings = ((originalStats.size - optimizedStats.size) / originalStats.size * 100).toFixed(2);
+
+    const metadata = await sharp(outputPath).metadata();
+
+    console.log(`
+PNG optimization results:
+------------------------
+Original size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB
+Optimized size: ${(optimizedStats.size / 1024 / 1024).toFixed(2)}MB
+Size reduction: ${savings}%
+Dimensions: ${metadata.width}x${metadata.height}
+Color depth: ${metadata.bitDepth}
+Channels: ${metadata.channels}
+Palette mode: ${usePalette ? 'enabled' : 'disabled'}
+Colors: ${usePalette ? validColors : 'full'}
+Dither: ${usePalette ? dither : 'n/a'}
+Quality: ${quality}
+Blur: ${enableBlur ? blur : 'disabled'}
+`);
+
+    return {
+      originalSize: originalStats.size,
+      optimizedSize: optimizedStats.size,
+      savings: parseFloat(savings),
+      width: metadata.width,
+      height: metadata.height,
+      usedPalette: usePalette,
+      usedColors: validColors
+    };
+
+  } catch (error) {
+    console.error('PNG optimization error:', error);
+    if (error.stack) {
+      console.error('Error stack:', error.stack);
+    }
+    throw error;
+  }
+}
+
+async function generateSpriteSheet({ videoPath, type, name, season, episode, cacheDir }) {
   try {
     const duration = await getVideoDuration(videoPath);
     const floorDuration = Math.floor(duration);
-    const hours = Math.floor(floorDuration / 3600);
-    const minutes = Math.floor((floorDuration % 3600) / 60);
-    const seconds = floorDuration % 60;
-    console.log(`Total Duration: ${hours}h ${minutes}m ${seconds}s`);
+    const interval = 5; // Interval between frames
 
-    const interval = 5; // Adjust if needed
+    // Calculate dimensions
+    const totalFrames = Math.floor(floorDuration / interval) + 1;
+    const columns = 10;
+    const rows = Math.ceil(totalFrames / columns);
+    const thumbHeight = 180; // Each thumbnail is 320x180
+    const totalHeight = rows * thumbHeight;
+    const maxAvifHeight = 30780;
+    
+    // Calculate dimensions and determine format
+    const useAvif = totalHeight <= maxAvifHeight;
+    console.log(`Sprite sheet dimensions: ${columns} columns x ${rows} rows = ${totalHeight}px height`);
+    console.log(`Using ${useAvif ? 'AVIF' : 'PNG'} format`);
 
-    // Calculate the total number of frames
-    const totalFrames = Math.floor(floorDuration / interval) + 1; // Add 1 to include the last frame
-    const columns = 10; // Number of columns in the sprite sheet
-    const rows = Math.ceil(totalFrames / columns); // Calculate the number of rows
-
-    // Define base file name (without extension)
+    // Define filenames
     let spriteSheetFileNameBase, vttFileName;
     if (type === 'movies') {
       spriteSheetFileNameBase = `movie_${name}_spritesheet`;
@@ -62,55 +173,81 @@ async function generateSpriteSheet({ videoPath, type, name, season = null, episo
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
 
-    // Determine output format based on duration
-    let outputFormat = 'png'; // Default to png
-    // if (duration > 3600) { // If video is longer than 1 hour
-    //   outputFormat = 'png';
-    // }
-
-    const spriteSheetExtension = outputFormat === 'avif' ? '.avif' : '.png';
-    const spriteSheetFileName = spriteSheetFileNameBase + spriteSheetExtension;
-    const spriteSheetPath = path.join(cacheDir, spriteSheetFileName);
+    const finalSpriteSheetPath = path.join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
     const vttFilePath = path.join(cacheDir, vttFileName);
 
-    const avifSpriteSheetPath = path.join(cacheDir, spriteSheetFileNameBase + '.avif')
-    const pngSpriteSheetPath = path.join(cacheDir, spriteSheetFileNameBase + '.png')
+    // Check if we need to generate the spritesheet
+    if (!await fileExists(finalSpriteSheetPath)) {
+      console.log('Generating new sprite sheet...');
+      
+      // Generate initial PNG with FFmpeg
+      const ffmpegOutputPath = path.join(cacheDir, `${spriteSheetFileNameBase}_ffmpeg.png`);
+      
+      await generateSpriteSheetWithFFmpeg(
+        videoPath,
+        ffmpegOutputPath,
+        interval,
+        columns,
+        rows,
+        'png'
+      );
 
-    let spriteSheetTypeAvailablePath = false;
-    spriteSheetTypeAvailablePath = await checkSpriteSheetTypeAvailablePath(avifSpriteSheetPath, pngSpriteSheetPath, spriteSheetPath);
-
-    // Check if sprite sheet and VTT already exist
-    if (spriteSheetTypeAvailablePath && await fileExists(vttFilePath)) {
-      console.log(`Serving existing sprite sheet and VTT files.`);
-      return { spriteSheetTypeAvailablePath, vttFilePath };
+      if (useAvif) {
+        // Convert to AVIF
+        await convertToAvif(ffmpegOutputPath, finalSpriteSheetPath, 90, 6, true);
+        // Clean up FFmpeg output
+        await fs.unlink(ffmpegOutputPath).catch(console.error);
+      } else {
+        // Optimize PNG
+        console.log('Optimizing PNG spritesheet...');
+        try {
+          await optimizePNGSpritesheet(
+            ffmpegOutputPath,  // Input is FFmpeg output
+            finalSpriteSheetPath,  // Output is final destination
+            {
+              quality: 65,
+              compressionLevel: 9,
+              colors: 256,
+              dither: 0.9,
+              usePalette: true
+            }
+          );
+          // Clean up FFmpeg output after successful optimization
+          await fs.unlink(ffmpegOutputPath).catch(console.error);
+        } catch (optimizeError) {
+          console.error('PNG optimization failed, using unoptimized PNG:', optimizeError);
+          // If optimization fails, just move the FFmpeg output to final destination
+          await fs.rename(ffmpegOutputPath, finalSpriteSheetPath);
+        }
+      }
+    } else {
+      console.log('Using existing sprite sheet');
     }
 
-    await handlePNGSpriteSheetConversion(pngSpriteSheetPath, avifSpriteSheetPath);
-    // If sprite sheet doesn't exist, generate it according to the output format available
-    // (ffmpeg can't handle long videos for AVIF spritesheets)
-    // So we convert create it as either an AVIF or PNG spritesheet
-    // and then convert the AVIF sprite sheet to AVIF if needed
-    if (!spriteSheetTypeAvailablePath) {
-      // Use FFmpeg to generate the sprite sheet
-      await generateSpriteSheetWithFFmpeg(videoPath, spriteSheetPath, interval, columns, rows, outputFormat);
-      await handlePNGSpriteSheetConversion(pngSpriteSheetPath, avifSpriteSheetPath);
-    }
-    spriteSheetTypeAvailablePath = await checkSpriteSheetTypeAvailablePath(avifSpriteSheetPath, pngSpriteSheetPath);
-    // Check if VTT file exists
-    if (!await fileExists(vttFilePath) && spriteSheetTypeAvailablePath) {
-      // Generate the VTT file
-      await generateVttFileFFmpeg(spriteSheetTypeAvailablePath, vttFilePath, floorDuration, interval, columns, rows, type, name, season, episode);
-    } else if (!spriteSheetTypeAvailablePath) {
-      console.error(`Sprite sheet not found at: ${spriteSheetPath}`);
-      return {}
+    // Generate VTT if needed
+    if (!await fileExists(vttFilePath)) {
+      await generateVttFileFFmpeg(
+        finalSpriteSheetPath,
+        vttFilePath,
+        floorDuration,
+        interval,
+        columns,
+        rows,
+        type,
+        name,
+        season,
+        episode
+      );
     }
 
-
-    console.log('Sprite sheet and VTT file generated successfully.');
-    return { spriteSheetTypeAvailablePath, vttFilePath };
+    return {
+      spriteSheetPath: finalSpriteSheetPath,
+      vttFilePath,
+      format: useAvif ? 'avif' : 'png'
+    };
   } catch (error) {
     console.error(`Error in generateSpriteSheet: ${error}`);
-    throw error; // Re-throw the error to be handled by the caller
+    throw error;
   }
 }
 

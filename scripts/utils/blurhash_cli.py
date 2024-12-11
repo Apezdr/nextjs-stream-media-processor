@@ -21,6 +21,9 @@ async def generate_blurhash(image_path, x_components=4, y_components=3):
         if img.mode != 'RGB':
             img = await asyncio.to_thread(img.convert, 'RGB')
 
+        # Get original image dimensions
+        width, height = img.size
+
         # Save the image to an in-memory buffer
         buffered = io.BytesIO()
         await asyncio.to_thread(img.save, buffered, format="JPEG")  # Save image to buffer as JPEG
@@ -32,14 +35,16 @@ async def generate_blurhash(image_path, x_components=4, y_components=3):
         # Close the image (clean up)
         img.close()
 
-        return hash
+        return hash, width, height
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return None
 
 # Async function to convert a blurhash string to a base64-encoded image
-async def blurhash_to_base64(hash, width=400, height=300):
+async def blurhash_to_base64(hash, width, height):
     try:
+        width = int(width)
+        height = int(height)
         # Decode the blurhash to an image (non-blocking)
         image = await asyncio.to_thread(blurhash.decode, hash, width, height)
         buffered = io.BytesIO()
@@ -51,9 +56,20 @@ async def blurhash_to_base64(hash, width=400, height=300):
 
 # Async function to process an image (generate blurhash and convert to base64)
 async def process_image(image_path):
-    blurhash_string = await generate_blurhash(image_path)
-    if blurhash_string:
-        base64_image = await blurhash_to_base64(blurhash_string)
+    result = await generate_blurhash(image_path)
+    if result:
+        blurhash_string, original_width, original_height = result
+        max_height = 80
+        if original_height == 0:
+            print(f"Error: Original image height is zero.", file=sys.stderr)
+            return None
+        output_height = min(original_height, max_height)
+        scale_factor = output_height / original_height
+        output_width = int(original_width * scale_factor)
+        # Ensure output_width is at least 1
+        output_width = max(output_width, 1)
+        output_height = int(output_height)
+        base64_image = await blurhash_to_base64(blurhash_string, width=output_width, height=output_height)
         return base64_image
     return None
 

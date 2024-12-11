@@ -1,19 +1,26 @@
 const fs = require("fs").promises;
 const util = require('util');
+const { fileExists } = require("./utils");
+const crypto = require('crypto');
 const exec = util.promisify(require("child_process").exec);
+const execAsync = util.promisify(exec);
+
+// Used to determine if regenerating info is necessary
+const CURRENT_VERSION = 1.0002;
 
 /**
- * Checks if a file exists.
- * @param {string} filePath - Path to the file.
- * @returns {Promise<boolean>}
+ * Validates basic info object structure
+ * @param {object} info - The info object to validate
+ * @returns {boolean} - Whether the info object is valid
  */
-async function fileExists(filePath) {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+function validateInfo(info) {
+  return (
+    typeof info.version === 'number' &&
+    typeof info.length === 'number' &&
+    typeof info.dimensions === 'string' &&
+    (info.hdr === null || typeof info.hdr === 'string') &&
+    typeof info.additionalMetadata === 'object'
+  );
 }
 
 /**
@@ -156,14 +163,84 @@ async function extractAdditionalMetadata(episodePath) {
     }));
 
     return {
-      duration: format.duration ? parseFloat(format.duration) : null, // in seconds
-      size: format.size ? parseInt(format.size) : null, // in bytes
+      duration: format.duration ? Math.floor(parseFloat(format.duration) * 1000) : null, // in ms
+      size: format.size ? parseInt(format.size) / 1024 : null, // in KB
       audio: audioDetails,
       video: videoDetails
     };
   } catch (error) {
     console.error(`Error extracting additional metadata for ${episodePath}:`, error);
     return {};
+  }
+}
+
+/**
+ * Extract stable header data using MediaInfo.
+ * We'll use a subset of attributes from both the General and Video tracks
+ * that are likely consistent across servers if they have the same exact file.
+ *
+ * @param {string} episodePath - The path to the media file.
+ * @returns {Promise<string>} A stable, reproducible string of header info.
+ */
+async function getHeaderData(episodePath) {
+  try {
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
+    const data = JSON.parse(stdout);
+
+    // Extract the General track
+    const generalTrack = data.media.track.find(t => t["@type"] === "General");
+    if (!generalTrack) {
+      console.warn(`No general track found in ${episodePath}, cannot form stable header data.`);
+      return '';
+    }
+
+    // Extract the first Video track
+    const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
+    if (videoTracks.length === 0) {
+      console.warn(`No video tracks found in ${episodePath}, cannot form stable header data.`);
+      return '';
+    }
+    const video = videoTracks[0];
+
+    // Attributes from General track
+    // Using these fields to improve uniqueness and reliability:
+    // FileSize, Duration, OverallBitRate, FrameCount
+    const generalFields = [
+      generalTrack.FileSize,
+      generalTrack.Duration,
+      generalTrack.OverallBitRate,
+      generalTrack.FrameCount
+    ];
+
+    // Attributes from Video track
+    // In addition to the previous fields (Format, CodecID, Width, Height, FrameRate, BitDepth, ColorSpace, ChromaSubsampling, ScanType, StreamSize)
+    // we include Format_Profile, Format_Level, FrameCount, and Encoded_Library_Settings if available.
+    const videoFields = [
+      video.Format,
+      video.CodecID,
+      video.Width,
+      video.Height,
+      video.FrameRate,
+      video.BitDepth,
+      video.ColorSpace,
+      video.ChromaSubsampling,
+      video.ScanType,
+      video.StreamSize,
+      video.Format_Profile,
+      video.Format_Level,
+      video.FrameCount,
+      video.Encoded_Library_Settings
+    ];
+
+    // Combine all fields
+    const stableFields = [...generalFields, ...videoFields]
+      .filter(Boolean) // Remove undefined or null values
+      .join('|');
+
+    return stableFields;
+  } catch (error) {
+    console.error(`Error extracting header data with MediaInfo for ${episodePath}:`, error);
+    return '';
   }
 }
 
@@ -185,11 +262,17 @@ async function generateInfo(episodePath, infoFile) {
     const fileLength = Math.floor(parseFloat(durationStdout.trim()) * 1000); // Convert to milliseconds
     const fileDimensions = dimensionsStdout.trim();
 
+    // Generate MD4 hash from headers
+    const headerData = await getHeaderData(episodePath);
+    const headerHash = crypto.createHash('sha256').update(headerData).digest('hex');
+
     // Extract HDR and additional metadata
     const hdr = await extractHDRInfo(episodePath);
     const additionalMetadata = await extractAdditionalMetadata(episodePath);
 
     const info = {
+      version: CURRENT_VERSION,
+      uuid: headerHash,
       length: fileLength,
       dimensions: fileDimensions,
       hdr: hdr, // Enhanced HDR information
@@ -207,7 +290,7 @@ async function generateInfo(episodePath, infoFile) {
   }
 }
 
-/**
+/*
  * Reads the .info file and returns an object.
  * If the file does not exist or is invalid, it generates the info using ffprobe.
  * @param {string} episodePath - Path to the episode file.
@@ -221,18 +304,14 @@ async function getInfo(episodePath) {
     try {
       const fileInfo = await fs.readFile(infoFile, 'utf-8');
       info = JSON.parse(fileInfo);
-      // Validate the presence of required properties
-      if (
-        typeof info.length !== 'number' ||
-        typeof info.dimensions !== 'string' ||
-        (info.hdr !== null && typeof info.hdr !== 'string') ||
-        typeof info.additionalMetadata !== 'object'
-      ) {
-        throw new Error('Invalid info format');
+      
+      // Regenerate if version is old or missing, or if basic validation fails
+      if (!info.version || info.version < CURRENT_VERSION || !validateInfo(info)) {
+        console.log(`Regenerating ${infoFile} due to version update or invalid format`);
+        info = await generateInfo(episodePath, infoFile);
       }
     } catch (error) {
-      console.warn(`Migrating or regenerating ${infoFile} due to error:`, error);
-      // Fallback: regenerate the info
+      console.warn(`Regenerating ${infoFile} due to error:`, error);
       info = await generateInfo(episodePath, infoFile);
     }
   } else {
@@ -260,6 +339,8 @@ async function writeInfo(episodePath, info) {
 }
 
 module.exports = {
+  getHeaderData,
+  extractHDRInfo,
   getInfo,
   writeInfo,
   fileExists

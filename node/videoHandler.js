@@ -11,8 +11,12 @@ const {
   ensureCacheDirs,
   generateCacheKey,
   getCachedClipPath,
-  isCacheValid
 } = require("./utils");
+const { getHardwareAccelerationInfo } = require('./hardwareAcceleration'); // Adjust the path as needed
+const encoderConfigs = require("./encoderConfig");
+const { extractHDRInfo } = require("./infoManager");
+
+let hardwareInfoPromise = null;
 
 async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
@@ -199,9 +203,10 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
  * @param {Object} res - Express response object.
  * @param {string} type - Type of media ('movies' or 'tv').
  * @param {string} basePath - Base path to media files.
+ * @param {Object} db - Database connection or reference.
  */
 async function handleVideoClipRequest(req, res, type, basePath, db) {
-  let cacheKey; // Declare cacheKey in the outer scope
+  let cacheKey;
   try {
     let videoPath;
 
@@ -222,9 +227,27 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
         throw new Error(`Season not found: ${showName} - Season ${season}`);
       }
 
-      const _episode = _season.fileNames.find((e) =>
-        e.includes(`S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`)
-      );
+      const _episode = _season.fileNames.find((e) => {
+        const episodeNumber = String(episode).padStart(2, "0");
+        const seasonNumber = String(season).padStart(2, "0");
+
+        // Match S01E01 format
+        const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
+        if (standardMatch) {
+          const matchedSeason = standardMatch[1].padStart(2, "0");
+          const matchedEpisode = standardMatch[2].padStart(2, "0");
+          return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
+        }
+
+        // Match "01 - Episode Name.mp4" format or variations
+        const alternateMatch = e.match(/^(\d{2})\s*-/);
+        if (alternateMatch) {
+          const matchedEpisode = alternateMatch[1].padStart(2, "0");
+          return matchedEpisode === episodeNumber;
+        }
+
+        return false;
+      });
 
       if (!_episode) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
@@ -247,31 +270,75 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
       return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
     }
 
-    // Generate cache key and cached clip path
-    cacheKey = generateCacheKey(videoPath, start, end); // Assign to the outer scoped variable
-    const cachedClipPath = getCachedClipPath(cacheKey);
+    // Get source video codec and HDR information
+    const probeCmd = `ffprobe -v quiet -print_format json -show_streams -show_format "${videoPath.replace(/"/g, '\\"')}"`;
+    const videoMetadata = await new Promise((resolve, reject) => {
+      exec(probeCmd, (error, stdout) => {
+        if (error) reject(error);
+        else resolve(JSON.parse(stdout));
+      });
+    });
+
+    const videoStream = videoMetadata.streams.find(s => s.codec_type === 'video');
+    const sourceCodec = videoStream.codec_name.toLowerCase();
+    const isHDR = videoStream.color_transfer?.includes('smpte2084') || 
+                  videoStream.color_space?.includes('bt2020');
+    
+    // Determine best encoder based on source and capabilities
+    let selectedEncoderConfig;
+    
+    // For clips, prefer VP9 when possible
+    if (encoderConfigs.vp9_vaapi) {
+      selectedEncoderConfig = encoderConfigs.vp9_vaapi;
+      console.log('Using VP9 VAAPI encoder for clip generation');
+    
+      // Create a copy of the config
+      selectedEncoderConfig = { ...selectedEncoderConfig };
+    
+      // If HDR content, use HDR video filter chain
+      if (isHDR) {
+        console.log('Using HDR conversion filter chain');
+        selectedEncoderConfig.vf = selectedEncoderConfig.hdr_vf;
+      }
+    } 
+    // Fallback to HEVC for HDR content if VP9 is not available
+    else if ((isHDR || sourceCodec === 'hevc') && encoderConfigs.hevc_vaapi) {
+      selectedEncoderConfig = encoderConfigs.hevc_vaapi;
+      console.log('Falling back to HEVC VAAPI encoder');
+    }
+    // Final fallback to H.264
+    else {
+      selectedEncoderConfig = encoderConfigs.libx264;
+      console.log('Falling back to H.264 encoder');
+    }
+
+    // Verify VAAPI device availability
+    if (selectedEncoderConfig.vaapi_device) {
+      try {
+        await fs.access(selectedEncoderConfig.vaapi_device);
+      } catch (error) {
+        console.warn('VAAPI device not available, falling back to software encoding');
+        selectedEncoderConfig = encoderConfigs.libx264;
+      }
+    }
+
+    // Generate cache key
+    cacheKey = generateCacheKey(videoPath, start, end);
+    const cachedClipPath = getCachedClipPath(cacheKey, selectedEncoderConfig.extension);
 
     // Check if cached clip exists and is valid
     if (await fileExists(cachedClipPath)) {
-      // Serve cached clip directly
+      console.log(`Serving existing cached clip: ${cachedClipPath}`);
       return serveCachedClip(res, cachedClipPath, type, req);
     }
 
-    // Check if the video file exists
+    // Check if video file exists
     if (!await fileExists(videoPath)) {
       return res.status(404).send('Video not found.');
     }
 
     // Get video duration to validate end time
-    let videoDuration = 0;
-    try {
-      const { stdout: durationStdout } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`);
-      videoDuration = parseFloat(durationStdout);
-    } catch (err) {
-      console.error('Error getting video duration:', err);
-      return res.status(500).send('Error processing video.');
-    }
-
+    const videoDuration = parseFloat(videoMetadata.format.duration);
     if (end > videoDuration) {
       return res.status(400).send('End time exceeds video duration.');
     }
@@ -279,34 +346,32 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     // Check if another request is already generating this clip
     if (ongoingCacheGenerations.has(cacheKey)) {
       console.log(`Waiting for ongoing generation of cache key: ${cacheKey}`);
-
-      // Poll until the cached clip becomes available
-      await waitForCache(cachedClipPath, 500, 45000); // Poll every 500ms, timeout after 45 seconds
-
-      console.log(`Serving cached clip after waiting: ${cachedClipPath}`);
-      return serveCachedClip(res, cachedClipPath, type, req, start, end);
+      try {
+        await waitForCache(cachedClipPath, 500, 45000);
+        return serveCachedClip(res, cachedClipPath, type, req);
+      } catch (error) {
+        throw new Error('Cache generation timeout');
+      }
     }
 
     // Add to ongoing generations
     ongoingCacheGenerations.add(cacheKey);
 
     try {
-      // If not cached, generate the clip and cache it
+      // Generate the clip
       console.log(`Generating new clip for caching: ${cacheKey}`);
-
-      await generateAndCacheClip(videoPath, start, end, cachedClipPath);
+      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR);
+      
+      // Serve the newly cached clip
+      return serveCachedClip(res, cachedClipPath, type, req);
     } finally {
       // Ensure the cacheKey is removed regardless of success or failure
       ongoingCacheGenerations.delete(cacheKey);
     }
 
-    // Serve the newly cached clip
-    return serveCachedClip(res, cachedClipPath, type, req, start, end);
-
   } catch (error) {
-    console.error(error);
-    // Ensure the cache key is removed from ongoing generations in case of error
-    if (cacheKey) { // Check if cacheKey is defined
+    console.error('Error in clip generation:', error);
+    if (cacheKey) {
       ongoingCacheGenerations.delete(cacheKey);
     }
     if (!res.headersSent) {
@@ -317,43 +382,134 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
   }
 }
 
+/**
+ * Generates a video clip and caches it using FFmpeg.
+ * @param {string} videoPath - Path to the input video.
+ * @param {number} start - Start time in seconds.
+ * @param {number} end - End time in seconds.
+ * @param {string} cachedClipPath - Full path to save the cached clip (with extension).
+ * @param {Object} selectedEncoderConfig - Configuration for the selected encoder.
+ * @param {boolean} isHDR - Flag indicating whether the video is HDR.
+ * @returns {Promise<void>}
+ */
+async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR) {
+  const tmpDir = os.tmpdir();
+  const tempPrefix = path.join(tmpDir, `ffmpeg-${Date.now()}`);
+  const rawVideoFile = `${tempPrefix}-raw.mkv`;
 
-
-// Function to generate the clip and save it to the cache
-async function generateAndCacheClip(videoPath, start, end, cachedClipPath) {
-  return new Promise((resolve, reject) => {
-    const ffmpegArgs = [
+  try {
+    // Step 1: Extract the segment
+    const extractArgs = [
+      '-y',
       '-ss', start.toString(),
-      '-to', end.toString(),
+      '-t', (end - start).toString(),
       '-i', videoPath,
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
       '-c', 'copy',
-      '-movflags', 'frag_keyframe+empty_moov',
-      '-strict', 'unofficial',
-      '-f', 'mp4',
-      cachedClipPath
-  ];
+      '-f', 'matroska',
+      rawVideoFile
+    ];
 
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    // Log the ffmpeg extract command
+    console.log(`Executing FFmpeg extract command: ffmpeg ${extractArgs.join(' ')}`);
 
-    ffmpeg.stderr.on('data', (data) => {
-      console.error(`FFmpeg stderr: ${data}`);
+    // Extract segment
+    await new Promise((resolve, reject) => {
+      const ffmpeg = spawn('ffmpeg', extractArgs);
+      ffmpeg.stderr.on('data', (data) => console.error(`FFmpeg extract stderr: ${data}`));
+      ffmpeg.on('error', reject);
+      ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg extract exited with code ${code}`)));
     });
 
-    ffmpeg.on('error', (err) => {
-      console.error('FFmpeg error:', err);
-      reject(err);
-    });
+    // Step 2: Encode with appropriate filter chain
+    const encodeArgs = [
+      '-y'
+    ];
 
-    ffmpeg.on('close', (code) => {
-      if (code === 0) {
-        console.log(`Cached clip generated at: ${cachedClipPath}`);
-        resolve();
+    if (selectedEncoderConfig.vaapi_device) {
+      encodeArgs.push('-vaapi_device', selectedEncoderConfig.vaapi_device);
+    }
+
+    encodeArgs.push(
+      '-i', rawVideoFile,
+      '-map', '0:v:0',
+      '-map', '0:a:0?',
+      '-fps_mode', 'cfr',
+      '-avoid_negative_ts', 'make_zero',
+      '-max_muxing_queue_size', '9999'
+    );
+
+    // Add codec
+    if (selectedEncoderConfig.codec) {
+      encodeArgs.push('-c:v', selectedEncoderConfig.codec);
+    }
+
+    // Add video filter based on HDR status
+    if (isHDR && selectedEncoderConfig.hdr_vf) {
+      encodeArgs.push('-vf', selectedEncoderConfig.hdr_vf);
+    } else if (selectedEncoderConfig.vf) {
+      encodeArgs.push('-vf', selectedEncoderConfig.vf);
+    }
+
+    // **Handle 'additional_args' correctly**
+    if (typeof selectedEncoderConfig.additional_args === 'function') {
+      // If 'additional_args' is a function, call it with 'isHDR' and spread the resulting array
+      const argsFromFunction = selectedEncoderConfig.additional_args(isHDR);
+      if (Array.isArray(argsFromFunction)) {
+        encodeArgs.push(...argsFromFunction);
       } else {
-        console.error(`FFmpeg exited with code ${code}`);
-        reject(new Error(`FFmpeg process exited with code ${code}`));
+        throw new TypeError('additional_args function must return an array');
       }
+    } else if (Array.isArray(selectedEncoderConfig.additional_args)) {
+      // If 'additional_args' is an array, spread it directly
+      encodeArgs.push(...selectedEncoderConfig.additional_args);
+    } else if (selectedEncoderConfig.additional_args !== undefined) {
+      // If 'additional_args' exists but is neither a function nor an array, throw an error
+      throw new TypeError('additional_args must be a function or an array if defined');
+    }
+    // If 'additional_args' is undefined, do nothing (it's optional)
+
+    // Add audio codec and output path
+    encodeArgs.push(
+      '-c:a', selectedEncoderConfig.audio_codec,
+      cachedClipPath
+    );
+
+    // Log the ffmpeg encode command
+    console.log(`Executing FFmpeg encode command: ffmpeg ${encodeArgs.join(' ')}`);
+
+    // Execute encoding
+    await new Promise((resolve, reject) => {
+      const ffmpeg = spawn('ffmpeg', encodeArgs);
+      ffmpeg.stderr.on('data', (data) => console.error(`FFmpeg encode stderr: ${data}`));
+      ffmpeg.on('error', reject);
+      ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg encode exited with code ${code}`)));
     });
-  });
+
+    // Verify the output
+    const stats = await fs.stat(cachedClipPath);
+    if (stats.size === 0) {
+      throw new Error('Generated file is empty');
+    }
+
+    console.log(`Successfully generated clip at: ${cachedClipPath}`);
+
+  } catch (error) {
+    console.error('Error during clip generation:', error);
+    // Cleanup
+    for (const file of [rawVideoFile, cachedClipPath]) {
+      if (_fs.existsSync(file)) {
+        _fs.unlinkSync(file);
+      }
+    }
+    throw error;
+  } finally {
+    // Clean up temporary files
+    if (_fs.existsSync(rawVideoFile)) {
+      _fs.unlinkSync(rawVideoFile);
+    }
+  }
 }
 
 // Function to serve the cached clip with enhanced headers and robust range support
@@ -435,7 +591,7 @@ async function waitForCache(cachedClipPath, intervalMs, timeoutMs) {
   const startTime = Date.now();
   return new Promise((resolve, reject) => {
     const interval = setInterval(async () => {
-      if (await isCacheValid(cachedClipPath)) {
+      if (await fileExists(cachedClipPath)) {
         clearInterval(interval);
         resolve();
       } else if ((Date.now() - startTime) > timeoutMs) {
