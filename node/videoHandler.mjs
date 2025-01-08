@@ -1,34 +1,41 @@
-const { exec, spawn } = require("child_process");
-const path = require("path");
-const fs = require("fs").promises;
-const _fs = require("fs");
-const os = require("os");
-const { findMp4File, fileExists, ongoingCacheGenerations } = require("./utils");
-const util = require('util');
-const { getTVShowByName } = require("./sqliteDatabase");
-const execAsync = util.promisify(exec);
-const {
-  ensureCacheDirs,
-  generateCacheKey,
-  getCachedClipPath,
-} = require("./utils");
-const { getHardwareAccelerationInfo } = require('./hardwareAcceleration'); // Adjust the path as needed
-const encoderConfigs = require("./encoderConfig");
-const { extractHDRInfo } = require("./infoManager");
+import { exec, spawn } from "child_process";
+import { join, extname, basename, dirname } from "path";
+import { promises as fs } from "fs";
+import { readFileSync, createReadStream, existsSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { findMp4File, fileExists, ongoingCacheGenerations } from "./utils.mjs";
+import { promisify } from 'util';
+import { getTVShowByName, getMovieByName } from "./sqliteDatabase.mjs";
+const execAsync = promisify(exec);
+import { ensureCacheDirs, generateCacheKey, getCachedClipPath } from "./utils.mjs";
+import { getHardwareAccelerationInfo } from './hardwareAcceleration.mjs'; // Adjust the path as needed
+import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./encoderConfig.mjs";
+import { extractHDRInfo } from "./infoManager.mjs";
+import { createCategoryLogger } from "./lib/logger.mjs";
 
-let hardwareInfoPromise = null;
+const logger = createCategoryLogger('videoHandler');
+// Video Clip Generation Version Control (for cache invalidation)
+const VIDEO_CLIP_VERSION = 1.0001;
 
-async function handleVideoRequest(req, res, type, BASE_PATH) {
+let hardwareInfo;
+async function initHardwareInfo() {
+  if (!hardwareInfo) {
+    hardwareInfo = await getHardwareAccelerationInfo();
+  }
+  return hardwareInfo;
+}
+
+export async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
   const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
 
   try {
     let videoPath;
     if (type === "movies") {
-      const directoryPath = path.join(`${BASE_PATH}/movies`, movieName);
+      const directoryPath = join(`${BASE_PATH}/movies`, movieName);
       videoPath = await findMp4File(directoryPath);
     } else if (type === "tv") {
-      const showsDataRaw = _fs.readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
+      const showsDataRaw = readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
       const showsData = JSON.parse(showsDataRaw);
       const showData = showsData[showName];
 
@@ -54,7 +61,7 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
       }
 
-      const directoryPath = path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
+      const directoryPath = join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
       videoPath = await findMp4File(directoryPath, _episode);
     }
 
@@ -85,7 +92,7 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
     if (audioTrackParam === "max" && channelCount === 2) {
       // Use the original video file if audio is set to "max" and channel count is 2
       modifiedVideoPath = videoPath;
-      console.log("Using the original video file");
+      logger.info("Using the original video file");
     } else {
       // Generate the modified MP4 file
       modifiedVideoPath = await generateModifiedMp4(videoPath, selectedAudioTrack, channelCount);
@@ -101,7 +108,7 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
       const chunkSize = (end - start) + 1;
-      const fileStream = _fs.createReadStream(modifiedVideoPath, { start, end });
+      const fileStream = createReadStream(modifiedVideoPath, { start, end });
 
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
@@ -115,10 +122,10 @@ async function handleVideoRequest(req, res, type, BASE_PATH) {
         "Content-Length": fileSize,
         "Content-Type": "video/mp4",
       });
-      _fs.createReadStream(modifiedVideoPath).pipe(res);
+      createReadStream(modifiedVideoPath).pipe(res);
     }
   } catch (error) {
-    console.error(error);
+    logger.error(error);
     res.status(500).send("Internal server error");
   }
 }
@@ -129,7 +136,7 @@ async function getAudioTracks(videoPath) {
 
     exec(command, (error, stdout, stderr) => {
       if (error) {
-        console.error(`Error getting audio tracks: ${error.message}`);
+        logger.error(`Error getting audio tracks: ${error.message}`);
         reject(error);
       } else {
         const output = JSON.parse(stdout);
@@ -161,15 +168,15 @@ function getHighestChannelTrack(audioTracks) {
 }
 
 async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
-  const fileExtension = path.extname(videoPath);
-  const fileNameWithoutExtension = path.basename(videoPath, fileExtension);
+  const fileExtension = extname(videoPath);
+  const fileNameWithoutExtension = basename(videoPath, fileExtension);
   const outputFileName = `${fileNameWithoutExtension}_${channelCount}ch${fileExtension}`;
-  const outputPath = path.join(path.dirname(videoPath), outputFileName);
+  const outputPath = join(dirname(videoPath), outputFileName);
 
   // Check if the output file already exists
   try {
     await fs.access(outputPath);
-    console.log(`Modified MP4 file already exists: ${outputPath}`);
+    logger.info(`Modified MP4 file already exists: ${outputPath}`);
     return outputPath;
   } catch (error) {
     // File doesn't exist, proceed with generating it
@@ -182,16 +189,16 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
 
     ffmpegProcess.on("close", (code) => {
       if (code === 0) {
-        console.log(`Modified MP4 saved: ${outputPath}`);
+        logger.info(`Modified MP4 saved: ${outputPath}`);
         resolve(outputPath);
       } else {
-        console.error(`FFmpeg process exited with code ${code}`);
+        logger.error(`FFmpeg process exited with code ${code}`);
         reject(new Error(`FFmpeg process exited with code ${code}`));
       }
     });
 
     ffmpegProcess.on("error", (error) => {
-      console.error(`Error generating modified MP4: ${error.message}`);
+      logger.error(`Error generating modified MP4: ${error.message}`);
       reject(error);
     });
   });
@@ -205,14 +212,20 @@ async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
  * @param {string} basePath - Base path to media files.
  * @param {Object} db - Database connection or reference.
  */
-async function handleVideoClipRequest(req, res, type, basePath, db) {
+export async function handleVideoClipRequest(req, res, type, basePath, db) {
   let cacheKey;
   try {
     let videoPath;
+    let videoID = null;
 
     if (type === "movies") {
       const { movieName } = req.params;
-      const directoryPath = path.join(`${basePath}/movies`, movieName);
+      const movieData = await getMovieByName(db, movieName);
+      if (!movieData) {
+        throw new Error(`Movie not found: ${movieName}`);
+      }
+      videoID = movieData._id;
+      const directoryPath = join(`${basePath}/movies`, movieName);
       videoPath = await findMp4File(directoryPath);
     } else if (type === "tv") {
       const { showName, season, episode } = req.params;
@@ -222,12 +235,14 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
         throw new Error(`Show not found: ${showName}`);
       }
 
-      const _season = showData.metadata.seasons[`Season ${season}`];
+      const _season = showData.seasons[`Season ${season}`];
       if (!_season) {
         throw new Error(`Season not found: ${showName} - Season ${season}`);
       }
 
-      const _episode = _season.fileNames.find((e) => {
+      const arrayOfEpisodes = Object.keys(_season.episodes);
+
+      const _episode = arrayOfEpisodes.find((e) => {
         const episodeNumber = String(episode).padStart(2, "0");
         const seasonNumber = String(season).padStart(2, "0");
 
@@ -253,8 +268,10 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
       }
 
-      const directoryPath = path.join(`${basePath}/tv`, showName, `Season ${season}`);
-      videoPath = await findMp4File(directoryPath, _episode);
+      const directoryPath = join(`${basePath}/tv`, showName, `Season ${season}`);
+      const episodePath = _season.episodes[_episode].filename;
+      videoID = _season.episodes[_episode]._id;
+      videoPath = await findMp4File(directoryPath, episodePath);
     }
 
     // Parse and validate start and end parameters
@@ -286,49 +303,66 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     
     // Determine best encoder based on source and capabilities
     let selectedEncoderConfig;
-    
-    // For clips, prefer VP9 when possible
-    if (encoderConfigs.vp9_vaapi) {
-      selectedEncoderConfig = encoderConfigs.vp9_vaapi;
-      console.log('Using VP9 VAAPI encoder for clip generation');
-    
-      // Create a copy of the config
-      selectedEncoderConfig = { ...selectedEncoderConfig };
-    
-      // If HDR content, use HDR video filter chain
-      if (isHDR) {
-        console.log('Using HDR conversion filter chain');
+
+    const hardwareInfo = await initHardwareInfo();
+    let selectedEncoder = null;
+
+    if (!hardwareInfo || !hardwareInfo.encoder) {
+      logger.info('No suitable hardware encoder found. Falling back to software encoding.');
+      selectedEncoderConfig = libx264;
+      selectedEncoder = 'libx264';
+    } else {
+      const availableEncoder = hardwareInfo.encoder.encoder;
+      switch (availableEncoder) {
+        case 'vp9_vaapi':
+          selectedEncoderConfig = vp9_vaapi;
+          selectedEncoder = 'vp9_vaapi';
+          logger.info('Using VP9 VAAPI encoder based on hardware info');
+          break;
+        case 'hevc_vaapi':
+          selectedEncoderConfig = hevc_vaapi;
+          selectedEncoder = 'hevc_vaapi';
+          logger.info('Using HEVC VAAPI encoder based on hardware info');
+          break;
+        case 'hevc_nvenc':
+          selectedEncoderConfig = hevc_nvenc;
+          selectedEncoder = 'hevc_nvenc';
+          logger.info('Using HEVC NVENC encoder based on hardware info');
+          break;
+        default:
+          // Fallback to software encoding if no suitable hardware encoder is found
+          selectedEncoderConfig = libx264;
+          selectedEncoder = 'libx264';
+          logger.info('Falling back to H.264 encoder (no suitable hardware encoder found)');
+      }
+
+      // If HDR content and using vp9_vaapi, use HDR video filter chain
+      if (isHDR && selectedEncoderConfig.codec === 'vp9_vaapi') {
+        logger.info('Using HDR conversion filter chain');
+        selectedEncoderConfig = { ...selectedEncoderConfig }; // Create a copy
         selectedEncoderConfig.vf = selectedEncoderConfig.hdr_vf;
       }
-    } 
-    // Fallback to HEVC for HDR content if VP9 is not available
-    else if ((isHDR || sourceCodec === 'hevc') && encoderConfigs.hevc_vaapi) {
-      selectedEncoderConfig = encoderConfigs.hevc_vaapi;
-      console.log('Falling back to HEVC VAAPI encoder');
-    }
-    // Final fallback to H.264
-    else {
-      selectedEncoderConfig = encoderConfigs.libx264;
-      console.log('Falling back to H.264 encoder');
     }
 
-    // Verify VAAPI device availability
+    // Verify VAAPI device availability (if applicable)
     if (selectedEncoderConfig.vaapi_device) {
       try {
         await fs.access(selectedEncoderConfig.vaapi_device);
       } catch (error) {
-        console.warn('VAAPI device not available, falling back to software encoding');
-        selectedEncoderConfig = encoderConfigs.libx264;
+        logger.warn('VAAPI device not available, falling back to software encoding');
+        selectedEncoder = 'libx264';
+        selectedEncoderConfig = libx264;
       }
     }
 
     // Generate cache key
-    cacheKey = generateCacheKey(videoPath, start, end);
+    //cacheKey = generateCacheKey(videoPath, start, end);
+    cacheKey = `${videoID}-v${VIDEO_CLIP_VERSION}-s_${start}-e_${end}-${selectedEncoder}`;
     const cachedClipPath = getCachedClipPath(cacheKey, selectedEncoderConfig.extension);
 
     // Check if cached clip exists and is valid
     if (await fileExists(cachedClipPath)) {
-      console.log(`Serving existing cached clip: ${cachedClipPath}`);
+      logger.info(`Serving existing cached clip: ${cachedClipPath}`);
       return serveCachedClip(res, cachedClipPath, type, req);
     }
 
@@ -345,7 +379,7 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     // Check if another request is already generating this clip
     if (ongoingCacheGenerations.has(cacheKey)) {
-      console.log(`Waiting for ongoing generation of cache key: ${cacheKey}`);
+      logger.info(`Waiting for ongoing generation of cache key: ${cacheKey}`);
       try {
         await waitForCache(cachedClipPath, 500, 45000);
         return serveCachedClip(res, cachedClipPath, type, req);
@@ -359,7 +393,7 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     try {
       // Generate the clip
-      console.log(`Generating new clip for caching: ${cacheKey}`);
+      logger.info(`Generating new clip for caching: ${cacheKey}`);
       await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR);
       
       // Serve the newly cached clip
@@ -370,7 +404,7 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
     }
 
   } catch (error) {
-    console.error('Error in clip generation:', error);
+    logger.error('Error in clip generation:', error);
     if (cacheKey) {
       ongoingCacheGenerations.delete(cacheKey);
     }
@@ -393,8 +427,8 @@ async function handleVideoClipRequest(req, res, type, basePath, db) {
  * @returns {Promise<void>}
  */
 async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR) {
-  const tmpDir = os.tmpdir();
-  const tempPrefix = path.join(tmpDir, `ffmpeg-${Date.now()}`);
+  const tmpDir = tmpdir();
+  const tempPrefix = join(tmpDir, `ffmpeg-${Date.now()}`);
   const rawVideoFile = `${tempPrefix}-raw.mkv`;
 
   try {
@@ -412,12 +446,12 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selec
     ];
 
     // Log the ffmpeg extract command
-    console.log(`Executing FFmpeg extract command: ffmpeg ${extractArgs.join(' ')}`);
+    logger.info(`Executing FFmpeg extract command: ffmpeg ${extractArgs.join(' ')}`);
 
     // Extract segment
     await new Promise((resolve, reject) => {
       const ffmpeg = spawn('ffmpeg', extractArgs);
-      ffmpeg.stderr.on('data', (data) => console.error(`FFmpeg extract stderr: ${data}`));
+      ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg extract stderr: ${data}`));
       ffmpeg.on('error', reject);
       ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg extract exited with code ${code}`)));
     });
@@ -445,11 +479,14 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selec
       encodeArgs.push('-c:v', selectedEncoderConfig.codec);
     }
 
-    // Add video filter based on HDR status
+    // **Handle 'vf' correctly: Check if it's a function or a string**
     if (isHDR && selectedEncoderConfig.hdr_vf) {
       encodeArgs.push('-vf', selectedEncoderConfig.hdr_vf);
     } else if (selectedEncoderConfig.vf) {
-      encodeArgs.push('-vf', selectedEncoderConfig.vf);
+      const vf = typeof selectedEncoderConfig.vf === 'function' 
+        ? selectedEncoderConfig.vf(isHDR) 
+        : selectedEncoderConfig.vf;
+      encodeArgs.push('-vf', vf);
     }
 
     // **Handle 'additional_args' correctly**
@@ -477,12 +514,12 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selec
     );
 
     // Log the ffmpeg encode command
-    console.log(`Executing FFmpeg encode command: ffmpeg ${encodeArgs.join(' ')}`);
+    logger.info(`Executing FFmpeg encode command: ffmpeg ${encodeArgs.join(' ')}`);
 
     // Execute encoding
     await new Promise((resolve, reject) => {
       const ffmpeg = spawn('ffmpeg', encodeArgs);
-      ffmpeg.stderr.on('data', (data) => console.error(`FFmpeg encode stderr: ${data}`));
+      ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg encode stderr: ${data}`));
       ffmpeg.on('error', reject);
       ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg encode exited with code ${code}`)));
     });
@@ -493,21 +530,21 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selec
       throw new Error('Generated file is empty');
     }
 
-    console.log(`Successfully generated clip at: ${cachedClipPath}`);
+    logger.info(`Successfully generated clip at: ${cachedClipPath}`);
 
   } catch (error) {
-    console.error('Error during clip generation:', error);
+    logger.error('Error during clip generation:', error);
     // Cleanup
     for (const file of [rawVideoFile, cachedClipPath]) {
-      if (_fs.existsSync(file)) {
-        _fs.unlinkSync(file);
+      if (existsSync(file)) {
+        unlinkSync(file);
       }
     }
     throw error;
   } finally {
     // Clean up temporary files
-    if (_fs.existsSync(rawVideoFile)) {
-      _fs.unlinkSync(rawVideoFile);
+    if (existsSync(rawVideoFile)) {
+      unlinkSync(rawVideoFile);
     }
   }
 }
@@ -549,11 +586,11 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
       }
 
       const chunkSize = (endByte - startByte) + 1;
-      const fileStream = _fs.createReadStream(cachedClipPath, { start: startByte, end: endByte });
+      const fileStream = createReadStream(cachedClipPath, { start: startByte, end: endByte });
 
       // Handle stream errors
       fileStream.on('error', (streamErr) => {
-        console.error(`Stream error: ${streamErr.message}`);
+        logger.error(`Stream error: ${streamErr.message}`);
         res.status(500).send('Error streaming video.');
       });
 
@@ -565,11 +602,11 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
       });
       fileStream.pipe(res);
     } else {
-      const fileStream = _fs.createReadStream(cachedClipPath);
+      const fileStream = createReadStream(cachedClipPath);
 
       // Handle stream errors
       fileStream.on('error', (streamErr) => {
-        console.error(`Stream error: ${streamErr.message}`);
+        logger.error(`Stream error: ${streamErr.message}`);
         res.status(500).send('Error streaming video.');
       });
 
@@ -580,7 +617,7 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
       fileStream.pipe(res);
     }
   } catch (error) {
-    console.error(`Error serving cached clip: ${error.message}`);
+    logger.error(`Error serving cached clip: ${error.message}`);
     res.status(500).send('Error serving cached video.');
   }
 }
@@ -601,8 +638,3 @@ async function waitForCache(cachedClipPath, intervalMs, timeoutMs) {
     }, intervalMs);
   });
 }
-
-module.exports = {
-  handleVideoRequest,
-  handleVideoClipRequest,
-};

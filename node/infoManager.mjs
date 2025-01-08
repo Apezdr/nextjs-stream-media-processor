@@ -1,12 +1,14 @@
-const fs = require("fs").promises;
-const util = require('util');
-const { fileExists } = require("./utils");
-const crypto = require('crypto');
-const exec = util.promisify(require("child_process").exec);
-const execAsync = util.promisify(exec);
+import { promises as fs } from "fs";
+import { promisify } from 'util';
+import { fileExists } from "./utils.mjs";
+import { createHash } from 'crypto';
+import { exec as execCallback } from "child_process";
+import { createCategoryLogger } from "./lib/logger.mjs";
+const logger = createCategoryLogger('infoFileManager');
+const exec = promisify(execCallback);
 
 // Used to determine if regenerating info is necessary
-const CURRENT_VERSION = 1.0002;
+const CURRENT_VERSION = 1.0005;
 
 /**
  * Validates basic info object structure
@@ -28,102 +30,102 @@ function validateInfo(info) {
  * @param {string} episodePath - Path to the episode file.
  * @returns {Promise<string|null>} - Returns a string of HDR types separated by commas or null if not found.
  */
-async function extractHDRInfo(episodePath) {
+export async function extractHDRInfo(episodePath) {
   try {
-    // Execute MediaInfo with JSON output
     const { stdout } = await exec(`mediainfo --Output=JSON "${episodePath}"`);
     const data = JSON.parse(stdout);
 
-    // Find all Video tracks
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
     if (!videoTracks || videoTracks.length === 0) {
-      console.warn(`No video tracks found in ${episodePath}.`);
+      logger.warn(`No video tracks found in ${episodePath}.`);
       return null;
     }
 
-    const detectedHDR = new Set(); // Use Set to avoid duplicates
+    const detectedHDR = new Set();
 
-    // Function to perform case-insensitive substring check
     const includesIgnoreCase = (str, substr) =>
       str && str.toLowerCase().includes(substr.toLowerCase());
 
-    // Iterate through each Video track to detect HDR formats
     for (const videoTrack of videoTracks) {
-      // Check for HDR10+
-      if (
-        videoTrack["HDR_Format_Compatibility"] &&
-        includesIgnoreCase(videoTrack["HDR_Format_Compatibility"], "HDR10+")
-      ) {
-        detectedHDR.add("HDR10+");
-        continue; // HDR10+ takes precedence; no need to check further
+      // Check for various HDR formats through HDR_Format field
+      if (videoTrack["HDR_Format"]) {
+        if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
+          detectedHDR.add("HDR10+");
+          continue; // HDR10+ takes precedence
+        } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
+          detectedHDR.add("HDR10");
+        } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
+          detectedHDR.add("Dolby Vision");
+        }
       }
 
-      // Check for HDR10
-      if (
-        videoTrack["HDR_Format_Compatibility"] &&
-        includesIgnoreCase(videoTrack["HDR_Format_Compatibility"], "HDR10")
-      ) {
-        detectedHDR.add("HDR10");
-      }
-
-      // Check for Dolby Vision
-      if (
-        videoTrack["HDR_Format_Compatibility"] &&
-        includesIgnoreCase(videoTrack["HDR_Format_Compatibility"], "Dolby Vision")
-      ) {
-        detectedHDR.add("Dolby Vision");
-      }
-
-      // Check for HLG (Hybrid Log-Gamma)
-      if (
-        videoTrack["HDR_Format_Compatibility"] &&
-        includesIgnoreCase(videoTrack["HDR_Format_Compatibility"], "HLG")
-      ) {
-        detectedHDR.add("HLG");
-      }
-
-      // Additional checks based on transfer characteristics and color space
+      // Get all relevant fields with correct names
       const transferCharacteristics = videoTrack["transfer_characteristics"] || "";
       const colorSpace = videoTrack["ColorSpace"] || "";
-      const colorPrimaries = videoTrack["ColorPrimaries"] || "";
+      const colourPrimaries = videoTrack["colour_primaries"] || "";
       const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
       const contentLightLevel = videoTrack["MaxCLL"] || "";
 
-      // Detect HDR10 based on transfer characteristics and color space if not already detected
+      // Detect HDR10 through PQ/SMPTE 2084 transfer characteristics
       if (
-        includesIgnoreCase(transferCharacteristics, "smpte2084") &&
-        includesIgnoreCase(colorSpace, "bt2020")
+        (includesIgnoreCase(transferCharacteristics, "PQ") || 
+         includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
+        includesIgnoreCase(colourPrimaries, "BT.2020")
       ) {
         if (masteringDisplayColorPrimaries && contentLightLevel) {
           detectedHDR.add("HDR10");
         }
       }
 
-      // Detect potential HDR based on BT.2020 color space and primaries
-      if (
-        includesIgnoreCase(colorSpace, "bt2020") &&
-        includesIgnoreCase(colorPrimaries, "bt2020")
-      ) {
-        detectedHDR.add("Potential HDR (BT.2020)");
+      // Check for HLG
+      if (includesIgnoreCase(transferCharacteristics, "HLG")) {
+        detectedHDR.add("HLG");
       }
 
-      // Detect SDR based on BT.709 color space and transfer characteristics
+      // Detect potential HDR based on BT.2020 color space and primaries
       if (
-        includesIgnoreCase(colorSpace, "bt.709") &&
-        includesIgnoreCase(transferCharacteristics, "bt.709")
+        (includesIgnoreCase(colorSpace, "BT.2020") || 
+         includesIgnoreCase(colorSpace, "bt2020")) &&
+        (includesIgnoreCase(colourPrimaries, "BT.2020") || 
+         includesIgnoreCase(colourPrimaries, "bt2020"))
       ) {
-        detectedHDR.add("SDR (BT.709)");
+        // Only add if no other HDR type detected
+        if (detectedHDR.size === 0) {
+          detectedHDR.add("Potential HDR (BT.2020)");
+        }
       }
+
+      // Detect SDR based on BT.709
+      if (
+        (includesIgnoreCase(colorSpace, "BT.709") || 
+         includesIgnoreCase(colorSpace, "bt709")) &&
+        (includesIgnoreCase(transferCharacteristics, "BT.709") || 
+         includesIgnoreCase(transferCharacteristics, "bt709"))
+      ) {
+        // Only add if no HDR type detected
+        if (detectedHDR.size === 0) {
+          detectedHDR.add("SDR (BT.709)");
+        }
+      }
+
+      // Add debug logging
+      logger.debug('Video Track Analysis:', {
+        HDR_Format: videoTrack["HDR_Format"],
+        transfer_characteristics: transferCharacteristics,
+        ColorSpace: colorSpace,
+        colour_primaries: colourPrimaries,
+        MasteringDisplay_ColorPrimaries: masteringDisplayColorPrimaries,
+        MaxCLL: contentLightLevel
+      });
     }
 
     if (detectedHDR.size === 0) {
-      return null; // No HDR detected
+      return null;
     }
 
-    // Convert the Set to an Array and join into a single string
     return Array.from(detectedHDR).join(', ');
   } catch (error) {
-    console.error(`Error extracting HDR info with MediaInfo for ${episodePath}:`, error);
+    logger.error(`Error extracting HDR info with MediaInfo for ${episodePath}:`, error);
     return null;
   }
 }
@@ -169,7 +171,7 @@ async function extractAdditionalMetadata(episodePath) {
       video: videoDetails
     };
   } catch (error) {
-    console.error(`Error extracting additional metadata for ${episodePath}:`, error);
+    logger.error(`Error extracting additional metadata for ${episodePath}:`, error);
     return {};
   }
 }
@@ -182,22 +184,22 @@ async function extractAdditionalMetadata(episodePath) {
  * @param {string} episodePath - The path to the media file.
  * @returns {Promise<string>} A stable, reproducible string of header info.
  */
-async function getHeaderData(episodePath) {
+export async function getHeaderData(episodePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
+    const { stdout } = await exec(`mediainfo --Output=JSON "${episodePath}"`);
     const data = JSON.parse(stdout);
 
     // Extract the General track
     const generalTrack = data.media.track.find(t => t["@type"] === "General");
     if (!generalTrack) {
-      console.warn(`No general track found in ${episodePath}, cannot form stable header data.`);
+      logger.warn(`No general track found in ${episodePath}, cannot form stable header data.`);
       return '';
     }
 
     // Extract the first Video track
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
     if (videoTracks.length === 0) {
-      console.warn(`No video tracks found in ${episodePath}, cannot form stable header data.`);
+      logger.warn(`No video tracks found in ${episodePath}, cannot form stable header data.`);
       return '';
     }
     const video = videoTracks[0];
@@ -239,7 +241,7 @@ async function getHeaderData(episodePath) {
 
     return stableFields;
   } catch (error) {
-    console.error(`Error extracting header data with MediaInfo for ${episodePath}:`, error);
+    logger.error(`Error extracting header data with MediaInfo for ${episodePath}: ${error.message}`);
     return '';
   }
 }
@@ -260,11 +262,10 @@ async function generateInfo(episodePath, infoFile) {
       `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${episodePath}"`
     );
     const fileLength = Math.floor(parseFloat(durationStdout.trim()) * 1000); // Convert to milliseconds
-    const fileDimensions = dimensionsStdout.trim();
-
+    const fileDimensions = dimensionsStdout.trim().replace(/x+$/, ''); // Remove any trailing x characters
     // Generate MD4 hash from headers
     const headerData = await getHeaderData(episodePath);
-    const headerHash = crypto.createHash('sha256').update(headerData).digest('hex');
+    const headerHash = createHash('sha256').update(headerData).digest('hex');
 
     // Extract HDR and additional metadata
     const hdr = await extractHDRInfo(episodePath);
@@ -281,11 +282,11 @@ async function generateInfo(episodePath, infoFile) {
 
     // Write the info to the .info file
     await fs.writeFile(infoFile, JSON.stringify(info, null, 2));
-    console.log(`Generated info for ${episodePath}`);
+    logger.info(`Generated info for ${episodePath}`);
 
     return info;
   } catch (error) {
-    console.error(`Error generating info for ${episodePath}:`, error);
+    logger.error(`Error generating info for ${episodePath}:`, error);
     throw error; // Rethrow to handle upstream if necessary
   }
 }
@@ -296,7 +297,7 @@ async function generateInfo(episodePath, infoFile) {
  * @param {string} episodePath - Path to the episode file.
  * @returns {Promise<{length: number, dimensions: string, hdr: string|null, additionalMetadata: object}>}
  */
-async function getInfo(episodePath) {
+export async function getInfo(episodePath) {
   const infoFile = `${episodePath}.info`;
   let info = {};
 
@@ -307,11 +308,11 @@ async function getInfo(episodePath) {
       
       // Regenerate if version is old or missing, or if basic validation fails
       if (!info.version || info.version < CURRENT_VERSION || !validateInfo(info)) {
-        console.log(`Regenerating ${infoFile} due to version update or invalid format`);
+        logger.info(`Regenerating ${infoFile} due to version update or invalid format`);
         info = await generateInfo(episodePath, infoFile);
       }
     } catch (error) {
-      console.warn(`Regenerating ${infoFile} due to error:`, error);
+      logger.warn(`Regenerating ${infoFile} due to error:`, error);
       info = await generateInfo(episodePath, infoFile);
     }
   } else {
@@ -327,21 +328,13 @@ async function getInfo(episodePath) {
  * @param {object} info - Info object containing length, dimensions, hdr, and additionalMetadata.
  * @returns {Promise<void>}
  */
-async function writeInfo(episodePath, info) {
+export async function writeInfo(episodePath, info) {
   const infoFile = `${episodePath}.info`;
   try {
     await fs.writeFile(infoFile, JSON.stringify(info, null, 2));
-    console.log(`Updated info for ${episodePath}`);
+    logger.info(`Updated info for ${episodePath}`);
   } catch (error) {
-    console.error(`Error writing info to ${infoFile}:`, error);
+    logger.error(`Error writing info to ${infoFile}:`, error);
     throw error;
   }
 }
-
-module.exports = {
-  getHeaderData,
-  extractHDRInfo,
-  getInfo,
-  writeInfo,
-  fileExists
-};

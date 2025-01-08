@@ -1,16 +1,18 @@
-const util = require('node:util');
-const exec = util.promisify(require('node:child_process').exec);
-const fs = require('fs');
-const path = require('path');
+import { promisify } from 'node:util';
+import { exec as execCallback } from 'node:child_process';
+import { createCategoryLogger } from './lib/logger.mjs';
+const logger = createCategoryLogger('chapter-generator');
+
+const exec = promisify(execCallback);
 const ffprobeBinary = '/usr/bin/ffprobe';
 
-async function hasChapterInfo(mediaPath) {
+export async function hasChapterInfo(mediaPath) {
   return new Promise((resolve, reject) => {
     const ffprobeCommand = `${ffprobeBinary} -show_entries chapter=start_time,metadata -print_format json -v quiet '${mediaPath.replace(/'/g, "'\\''")}'`;
 
     exec(ffprobeCommand, (error, stdout, stderr) => {
       if (error) {
-        console.error(`Error checking chapter information for ${mediaPath}:`, error);
+        logger.error(`Error checking chapter information for ${mediaPath}:`, error);
         reject(error);
         return;
       }
@@ -20,14 +22,14 @@ async function hasChapterInfo(mediaPath) {
         const hasChapters = ffprobeOutput.chapters && ffprobeOutput.chapters.length > 0;
         resolve(hasChapters);
       } catch (err) {
-        console.error(`Error parsing ffprobe output for ${mediaPath}:`, err);
+        logger.error(`Error parsing ffprobe output for ${mediaPath}:`, err);
         reject(err);
       }
     });
   });
 }
 
-async function generateChapters(mediaPath) {
+export async function generateChapters(mediaPath) {
   try {
     const ffprobeCommand = `${ffprobeBinary} -show_entries chapter=start_time,metadata -print_format json -v quiet '${mediaPath.replace(/'/g, "'\\''")}'`;
 
@@ -35,7 +37,7 @@ async function generateChapters(mediaPath) {
 
     if (stderr) {
       const errorMessage = `Error generating chapters for ${mediaPath}: ${stderr}`;
-      console.error(errorMessage);
+      logger.error(errorMessage);
       throw new Error(errorMessage);
     }
 
@@ -43,7 +45,7 @@ async function generateChapters(mediaPath) {
     const chapters = ffprobeOutput.chapters || [];
 
     if (chapters.length === 0) {
-      console.warn(`No chapter information found for ${mediaPath}`);
+      logger.warn(`No chapter information found for ${mediaPath}`);
       return "WEBVTT\n\n"; // Return a default WebVTT content
     }
 
@@ -69,7 +71,7 @@ async function generateChapters(mediaPath) {
     } else {
       errorMessage = `Error generating chapters for ${mediaPath}: ${error.toString()}`;
     }
-    console.error(errorMessage);
+    logger.error(errorMessage);
     throw new Error(errorMessage);
   }
 }
@@ -96,7 +98,7 @@ function formatTime(timeString) {
   const match = timeString.match(timeRegex);
 
   if (!match) {
-    console.warn(`Invalid time string format: ${timeString}`);
+    logger.warn(`Invalid time string format: ${timeString}`);
     return '00:00:00.000'; // Return a default time if the format is invalid
   }
 
@@ -122,16 +124,10 @@ async function getVideoDuration(mediaPath) {
   const { stdout, stderr } = await exec(ffprobeCommand);
 
   if (stderr) {
-    console.error(`Error getting video duration for ${mediaPath}:`, stderr);
+    logger.error(`Error getting video duration for ${mediaPath}:`, stderr);
     throw new Error(stderr);
   }
 
   const duration = parseFloat(stdout) * 1000;
   return duration;
 }
-
-
-module.exports = {
-  hasChapterInfo,
-  generateChapters,
-};

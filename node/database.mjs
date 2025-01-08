@@ -1,4 +1,6 @@
-const { MongoClient } = require('mongodb');
+import { MongoClient } from 'mongodb';
+import { createCategoryLogger } from './lib/logger.mjs';
+const logger = createCategoryLogger('mongoDB');
 const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 
@@ -13,7 +15,7 @@ async function ensureIndex(collection, indexSpec, indexOptions) {
     }
 }
 
-async function initializeMongoDatabase() {
+export async function initializeMongoDatabase() {
     try {
         await client.connect();
         const mediaDb = client.db("Media");
@@ -24,12 +26,12 @@ async function initializeMongoDatabase() {
 
         if (!collectionNames.includes("Movies")) {
             await mediaDb.createCollection("Movies");
-            console.log("Created collection: Movies");
+            logger.info("Created collection: Movies");
         }
 
         if (!collectionNames.includes("TV")) {
             await mediaDb.createCollection("TV");
-            console.log("Created collection: TV");
+            logger.info("Created collection: TV");
         }
 
         // Ensure collections in PlaybackStatus database
@@ -38,17 +40,17 @@ async function initializeMongoDatabase() {
 
         if (!mediaCollectionNames.includes("PlaybackStatus")) {
             await mediaDb.createCollection("PlaybackStatus");
-            console.log("Created collection: PlaybackStatus");
+            logger.info("Created collection: PlaybackStatus");
         }
 
-        console.log("Database and collections have been initialized successfully.");
+        logger.info("Database and collections have been initialized successfully.");
     } catch (error) {
-        console.error("An error occurred while initializing the database and collections:", error);
+        logger.error("An error occurred while initializing the database and collections:", error);
         process.exit(1); // Exit with error
     }
 }
 
-async function initializeIndexes() {
+export async function initializeIndexes() {
     try {
         await client.connect();
         const mediaDb = client.db("Media");
@@ -99,16 +101,16 @@ async function initializeIndexes() {
         //     }
         // );
 
-        console.log("Indexes have been initialized successfully.");
+        logger.info("Indexes have been initialized successfully.");
     } catch (error) {
-        console.error("An error occurred while initializing indexes:", error);
+        logger.error("An error occurred while initializing indexes:", error);
         process.exit(1); // Exit with error
     } finally {
         await client.close();
     }
 }
 
-async function checkAutoSync() {
+export async function checkAutoSync() {
     let autoSyncResponse = false
     try {
         await client.connect();
@@ -122,7 +124,7 @@ async function checkAutoSync() {
         if (!autoSyncSetting) {
             await settings.insertOne({ name: "autoSync", value: true });
             autoSyncSetting = { value: true };
-            console.log("Auto Sync setting initialized to true.");
+            logger.info("Auto Sync setting initialized to true.");
         }
 
         // Check the value of autoSync
@@ -132,7 +134,7 @@ async function checkAutoSync() {
             autoSyncResponse = false;
         }
     } catch (error) {
-        console.error("An error occurred:", error);
+        logger.error("An error occurred:", error);
         //process.exit(1); // Exit with error
     } finally {
         await client.close();
@@ -140,7 +142,7 @@ async function checkAutoSync() {
     }
 }
 
-async function updateLastSyncTime() {
+export async function updateLastSyncTime() {
     try {
         await client.connect();
         const database = client.db("app_config");
@@ -153,20 +155,11 @@ async function updateLastSyncTime() {
             { upsert: true }
         );
 
-        console.log("Last sync time updated successfully.");
+        logger.info("Last sync time updated successfully.");
     } catch (error) {
-        console.error("An error occurred while updating the last sync time:", error);
+        logger.error("An error occurred while updating the last sync time:" + error.message);
         process.exit(1); // Exit with error
     } finally {
         await client.close();
     }
 }
-
-// Export the functions
-module.exports = {
-    initializeMongoDatabase,
-    initializeIndexes,
-    checkAutoSync,
-    updateLastSyncTime
-};
-

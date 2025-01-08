@@ -1,12 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
-const { generateFrame, fileExists } = require('./utils');
+const { createCategoryLogger } = require('./lib/logger.mjs');
+const { generateFrame, fileExists } = require('./utils.mjs').default;
+const logger = createCategoryLogger('snapshotWorker');
 
 process.on('message', async (data) => {
   try {
     const { videoPath, type, name, season, episode, cacheDir, timestamps } = data;
-    console.log(`Worker ${process.pid} started processing ${timestamps.length} timestamps.`);
+    logger.info(`Worker ${process.pid} started processing ${timestamps.length} timestamps.`);
     const frames = [];
 
     for (const timestamp of timestamps) {
@@ -23,9 +25,9 @@ process.on('message', async (data) => {
 
       // Check if the frame already exists
       if (await fileExists(framePath)) {
-        console.log(`Worker ${process.pid} using cached frame: ${frameFileName}`);
+        logger.info(`Worker ${process.pid} using cached frame: ${frameFileName}`);
       } else {
-        console.log(`Worker ${process.pid} generating new frame: ${frameFileName}`);
+        logger.info(`Worker ${process.pid} generating new frame: ${frameFileName}`);
         // Generate the frame
         await generateFrame(videoPath, timestamp, framePath);
       }
@@ -35,7 +37,7 @@ process.on('message', async (data) => {
       const ffprobePromise = new Promise((resolve, reject) => {
         exec(ffprobeCommand, (error, stdout, stderr) => {
           if (error) {
-            console.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
+            logger.error(`Worker ${process.pid} error getting frame dimensions: ${error.message}`);
             reject(error);
           } else {
             const [width, height] = stdout.trim().split('x');
@@ -46,9 +48,9 @@ process.on('message', async (data) => {
       frames.push(await ffprobePromise);
     }
 
-    console.log(`Worker ${process.pid} completed processing. Generated ${frames.length} frames.`);
+    logger.info(`Worker ${process.pid} completed processing. Generated ${frames.length} frames.`);
     process.send({ frames });
   } catch (error) {
-    console.error(`Worker ${process.pid} encountered an error:`, error);
+    logger.error(`Worker ${process.pid} encountered an error:`, error);
   }
 });

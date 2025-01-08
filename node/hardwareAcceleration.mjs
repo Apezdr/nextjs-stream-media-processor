@@ -1,7 +1,8 @@
 // hardwareAcceleration.js
-const { exec } = require('child_process');
-const os = require('os');
-
+import { exec } from 'child_process';
+import { platform as _platform } from 'os';
+import { createCategoryLogger } from './lib/logger.mjs';
+const logger = createCategoryLogger('hardwareAcceleration');
 let cachedResult = null;
 
 /**
@@ -73,11 +74,11 @@ async function getSupportedHardwareEncoders() {
       return regex.test(output);
     });
 
-    console.log('Available Hardware Encoders after filtering:', availableEncoders);
+    logger.info('Available Hardware Encoders after filtering:', availableEncoders);
 
     return availableEncoders;
   } catch (error) {
-    console.error('Error checking ffmpeg encoders:', error);
+    logger.error('Error checking ffmpeg encoders:', error);
     return [];
   }
 }
@@ -87,42 +88,41 @@ async function getSupportedHardwareEncoders() {
  * @returns {Promise<{vendor: string, name: string}[]>} - List of GPUs in the system.
  */
 async function getSystemGPUs() {
-  const platform = os.platform();
+  const platform = _platform();
 
   try {
     if (platform === 'win32') {
       // Windows: Use 'wmic' to get GPU info
       const output = await executeCommand('wmic path win32_VideoController get name,AdapterCompatibility /format:list');
-      const gpuLines = output.split(/\r?\n/).filter(line => line.trim() !== '');
+      const gpuLines = output.split(/\r\r\n/).filter(line => line.trim() !== '');
       const gpus = [];
       let gpu = {};
 
       gpuLines.forEach(line => {
-        if (line.startsWith('Name=')) {
-          gpu.name = line.split('=')[1].trim();
-        }
         if (line.startsWith('AdapterCompatibility=')) {
           gpu.vendor = line.split('=')[1].trim();
+        }
+        if (line.startsWith('Name=')) {
+          gpu.name = line.split('=')[1].trim();
           if (gpu.name && gpu.vendor) {
             gpus.push({ ...gpu });
             gpu = {};
           }
         }
       });
-
-      console.log('Detected GPUs (Windows):', gpus);
+      logger.info('Detected GPUs (Windows):', gpus);
       return gpus;
     } else if (platform === 'linux') {
       // Linux: Use 'lspci' to list GPUs
       const hasLspci = await commandExists('lspci');
       if (!hasLspci) {
-        console.warn("'lspci' command not found. Skipping GPU detection on Linux.");
+        logger.warn("'lspci' command not found. Skipping GPU detection on Linux.");
         return [];
       }
 
       const output = await executeCommand("lspci | grep -E 'VGA|3D|Display'");
       if (!output) {
-        console.warn('No GPU devices found via lspci.');
+        logger.warn('No GPU devices found via lspci.');
         return [];
       }
 
@@ -141,7 +141,7 @@ async function getSystemGPUs() {
         return null;
       }).filter(gpu => gpu !== null);
 
-      console.log('Detected GPUs (Linux):', gpus);
+      logger.info('Detected GPUs (Linux):', gpus);
       return gpus;
     } else if (platform === 'darwin') {
       // macOS: Use 'system_profiler SPDisplaysDataType'
@@ -155,14 +155,14 @@ async function getSystemGPUs() {
         else if (name.includes('Intel')) vendor = 'Intel';
         return { vendor, name };
       });
-      console.log('Detected GPUs (macOS):', gpus);
+      logger.info('Detected GPUs (macOS):', gpus);
       return gpus;
     } else {
-      console.warn('Unsupported platform for GPU detection:', platform);
+      logger.warn('Unsupported platform for GPU detection:', platform);
       return [];
     }
   } catch (error) {
-    console.error('Error detecting system GPUs:', error);
+    logger.error('Error detecting system GPUs:', error);
     return [];
   }
 }
@@ -177,44 +177,41 @@ async function determineBestEncoder() {
     getSystemGPUs(),
   ]);
 
-  console.log('Available Encoders:', availableEncoders);
-  console.log('System GPUs:', systemGPUs);
+  logger.info('Available Encoders:', availableEncoders);
+  logger.info('System GPUs:', systemGPUs);
 
   if (!Array.isArray(availableEncoders) || availableEncoders.length === 0) {
-    console.warn('No hardware encoders available.');
+    logger.warn('No hardware encoders available.');
     return null;
   }
 
   if (!Array.isArray(systemGPUs) || systemGPUs.length === 0) {
-    console.warn('No GPUs detected.');
+    logger.warn('No GPUs detected.');
     return null;
   }
 
   // Define encoder priority (optional)
   const encoderPriority = [
-    'vp9_vaapi',     // VAAPI VP9 encoder
+    'vp9_vaapi',     // VAAPI VP9 encoder (best compression)
     'vp9_qsv',       // Quick Sync VP9 encoder
-    'vaapi',         // Unified VAAPI encoder
-    'h264_vaapi',    // VAAPI H.264 encoder
-    'h264_qsv',      // Quick Sync H.264 encoder
-    'h264_nvenc',    // NVIDIA NVENC H.264
+    'av1_vaapi',     // VAAPI AV1 encoder (good compression, growing support)
     'hevc_vaapi',    // VAAPI HEVC encoder
-    'hevc_qsv',      // Quick Sync HEVC encoder
     'hevc_nvenc',    // NVIDIA NVENC HEVC
-    'av1_vaapi',     // VAAPI AV1 encoder
-    'h264_amf',      // AMD AMF H.264
+    'hevc_qsv',      // Quick Sync HEVC encoder
     'hevc_amf',      // AMD AMF HEVC
-    'h264_videotoolbox', // Apple VideoToolbox H.264
     'hevc_videotoolbox', // Apple VideoToolbox HEVC
-    // Add more encoders as needed
-  ];
-
-  // Sort available encoders based on priority
+    'h264_vaapi',    // VAAPI H.264 encoder
+    'h264_nvenc',    // NVIDIA NVENC H.264
+    'h264_qsv',      // Quick Sync H.264 encoder
+    'h264_amf',      // AMD AMF H.264
+    'h264_videotoolbox', // Apple VideoToolbox H.264
+    'vaapi',         // Unified VAAPI encoder
+  ];  // Sort available encoders based on priority
   availableEncoders.sort((a, b) => {
     return encoderPriority.indexOf(a.encoder) - encoderPriority.indexOf(b.encoder);
   });
 
-  console.log('Available Encoders after sorting:', availableEncoders);
+  logger.info('Available Encoders after sorting:', availableEncoders);
 
   // Iterate through sorted encoders and match with GPUs
   for (const encoder of availableEncoders) {
@@ -225,15 +222,15 @@ async function determineBestEncoder() {
         (encoder.encoder.includes('qsv') && vendor === 'intel') ||
         (encoder.encoder.includes('nvenc') && vendor === 'nvidia') ||
         (encoder.encoder.includes('amf') && vendor === 'amd') ||
-        (encoder.encoder.includes('videotoolbox') && os.platform() === 'darwin')
+        (encoder.encoder.includes('videotoolbox') && _platform() === 'darwin')
       ) {
-        console.log(`Selected Encoder: ${encoder.name} (${encoder.encoder}) for GPU: ${gpu.name}`);
+        logger.info(`Selected Encoder: ${encoder.name} (${encoder.encoder}) for GPU: ${gpu.name}`);
         return { encoder, deviceInfo: gpu };
       }
     }
   }
 
-  console.warn('No matching encoder found for detected GPUs.');
+  logger.warn('No matching encoder found for detected GPUs.');
   return null;
 }
 
@@ -241,7 +238,7 @@ async function determineBestEncoder() {
  * Retrieves hardware acceleration information, caching the result after the first check.
  * @returns {Promise<{encoder: string, name: string, deviceInfo: any} | null>} - Encoder info or null.
  */
-async function getHardwareAccelerationInfo() {
+export async function getHardwareAccelerationInfo() {
   if (cachedResult !== null) {
     return cachedResult;
   }
@@ -249,13 +246,10 @@ async function getHardwareAccelerationInfo() {
   const bestEncoder = await determineBestEncoder();
   cachedResult = bestEncoder;
   if (bestEncoder) {
-    console.log(`Selected hardware encoder: ${bestEncoder.encoder.name} (${bestEncoder.encoder.encoder})`);
+    logger.info(`Selected hardware encoder: ${bestEncoder.encoder.name} (${bestEncoder.encoder.encoder})`);
   } else {
-    console.log('No suitable hardware encoder found. Falling back to software encoding.');
+    logger.info('No suitable hardware encoder found. Falling back to software encoding.');
   }
   return cachedResult;
 }
 
-module.exports = {
-  getHardwareAccelerationInfo,
-};

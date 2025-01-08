@@ -1,40 +1,16 @@
-const { exec, spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs').promises;
-const { getVideoDuration, fileExists, convertToAvif } = require('./utils');
-const sharp = require('sharp');
+import { exec, spawn } from 'child_process';
+import { join } from 'path';
+import { promises as fs } from 'fs';
+import { getVideoDuration, fileExists, convertToAvif } from './utils.mjs';
+import sharp from 'sharp';
+import { createCategoryLogger } from './lib/logger.mjs';
+import PQueue from 'p-queue';
 
-let ffmpegQueue;
+const logger = createCategoryLogger('sprite');
 
-(async () => {
-  const PQueue = (await import('p-queue')).default;
-  ffmpegQueue = new PQueue({ concurrency: 3 });
-})();
+const FFMPEG_CONCURRENCY = parseInt(process.env.FFMPEG_CONCURRENCY) || 2;
 
-async function handlePNGSpriteSheetConversion(pngSpriteSheetPath, avifSpriteSheetPath) {
-  try {
-    // If PNG sprite sheet exists, convert it to AVIF
-    if (await fileExists(pngSpriteSheetPath)) {
-      await convertToAvif(pngSpriteSheetPath, avifSpriteSheetPath, 60, 4);
-      return Promise.resolve(true);
-    }
-    return Promise.resolve(false);
-  } catch (error) {
-    return Promise.reject(error);
-  }
-}
-
-async function checkSpriteSheetTypeAvailablePath(avifSpriteSheetPath, pngSpriteSheetPath, spriteSheetPath = false) {
-  if (avifSpriteSheetPath && await fileExists(avifSpriteSheetPath)) {
-    return avifSpriteSheetPath;
-  } else if (pngSpriteSheetPath && await fileExists(pngSpriteSheetPath)) {
-    return pngSpriteSheetPath;
-  } else if (spriteSheetPath && await fileExists(spriteSheetPath)) {
-    // Shouldn't normally need this, but just in case
-    return spriteSheetPath;
-  }
-  return false;
-}
+const ffmpegQueue = new PQueue({concurrency: FFMPEG_CONCURRENCY});
 
 /**
  * Optimizes a PNG spritesheet using Sharp with configurable options
@@ -55,12 +31,12 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
   } = options;
 
   try {
-    console.log('Starting PNG optimization...');
-    console.log('Input path:', inputPath);
-    console.log('Output path:', outputPath);
+    logger.info('Starting PNG optimization...');
+    logger.info('Input path:', inputPath);
+    logger.info('Output path:', outputPath);
 
     const originalStats = await fs.stat(inputPath);
-    console.log(`Original file size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB`);
+    logger.info(`Original file size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB`);
 
     // Create optimization temp path (distinct from input)
     const optimizationTempPath = outputPath.replace('.png', '_optimization.png');
@@ -69,7 +45,7 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
     const validColors = usePalette ? Math.min(Math.max(2, colors), 256) : undefined;
     
     // Step 1: Initial optimization
-    console.log('Step 1: Initial optimization...');
+    logger.info('Step 1: Initial optimization...');
     let sharpInstance = sharp(inputPath, {
       limitInputPixels: false,
       sequentialRead: true,
@@ -90,9 +66,9 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
       pngOptions.palette = true;
       pngOptions.colors = validColors;
       pngOptions.dither = dither;
-      console.log(`Using palette mode with ${validColors} colors and ${dither} dither`);
+      logger.info(`Using palette mode with ${validColors} colors and ${dither} dither`);
     } else {
-      console.log('Using standard PNG compression without palette');
+      logger.info('Using standard PNG compression without palette');
     }
 
     // Single optimization pass to temp file
@@ -109,7 +85,7 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
 
     const metadata = await sharp(outputPath).metadata();
 
-    console.log(`
+    logger.info(`
 PNG optimization results:
 ------------------------
 Original size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB
@@ -136,16 +112,19 @@ Blur: ${enableBlur ? blur : 'disabled'}
     };
 
   } catch (error) {
-    console.error('PNG optimization error:', error);
+    logger.error('PNG optimization error:', error);
     if (error.stack) {
-      console.error('Error stack:', error.stack);
+      logger.error('Error stack:', error.stack);
     }
     throw error;
   }
 }
 
-async function generateSpriteSheet({ videoPath, type, name, season, episode, cacheDir }) {
+export async function generateSpriteSheet({ videoPath, type, name, season, episode, cacheDir, onProgress = async () => {} }) {
   try {
+    // Step 1: FFmpeg (generating the raw spritesheet)
+    await onProgress(1, "Running FFmpeg to create raw sprite sheet");
+
     const duration = await getVideoDuration(videoPath);
     const floorDuration = Math.floor(duration);
     const interval = 5; // Interval between frames
@@ -160,8 +139,8 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
     
     // Calculate dimensions and determine format
     const useAvif = totalHeight <= maxAvifHeight;
-    console.log(`Sprite sheet dimensions: ${columns} columns x ${rows} rows = ${totalHeight}px height`);
-    console.log(`Using ${useAvif ? 'AVIF' : 'PNG'} format`);
+    logger.info(`Sprite sheet dimensions: ${columns} columns x ${rows} rows = ${totalHeight}px height`);
+    logger.info(`Using ${useAvif ? 'AVIF' : 'PNG'} format`);
 
     // Define filenames
     let spriteSheetFileNameBase, vttFileName;
@@ -173,15 +152,15 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
 
-    const finalSpriteSheetPath = path.join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
-    const vttFilePath = path.join(cacheDir, vttFileName);
+    const finalSpriteSheetPath = join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
+    const vttFilePath = join(cacheDir, vttFileName);
 
     // Check if we need to generate the spritesheet
     if (!await fileExists(finalSpriteSheetPath)) {
-      console.log('Generating new sprite sheet...');
+      logger.info('Generating new sprite sheet...');
       
       // Generate initial PNG with FFmpeg
-      const ffmpegOutputPath = path.join(cacheDir, `${spriteSheetFileNameBase}_ffmpeg.png`);
+      const ffmpegOutputPath = join(cacheDir, `${spriteSheetFileNameBase}_ffmpeg.png`);
       
       await generateSpriteSheetWithFFmpeg(
         videoPath,
@@ -192,14 +171,20 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
         'png'
       );
 
+      // Step 2: AVIF or PNG optimization
+      await onProgress(2, useAvif
+        ? "Converting PNG to AVIF"
+        : "Optimizing PNG"
+      );
+
       if (useAvif) {
         // Convert to AVIF
         await convertToAvif(ffmpegOutputPath, finalSpriteSheetPath, 90, 6, true);
         // Clean up FFmpeg output
-        await fs.unlink(ffmpegOutputPath).catch(console.error);
+        await fs.unlink(ffmpegOutputPath).catch(logger.error);
       } else {
         // Optimize PNG
-        console.log('Optimizing PNG spritesheet...');
+        logger.info('Optimizing PNG spritesheet...');
         try {
           await optimizePNGSpritesheet(
             ffmpegOutputPath,  // Input is FFmpeg output
@@ -213,19 +198,20 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
             }
           );
           // Clean up FFmpeg output after successful optimization
-          await fs.unlink(ffmpegOutputPath).catch(console.error);
+          await fs.unlink(ffmpegOutputPath).catch(logger.error);
         } catch (optimizeError) {
-          console.error('PNG optimization failed, using unoptimized PNG:', optimizeError);
+          logger.error('PNG optimization failed, using unoptimized PNG:', optimizeError);
           // If optimization fails, just move the FFmpeg output to final destination
           await fs.rename(ffmpegOutputPath, finalSpriteSheetPath);
         }
       }
     } else {
-      console.log('Using existing sprite sheet');
+      logger.info('Using existing sprite sheet');
     }
 
     // Generate VTT if needed
     if (!await fileExists(vttFilePath)) {
+      await onProgress(3, "Generating VTT file");
       await generateVttFileFFmpeg(
         finalSpriteSheetPath,
         vttFilePath,
@@ -236,7 +222,7 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
         type,
         name,
         season,
-        episode
+        episode,
       );
     }
 
@@ -246,7 +232,7 @@ async function generateSpriteSheet({ videoPath, type, name, season, episode, cac
       format: useAvif ? 'avif' : 'png'
     };
   } catch (error) {
-    console.error(`Error in generateSpriteSheet: ${error}`);
+    logger.error(`Error in generateSpriteSheet: ${error}`);
     throw error;
   }
 }
@@ -261,7 +247,7 @@ async function isVideoHDR(videoPath) {
     const command = `ffprobe -v error -select_streams v:0 -show_entries stream=color_space,color_transfer,color_primaries -of default=noprint_wrappers=1 "${videoPath}"`;
     exec(command, (error, stdout, stderr) => {
       if (error) {
-        console.error(`ffprobe error: ${stderr}`);
+        logger.error(`ffprobe error: ${stderr}`);
         return reject(error);
       }
 
@@ -306,11 +292,11 @@ async function generateSpriteSheetWithFFmpeg(
 
     // Step 1: Detect if the video is HDR
     const hdr = await isVideoHDR(videoPath);
-    console.log(`Video HDR: ${hdr}`);
+    logger.info(`Video HDR: ${hdr}`);
     const videoExists = await fileExists(videoPath);
 
     if (!videoExists) {
-      console.log(`Video file not found in Spritesheet step: ${videoPath}`);
+      logger.info(`Video file not found in Spritesheet step: ${videoPath}`);
       return;
     }
 
@@ -352,26 +338,26 @@ async function generateSpriteSheetWithFFmpeg(
       ffmpegOutputPath,
     ];
 
-    console.log(`Queuing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
+    logger.info(`Queuing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
 
     // Step 6: Add the FFmpeg execution to the queue
     await ffmpegQueue.add(async () => {
-      console.log(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
+      logger.info(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
 
       await new Promise((resolve, reject) => {
         const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
 
         ffmpegProcess.stdout.on('data', (data) => {
-          console.log(`stdout: ${data}`);
+          logger.info(`stdout: ${data}`);
         });
 
         ffmpegProcess.stderr.on('data', (data) => {
-          console.error(`stderr: ${data}`);
+          logger.error(`stderr: ${data}`);
         });
 
         ffmpegProcess.on('close', (code) => {
           if (code === 0) {
-            console.log(`Sprite sheet execution completed, stored at ${ffmpegOutputPath}`);
+            logger.info(`Sprite sheet execution completed, stored at ${ffmpegOutputPath}`);
             resolve();
           } else {
             reject(new Error(`FFmpeg process exited with code ${code}`));
@@ -388,9 +374,9 @@ async function generateSpriteSheetWithFFmpeg(
     if (outputFormat === 'avif') {
       try {
         await convertToAvif(ffmpegOutputPath, spriteSheetPath, 60, 4);
-        console.log(`Converted sprite sheet to AVIF at ${spriteSheetPath}`);
+        logger.info(`Converted sprite sheet to AVIF at ${spriteSheetPath}`);
       } catch (conversionError) {
-        console.error(`Error converting PNG to AVIF: ${conversionError}`);
+        logger.error(`Error converting PNG to AVIF: ${conversionError}`);
         // Optionally implement retry mechanisms or handle the error as needed
         throw conversionError;
       }
@@ -400,19 +386,19 @@ async function generateSpriteSheetWithFFmpeg(
     if (res) {
       res.sendFile(spriteSheetPath, (err) => {
         if (err) {
-          console.error(`Error sending file: ${err}`);
+          logger.error(`Error sending file: ${err}`);
         }
       });
     }
 
-    console.log('Sprite sheet generation process completed.');
+    logger.info('Sprite sheet generation process completed.');
   } catch (err) {
-    console.error(`Error generating sprite sheet: ${err}`);
+    logger.error(`Error generating sprite sheet: ${err}`);
     throw err;
   }
 }
 
-async function generateVttFileFFmpeg(spriteSheetPath, vttFilePath, duration, interval, columns, rows, type, name, season = null, episode = null) {
+export async function generateVttFileFFmpeg(spriteSheetPath, vttFilePath, duration, interval, columns, rows, type, name, season = null, episode = null) {
   const vttContent = ['WEBVTT', ''];
 
   const baseUrl = process.env.FILE_SERVER_NODE_URL;
@@ -466,7 +452,3 @@ async function getImageDimensions(imagePath) {
   const metadata = await sharp(imagePath, { limitInputPixels: 0, unlimited: true }).metadata();
   return { width: metadata.width, height: metadata.height };
 }
-
-module.exports = {
-  generateSpriteSheet,
-};

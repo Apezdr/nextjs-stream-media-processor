@@ -1,68 +1,34 @@
-const express = require("express");
-const schedule = require("node-schedule");
-const { exec } = require("child_process");
-const util = require("util");
-const os = require("os");
-const path = require("path");
-const _fs = require("fs"); // Callback-based version of fs
-const fs = require("fs").promises; // Use the promise-based version of fs
-const compression = require("compression");
-const axios = require("axios");
+import express from "express";
+import { scheduleJob } from "node-schedule";
+import { exec } from "child_process";
+import { promisify } from "util";
+import os from "os";
+import { join, resolve, basename, extname, dirname, normalize } from "path";
+import { createReadStream } from "fs"; // Callback-based version of fs
+import { promises as fs } from "fs"; // Use the promise-based version of fs
+import compression from "compression";
+import axios from "axios";
+import { generateSpriteSheet, generateVttFileFFmpeg } from "./sprite.mjs";
+import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
+import { generateFrame, getVideoDuration, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey } from "./utils.mjs";
+import { generateChapters, hasChapterInfo } from "./chapter-generator.mjs";
+import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
+import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
+import sharp from "sharp";
+import { getInfo, getHeaderData } from "./infoManager.mjs";
+import { fileURLToPath } from "url";
+import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
+import chokidar from "chokidar";
+import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+const logger = createCategoryLogger('main');
+const __filename = fileURLToPath(import.meta.url); // Get __filename
+const __dirname = dirname(__filename); // Get __dirname
+const execAsync = promisify(exec);
 const app = express();
-const thumbnailGenerationInProgress = new Set();
-const { generateSpriteSheet } = require("./sprite");
-const {
-  initializeDatabase,
-  insertOrUpdateMovie,
-  getMovies,
-  isDatabaseEmpty,
-  getTVShows,
-  insertOrUpdateTVShow,
-  insertOrUpdateMissingDataMedia,
-  getMissingDataMedia,
-  deleteMovie,
-  deleteTVShow,
-  getMovieByName,
-  getTVShowByName,
-  releaseDatabase,
-} = require("./sqliteDatabase");
-const {
-  generateFrame,
-  getVideoDuration,
-  fileExists,
-  ensureCacheDirs,
-  mainCacheDir,
-  generalCacheDir,
-  spritesheetCacheDir,
-  framesCacheDir,
-  findMp4File,
-  getStoredBlurhash,
-  calculateDirectoryHash,
-  getLastModifiedTime,
-  clearSpritesheetCache,
-  clearFramesCache,
-  clearGeneralCache,
-  clearVideoClipsCache,
-  convertToAvif,
-  generateCacheKey,
-} = require("./utils");
-const { generateChapters, hasChapterInfo } = require("./chapter-generator");
-const {
-  checkAutoSync,
-  updateLastSyncTime,
-  initializeIndexes,
-  initializeMongoDatabase,
-} = require("./database");
-const {
-  handleVideoRequest,
-  handleVideoClipRequest,
-} = require("./videoHandler");
-const sharp = require("sharp");
-const { getInfo, getHeaderData } = require("./infoManager");
-const execAsync = util.promisify(exec);
 //const { handleVideoRequest } = require("./videoHandler");
+const logDirectory = resolve('logs');
 const LOG_FILE = process.env.LOG_PATH
-  ? path.join(process.env.LOG_PATH, "cron.log")
+  ? join(process.env.LOG_PATH, "cron.log")
   : "/var/log/cron.log";
 // Define the base path to the tv/movie folders
 const BASE_PATH = process.env.BASE_PATH
@@ -70,15 +36,15 @@ const BASE_PATH = process.env.BASE_PATH
   : "/var/www/html";
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || "";
-const scriptsDir = path.resolve(__dirname, "../scripts");
+const scriptsDir = resolve(__dirname, "../scripts");
 // Moderately spaced out interval to check for missing data
 const RETRY_INTERVAL_HOURS = 24; // Interval to retry downloading missing tmdb data
 
-const generatePosterCollageScript = path.join(
+const generatePosterCollageScript = join(
   scriptsDir,
   "generate_poster_collage.py"
 );
-const downloadTmdbImagesScript = path.join(
+const downloadTmdbImagesScript = join(
   scriptsDir,
   "download_tmdb_images.py"
 );
@@ -88,6 +54,11 @@ const isDebugMode =
   process.env.DEBUG && process.env.DEBUG.toLowerCase() === "true";
 const debugMessage = isDebugMode ? " [Debugging Enabled]" : "";
 const CHROME_HEIGHT_LIMIT = 30780; // Chrome's maximum image height limit
+
+// Used to validate the version supported by frontend
+// To log a need to update code to support file server
+const TV_LIST_VERSION = 1.0001;
+const MOVIE_LIST_VERSION = 1.0000;
 
 // Enable compression for all responses
 app.use(compression());
@@ -200,71 +171,40 @@ async function handleFrameRequest(req, res, type) {
   const { movieName, showName, season, episode, timestamp } = req.params;
   let movie_name = decodeURIComponent(movieName);
   let show_name = decodeURIComponent(showName);
+  // Cant use `:` on Windows so replace with `-`
+  const sanitizeTimestamp = timestamp.replace(/:/g, '-');
 
   if (type === "movies") {
-    directoryPath = path.join(`${BASE_PATH}/movies`, movie_name);
-    frameFileName = `movie_${movie_name}_${timestamp}.avif`;
+    directoryPath = join(`${BASE_PATH}/movies`, movie_name);
+    frameFileName = `movie_${movie_name}_${sanitizeTimestamp}.avif`;
   } else {
     // Extract episode number
     const episodeMatch =
       episode.match(/E(\d{1,2})/i) || episode.match(/^(\d{1,2})( -)?/);
     const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
-    directoryPath = path.join(`${BASE_PATH}/tv`, show_name, `Season ${season}`);
-    frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${timestamp}.avif`;
+    directoryPath = join(`${BASE_PATH}/tv`, show_name, `Season ${season}`);
+    frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${sanitizeTimestamp}.avif`;
 
     const db = await initializeDatabase();
     const showData = await getTVShowByName(db, show_name);
     await releaseDatabase(db);
     if (showData) {
-      const _season = showData.metadata.seasons[`Season ${season}`];
-      if (_season) {
-        const _episode = _season.fileNames.find((e) => {
-          // Match S01E01 format
-          const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-          if (standardMatch) {
-            const seasonNum = standardMatch[1].padStart(2, "0");
-            const episodeNum = standardMatch[2].padStart(2, "0");
-            return (
-              seasonNum === season.padStart(2, "0") &&
-              episodeNum === episodeNumber.padStart(2, "0")
-            );
-          }
-
-          // Match "01 - Episode Name.mp4" format
-          const alternateMatch = e.match(/^(\d{2})\s*-/);
-          if (alternateMatch) {
-            const episodeNum = alternateMatch[1].padStart(2, "0");
-            // For this format, we assume the file is already in the correct season folder
-            // so we only need to match the episode number
-            return episodeNum === episodeNumber.padStart(2, "0");
-          }
-
-          // No match found
-          return false;
-        });
-
-        if (_episode) {
-          specificFileName = _episode;
-        } else {
-          throw new Error(
-            `Episode not found: ${show_name} - Season ${season} Episode ${episode}`
-          );
-        }
+      const _episode = getEpisodeFilename(showData, season, episode)
+      specificFileName = _episode;
       } else {
         throw new Error(
           `Season not found: ${show_name} - Season ${season} Episode ${episode}`
         );
       }
-    }
   }
 
-  const framePath = path.join(framesCacheDir, frameFileName);
+  const framePath = join(framesCacheDir, frameFileName);
 
   try {
     if (await fileExists(framePath)) {
       // Serve from cache if exists
-      console.log(`Serving cached frame: ${frameFileName}`);
+      logger.info(`Serving cached frame: ${frameFileName}`);
     } else {
       wasCached = false;
       // Find the MP4 file dynamically
@@ -272,85 +212,16 @@ async function handleFrameRequest(req, res, type) {
 
       // Generate the frame
       await generateFrame(videoPath, timestamp, framePath);
-      console.log(`Generated new frame: ${frameFileName}`);
+      logger.info(`Generated new frame: ${frameFileName}`);
     }
 
-    res.sendFile(framePath);
-
-    //
-    // Historic usage where it would generate
-    // all frames for a given media file, this
-    // is no longer necessary.
-    //
-    // Check if thumbnail generation is in progress to avoid duplication
-    // if (!thumbnailGenerationInProgress.has(videoPath) && videoPath) {
-    //   thumbnailGenerationInProgress.add(videoPath);
-    //   generateAllThumbnails(
-    //     videoPath,
-    //     type,
-    //     req.params.movieName ||
-    //       (req.params.showName ? req.params.showName.replace(/%20/g, " ") : ""),
-    //     req.params.season ? req.params.season.replace(/%20/g, " ") : "",
-    //     req.params.episode
-    //   )
-    //     .then(() => {
-    //       console.log("Processing complete show generation");
-    //       thumbnailGenerationInProgress.delete(videoPath);
-    //     })
-    //     .catch((error) => {
-    //       console.error(error);
-    //       thumbnailGenerationInProgress.delete(videoPath);
-    //     });
-    // }
+    res.set('Content-Disposition', 'inline');
+    res.type('image/avif').sendFile(framePath);
   } catch (error) {
-    console.error(error);
+    logger.error(error);
     return res.status(404).send("Video file not found");
   }
 }
-
-// Historic, no longer necessary
-//
-// async function generateAllThumbnails(
-//   videoPath,
-//   type,
-//   name,
-//   season = null,
-//   episode = null
-// ) {
-//   try {
-//     const duration = await getVideoDuration(videoPath);
-//     const floorDuration = Math.floor(duration);
-//     console.log(`Total Duration: ${floorDuration} seconds`);
-
-//     const interval = 5; // Adjust if needed for debugging
-//     for (
-//       let currentTime = 0;
-//       currentTime <= floorDuration;
-//       currentTime += interval
-//     ) {
-//       let timestamp = new Date(currentTime * 1000).toISOString().substr(11, 8);
-//       console.log(`Processing timestamp: ${timestamp}`); // Debugging log
-
-//       let frameFileName;
-//       if (type === "movies") {
-//         frameFileName = `movie_${name}_${timestamp}.jpg`;
-//       } else if (type === "tv") {
-//         frameFileName = `${type}_${name}_${season}_${episode}_${timestamp}.jpg`;
-//       }
-
-//       let framePath = path.join(framesCacheDir, frameFileName);
-
-//       if (!(await fileExists(framePath))) {
-//         console.log(`Generating new frame: ${frameFileName}`);
-//         await generateFrame(videoPath, timestamp, framePath);
-//       } else {
-//         console.log(`Frame already exists: ${frameFileName}, skipping...`);
-//       }
-//     }
-//   } catch (error) {
-//     console.error(`Error in generateAllThumbnails: ${error}`);
-//   }
-// }
 
 //
 // Sprite
@@ -382,53 +253,26 @@ async function getVideoPath(
       throw new Error(`Movie not found: ${movieName}`);
     }
     const videoMp4 = decodeURIComponent(JSON.parse(movie.urls).mp4);
-    return path.join(BASE_PATH, videoMp4);
+    return join(BASE_PATH, videoMp4);
   } else {
     const showData = await getTVShowByName(db, showName);
     if (!showData) {
       throw new Error(`Show not found: ${showName}`);
     }
+    const _season = showData.seasons[`Season ${season}`];
+    const episodeKey = getEpisodeKey(showData, season, episode);
+    const _episode = getEpisodeFilename(showData, season, episode);
+    let specificFileName = null;
 
-    const _season = showData.metadata.seasons[`Season ${season}`];
-    if (!_season) {
-      throw new Error(`Season not found: ${showName} - Season ${season}`);
-    }
-
-    const _episode = _season.fileNames.find((e) => {
-      const episodeNumber = episode.padStart(2, "0");
-      const seasonNumber = season.padStart(2, "0");
-
-      // Match S01E01 format
-      const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-      if (standardMatch) {
-        const matchedSeason = standardMatch[1].padStart(2, "0");
-        const matchedEpisode = standardMatch[2].padStart(2, "0");
-        return (
-          matchedSeason === seasonNumber && matchedEpisode === episodeNumber
-        );
-      }
-
-      // Match "01 - Episode Name.mp4" format or variations
-      const alternateMatch = e.match(/^(\d{2})\s*-/);
-      if (alternateMatch) {
-        const matchedEpisode = alternateMatch[1].padStart(2, "0");
-        return matchedEpisode === episodeNumber;
-      }
-
-      // Legacy format matches (keeping for backward compatibility)
-      return (
-        e.includes(` - `) &&
-        (e.startsWith(episodeNumber) || e.includes(` ${episodeNumber} - `))
-      );
-    });
-
-    if (!_episode) {
+    if (_episode) {
+      const fileNameFromEpisode = _season.episodes[episodeKey].filename;
+      specificFileName = fileNameFromEpisode;
+    } else {
       throw new Error(
-        `Episode not found; video path not found: ${showName} - Season ${season} Episode ${episode}`
+        `Episode not found: ${showName} - Season ${season} Episode ${episode}`
       );
     }
-
-    return path.join(`${BASE_PATH}/tv`, showName, `Season ${season}`, _episode);
+    return join(`${BASE_PATH}/tv`, showName, `Season ${season}`, specificFileName);
   }
 }
 
@@ -453,11 +297,11 @@ async function handleSpriteSheetRequest(req, res, type) {
     }
 
     // Check both formats
-    const avifPath = path.join(
+    const avifPath = join(
       spritesheetCacheDir,
       spriteSheetFileName + ".avif"
     );
-    const pngPath = path.join(
+    const pngPath = join(
       spritesheetCacheDir,
       spriteSheetFileName + ".png"
     );
@@ -475,7 +319,7 @@ async function handleSpriteSheetRequest(req, res, type) {
     }
 
     if (existingPath) {
-      console.log(`Serving existing sprite sheet: ${existingPath}`);
+      logger.info(`Serving existing sprite sheet: ${existingPath}`);
 
       // For PNG files, check dimensions to see if we should convert to AVIF
       if (format === "png") {
@@ -491,16 +335,16 @@ async function handleSpriteSheetRequest(req, res, type) {
 
             try {
               await convertToAvif(existingPath, avifPath, 60, 4, false);
-              console.log(
+              logger.info(
                 `Background conversion to AVIF successful: ${avifPath}`
               );
             } catch (error) {
-              console.error("Background AVIF conversion failed:", error);
+              logger.error("Background AVIF conversion failed:", error);
             }
             return;
           }
         } catch (error) {
-          console.error("Error checking PNG dimensions:", error);
+          logger.error("Error checking PNG dimensions:", error);
         }
       }
 
@@ -533,6 +377,17 @@ async function handleSpriteSheetRequest(req, res, type) {
 
     spriteSheetProcessingFiles.add(fileKey);
 
+    // -- Step 0: Create a process queue entry with totalSteps = 3
+    await createOrUpdateProcessQueue(
+      db,
+      fileKey + "_spritesheet",
+      "spritesheet",
+      3,        // total steps
+      0,        // current step
+      "in-progress",
+      "Starting sprite sheet creation"
+    );
+
     try {
       // Get video path logic...
       const videoPath = await getVideoPath(type, db, {
@@ -551,11 +406,23 @@ async function handleSpriteSheetRequest(req, res, type) {
         season,
         episode,
         cacheDir: spritesheetCacheDir,
+        onProgress: async (stepNumber, message) => {
+          // Utility callback to track each step
+          const dbInner = await initializeDatabase();
+          await updateProcessQueue(dbInner, fileKey + "_spritesheet", stepNumber, "in-progress", message);
+          await releaseDatabase(dbInner);
+        },
       });
 
       // Process queued requests
       const queuedRequests = spriteSheetRequestQueues.get(fileKey) || [];
       spriteSheetRequestQueues.delete(fileKey);
+      spriteSheetProcessingFiles.delete(fileKey);
+      // -- Mark the process as completed
+      const dbFinal = await initializeDatabase();
+      await finalizeProcessQueue(dbFinal, fileKey + "_spritesheet");
+      await releaseDatabase(dbFinal);
+
       queuedRequests.forEach((queuedRes) => {
         queuedRes.setHeader(
           "Cache-Control",
@@ -583,10 +450,15 @@ async function handleSpriteSheetRequest(req, res, type) {
       return res.sendFile(spriteSheetPath);
     } catch (error) {
       spriteSheetProcessingFiles.delete(fileKey);
+      // Mark the queue as errored
+      const dbErr = await initializeDatabase();
+      await finalizeProcessQueue(dbErr, fileKey + "_spritesheet", "error", error.message);
+      await releaseDatabase(dbErr);
+
       throw error;
     }
   } catch (error) {
-    console.error(error);
+    logger.error(error);
     if (!res.headersSent) {
       res.status(500).send("Internal server error");
     }
@@ -604,23 +476,23 @@ async function handleVttRequest(req, res, type) {
     vttFileName = `tv_${showName}_${season}_${episode}_spritesheet.vtt`;
   }
 
-  const vttFilePath = path.join(spritesheetCacheDir, vttFileName);
+  const vttFilePath = join(spritesheetCacheDir, vttFileName);
 
   try {
     if (await fileExists(vttFilePath)) {
-      console.log(`Serving VTT file from cache: ${vttFileName}`);
+      logger.info(`Serving VTT file from cache: ${vttFileName}`);
       res.setHeader("Content-Type", "text/vtt");
-      const fileStream = _fs.createReadStream(vttFilePath);
+      const fileStream = createReadStream(vttFilePath);
       fileStream.pipe(res);
     } else {
-      console.log(`VTT file not found in cache: ${vttFileName}`);
+      logger.info(`VTT file not found in cache: ${vttFileName}`);
 
       const fileKey =
         type === "movies"
           ? `movie_${movieName}`
           : `tv_${showName}_${season}_${episode}`;
       if (vttProcessingFiles.has(fileKey)) {
-        console.log(
+        logger.info(
           `VTT file ${fileKey} is already being processed. Adding request to queue.`
         );
         if (!vttRequestQueues.has(fileKey)) {
@@ -631,6 +503,17 @@ async function handleVttRequest(req, res, type) {
       }
       vttProcessingFiles.add(fileKey);
 
+      // Create or update the queue record for the VTT process
+      await createOrUpdateProcessQueue(
+        db,
+        fileKey + "_vtt",  // so we don't conflict with the sprite sheet queue
+        "vtt",
+        3, // total steps for VTT
+        1, // start on step 1
+        "in-progress",
+        "Starting VTT generation"
+      );
+
       // Generate the VTT file
       let videoPath;
       if (type === "movies") {
@@ -639,9 +522,9 @@ async function handleVttRequest(req, res, type) {
           vttProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
-        videoMp4 = movie.urls.mp4;
+        let videoMp4 = movie.urls.mp4;
         videoMp4 = decodeURIComponent(videoMp4);
-        videoPath = path.join(BASE_PATH, videoMp4);
+        videoPath = join(BASE_PATH, videoMp4);
         // await generateSpriteSheet({
         //   videoPath,
         //   type,
@@ -653,42 +536,18 @@ async function handleVttRequest(req, res, type) {
           const shows = await getTVShows(db);
           const showData = shows.find((show) => show.name === showName);
           if (showData) {
-            const _season = showData.metadata.seasons[`Season ${season}`];
+            const _season = showData.seasons[`Season ${season}`];
             if (_season) {
-              const _episode = _season.fileNames.find((e) => {
-                const episodeNumber = episode.padStart(2, "0");
-                const seasonNumber = season.padStart(2, "0");
+              const episodeKey = getEpisodeKey(showData, season, episode);
               
-                // Match S01E01 format
-                const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-                if (standardMatch) {
-                  const matchedSeason = standardMatch[1].padStart(2, "0");
-                  const matchedEpisode = standardMatch[2].padStart(2, "0");
-                  return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
-                }
-              
-                // Match "01 - Episode Name.mp4" format or variations
-                const alternateMatch = e.match(/^(\d{2})\s*-/);
-                if (alternateMatch) {
-                  const matchedEpisode = alternateMatch[1].padStart(2, "0");
-                  return matchedEpisode === episodeNumber;
-                }
-              
-                // Legacy format matches (keeping for backward compatibility)
-                return (
-                  e.includes(` - `) &&
-                  (e.startsWith(episodeNumber) ||
-                   e.includes(` ${episodeNumber} - `))
-                );
-              });
-              
-              if (_episode) {
-                const directoryPath = path.join(
+              if (episodeKey) {
+                const episodeVideo = _season.episodes[episodeKey].filename;
+                const directoryPath = join(
                   `${BASE_PATH}/tv`,
                   showName,
                   `Season ${season}`
                 );
-                videoPath = path.join(directoryPath, _episode);
+                videoPath = join(directoryPath, episodeVideo);
               } else {
                 throw new Error(
                   `Episode not found: ${showName} - Season ${season} Episode ${episode}`
@@ -703,11 +562,23 @@ async function handleVttRequest(req, res, type) {
             throw new Error(`Show not found: ${showName}`);
           }
         } catch (error) {
-          console.error(`Error accessing tv db data: ${error.message}`);
+          logger.error(`Error accessing tv db data: ${error.message}`);
           vttProcessingFiles.delete(fileKey);
           return res.status(500).send("Internal server error");
         }
       }
+
+      // Create a queue for the spritesheet process
+      await createOrUpdateProcessQueue(
+        db,
+        fileKey + "_spritesheet",
+        "spritesheet",
+        3,        // total steps
+        0,        // current step
+        "in-progress",
+        "Starting sprite sheet creation"
+      );
+
       await releaseDatabase(db);
       await generateSpriteSheet({
         videoPath,
@@ -716,7 +587,20 @@ async function handleVttRequest(req, res, type) {
         season,
         episode,
         cacheDir: spritesheetCacheDir,
+        onProgress: async (stepNumber, message) => {
+          // Utility callback to track each step
+          const dbInner = await initializeDatabase();
+          await updateProcessQueue(dbInner, fileKey + "_vtt", stepNumber, "in-progress", message);
+          await updateProcessQueue(dbInner, fileKey + "_spritesheet", stepNumber, "in-progress", message);
+          await releaseDatabase(dbInner);
+        },
       });
+
+      const finalizeDBqueue = await initializeDatabase();
+      // Finalize the queue
+      await finalizeProcessQueue(finalizeDBqueue, fileKey + "_vtt", "completed", "VTT generation done");
+      await finalizeProcessQueue(finalizeDBqueue, fileKey + "_spritesheet", "completed", "Spritesheet generation done");
+      await releaseDatabase(finalizeDBqueue);
 
       vttProcessingFiles.delete(fileKey);
 
@@ -726,18 +610,18 @@ async function handleVttRequest(req, res, type) {
         vttRequestQueues.delete(fileKey);
         queuedRequests.forEach((queuedRes) => {
           queuedRes.setHeader("Content-Type", "text/vtt");
-          const fileStream = _fs.createReadStream(vttFilePath);
+          const fileStream = createReadStream(vttFilePath);
           fileStream.pipe(queuedRes);
         });
 
         // Stream the generated VTT file
         res.setHeader("Content-Type", "text/vtt");
-        const fileStream = _fs.createReadStream(vttFilePath);
+        const fileStream = createReadStream(vttFilePath);
         fileStream.pipe(res);
       }
     }
   } catch (error) {
-    console.error(error);
+    logger.error(error);
     res.status(500).send("Internal server error");
   }
 }
@@ -772,17 +656,17 @@ async function handleChapterRequest(
     if (!movie) {
       return res.status(404).send(`Movie not found: ${movieName}`);
     }
-    videoMp4 = JSON.parse(movie.urls).mp4;
+    let videoMp4 = JSON.parse(movie.urls).mp4;
     videoMp4 = decodeURIComponent(videoMp4);
-    videoPath = path.join(BASE_PATH, videoMp4);
-    const movieFileName = path.basename(videoPath, path.extname(videoPath));
+    let videoPath = join(BASE_PATH, videoMp4);
+    const movieFileName = basename(videoPath, extname(videoPath));
     chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = path.join(
+    mediaPath = join(
       `${BASE_PATH}/movies`,
       movieName,
       `${movieFileName}.mp4`
     );
-    chapterFilePath = path.join(
+    chapterFilePath = join(
       `${BASE_PATH}/movies`,
       movieName,
       "chapters",
@@ -800,7 +684,7 @@ async function handleChapterRequest(
           for (const episodeFileName of season.fileNames) {
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = path.join(
+            const chapterFilePath = join(
               `${BASE_PATH}/tv`,
               showName,
               seasonName,
@@ -810,12 +694,12 @@ async function handleChapterRequest(
                 "0"
               )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
             );
-            const directoryPath = path.join(
+            const directoryPath = join(
               `${BASE_PATH}/tv`,
               showName,
               seasonName
             );
-            const mediaPath = path.join(directoryPath, episodeFileName);
+            const mediaPath = join(directoryPath, episodeFileName);
 
             await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
           }
@@ -836,7 +720,7 @@ async function handleChapterRequest(
           for (const episodeFileName of season.fileNames) {
             const episodeNumber = getEpisodeNumber(episodeFileName);
             const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = path.join(
+            const chapterFilePath = join(
               `${BASE_PATH}/tv`,
               showName,
               seasonName,
@@ -846,12 +730,12 @@ async function handleChapterRequest(
                 "0"
               )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
             );
-            const directoryPath = path.join(
+            const directoryPath = join(
               `${BASE_PATH}/tv`,
               showName,
               seasonName
             );
-            const mediaPath = path.join(directoryPath, episodeFileName);
+            const mediaPath = join(directoryPath, episodeFileName);
 
             await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
           }
@@ -862,7 +746,7 @@ async function handleChapterRequest(
         return res.status(404).send(`Show not found: ${showName}`);
       }
     } else {
-      const directoryPath = path.join(
+      const directoryPath = join(
         `${BASE_PATH}/tv`,
         showName,
         `Season ${season}`
@@ -870,7 +754,7 @@ async function handleChapterRequest(
       const episodeNumber = episode.padStart(2, "0");
       const seasonNumber = season.padStart(2, "0");
       chapterFileName = `${showName} - S${seasonNumber}E${episodeNumber}_chapters.vtt`;
-      chapterFilePath = path.join(directoryPath, "chapters", chapterFileName);
+      chapterFilePath = join(directoryPath, "chapters", chapterFileName);
 
       try {
         const mp4Files = await fs.readdir(directoryPath);
@@ -881,15 +765,15 @@ async function handleChapterRequest(
         );
 
         if (mp4File) {
-          mediaPath = path.join(directoryPath, mp4File);
+          mediaPath = join(directoryPath, mp4File);
         } else {
-          console.error(
+          logger.error(
             `Associated MP4 file not found for ${showName} - S${seasonNumber}E${episodeNumber}`
           );
           return res.status(404).send("Associated MP4 file not found");
         }
       } catch (error) {
-        console.error(
+        logger.error(
           `Error accessing directory or reading its contents: ${directoryPath}`,
           error
         );
@@ -913,12 +797,12 @@ function getEpisodeNumber(episodeFileName) {
 async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
   try {
     if (await fileExists(chapterFilePath)) {
-      console.log(
-        `Serving chapter file from cache: ${path.basename(chapterFilePath)}`
+      logger.info(
+        `Serving chapter file from cache: ${basename(chapterFilePath)}`
       );
     } else {
-      console.log(
-        `Chapter file not found in cache: ${path.basename(chapterFilePath)}`
+      logger.info(
+        `Chapter file not found in cache: ${basename(chapterFilePath)}`
       );
 
       // Check if the media file has chapter information
@@ -926,35 +810,91 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
 
       if (hasChapters) {
         // Create the chapters directory if it doesn't exist
-        await fs.mkdir(path.dirname(chapterFilePath), { recursive: true });
+        await fs.mkdir(dirname(chapterFilePath), { recursive: true });
 
         // If the media file has chapter information, generate the chapter file
         const chapterContent = await generateChapters(mediaPath);
 
         // Save the generated chapter content to the file
         await fs.writeFile(chapterFilePath, chapterContent);
-        console.log("The file has been saved!");
+        logger.info("The file has been saved!");
       } else {
         // If the media file doesn't have chapter information, send a 404 response
-        console.warn(
-          `Chapter information not found for ${path.basename(mediaPath)}`
+        logger.warn(
+          `Chapter information not found for ${basename(mediaPath)}`
         );
       }
     }
   } catch (error) {
     if (error.code === "EACCES") {
-      console.error(
+      logger.error(
         `Permission denied while accessing ${chapterFilePath}.\nPlease check the directory permissions.`,
         error
       );
     } else {
-      console.error(
-        `Error generating chapter file for ${path.basename(mediaPath)}:`,
+      logger.error(
+        `Error generating chapter file for ${basename(mediaPath)}:`,
         error
       );
     }
   }
 }
+
+/**
+ * GET /processes
+ * Retrieves the current process queue information in JSON format.
+ * Optional query parameters:
+ * - processType: Filter by process_type (e.g., "spritesheet", "vtt")
+ * - status: Filter by status (e.g., "in-progress", "queued", "completed", "error")
+ */
+app.get('/processes', async (req, res) => {
+  try {
+    const db = await initializeDatabase();
+
+    // Extract query parameters for filtering
+    const { processType, status } = req.query;
+
+    let processes;
+    if (processType || status) {
+      // Use the filtered retrieval function
+      processes = await getProcessesWithFilters(db, { processType, status });
+    } else {
+      // Retrieve all processes
+      processes = await getAllProcesses(db);
+    }
+
+    await releaseDatabase(db);
+
+    res.json({ success: true, data: processes });
+  } catch (error) {
+    logger.error(`Error fetching processes: ${error.message}`);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+});
+
+/**
+ * GET /processes/:fileKey
+ * Retrieves the process information for a specific fileKey.
+ */
+app.get('/processes/:fileKey', async (req, res) => {
+  try {
+    const { fileKey } = req.params;
+    const db = await initializeDatabase();
+
+    const process = await getProcessByFileKey(db, fileKey);
+
+    await releaseDatabase(db);
+
+    if (process) {
+      res.json({ success: true, data: process });
+    } else {
+      res.status(404).json({ success: false, message: 'Process not found' });
+    }
+  } catch (error) {
+    logger.error(`Error fetching process ${req.params.fileKey}: ${error.message}`);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+});
 
 //
 // Handle MP4 Audio requests
@@ -967,7 +907,7 @@ app.get("/rescan/tmdb", async (req, res) => {
     await runDownloadTmdbImages(null, null, true);
     res.status(200).send("Rescan initiated");
   } catch (error) {
-    console.error(error);
+    logger.error(error);
     res.status(500).send("Rescan Failed: Internal server error");
   }
 });
@@ -979,49 +919,49 @@ app.get("/rescan/tmdb", async (req, res) => {
 //
 // Clear General Cache every 30 minutes
 setInterval(() => {
-  console.log("Running General Cache Cleanup...");
+  logger.info("Running General Cache Cleanup...");
   clearGeneralCache()
     .then(() => {
-      console.log("General Cache Cleanup Completed.");
+      logger.info("General Cache Cleanup Completed.");
     })
     .catch((error) => {
-      console.error(`General Cache Cleanup Error: ${error.message}`);
+      logger.error(`General Cache Cleanup Error: ${error.message}`);
     });
 }, 30 * 60 * 1000); // 30 minutes
 
 // Clear Video Clips Cache every 24 hours
 setInterval(() => {
-  console.log("Running Video Clips Cache Cleanup...");
+  logger.info("Running Video Clips Cache Cleanup...");
   clearVideoClipsCache()
     .then(() => {
-      console.log("Video Clips Cache Cleanup Completed.");
+      logger.info("Video Clips Cache Cleanup Completed.");
     })
     .catch((error) => {
-      console.error(`Video Clips Cache Cleanup Error: ${error.message}`);
+      logger.error(`Video Clips Cache Cleanup Error: ${error.message}`);
     });
 }, 24 * 60 * 60 * 1000); // 24 hours
 
 //Clear Spritesheet Cache every day
 setInterval(() => {
-  console.log("Running Spritesheet Cache Cleanup...");
+  logger.info("Running Spritesheet Cache Cleanup...");
   clearSpritesheetCache()
     .then(() => {
-      console.log("Spritesheet Cache Cleanup Completed.");
+      logger.info("Spritesheet Cache Cleanup Completed.");
     })
     .catch((error) => {
-      console.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
+      logger.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
     });
 }, 24 * 60 * 60 * 1000); // 24 hours
 
 //Clear Frames Cache every day
 setInterval(() => {
-  console.log("Running Frames Cache Cleanup...");
+  logger.info("Running Frames Cache Cleanup...");
   clearFramesCache()
     .then(() => {
-      console.log("Frames Cache Cleanup Completed.");
+      logger.info("Frames Cache Cleanup Completed.");
     })
     .catch((error) => {
-      console.error(`Frames Cache Cleanup Error: ${error.message}`);
+      logger.error(`Frames Cache Cleanup Error: ${error.message}`);
     });
 }, 24 * 60 * 60 * 1000); // 24 hours
 //
@@ -1042,355 +982,356 @@ async function generateListTV(db, dirPath) {
     for (let index = 0; index < shows.length; index++) {
       const show = shows[index];
       if (isDebugMode) {
-        console.log(
-          `Processing show: ${show.name}: ${index + 1} of ${shows.length}`
-        );
+        logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
       }
-      if (show.isDirectory()) {
-        const showName = show.name;
-        existingShowNames.delete(showName); // Remove from the set of existing shows
-        const encodedShowName = encodeURIComponent(showName);
-        const showPath = path.normalize(path.join(dirPath, showName));
-        const allItems = await fs.readdir(showPath, { withFileTypes: true });
-        const seasonFolders = allItems.filter(
-          (item) => item.isDirectory() && item.name.startsWith("Season")
-        );
-        const sortedSeasonFolders = seasonFolders.sort((a, b) => {
-          const aNum = parseInt(a.name.replace("Season", ""));
-          const bNum = parseInt(b.name.replace("Season", ""));
-          return aNum - bNum;
-        });
-        const otherItems = allItems.filter(
-          (item) => !seasonFolders.includes(item)
-        );
-        const seasons = [...sortedSeasonFolders, ...otherItems];
+      if (!show.isDirectory()) continue; // Skip if not a directory
 
-        const showMetadata = {
-          metadata: `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`,
-          seasons: {},
-        };
+      const showName = show.name;
+      existingShowNames.delete(showName); // Remove from the set of existing shows
+      const encodedShowName = encodeURIComponent(showName);
+      const showPath = normalize(join(dirPath, showName));
+      const allItems = await fs.readdir(showPath, { withFileTypes: true });
+      const seasonFolders = allItems.filter(
+        (item) => item.isDirectory() && item.name.startsWith("Season")
+      );
+      const sortedSeasonFolders = seasonFolders.sort((a, b) => {
+        const aNum = parseInt(a.name.replace("Season", ""));
+        const bNum = parseInt(b.name.replace("Season", ""));
+        return aNum - bNum;
+      });
+      const otherItems = allItems.filter((item) => !seasonFolders.includes(item));
+      const seasons = [...sortedSeasonFolders, ...otherItems];
 
-        // Initialize runDownloadTmdbImagesFlag
-        let runDownloadTmdbImagesFlag = false;
+      // Initialize individual fields
+      let metadataUrl = "";
+      let metadata = "";
+      let poster = "";
+      let posterBlurhash = "";
+      let logo = "";
+      let logoBlurhash = "";
+      let backdrop = "";
+      let backdropBlurhash = "";
 
-        // Handle show poster, logo, and backdrop
-        const posterPath = path.normalize(
-          path.join(showPath, "show_poster.jpg")
-        );
-        if (await fileExists(posterPath)) {
-          showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
-          const posterBlurhash = await getStoredBlurhash(posterPath, BASE_PATH);
-          if (posterBlurhash) {
-            showMetadata.posterBlurhash = posterBlurhash;
+      // Initialize runDownloadTmdbImagesFlag
+      let runDownloadTmdbImagesFlag = false;
+
+      // Handle show poster
+      const posterPath = join(showPath, "show_poster.jpg");
+      if (await fileExists(posterPath)) {
+        poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
+        const blurhash = await getStoredBlurhash(posterPath, BASE_PATH);
+        if (blurhash) {
+          posterBlurhash = blurhash;
+        }
+      } else {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Handle show logo
+      const logoExtensions = ["svg", "jpg", "png", "gif"];
+      let logoFound = false;
+      for (const ext of logoExtensions) {
+        const logoPath = join(showPath, `show_logo.${ext}`);
+        if (await fileExists(logoPath)) {
+          logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
+          if (ext !== "svg") {
+            const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
+            if (blurhash) {
+              logoBlurhash = blurhash;
+            }
           }
+          logoFound = true;
+          break;
+        }
+      }
+      if (!logoFound) {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Handle show backdrop
+      const backdropExtensions = ["jpg", "png", "gif"];
+      let backdropFound = false;
+      for (const ext of backdropExtensions) {
+        const backdropPath = join(showPath, `show_backdrop.${ext}`);
+        if (await fileExists(backdropPath)) {
+          backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
+          const blurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
+          if (blurhash) {
+            backdropBlurhash = blurhash;
+          }
+          backdropFound = true;
+          break;
+        }
+      }
+      if (!backdropFound) {
+        runDownloadTmdbImagesFlag = true;
+      }
+
+      // Check for metadata.json
+      const metadataFilePath = join(showPath, "metadata.json");
+      if (!(await fileExists(metadataFilePath))) {
+        runDownloadTmdbImagesFlag = true;
+      } else {
+        metadataUrl = `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`
+        // metadata
+        metadata = JSON.stringify(JSON.parse(await fs.readFile(metadataFilePath, 'utf8')))
+      }
+
+      // Handle missing data attempts
+      const missingDataShow = missingDataMedia.find((media) => media.name === showName);
+      if (missingDataShow) {
+        const lastAttempt = new Date(missingDataShow.lastAttempt);
+        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
+        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
+          runDownloadTmdbImagesFlag = true;
         } else {
-          runDownloadTmdbImagesFlag = true;
+          runDownloadTmdbImagesFlag = false;
         }
-
-        const logoExtensions = ["svg", "jpg", "png", "gif"];
-        let logoFound = false;
-        for (const ext of logoExtensions) {
-          const logoPath = path.normalize(
-            path.join(showPath, `show_logo.${ext}`)
-          );
-          if (await fileExists(logoPath)) {
-            showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
-            if (ext !== "svg") {
-              const logoBlurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-              if (logoBlurhash) {
-                showMetadata.logoBlurhash = logoBlurhash;
-              }
-            }
-            logoFound = true;
-            break;
-          }
-        }
-        if (!logoFound) {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        const backdropExtensions = ["jpg", "png", "gif"];
-        let backdropFound = false;
-        for (const ext of backdropExtensions) {
-          const backdropPath = path.normalize(
-            path.join(showPath, `show_backdrop.${ext}`)
-          );
-          if (await fileExists(backdropPath)) {
-            showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
-            const backdropBlurhash = await getStoredBlurhash(
-              backdropPath,
-              BASE_PATH
-            );
-            if (backdropBlurhash) {
-              showMetadata.backdropBlurhash = backdropBlurhash;
-            }
-            backdropFound = true;
-            break;
-          }
-        }
-        if (!backdropFound) {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        const metadataPath = path.normalize(
-          path.join(showPath, "metadata.json")
-        );
-        if (!(await fileExists(metadataPath))) {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        const missingDataShow = missingDataMedia.find(
-          (media) => media.name === showName
-        );
-        if (missingDataShow) {
-          const lastAttempt = new Date(missingDataShow.lastAttempt);
-          const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-          if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-            runDownloadTmdbImagesFlag = true;
-          } else {
-            runDownloadTmdbImagesFlag = false;
-          }
-        }
-
-        if (runDownloadTmdbImagesFlag) {
-          await insertOrUpdateMissingDataMedia(db, showName);
-          await runDownloadTmdbImages(showName);
-          const retryFiles = await fs.readdir(showPath);
-          const retryFileSet = new Set(retryFiles);
-
-          if (retryFileSet.has("show_poster.jpg")) {
-            showMetadata.poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
-            const posterBlurhash = await getStoredBlurhash(
-              path.normalize(path.join(showPath, "show_poster.jpg")),
-              BASE_PATH
-            );
-            if (posterBlurhash) {
-              showMetadata.posterBlurhash = posterBlurhash;
-            }
-          }
-
-          for (const ext of logoExtensions) {
-            const logoPath = path.join(showPath, `show_logo.${ext}`);
-            if (retryFileSet.has(`show_logo.${ext}`)) {
-              showMetadata.logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
-              if (ext !== "svg") {
-                const logoBlurhash = await getStoredBlurhash(
-                  logoPath,
-                  BASE_PATH
-                );
-                if (logoBlurhash) {
-                  showMetadata.logoBlurhash = logoBlurhash;
-                }
-              }
-              break;
-            }
-          }
-
-          for (const ext of backdropExtensions) {
-            const backdropPath = path.join(showPath, `show_backdrop.${ext}`);
-            if (retryFileSet.has(`show_backdrop.${ext}`)) {
-              showMetadata.backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
-              const backdropBlurhash = await getStoredBlurhash(
-                backdropPath,
-                BASE_PATH
-              );
-              if (backdropBlurhash) {
-                showMetadata.backdropBlurhash = backdropBlurhash;
-              }
-              break;
-            }
-          }
-        }
-
-        await Promise.all(
-          seasons.map(async (season, index) => {
-            if (season.isDirectory()) {
-              const seasonName = season.name;
-              const encodedSeasonName = encodeURIComponent(seasonName);
-              const seasonPath = path.join(showPath, seasonName);
-              const episodes = await fs.readdir(seasonPath);
-
-              const validEpisodes = episodes.filter(
-                (episode) =>
-                  episode.endsWith(".mp4") &&
-                  !episode.includes("-TdarrCacheFile-")
-              );
-              if (validEpisodes.length === 0) {
-                return;
-              }
-
-              const seasonData = {
-                fileNames: [],
-                urls: {},
-                lengths: {},
-                dimensions: {},
-              };
-
-              const seasonPosterPath = path.join(
-                seasonPath,
-                "season_poster.jpg"
-              );
-              if (await fileExists(seasonPosterPath)) {
-                seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
-                const seasonPosterBlurhash = await getStoredBlurhash(
-                  seasonPosterPath,
-                  BASE_PATH
-                );
-                if (seasonPosterBlurhash) {
-                  seasonData.seasonPosterBlurhash = seasonPosterBlurhash;
-                }
-              }
-
-              for (const episode of validEpisodes) {
-                const episodePath = path.join(seasonPath, episode);
-                const encodedEpisodePath = encodeURIComponent(episode);
-
-                let fileLength;
-                let fileDimensions;
-                let hdrInfo;
-                let additionalMetadata;
-
-                try {
-                  const info = await getInfo(episodePath);
-                  fileLength = info.length;
-                  fileDimensions = info.dimensions;
-                  hdrInfo = info.hdr;
-                  additionalMetadata = info.additionalMetadata; // Use additional metadata as needed
-                } catch (error) {
-                  console.error(
-                    `Failed to retrieve info for ${episodePath}:`,
-                    error
-                  );
-                }
-
-                seasonData.fileNames.push(episode);
-                seasonData.lengths[episode] = parseInt(fileLength, 10);
-                seasonData.dimensions[episode] = fileDimensions;
-
-                const episodeData = {
-                  videourl: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-                  mediaLastModified: (
-                    await fs.stat(episodePath)
-                  ).mtime.toISOString(),
-                  hdr: hdrInfo || null,
-                  additionalMetadata: additionalMetadata || {},
-                };
-
-                // ex. values
-                // 01, 02, 03, 04, etc.
-                // 2 digit string
-                const episodeNumber =
-                  episode.match(/S\d+E(\d+)/i)?.[1] ||
-                  episode.match(/\d+/)?.[0];
-
-                if (episodeNumber) {
-                  episodeData.episodeNumber = parseInt(episodeNumber, 10);
-                  const thumbnailPath = path.join(
-                    seasonPath,
-                    `${episodeNumber} - Thumbnail.jpg`
-                  );
-                  if (await fileExists(thumbnailPath)) {
-                    episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                      `${episodeNumber} - Thumbnail.jpg`
-                    )}`;
-                    const thumbnailBlurhash = await getStoredBlurhash(
-                      thumbnailPath,
-                      BASE_PATH
-                    );
-                    if (thumbnailBlurhash) {
-                      episodeData.thumbnailBlurhash = thumbnailBlurhash;
-                    }
-                  }
-
-                  const metadataPath = path.join(
-                    seasonPath,
-                    `${episodeNumber}_metadata.json`
-                  );
-                  if (await fileExists(metadataPath)) {
-                    episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                      `${episodeNumber}_metadata.json`
-                    )}`;
-                  }
-
-                  const seasonNumber = seasonName
-                    .match(/\d+/)?.[0]
-                    ?.padStart(2, "0");
-                  const paddedEpisodeNumber = episodeNumber.padStart(2, "0");
-                  const chaptersPath = path.join(
-                    seasonPath,
-                    "chapters",
-                    `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
-                  );
-                  if (await fileExists(chaptersPath)) {
-                    episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
-                      `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
-                    )}`;
-                  }
-
-                  // Generate a Unique ID for each episode
-                  // Bypassing the TMDB id
-                  if (episodeNumber && seasonNumber && showName) {
-                    episodeData._id = generateCacheKey(`${showName.toLowerCase()}_S${seasonNumber}E${episodeNumber}`);
-                  }
-
-                  const subtitleFiles = await fs.readdir(seasonPath);
-                  const subtitles = {};
-                  for (const subtitleFile of subtitleFiles) {
-                    if (
-                      subtitleFile.startsWith(episode.replace(".mp4", "")) &&
-                      subtitleFile.endsWith(".srt")
-                    ) {
-                      const parts = subtitleFile.split(".");
-                      const srtIndex = parts.lastIndexOf("srt");
-                      const isHearingImpaired = parts[srtIndex - 1] === "hi";
-                      const langCode = isHearingImpaired
-                        ? parts[srtIndex - 2]
-                        : parts[srtIndex - 1];
-                      const langName = langMap[langCode] || langCode;
-                      const subtitleKey = isHearingImpaired
-                        ? `${langName} Hearing Impaired`
-                        : langName;
-                      subtitles[subtitleKey] = {
-                        url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                          subtitleFile
-                        )}`,
-                        srcLang: langCode,
-                        lastModified: (
-                          await fs.stat(path.join(seasonPath, subtitleFile))
-                        ).mtime.toISOString(),
-                      };
-                    }
-                  }
-                  if (Object.keys(subtitles).length > 0) {
-                    episodeData.subtitles = subtitles;
-                  }
-                }
-
-                seasonData.urls[episode] = episodeData;
-              }
-
-              // Process all thumbnails in the season directory
-              const thumbnailFiles = episodes.filter((file) =>
-                file.endsWith(" - Thumbnail.jpg")
-              );
-              for (const thumbnailFile of thumbnailFiles) {
-                const thumbnailPath = path.join(seasonPath, thumbnailFile);
-                const episodeNumber =
-                  thumbnailFile.match(/S\d+E(\d+)/i)?.[1] ||
-                  thumbnailFile.match(/\d+/)?.[0];
-                if (episodeNumber) {
-                  await getStoredBlurhash(thumbnailPath, BASE_PATH);
-                }
-              }
-
-              showMetadata.seasons[seasonName] = seasonData;
-            }
-          })
-        );
-
-        // Always update the database with the latest data
-        await insertOrUpdateTVShow(db, showName, showMetadata, "{}");
       }
+
+      if (runDownloadTmdbImagesFlag) {
+        await insertOrUpdateMissingDataMedia(db, showName);
+        await runDownloadTmdbImages(showName);
+        const retryFiles = await fs.readdir(showPath);
+        const retryFileSet = new Set(retryFiles);
+
+        // Retry poster
+        if (retryFileSet.has("show_poster.jpg")) {
+          poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
+          const blurhash = await getStoredBlurhash(
+            join(showPath, "show_poster.jpg"),
+            BASE_PATH
+          );
+          if (blurhash) {
+            posterBlurhash = blurhash;
+          }
+        }
+
+        // Retry logo
+        for (const ext of logoExtensions) {
+          const lPath = join(showPath, `show_logo.${ext}`);
+          if (retryFileSet.has(`show_logo.${ext}`)) {
+            logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
+            if (ext !== "svg") {
+              const blurhash = await getStoredBlurhash(lPath, BASE_PATH);
+              if (blurhash) {
+                logoBlurhash = blurhash;
+              }
+            }
+            break;
+          }
+        }
+
+        // Retry backdrop
+        for (const ext of backdropExtensions) {
+          const bPath = join(showPath, `show_backdrop.${ext}`);
+          if (retryFileSet.has(`show_backdrop.${ext}`)) {
+            backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
+            const blurhash = await getStoredBlurhash(bPath, BASE_PATH);
+            if (blurhash) {
+              backdropBlurhash = blurhash;
+            }
+            break;
+          }
+        }
+      }
+
+      // Initialize seasons object
+      const seasonsObj = {};
+
+      // Process each season
+      await Promise.all(
+        seasons.map(async (season) => {
+          if (!season.isDirectory()) return;
+
+          const seasonName = season.name;
+          const encodedSeasonName = encodeURIComponent(seasonName);
+          const seasonPath = join(showPath, seasonName);
+          const seasonNumberMatch = seasonName.match(/\d+/);
+          const seasonNumber = seasonNumberMatch ? seasonNumberMatch[0].padStart(2, "0") : "00";
+
+          const episodes = await fs.readdir(seasonPath);
+          const validEpisodes = episodes.filter(
+            (episode) => episode.endsWith(".mp4") && !episode.includes("-TdarrCacheFile-")
+          );
+          if (validEpisodes.length === 0) return;
+
+          // Restructure to use episodeKey = SxxExx
+          const seasonData = {
+            episodes: {},
+            lengths: {},
+            dimensions: {},
+            seasonNumber: parseInt(seasonNumber, 10)
+          };
+
+          // Handle season poster
+          const seasonPosterPath = join(seasonPath, "season_poster.jpg");
+          if (await fileExists(seasonPosterPath)) {
+            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
+            const blurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
+            if (blurhash) {
+              seasonData.seasonPosterBlurhash = blurhash;
+            }
+          }
+
+          for (const episode of validEpisodes) {
+            const episodePath = join(seasonPath, episode);
+            const encodedEpisodePath = encodeURIComponent(episode);
+
+            let fileLength;
+            let fileDimensions;
+            let hdrInfo;
+            let additionalMetadata;
+            let uuid;
+
+            try {
+              const info = await getInfo(episodePath);
+              fileLength = info.length;
+              fileDimensions = info.dimensions;
+              hdrInfo = info.hdr;
+              additionalMetadata = info.additionalMetadata;
+              uuid = info.uuid;
+            } catch (error) {
+              logger.error(`Failed to retrieve info for ${episodePath}:`, error);
+            }
+
+            // Extract episode number
+            const episodeNumberMatch = episode.match(/S\d+E(\d+)/i);
+            const episodeNumber = episodeNumberMatch ? episodeNumberMatch[1] : (episode.match(/\d+/) || ["0"])[0];
+            if (!episodeNumber || !seasonNumber) {
+              logger.warn(`Could not extract episode or season number from ${episode}, skipping.`);
+              continue;
+            }
+
+            const paddedEpisodeNumber = episodeNumber.padStart(2, "0");
+            const episodeKey = `S${seasonNumber}E${paddedEpisodeNumber}`;
+
+            // Store length/dimensions keyed by episodeKey
+            seasonData.lengths[episodeKey] = parseInt(fileLength, 10);
+            seasonData.dimensions[episodeKey] = fileDimensions;
+
+            const episodeData = {
+              _id: uuid,
+              filename: episode, // store original filename for reference
+              videoURL: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
+              mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
+              hdr: hdrInfo || null,
+              additionalMetadata: additionalMetadata || {},
+              episodeNumber: parseInt(episodeNumber, 10),
+            };
+
+            // Handle thumbnail
+            const thumbnailPath = join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
+            if (await fileExists(thumbnailPath)) {
+              episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
+                `${episodeNumber} - Thumbnail.jpg`
+              )}`;
+              const blurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
+              if (blurhash) {
+                episodeData.thumbnailBlurhash = blurhash;
+              }
+            }
+
+            // Handle episode metadata
+            const episodeMetadataPath = join(seasonPath, `${episodeNumber}_metadata.json`);
+            if (await fileExists(episodeMetadataPath)) {
+              episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
+                `${episodeNumber}_metadata.json`
+              )}`;
+            }
+
+            // Handle chapters
+            const chaptersPath = join(
+              seasonPath,
+              "chapters",
+              `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
+            );
+            if (await fileExists(chaptersPath)) {
+              episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
+                `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
+              )}`;
+            }
+
+            // Generate a Unique ID for each episode
+            // if (episodeNumber && seasonNumber && showName) {
+            //   episodeData._id = generateCacheKey(`${showName.toLowerCase()}_S${seasonNumber}E${episodeNumber}`);
+            // }
+
+            // Find subtitles
+            const subtitleFiles = await fs.readdir(seasonPath);
+            const subtitles = {};
+            for (const subtitleFile of subtitleFiles) {
+              if (
+                subtitleFile.startsWith(episode.replace(".mp4", "")) &&
+                subtitleFile.endsWith(".srt")
+              ) {
+                const parts = subtitleFile.split(".");
+                const srtIndex = parts.lastIndexOf("srt");
+                const isHearingImpaired = parts[srtIndex - 1] === "hi";
+                const langCode = isHearingImpaired
+                  ? parts[srtIndex - 2]
+                  : parts[srtIndex - 1];
+                const langName = langMap[langCode] || langCode;
+                const subtitleKey = isHearingImpaired
+                  ? `${langName} Hearing Impaired`
+                  : langName;
+                subtitles[subtitleKey] = {
+                  url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
+                    subtitleFile
+                  )}`,
+                  srcLang: langCode,
+                  lastModified: (await fs.stat(join(seasonPath, subtitleFile))).mtime.toISOString(),
+                };
+              }
+            }
+            if (Object.keys(subtitles).length > 0) {
+              episodeData.subtitles = subtitles;
+            }
+
+            // Store episode data under canonical episodeKey
+            seasonData.episodes[episodeKey] = episodeData;
+          }
+
+          // Process all thumbnails to ensure blurhash is generated (optional)
+          const thumbnailFiles = episodes.filter((file) =>
+            file.endsWith(" - Thumbnail.jpg")
+          );
+          for (const thumbnailFile of thumbnailFiles) {
+            const thumbnailPath = join(seasonPath, thumbnailFile);
+            // Even if we don't store them by filename now, we ensure blurhash is available.
+            await getStoredBlurhash(thumbnailPath, BASE_PATH);
+          }
+          
+          seasonsObj[seasonName] = seasonData;
+        })
+      );
+
+      // Sort seasons
+      const sortedSeasons = Object.fromEntries(
+        Object.entries(seasonsObj).sort((a, b) => {
+          // Extract numbers from season names and pad with zeros for proper string comparison
+          const seasonA = a[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
+          const seasonB = b[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
+          return seasonA.localeCompare(seasonB);
+        })
+      );
+
+      // Prepare individual fields for insertion
+      const seasonsFinal = sortedSeasons;
+
+      await insertOrUpdateTVShow(
+        db,
+        showName,
+        metadata,
+        metadataUrl,
+        poster,
+        posterBlurhash,
+        logo,
+        logoBlurhash,
+        backdrop,
+        backdropBlurhash,
+        seasonsFinal
+      );
     }
 
     // Remove TV shows from the database that no longer exist in the file system
@@ -1403,7 +1344,7 @@ async function generateListTV(db, dirPath) {
   } catch (error) {
     // Rollback the transaction in case of error
     await db.run("ROLLBACK");
-    console.error("Error during database update:", error);
+    logger.error("Error during database update:", error);
   }
 }
 
@@ -1418,21 +1359,21 @@ app.get("/media/tv", async (req, res) => {
 
     const tvData = shows.reduce((acc, show) => {
       acc[show.name] = {
-        metadata: show.metadata.metadata,
-        poster: show.metadata.poster,
-        posterBlurhash: show.metadata.posterBlurhash,
-        logo: show.metadata.logo,
-        logoBlurhash: show.metadata.logoBlurhash,
-        backdrop: show.metadata.backdrop,
-        backdropBlurhash: show.metadata.backdropBlurhash,
-        seasons: show.metadata.seasons,
+        metadata: show.metadata_path,
+        poster: show.poster,
+        posterBlurhash: show.posterBlurhash,
+        logo: show.logo,
+        logoBlurhash: show.logoBlurhash,
+        backdrop: show.backdrop,
+        backdropBlurhash: show.backdropBlurhash,
+        seasons: show.seasons,
       };
       return acc;
     }, {});
 
-    res.json(tvData);
+    res.json({ ...tvData, version: TV_LIST_VERSION });
   } catch (error) {
-    console.error(`Error fetching TV shows: ${error}`);
+    logger.error(`Error fetching TV shows: ${error}`);
     res.status(500).send("Internal server error");
   }
 });
@@ -1449,14 +1390,14 @@ async function generateListMovies(db, dirPath) {
   await Promise.all(
     dirs.map(async (dir, index) => {
       if (isDebugMode) {
-        console.log(
+        logger.info(
           `Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`
         );
       }
       if (dir.isDirectory()) {
         const dirName = dir.name;
-        const fullDirPath = path.join(dirPath, dirName);
-        const files = await fs.readdir(path.join(dirPath, dirName));
+        const fullDirPath = join(dirPath, dirName);
+        const files = await fs.readdir(join(dirPath, dirName));
         const hash = await calculateDirectoryHash(fullDirPath);
 
         const existingMovie = await db.get(
@@ -1470,14 +1411,14 @@ async function generateListMovies(db, dirPath) {
         if (!dirHashChanged && existingMovie) {
           // If the hash is the same, skip detailed processing and use the existing data.
           if (isDebugMode) {
-            console.log(
+            logger.info(
               `No changes detected in ${dirName}, skipping processing.`
             );
           }
           return; // Use return instead of continue
         }
 
-        console.log("Directory Hash invalidated for", dirName);
+        logger.info(`Directory Hash invalidated for, ${dirName}`);
 
         const encodedDirName = encodeURIComponent(dirName);
         const fileSet = new Set(files); // Create a set of filenames for quick lookup
@@ -1501,7 +1442,7 @@ async function generateListMovies(db, dirPath) {
 
         let runDownloadTmdbImagesFlag = false;
 
-        const tmdbConfigPath = path.join(dirPath, dirName, "tmdb.config");
+        const tmdbConfigPath = join(dirPath, dirName, "tmdb.config");
         let tmdbConfigLastModified = null;
 
         // Check if tmdb.config exists before getting its last modified time
@@ -1521,12 +1462,12 @@ async function generateListMovies(db, dirPath) {
               _id = `tmdb_${tmdbConfig.tmdb_id}`;
             }
           } catch (error) {
-            console.error(`Failed to parse tmdb.config for ${dirName}:`, error);
+            logger.error(`Failed to parse tmdb.config for ${dirName}:`, error);
           }
         }
 
         for (const file of fileNames) {
-          const filePath = path.join(dirPath, dirName, file);
+          const filePath = join(dirPath, dirName, file);
           const encodedFilePath = encodeURIComponent(file);
 
           if (file.endsWith(".mp4")) {
@@ -1539,8 +1480,9 @@ async function generateListMovies(db, dirPath) {
               fileDimensionsStr = info.dimensions;
               hdrInfo = info.hdr;
               additionalMetadata = info.additionalMetadata;
+              _id = info.uuid;
             } catch (error) {
-              console.error(`Failed to retrieve info for ${filePath}:`, error);
+              logger.error(`Failed to retrieve info for ${filePath}:`, error);
             }
 
             fileLengths[file] = parseInt(fileLength, 10);
@@ -1553,10 +1495,10 @@ async function generateListMovies(db, dirPath) {
             ).mtime.toISOString();
             // Generate a Unique ID for each episode
             // Bypassing the TMDB id
-            if (await fileExists(filePath)) {
-              const headerInfo = getHeaderData(filePath);
-              _id = generateCacheKey(headerInfo);
-            }
+            // if (await fileExists(filePath)) {
+            //   const headerInfo = getHeaderData(filePath);
+            //   _id = generateCacheKey(headerInfo);
+            // }
           }
 
           if (file.endsWith(".srt")) {
@@ -1581,7 +1523,7 @@ async function generateListMovies(db, dirPath) {
 
         // Check for required files using the set
         if (fileSet.has("backdrop.jpg")) {
-          const backdropPath = path.join(dirPath, dirName, "backdrop.jpg");
+          const backdropPath = join(dirPath, dirName, "backdrop.jpg");
           urls[
             "backdrop"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
@@ -1611,7 +1553,7 @@ async function generateListMovies(db, dirPath) {
         }
 
         if (fileSet.has("poster.jpg")) {
-          const posterPath = path.join(dirPath, dirName, "poster.jpg");
+          const posterPath = join(dirPath, dirName, "poster.jpg");
           urls[
             "poster"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
@@ -1658,7 +1600,7 @@ async function generateListMovies(db, dirPath) {
           )}`;
 
           // Check if tmdb.config has been updated more recently
-          const metadataPath = path.join(dirPath, dirName, "metadata.json");
+          const metadataPath = join(dirPath, dirName, "metadata.json");
           const metadataLastModified = await getLastModifiedTime(metadataPath);
           if (
             tmdbConfigLastModified &&
@@ -1691,11 +1633,11 @@ async function generateListMovies(db, dirPath) {
           await insertOrUpdateMissingDataMedia(db, dirName); // Update the last attempt timestamp
           await runDownloadTmdbImages(null, dirName);
           // Retry fetching the data after running the script
-          const retryFiles = await fs.readdir(path.join(dirPath, dirName));
+          const retryFiles = await fs.readdir(join(dirPath, dirName));
           const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
 
           if (retryFileSet.has("backdrop.jpg")) {
-            const backdropPath = path.join(dirPath, dirName, "backdrop.jpg");
+            const backdropPath = join(dirPath, dirName, "backdrop.jpg");
             urls[
               "backdrop"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
@@ -1713,7 +1655,7 @@ async function generateListMovies(db, dirPath) {
           }
 
           if (retryFileSet.has("poster.jpg")) {
-            const posterPath = path.join(dirPath, dirName, "poster.jpg");
+            const posterPath = join(dirPath, dirName, "poster.jpg");
             urls[
               "poster"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
@@ -1756,13 +1698,13 @@ async function generateListMovies(db, dirPath) {
         mp4Filename = mp4Filename?.replace(".mp4", "");
 
         // Add chapter information
-        const chaptersPath = path.join(
+        const chaptersPath = join(
           dirPath,
           dirName,
           "chapters",
           `${dirName}_chapters.vtt`
         );
-        const chaptersPath2 = path.join(
+        const chaptersPath2 = join(
           dirPath,
           dirName,
           "chapters",
@@ -1790,7 +1732,7 @@ async function generateListMovies(db, dirPath) {
         }
 
         if (Object.keys(urls).length === 0) {
-          delete urls;
+          urls = {}; // Initialize urls as an empty object instead of deleting it
         }
 
         const final_hash = await calculateDirectoryHash(fullDirPath);
@@ -1840,9 +1782,9 @@ app.get("/media/movies", async (req, res) => {
       return acc;
     }, {});
 
-    res.json(movieData);
+    res.json({...movieData, 'version': MOVIE_LIST_VERSION});
   } catch (error) {
-    console.error(`Error fetching movies: ${error}`);
+    logger.error(`Error fetching movies: ${error}`);
     res.status(500).send("Internal server error");
   }
 });
@@ -1854,13 +1796,13 @@ app.post("/media/scan", async (req, res) => {
     await releaseDatabase(db);
     res.status(200).send("Library scan completed");
   } catch (error) {
-    console.error(`Error scanning library: ${error}`);
+    logger.error(`Error scanning library: ${error}`);
     res.status(500).send("Internal server error");
   }
 });
 
 async function runGeneratePosterCollage() {
-  console.log(`Running generate_poster_collage.py job${debugMessage}`);
+  logger.info(`Running generate_poster_collage.py job${debugMessage}`);
   const pythonExecutable = process.platform === "win32" ? "python" : "python3";
   const escapedScript =
     process.platform === "win32"
@@ -1878,7 +1820,7 @@ async function runGeneratePosterCollage() {
     };
     await execAsync(command, { env });
   } catch (error) {
-    console.error(`Error executing generate_poster_collage.py: ${error}`);
+    logger.error(`Error executing generate_poster_collage.py: ${error}`);
   }
 }
 async function runDownloadTmdbImages(
@@ -1887,7 +1829,7 @@ async function runDownloadTmdbImages(
   fullScan = false
 ) {
   const debugMessage = isDebugMode ? " with debug" : "";
-  console.log(
+  logger.info(
     `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ""}${
       specificMovie ? ` for movie "${specificMovie}"` : ""
     }${fullScan ? " with full scan" : ""}`
@@ -1913,14 +1855,14 @@ async function runDownloadTmdbImages(
           ? ` >> "${LOG_FILE}" 2>&1`
           : ` >> "${LOG_FILE}" 2>&1`;
     } catch (err) {
-      console.warn(
+      logger.warn(
         `No write access to ${LOG_FILE}. Logging to console instead.`
       );
     }
   }
 
   try {
-    console.log(
+    logger.info(
       `Running download_tmdb_images.py job${debugMessage}${
         specificShow ? ` for show "${specificShow}"` : ""
       }${specificMovie ? ` for movie "${specificMovie}"` : ""}${
@@ -1936,9 +1878,9 @@ async function runDownloadTmdbImages(
     });
 
     if (stderr) {
-      console.error(`download_tmdb_images.py error: ${stderr}`);
+      logger.error(`download_tmdb_images.py error: ${stderr}`);
     }
-    console.log(
+    logger.info(
       `Finished running download_tmdb_images.py job${debugMessage}${
         specificShow ? ` for show "${specificShow}"` : ""
       }${
@@ -1948,11 +1890,11 @@ async function runDownloadTmdbImages(
       }`
     );
   } catch (error) {
-    console.error(`Error executing download_tmdb_images.py: ${error}`);
+    logger.error(`Error executing download_tmdb_images.py: ${error}`);
   }
 }
 // async function runGenerateThumbnailJson() {
-//   console.log(`Running generate_thumbnail_json.sh job${debugMessage}`);
+//   logger.info(`Running generate_thumbnail_json.sh job${debugMessage}`);
 //   const command = isDebugMode
 //     ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript} >> ${LOG_FILE} 2>&1'`
 //     : `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript}'`;
@@ -1960,9 +1902,170 @@ async function runDownloadTmdbImages(
 //   try {
 //     await execAsync(command);
 //   } catch (error) {
-//     console.error(`Error executing generate_thumbnail_json.sh: ${error}`);
+//     logger.error(`Error executing generate_thumbnail_json.sh: ${error}`);
 //   }
 // }
+
+// Function to parse and format a log line
+const formatLogEntry = (entry) => {
+  try {
+    const timestamp = entry.timestamp || new Date().toISOString();
+    const category = entry.category || "general";
+    const message = entry.message || "";
+
+    // Format: [category timestamp] message
+    return `[${category} ${timestamp}] ${message}`;
+  } catch (e) {
+    console.error("Failed to format log entry:", e);
+    return null;
+  }
+};
+
+// Function to load all logs up to the current point
+const loadHistoricalLogs = async (category) => {
+  const logs = [];
+  const logFiles = (await fs.readdir(logDirectory)).filter((file) => file.endsWith(".log"));
+
+  for (const file of logFiles) {
+    const filePath = join(logDirectory, file);
+    const fileContent = await fs.readFile(filePath, "utf8");
+    const logLines = fileContent.split("\n").filter((line) => line);
+
+    logLines.forEach((line) => {
+      try {
+        const logEntry = JSON.parse(line);
+        if (!category || logEntry.category === category) {
+          logs.push(formatLogEntry(logEntry));
+        }
+      } catch (e) {
+        console.error("Failed to parse log line:", e);
+      }
+    });
+  }
+
+  // Sort logs by timestamp ascending
+  return logs.sort((a, b) => {
+    const timestampA = a.match(/\[(.*?)\]/)[1];
+    const timestampB = b.match(/\[(.*?)\]/)[1];
+    return new Date(timestampA) - new Date(timestampB);
+  });
+};
+
+// SSE Headers
+const setSSEHeaders = (res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders(); // Flush headers to establish SSE connection
+};
+
+// SSE Streaming Logs
+const streamLogs = async (req, res, category) => {
+  setSSEHeaders(res);
+
+  // Load historical logs and send them to the client
+  try {
+    const historicalLogs = await loadHistoricalLogs(category);
+    historicalLogs.forEach((log) => {
+      res.write(`data: ${log}\n\n`);
+    });
+  } catch (err) {
+    console.error("Failed to load historical logs:", err);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: "Failed to load historical logs" })}\n\n`);
+  }
+
+  // Keep connection alive with a comment
+  const keepAliveInterval = setInterval(() => {
+    res.write(": keep-alive\n\n");
+  }, 15000); // Send a keep-alive message every 15 seconds
+
+  // Watch for new logs
+  const watcher = chokidar.watch(logDirectory, {
+    persistent: true,
+    ignoreInitial: true,
+  });
+
+  // Function to handle new or updated log files
+  const sendLog = async (filePath) => {
+    if (!filePath.endsWith(".log")) return;
+
+    try {
+      const fileContent = await fs.readFile(filePath, "utf8");
+      const logLines = fileContent.split("\n").filter((line) => line);
+
+      logLines.forEach((line) => {
+        try {
+          const logEntry = JSON.parse(line);
+          if (!category || logEntry.category === category) {
+            const formattedLog = formatLogEntry(logEntry);
+            if (formattedLog) {
+              res.write(`data: ${formattedLog}\n\n`);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse log line:", e);
+        }
+      });
+    } catch (e) {
+      console.error(`Error reading log file ${filePath}:`, e);
+    }
+  };
+
+  // Set up chokidar event handlers
+  watcher
+    .on("add", sendLog) // Triggered when a new log file is added
+    .on("change", sendLog) // Triggered when an existing log file is updated
+    .on("error", (error) => {
+      console.error("Watcher error:", error);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: "Watcher error" })}\n\n`);
+    });
+
+  // Handle client disconnection
+  req.on("close", () => {
+    console.log("Client disconnected from SSE");
+    clearInterval(keepAliveInterval); // Clear the keep-alive interval
+    watcher.close(); // Close the file watcher
+    res.end(); // End the response
+  });
+};
+
+// Enhanced /api/logs endpoint
+app.get("/api/logs", async (req, res) => {
+  res.header("Access-Control-Allow-Origin", process.env.FRONT_END);
+  res.header("Access-Control-Allow-Methods", "GET");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+
+  const { category, format = "json", stream } = req.query;
+
+  if (stream === "true") {
+    await streamLogs(req, res, category);
+    return;
+  }
+
+  // Default behavior: Load logs without streaming
+  try {
+    const logs = await loadHistoricalLogs(category);
+
+    if (format === "logViewer") {
+      res.setHeader("Content-Type", "text/plain");
+      res.send(logs.join("\n"));
+    } else {
+      res.json(logs); // Wrap logs in objects for JSON
+    }
+  } catch (err) {
+    console.error("Error retrieving logs:", err);
+    res.status(500).json({ error: "Failed to retrieve logs" });
+  }
+});
+
+// Log Categories
+app.get('/api/logs/categories', (req, res) => {
+  res.header("Access-Control-Allow-Origin", process.env.FRONT_END);
+  res.header("Access-Control-Allow-Methods", "GET");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.json(getCategories());
+});
+
 
 // Clipping routes for movies and TV shows
 app.get("/videoClip/movie/:movieName", async (req, res) => {
@@ -1981,12 +2084,12 @@ let isScanning = false;
 
 async function runGenerateList() {
   if (isScanning) {
-    console.warn(
+    logger.warn(
       `[${new Date().toISOString()}] Previous scan is still running. Skipping this iteration.`
     );
     return;
   } else {
-    console.log(`[${new Date().toISOString()}] Generating media list`);
+    logger.info(`[${new Date().toISOString()}] Generating media list`);
   }
 
   isScanning = true;
@@ -1995,21 +2098,22 @@ async function runGenerateList() {
     const db = await initializeDatabase();
     await generateListMovies(db, `${BASE_PATH}/movies`);
     await generateListTV(db, `${BASE_PATH}/tv`);
-    console.log(`[${new Date().toISOString()}] Finished generating media list`);
+    logger.info(`[${new Date().toISOString()}] Finished generating media list`);
     await releaseDatabase(db);
   } catch (error) {
-    console.error(`Error generating media list: ${error}`);
+    logger.error(`Error generating media list: ${error}`);
   } finally {
     isScanning = false;
-    autoSync().catch(console.error); // Add autoSync to the scheduled tasks
+    autoSync().catch(logger.error); // Add autoSync to the scheduled tasks
   }
 }
 
 async function autoSync() {
-  console.log("Checking autoSync Settings..");
+  let errorMessage = "";
+  logger.info("Checking autoSync Settings..");
   const autoSyncEnabled = await checkAutoSync();
   if (autoSyncEnabled) {
-    console.log("Auto Sync is enabled. Proceeding with sync...");
+    logger.info("Auto Sync is enabled. Proceeding with sync...");
 
     try {
       const headers = {
@@ -2018,7 +2122,7 @@ async function autoSync() {
       };
 
       if (isDebugMode) {
-        console.log(`Sending headers:${debugMessage}`, headers);
+        logger.info(`Sending headers:${debugMessage}`, headers);
       }
 
       const response = await axios.post(
@@ -2028,38 +2132,35 @@ async function autoSync() {
       );
 
       if (response.status >= 200 && response.status < 300) {
-        console.log("Sync request completed successfully.");
+        logger.info("Sync request completed successfully.");
         await updateLastSyncTime();
       } else {
-        console.log(`Sync request failed with status code: ${response.status}`);
+        logger.info(`Sync request failed with status code: ${response.status}`);
       }
     } catch (error) {
       const prefix = "Sync request failed: ";
 
       if (error.response && error.response.data) {
-        console.error(`${prefix}${JSON.stringify(error.response.data)}`);
+        logger.error(`${prefix}${JSON.stringify(error.response.data)}`);
         errorMessage = error.response.data;
       } else if (error.response && error.response.status === 404) {
         const unavailableMessage = `${process.env.FRONT_END}/api/authenticated/admin/sync is unavailable`;
-        console.error(`${prefix}${unavailableMessage}`);
+        logger.error(`${prefix}${unavailableMessage}`);
         errorMessage = unavailableMessage;
       } else if (error.code === "ECONNRESET") {
         const connectionResetMessage =
           "Connection was reset. Please try again later.";
-        console.error(
+        logger.error(
           `${prefix}${connectionResetMessage}`,
           JSON.stringify(error)
         );
         errorMessage = connectionResetMessage;
       } else {
-        console.error(
-          `${prefix}An unexpected error occurred.`,
-          JSON.stringify(error)
-        );
+        logger.error(`${prefix}An unexpected error occurred. ` + JSON.stringify(error));
       }
     }
   } else {
-    console.log("Auto Sync is disabled. Skipping sync...");
+    logger.info("Auto Sync is disabled. Skipping sync...");
   }
 }
 
@@ -2067,7 +2168,7 @@ function scheduleTasks() {
   // Schedule for generate_thumbnail_json.sh
   // Scheduled to run every 6 minutes.
   // schedule.scheduleJob('*/6 * * * *', () => {
-  //   runGenerateThumbnailJson().catch(console.error);
+  //   runGenerateThumbnailJson().catch(logger.error);
   // });
   // Disabled because this was the old way of generating
   // a thumbnail seek option. Instead we now use
@@ -2075,23 +2176,23 @@ function scheduleTasks() {
 
   // Schedule for download_tmdb_images.py
   // Scheduled to run every 7 minutes.
-  schedule.scheduleJob("*/7 * * * *", async () => {
+  scheduleJob("*/7 * * * *", async () => {
     try {
       await runDownloadTmdbImages(null, null, true);
     } catch (error) {
-      console.error(error);
+      logger.error(error);
     }
   });
 
   // Schedule for generate_poster_collage.py
   // Scheduled to run at 3, 6, 9, 12, 15, 18, 21, 24, 27, and 30 hours of the day.
-  schedule.scheduleJob("0 3,6,9,12,15,18,21,24,27,30 * * *", () => {
-    runGeneratePosterCollage().catch(console.error);
+  scheduleJob("0 3,6,9,12,15,18,21,24,27,30 * * *", () => {
+    runGeneratePosterCollage().catch(logger.error);
   });
   // Schedule for runGenerateList and autoSync
   // Scheduled to run every 1 minute
-  schedule.scheduleJob("*/1 * * * *", () => {
-    runGenerateList().catch(console.error);
+  scheduleJob("*/1 * * * *", () => {
+    runGenerateList().catch(logger.error);
   });
 }
 
@@ -2100,22 +2201,27 @@ async function initialize() {
   const port = 3000;
   app.listen(port, async () => {
     scheduleTasks();
-    //runGenerateThumbnailJson().catch(console.error);
-    console.log(`Server running on port ${port}`);
+    //runGenerateThumbnailJson().catch(logger.error);
+    logger.info(`Server running on port ${port}`);
+    const db = await initializeDatabase();
+    // As part of startup clear out any in progress processes
+    // This will prevent any processes from being stuck in the queue
+    await markInProgressAsInterrupted(db);
+    logger.info('Process queue has been reset.');
     initializeMongoDatabase()
       .then(() => {
         return initializeIndexes();
       })
       .then(() => {
-        console.log("Database and indexes initialized successfully.");
+        logger.info("Database and indexes initialized successfully.");
       })
       .catch((error) => {
-        console.error("Error during initialization:", error);
+        logger.error("Error during initialization:", error);
       });
-    runGenerateList().catch(console.error);
-    runGeneratePosterCollage().catch(console.error);
+    runGenerateList().catch(logger.error);
+    runGeneratePosterCollage().catch(logger.error);
   });
 }
 
 // Initialize the application
-initialize().catch(console.error);
+initialize().catch(logger.error);

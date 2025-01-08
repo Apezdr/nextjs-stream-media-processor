@@ -105,4 +105,4 @@ RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py
 RUN dos2unix /usr/src/app/scripts/*.sh
 
 # Command to run Node.js app
-CMD ["sh", "-c", "node /usr/src/app/node/app.js --max-old-space-size=6144"]
+CMD ["sh", "-c", "node /usr/src/app/node/app.mjs --max-old-space-size=6144"]
