@@ -7,11 +7,12 @@ import { findMp4File, fileExists, ongoingCacheGenerations } from "./utils.mjs";
 import { promisify } from 'util';
 import { getTVShowByName, getMovieByName } from "./sqliteDatabase.mjs";
 const execAsync = promisify(exec);
-import { ensureCacheDirs, generateCacheKey, getCachedClipPath } from "./utils.mjs";
+import { ensureCacheDirs, generateCacheKey, getCachedClipPath, getCachedTranscodedPath } from "./utils.mjs";
 import { getHardwareAccelerationInfo } from './hardwareAcceleration.mjs'; // Adjust the path as needed
 import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./encoderConfig.mjs";
 import { extractHDRInfo } from "./infoManager.mjs";
 import { createCategoryLogger } from "./lib/logger.mjs";
+import { isVideoHDR } from "./sprite.mjs";
 
 const logger = createCategoryLogger('videoHandler');
 // Video Clip Generation Version Control (for cache invalidation)
@@ -65,69 +66,93 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
       videoPath = await findMp4File(directoryPath, _episode);
     }
 
-    // Get the available audio tracks
+    // If no video path found:
+    if (!videoPath) {
+      throw new Error("Video file not found");
+    }
+
+    // 1) Collect audio track data
     const audioTracks = await getAudioTracks(videoPath);
+    // 2) Figure out which track to use
+    const { selectedAudioTrack, channelCount } = determineSelectedAudioTrack(audioTracks, audioTrackParam);
 
-    // Determine the selected audio track
-    let selectedAudioTrack;
-    if (audioTrackParam === "max") {
-      selectedAudioTrack = getHighestChannelTrack(audioTracks);
-    } else if (audioTrackParam === "stereo") {
-      selectedAudioTrack = audioTracks.findIndex(track => track.channels === 2);
-      if (selectedAudioTrack === -1) {
-        throw new Error("Stereo track not found");
+    // 3) Decide if we need to do a "pass-through" or a "transcode"
+    const needsTranscode = audioTrackParam !== "max" || channelCount !== 2;
+
+    // Basic concurrency key: (video path) + (selected audio track) + (channel count) + version
+    const FULL_TRANSCODE_VERSION = 1.0001; // Increment if encoder settings change
+    const cacheKey = `FULL-${videoPath}-${selectedAudioTrack}-${channelCount}-v${FULL_TRANSCODE_VERSION}`;
+
+    // Define cache path
+    const transcodedFileName = `${generateCacheKey(cacheKey)}.mp4`;
+    const cacheDir = getCachedTranscodedPath(cacheKey, '.mp4');
+    const transcodedFilePath = join(cacheDir, transcodedFileName);
+
+    let finalVideoPath;
+
+    if (!needsTranscode) {
+      // No transcoding needed, serve original file
+      finalVideoPath = videoPath;
+      logger.info("No transcoding needed, serving original video file.");
+    } else {
+      // Check if transcoded file already exists
+      if (await fileExists(transcodedFilePath)) {
+        logger.info(`Serving existing transcoded video: ${transcodedFilePath}`);
+        finalVideoPath = transcodedFilePath;
+      } else {
+        // Check if another request is already transcoding this file
+        if (ongoingCacheGenerations.has(cacheKey)) {
+          logger.info(`Waiting for ongoing transcoding of cache key: ${cacheKey}`);
+          try {
+            await waitForCache(transcodedFilePath, 500, 120000); // Wait up to 2 minutes
+            if (await fileExists(transcodedFilePath)) {
+              finalVideoPath = transcodedFilePath;
+            } else {
+              throw new Error('Transcoding failed or timed out.');
+            }
+          } catch (error) {
+            throw new Error('Transcoding timed out.');
+          }
+        } else {
+          // Initiate transcoding
+          ongoingCacheGenerations.add(cacheKey);
+          try {
+            logger.info(`Initiating transcoding for cache key: ${cacheKey}`);
+            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath);
+            finalVideoPath = transcodedFilePath;
+          } finally {
+            ongoingCacheGenerations.delete(cacheKey);
+          }
+        }
       }
-    } else {
-      selectedAudioTrack = parseInt(audioTrackParam);
-      if (isNaN(selectedAudioTrack) || selectedAudioTrack < 0 || selectedAudioTrack >= audioTracks.length) {
-        throw new Error("Invalid audio track specified");
-      }
     }
 
-    // Get the channel count of the selected audio track
-    const channelCount = audioTracks[selectedAudioTrack].channels;
-
-    let modifiedVideoPath;
-
-    if (audioTrackParam === "max" && channelCount === 2) {
-      // Use the original video file if audio is set to "max" and channel count is 2
-      modifiedVideoPath = videoPath;
-      logger.info("Using the original video file");
-    } else {
-      // Generate the modified MP4 file
-      modifiedVideoPath = await generateModifiedMp4(videoPath, selectedAudioTrack, channelCount);
-    }
-
-    // Serve the video file (either modified or original) with support for range requests
-    const stat = await fs.stat(modifiedVideoPath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = (end - start) + 1;
-      const fileStream = createReadStream(modifiedVideoPath, { start, end });
-
-      res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunkSize,
-        "Content-Type": "video/mp4",
-      });
-      fileStream.pipe(res);
-    } else {
-      res.writeHead(200, {
-        "Content-Length": fileSize,
-        "Content-Type": "video/mp4",
-      });
-      createReadStream(modifiedVideoPath).pipe(res);
-    }
+    // Serve the final video file with range support
+    return serveVideoWithRange(req, res, finalVideoPath);
   } catch (error) {
-    logger.error(error);
+    logger.error(`Error in handleVideoRequest: ${error.message}`);
     res.status(500).send("Internal server error");
   }
+}
+
+function determineSelectedAudioTrack(audioTracks, audioTrackParam) {
+  let selectedAudioTrack;
+  if (audioTrackParam === "max") {
+    selectedAudioTrack = getHighestChannelTrack(audioTracks);
+  } else if (audioTrackParam === "stereo") {
+    selectedAudioTrack = audioTracks.findIndex(track => track.channels === 2);
+    if (selectedAudioTrack === -1) {
+      throw new Error("Stereo track not found");
+    }
+  } else {
+    selectedAudioTrack = parseInt(audioTrackParam);
+    if (isNaN(selectedAudioTrack) || selectedAudioTrack < 0 || selectedAudioTrack >= audioTracks.length) {
+      throw new Error("Invalid audio track specified");
+    }
+  }
+
+  const channelCount = audioTracks[selectedAudioTrack]?.channels || 2;
+  return { selectedAudioTrack, channelCount };
 }
 
 async function getAudioTracks(videoPath) {
@@ -165,6 +190,82 @@ function getHighestChannelTrack(audioTracks) {
     }
   }
   return highestChannelTrack.index;
+}
+
+async function generateFullTranscode(inputPath, audioTrackIndex, channelCount, outputPath) {
+  const hardwareInfo = await initHardwareInfo();
+
+  // Select the best encoder based on available hardware
+  let selectedEncoderConfig = libx264; // Default to software encoding
+  if (hardwareInfo && hardwareInfo.encoder) {
+    const hwEncoder = hardwareInfo.encoder.encoder;
+    switch (hwEncoder) {
+      case 'vp9_vaapi':
+        selectedEncoderConfig = vp9_vaapi;
+        break;
+      case 'hevc_vaapi':
+        selectedEncoderConfig = hevc_vaapi;
+        break;
+      case 'hevc_nvenc':
+        selectedEncoderConfig = hevc_nvenc;
+        break;
+      default:
+        selectedEncoderConfig = libx264; // Fallback to libx264
+    }
+  }
+
+  // Check if the input video is HDR
+  const isHDR = await isVideoHDR(inputPath);
+
+  // Extract relevant FFmpeg arguments from the selected encoder config
+  const videoFilter = isHDR
+    ? selectedEncoderConfig.hdr_vf || selectedEncoderConfig.vf
+    : selectedEncoderConfig.vf;
+  const additionalArgs = typeof selectedEncoderConfig.additional_args === 'function'
+    ? selectedEncoderConfig.additional_args(isHDR)
+    : selectedEncoderConfig.additional_args || [];
+
+  // Construct the FFmpeg command
+  const ffmpegArgs = [
+    '-y', // Overwrite output files without asking
+    '-i', inputPath, // Input file
+    '-map', '0:v:0', // Map the first video stream
+    `-map`, `0:a:${audioTrackIndex}?`, // Map the selected audio track
+    '-c:v', selectedEncoderConfig.codec, // Video codec
+    '-c:a', selectedEncoderConfig.audio_codec || 'aac', // Audio codec
+    '-ac', channelCount.toString(), // Audio channel count
+    ...(videoFilter ? ['-vf', videoFilter] : []), // Video filter chain
+    ...additionalArgs, // Additional encoder-specific arguments
+    outputPath, // Output file
+  ];
+
+  logger.info(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
+
+  // Execute the FFmpeg process
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+
+    ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg stderr: ${data}`));
+    ffmpeg.on('error', (error) => {
+      logger.error(`Error during FFmpeg process: ${error.message}`);
+      reject(error);
+    });
+    ffmpeg.on('close', async (code) => {
+      if (code === 0) {
+        // Verify the output file
+        if (await fileExists(outputPath)) {
+          logger.info(`Successfully transcoded video: ${outputPath}`);
+          resolve();
+        } else {
+          logger.error(`Transcoded file not found: ${outputPath}`);
+          reject(new Error('Transcoded file not found.'));
+        }
+      } else {
+        logger.error(`FFmpeg exited with code ${code}`);
+        reject(new Error(`FFmpeg exited with code ${code}`));
+      }
+    });
+  });
 }
 
 async function generateModifiedMp4(videoPath, audioTrack, channelCount) {

@@ -242,7 +242,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
  * @param {string} videoPath - Path to the video file.
  * @returns {Promise<boolean>} - Resolves to true if HDR, else false.
  */
-async function isVideoHDR(videoPath) {
+export async function isVideoHDR(videoPath) {
   return new Promise((resolve, reject) => {
     const command = `ffprobe -v error -select_streams v:0 -show_entries stream=color_space,color_transfer,color_primaries -of default=noprint_wrappers=1 "${videoPath}"`;
     exec(command, (error, stdout, stderr) => {
