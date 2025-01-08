@@ -1,7 +1,7 @@
 import { exec, spawn } from "child_process";
 import { join, extname, basename, dirname } from "path";
 import { promises as fs } from "fs";
-import { readFileSync, createReadStream, existsSync, unlinkSync } from "fs";
+import { readFileSync, createReadStream, existsSync, unlinkSync, stat } from "fs";
 import { tmpdir } from "os";
 import { findMp4File, fileExists, ongoingCacheGenerations } from "./utils.mjs";
 import { promisify } from 'util';
@@ -13,10 +13,12 @@ import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./encoderConfig.mjs"
 import { extractHDRInfo } from "./infoManager.mjs";
 import { createCategoryLogger } from "./lib/logger.mjs";
 import { isVideoHDR } from "./sprite.mjs";
+const fileInfo = promisify(stat);
 
 const logger = createCategoryLogger('videoHandler');
 // Video Clip Generation Version Control (for cache invalidation)
 const VIDEO_CLIP_VERSION = 1.0001;
+const FULL_TRANSCODE_VERSION = 1.0001; // Increment if encoder settings change
 
 let hardwareInfo;
 async function initHardwareInfo() {
@@ -26,9 +28,36 @@ async function initHardwareInfo() {
   return hardwareInfo;
 }
 
+async function getVideoCodec(videoPath) {
+  const probeCmd = `ffprobe -v quiet -print_format json -show_streams "${videoPath.replace(/"/g, '\\"')}"`;
+  try {
+    const { stdout } = await execAsync(probeCmd);
+    const metadata = JSON.parse(stdout);
+    const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+    return videoStream.codec_name.toLowerCase(); // e.g., 'h264'
+  } catch (error) {
+    logger.warn(`Failed to get video codec: ${error.message}`);
+    return false; // Treat as no codec found
+  }
+}
+
+function getExtensionFromCodec(codec) {
+  // Map codecs to file extensions
+  const codecToExtension = {
+    'libx264': '.mp4',
+    'vp9_vaapi': '.webm',
+    'hevc_vaapi': '.mp4',
+    'hevc_nvenc': '.mp4',
+    // Add more mappings as needed
+  };
+
+  return codecToExtension[codec] || '.mp4'; // Default to .mp4
+}
+
 export async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
   const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
+  const videoCodecParam = req.query.video || false; // No default, use original codec if not specified
 
   try {
     let videoPath;
@@ -76,17 +105,41 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
     // 2) Figure out which track to use
     const { selectedAudioTrack, channelCount } = determineSelectedAudioTrack(audioTracks, audioTrackParam);
 
-    // 3) Decide if we need to do a "pass-through" or a "transcode"
-    const needsTranscode = audioTrackParam !== "max" || channelCount !== 2;
+    // 3) Determine the original video codec using ffprobe
+    const originalCodec = await getVideoCodec(videoPath);
 
-    // Basic concurrency key: (video path) + (selected audio track) + (channel count) + version
-    const FULL_TRANSCODE_VERSION = 1.0001; // Increment if encoder settings change
-    const cacheKey = `FULL-${videoPath}-${selectedAudioTrack}-${channelCount}-v${FULL_TRANSCODE_VERSION}`;
+    // 4) Decide if we need to transcode based on videoCodecParam and audio parameters
+    let needsTranscode = false;
+    let targetCodec = originalCodec; // Default to original codec
+
+    if (videoCodecParam) {
+      if (videoCodecParam !== originalCodec) {
+        needsTranscode = true;
+        targetCodec = videoCodecParam;
+      }
+    }
+
+    if (audioTrackParam !== "max" && channelCount !== 2) {
+      needsTranscode = true;
+      // Note: If targetCodec is already set by videoCodecParam, retain it
+    }
+
+    // 5) Generate cache key based on video parameters and target codec
+    const videoBaseName = basename(videoPath, extname(videoPath)); // Extracts only the filename without extension
+    const cacheKeyComponents = [
+      videoBaseName,
+      selectedAudioTrack,
+      channelCount,
+      targetCodec,
+      `v${FULL_TRANSCODE_VERSION}`
+    ];
+    const cacheKey = cacheKeyComponents.join('-'); // e.g., "videoName-0-2-libx264-v1.0001"
+
+    // Generate a hashed cache key to ensure it's directory-safe
+    const hashedCacheKey = generateCacheKey(cacheKey); // Assuming this hashes the string without adding slashes
 
     // Define cache path
-    const transcodedFileName = `${generateCacheKey(cacheKey)}.mp4`;
-    const cacheDir = getCachedTranscodedPath(cacheKey, '.mp4');
-    const transcodedFilePath = join(cacheDir, transcodedFileName);
+    const transcodedFilePath = getCachedTranscodedPath(hashedCacheKey, getExtensionFromCodec(targetCodec))
 
     let finalVideoPath;
 
@@ -96,7 +149,7 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
       logger.info("No transcoding needed, serving original video file.");
     } else {
       // Check if transcoded file already exists
-      if (await fileExists(transcodedFilePath)) {
+      if (await fileExists(transcodedFilePath) && !ongoingCacheGenerations.has(cacheKey)) {
         logger.info(`Serving existing transcoded video: ${transcodedFilePath}`);
         finalVideoPath = transcodedFilePath;
       } else {
@@ -118,7 +171,7 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
           ongoingCacheGenerations.add(cacheKey);
           try {
             logger.info(`Initiating transcoding for cache key: ${cacheKey}`);
-            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath);
+            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath, targetCodec, { width: 1920 });
             finalVideoPath = transcodedFilePath;
           } finally {
             ongoingCacheGenerations.delete(cacheKey);
@@ -128,6 +181,7 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
     }
 
     // Serve the final video file with range support
+    //return serveCachedClip(res, finalVideoPath, type, req);
     return serveVideoWithRange(req, res, finalVideoPath);
   } catch (error) {
     logger.error(`Error in handleVideoRequest: ${error.message}`);
@@ -192,57 +246,104 @@ function getHighestChannelTrack(audioTracks) {
   return highestChannelTrack.index;
 }
 
-async function generateFullTranscode(inputPath, audioTrackIndex, channelCount, outputPath) {
-  const hardwareInfo = await initHardwareInfo();
-
-  // Select the best encoder based on available hardware
-  let selectedEncoderConfig = libx264; // Default to software encoding
-  if (hardwareInfo && hardwareInfo.encoder) {
-    const hwEncoder = hardwareInfo.encoder.encoder;
-    switch (hwEncoder) {
-      case 'vp9_vaapi':
-        selectedEncoderConfig = vp9_vaapi;
-        break;
-      case 'hevc_vaapi':
-        selectedEncoderConfig = hevc_vaapi;
-        break;
-      case 'hevc_nvenc':
-        selectedEncoderConfig = hevc_nvenc;
-        break;
-      default:
-        selectedEncoderConfig = libx264; // Fallback to libx264
-    }
+async function generateFullTranscode(inputPath, audioTrackIndex, channelCount, outputPath, targetCodec, scaleOverride = null) {
+  // 1) Select encoder config based on targetCodec
+  let selectedEncoderConfig = libx264; // Default to libx264
+  if (targetCodec === 'vp9_vaapi') {
+    selectedEncoderConfig = vp9_vaapi;
+  } else if (targetCodec === 'hevc_vaapi') {
+    selectedEncoderConfig = hevc_vaapi;
+  } else if (targetCodec === 'hevc_nvenc') {
+    selectedEncoderConfig = hevc_nvenc;
+  } else if (targetCodec === 'libx264') {
+    selectedEncoderConfig = libx264;
+  } else {
+    logger.warn(`Unsupported codec "${targetCodec}". Falling back to libx264.`);
+    selectedEncoderConfig = libx264;
   }
 
-  // Check if the input video is HDR
+  // 2) Detect HDR
   const isHDR = await isVideoHDR(inputPath);
 
-  // Extract relevant FFmpeg arguments from the selected encoder config
-  const videoFilter = isHDR
-    ? selectedEncoderConfig.hdr_vf || selectedEncoderConfig.vf
+  // 3) Pick and optionally override the filter chain
+  let videoFilter;
+  const baseFilter = isHDR && selectedEncoderConfig.hdr_vf
+    ? selectedEncoderConfig.hdr_vf
+    : typeof selectedEncoderConfig.vf === 'function'
+    ? selectedEncoderConfig.vf(isHDR)
     : selectedEncoderConfig.vf;
-  const additionalArgs = typeof selectedEncoderConfig.additional_args === 'function'
-    ? selectedEncoderConfig.additional_args(isHDR)
-    : selectedEncoderConfig.additional_args || [];
 
-  // Construct the FFmpeg command
-  const ffmpegArgs = [
-    '-y', // Overwrite output files without asking
-    '-i', inputPath, // Input file
-    '-map', '0:v:0', // Map the first video stream
-    `-map`, `0:a:${audioTrackIndex}?`, // Map the selected audio track
-    '-c:v', selectedEncoderConfig.codec, // Video codec
-    '-c:a', selectedEncoderConfig.audio_codec || 'aac', // Audio codec
-    '-ac', channelCount.toString(), // Audio channel count
-    ...(videoFilter ? ['-vf', videoFilter] : []), // Video filter chain
-    ...additionalArgs, // Additional encoder-specific arguments
-    outputPath, // Output file
-  ];
+  if (scaleOverride && baseFilter) {
+    // Dynamically replace `scale` in the filter chain
+    videoFilter = baseFilter.replace(/scale=\d+:-?\d+/g, `scale=${scaleOverride.width}:${scaleOverride.height || -2}`);
+    logger.info(`Overriding scale parameter in filter chain: ${videoFilter}`);
+  } else {
+    videoFilter = baseFilter; // Use the default filter
+  }
 
+  // 4) Gather additional_args (often a function)
+  let additionalArgs = [];
+  if (typeof selectedEncoderConfig.additional_args === 'function') {
+    additionalArgs = selectedEncoderConfig.additional_args(isHDR);
+  } else if (Array.isArray(selectedEncoderConfig.additional_args)) {
+    additionalArgs = selectedEncoderConfig.additional_args;
+  }
+
+  // 5) Construct FFmpeg arguments
+  const ffmpegArgs = ['-y'];
+
+  // 6) Conditionally add VAAPI device for hardware acceleration
+  if (selectedEncoderConfig.vaapi_device) {
+    ffmpegArgs.push('-vaapi_device', selectedEncoderConfig.vaapi_device);
+  }
+
+  // 7) Input file
+  ffmpegArgs.push('-i', inputPath);
+
+  // 8) Map the chosen tracks
+  ffmpegArgs.push('-map', '0:v:0', '-map', `0:a:${audioTrackIndex}?`);
+
+  // 9) Set video and audio codecs
+  ffmpegArgs.push('-c:v', selectedEncoderConfig.codec, '-c:a', selectedEncoderConfig.audio_codec || 'aac');
+
+  // 10) Add common options
+  ffmpegArgs.push(
+    '-fps_mode', 'cfr',
+    '-avoid_negative_ts', 'make_zero',
+    '-max_muxing_queue_size', '9999'
+  );
+
+  // **Add container-specific flags**
+  const containerExtension = extname(outputPath).toLowerCase();
+  if (containerExtension === '.mp4') {
+    ffmpegArgs.push('-movflags', '+faststart');
+  } else if (containerExtension === '.webm') {
+    // Fragmented WebM flags
+    //ffmpegArgs.push('-g', '30'); // GOP size (30 frames)
+    ffmpegArgs.push('-frag_duration', '1000000'); // Fragment duration in microseconds (1 second)
+  }
+
+  // 11) Add video filter if applicable
+  if (videoFilter && !stringArrayContainsArg(additionalArgs, '-vf')) {
+    ffmpegArgs.push('-vf', videoFilter);
+  }
+
+  // 12) Add channel count if not already in additional_args
+  if (!stringArrayContainsArg(additionalArgs, '-ac')) {
+    ffmpegArgs.push('-ac', channelCount.toString());
+  }
+
+  // 13) Spread additional_args from the config
+  ffmpegArgs.push(...additionalArgs);
+
+  // 14) Output path
+  ffmpegArgs.push(outputPath);
+
+  // For logging/diagnostics
   logger.info(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
 
-  // Execute the FFmpeg process
-  return new Promise((resolve, reject) => {
+  // 15) Spawn the FFmpeg process
+  return new Promise(async (resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
     ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg stderr: ${data}`));
@@ -266,6 +367,15 @@ async function generateFullTranscode(inputPath, audioTrackIndex, channelCount, o
       }
     });
   });
+}
+
+/**
+ * Helper to see if an array of arguments includes a certain argument key (e.g. "-vf").
+ * Simple utility so we don’t double-add the same flag.
+ */
+function stringArrayContainsArg(argsArray, argKey) {
+  // e.g. argKey = "-vf" or "-ac"
+  return argsArray.some((item) => item.trim().toLowerCase() === argKey);
 }
 
 async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
@@ -650,6 +760,161 @@ async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selec
   }
 }
 
+const mimeTypes = {
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska',
+  // Add more mappings as needed
+};
+
+function getMimeType(filePath) {
+  const ext = extname(filePath).toLowerCase();
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+async function serveVideoWithRange(req, res, videoPath) {
+  try {
+    const stat = await fileInfo(videoPath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    // Generate ETag and Last-Modified headers
+    const etag = `${stat.size}-${stat.mtime.getTime()}`;
+    const lastModified = stat.mtime.toUTCString();
+
+    // Set caching headers
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', lastModified);
+    res.setHeader('Cache-Control', 'public, max-age=31536000'); // 1 year
+
+    // Determine the MIME type of the video
+    const mimeType = getMimeType(videoPath) || 'application/octet-stream';
+    res.setHeader('Content-Type', mimeType);
+
+    // Handle conditional requests (If-None-Match / If-Modified-Since)
+    if (
+      req.headers['if-none-match'] === etag ||
+      req.headers['if-modified-since'] === lastModified
+    ) {
+      res.writeHead(304);
+      return res.end();
+    }
+
+    if (range) {
+      const rangePattern = /^bytes=(\d*)-(\d*)$/;
+      const matches = range.match(rangePattern);
+
+      if (!matches) {
+        // Invalid Range header format
+        res.writeHead(416, {
+          'Content-Range': `bytes */${fileSize}`,
+          'Content-Type': mimeType,
+        });
+        return res.end();
+      }
+
+      let start = matches[1];
+      let end = matches[2];
+
+      let startByte;
+      let endByte;
+
+      if (start === '' && end === '') {
+        // Both start and end are missing; invalid range
+        res.writeHead(416, {
+          'Content-Range': `bytes */${fileSize}`,
+          'Content-Type': mimeType,
+        });
+        return res.end();
+      }
+
+      if (start === '') {
+        // Suffix byte range: bytes=-500 (last 500 bytes)
+        const suffixLength = parseInt(end, 10);
+        if (isNaN(suffixLength)) {
+          res.writeHead(416, {
+            'Content-Range': `bytes */${fileSize}`,
+            'Content-Type': mimeType,
+          });
+          return res.end();
+        }
+        startByte = fileSize - suffixLength;
+        endByte = fileSize - 1;
+      } else {
+        // Start is specified
+        startByte = parseInt(start, 10);
+        endByte = end ? parseInt(end, 10) : fileSize - 1;
+
+        // Validate startByte and endByte
+        if (
+          isNaN(startByte) ||
+          isNaN(endByte) ||
+          startByte > endByte ||
+          startByte < 0 ||
+          endByte >= fileSize
+        ) {
+          res.writeHead(416, {
+            'Content-Range': `bytes */${fileSize}`,
+            'Content-Type': mimeType,
+          });
+          return res.end();
+        }
+      }
+
+      const chunkSize = endByte - startByte + 1;
+
+      // Set response headers for partial content
+      res.writeHead(206, {
+        'Content-Range': `bytes ${startByte}-${endByte}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': mimeType,
+      });
+
+      // Create a read stream for the specified range
+      const fileStream = createReadStream(videoPath, { start: startByte, end: endByte });
+
+      // Handle stream errors
+      fileStream.on('error', (err) => {
+        logger.error(`Stream error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+        }
+        res.end('Error streaming video.');
+      });
+
+      // Pipe the stream to the response
+      fileStream.pipe(res);
+    } else {
+      // No Range header; send the entire file
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': mimeType,
+      });
+
+      const fileStream = createReadStream(videoPath);
+
+      // Handle stream errors
+      fileStream.on('error', (err) => {
+        logger.error(`Stream error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+        }
+        res.end('Error streaming video.');
+      });
+
+      // Pipe the stream to the response
+      fileStream.pipe(res);
+    }
+  } catch (error) {
+    logger.error(`Error serving video: ${error.message}`);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+    }
+    res.end('Internal server error');
+  }
+}
+
 // Function to serve the cached clip with enhanced headers and robust range support
 async function serveCachedClip(res, cachedClipPath, type, req) {
   try {
@@ -666,6 +931,10 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
     res.setHeader('Last-Modified', lastModified);
     res.setHeader('Cache-Control', 'public, max-age=31536000'); // 1 year
 
+    // Set the correct Content-Type based on file extension
+    const mimeType = getMimeType(cachedClipPath);
+    res.setHeader('Content-Type', mimeType);
+
     // Handle conditional requests
     if (req.headers['if-none-match'] === etag || req.headers['if-modified-since'] === lastModified) {
       res.writeHead(304);
@@ -681,7 +950,7 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
       if (isNaN(startByte) || isNaN(endByte) || startByte > endByte || endByte >= fileSize) {
         res.writeHead(416, {
           "Content-Range": `bytes */${fileSize}`,
-          "Content-Type": "video/mp4",
+          "Content-Type": mimeType,
         });
         return res.end();
       }
@@ -699,7 +968,7 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
         "Content-Range": `bytes ${startByte}-${endByte}/${fileSize}`,
         "Accept-Ranges": "bytes",
         "Content-Length": chunkSize,
-        "Content-Type": "video/mp4",
+        "Content-Type": mimeType,
       });
       fileStream.pipe(res);
     } else {
@@ -713,7 +982,7 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
 
       res.writeHead(200, {
         "Content-Length": fileSize,
-        "Content-Type": "video/mp4",
+        "Content-Type": mimeType,
       });
       fileStream.pipe(res);
     }
@@ -722,7 +991,6 @@ async function serveCachedClip(res, cachedClipPath, type, req) {
     res.status(500).send('Error serving cached video.');
   }
 }
-
 
 // Utility function to wait for cache to be generated
 async function waitForCache(cachedClipPath, intervalMs, timeoutMs) {
