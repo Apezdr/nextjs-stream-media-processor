@@ -1,23 +1,21 @@
-import { exec, spawn } from "child_process";
-import { join, extname, basename, dirname } from "path";
+import { exec } from "child_process";
+import { join, extname, basename } from "path";
 import { promises as fs } from "fs";
-import { readFileSync, createReadStream, existsSync, unlinkSync, stat } from "fs";
-import { tmpdir } from "os";
-import { findMp4File, fileExists, ongoingCacheGenerations } from "./utils.mjs";
-import { promisify } from 'util';
+import { readFileSync, createReadStream } from "fs";
+import { findMp4File, fileExists, ongoingCacheGenerations, fileInfo } from "./utils/utils.mjs";
 import { getTVShowByName, getMovieByName } from "./sqliteDatabase.mjs";
-const execAsync = promisify(exec);
-import { ensureCacheDirs, generateCacheKey, getCachedClipPath, getCachedTranscodedPath } from "./utils.mjs";
-import { getHardwareAccelerationInfo } from './hardwareAcceleration.mjs'; // Adjust the path as needed
-import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./encoderConfig.mjs";
-import { extractHDRInfo } from "./infoManager.mjs";
+//const execAsync = promisify(exec);
+import { generateCacheKey, getCachedClipPath, getCachedTranscodedPath } from "./utils/utils.mjs";
+import { getHardwareAccelerationInfo } from './hardwareAcceleration.mjs';
+import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./ffmpeg/encoderConfig.mjs";
 import { createCategoryLogger } from "./lib/logger.mjs";
-import { isVideoHDR } from "./sprite.mjs";
-const fileInfo = promisify(stat);
+//import { extractHDRInfo } from "./mediaInfo/mediaInfo.mjs";
+import { generateAndCacheClip, generateFullTranscode } from "./ffmpeg/transcode.mjs";
+import { getAudioTracks, getVideoCodec } from "./ffmpeg/ffprobe.mjs";
 
 const logger = createCategoryLogger('videoHandler');
 // Video Clip Generation Version Control (for cache invalidation)
-const VIDEO_CLIP_VERSION = 1.0001;
+const VIDEO_CLIP_VERSION = 1.0002;
 const FULL_TRANSCODE_VERSION = 1.0001; // Increment if encoder settings change
 
 let hardwareInfo;
@@ -28,19 +26,11 @@ async function initHardwareInfo() {
   return hardwareInfo;
 }
 
-async function getVideoCodec(videoPath) {
-  const probeCmd = `ffprobe -v quiet -print_format json -show_streams "${videoPath.replace(/"/g, '\\"')}"`;
-  try {
-    const { stdout } = await execAsync(probeCmd);
-    const metadata = JSON.parse(stdout);
-    const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-    return videoStream.codec_name.toLowerCase(); // e.g., 'h264'
-  } catch (error) {
-    logger.warn(`Failed to get video codec: ${error.message}`);
-    return false; // Treat as no codec found
-  }
-}
-
+/**
+ * Determines the file extension based on the provided video codec.
+ * @param {string} codec - The video codec to map to a file extension.
+ * @returns {string} The file extension corresponding to the input codec, or '.mp4' if the codec is not found in the mapping.
+ */
 function getExtensionFromCodec(codec) {
   // Map codecs to file extensions
   const codecToExtension = {
@@ -54,6 +44,15 @@ function getExtensionFromCodec(codec) {
   return codecToExtension[codec] || '.mp4'; // Default to .mp4
 }
 
+/**
+ * Handles video clip requests by streaming a specific segment of the video.
+ * This function is responsible for determining the appropriate audio track, video codec, and whether transcoding is required. It also manages the caching of transcoded video files.
+ * @param {Object} req - Express request object.
+ * @param {Object} res - Express response object.
+ * @param {string} type - Type of media ('movies' or 'tv').
+ * @param {string} BASE_PATH - Base path to media files.
+ * @returns {Promise<void>} - Resolves when the video has been served.
+ */
 export async function handleVideoRequest(req, res, type, BASE_PATH) {
   const { movieName, showName, season, episode } = req.params;
   const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
@@ -171,7 +170,7 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
           ongoingCacheGenerations.add(cacheKey);
           try {
             logger.info(`Initiating transcoding for cache key: ${cacheKey}`);
-            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath, targetCodec, { width: 1920 });
+            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath, targetCodec, 'full');
             finalVideoPath = transcodedFilePath;
           } finally {
             ongoingCacheGenerations.delete(cacheKey);
@@ -189,6 +188,13 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
   }
 }
 
+/**
+ * Determines the selected audio track based on the provided audio track parameter.
+ * @param {Object[]} audioTracks - An array of audio track objects, each with a 'channels' property.
+ * @param {string|number} audioTrackParam - The parameter specifying the desired audio track. Can be 'max', 'stereo', or a numeric index.
+ * @returns {Object} An object containing the selected audio track index and the channel count of the selected track.
+ * @throws {Error} If the 'stereo' track is not found or the specified audio track index is invalid.
+ */
 function determineSelectedAudioTrack(audioTracks, audioTrackParam) {
   let selectedAudioTrack;
   if (audioTrackParam === "max") {
@@ -209,33 +215,11 @@ function determineSelectedAudioTrack(audioTracks, audioTrackParam) {
   return { selectedAudioTrack, channelCount };
 }
 
-async function getAudioTracks(videoPath) {
-  return new Promise((resolve, reject) => {
-    const command = `ffprobe -v quiet -print_format json -show_streams "${videoPath}"`;
-
-    exec(command, (error, stdout, stderr) => {
-      if (error) {
-        logger.error(`Error getting audio tracks: ${error.message}`);
-        reject(error);
-      } else {
-        const output = JSON.parse(stdout);
-        const videoStreams = output.streams.filter((stream) => stream.codec_type === "video");
-        const audioStreams = output.streams.filter((stream) => stream.codec_type === "audio");
-
-        const videoTrackCount = videoStreams.length;
-
-        const audioTracks = audioStreams.map((stream) => ({
-          index: stream.index - videoTrackCount,
-          codec: stream.codec_name,
-          channels: stream.channels,
-        }));
-
-        resolve(audioTracks);
-      }
-    });
-  });
-}
-
+/**
+ * Finds the audio track with the highest number of channels from the provided list of audio tracks.
+ * @param {Object[]} audioTracks - An array of audio track objects, each with a 'channels' property.
+ * @returns {number} The index of the audio track with the highest number of channels.
+ */
 function getHighestChannelTrack(audioTracks) {
   let highestChannelTrack = audioTracks[0];
   for (const track of audioTracks) {
@@ -244,175 +228,6 @@ function getHighestChannelTrack(audioTracks) {
     }
   }
   return highestChannelTrack.index;
-}
-
-async function generateFullTranscode(inputPath, audioTrackIndex, channelCount, outputPath, targetCodec, scaleOverride = null) {
-  // 1) Select encoder config based on targetCodec
-  let selectedEncoderConfig = libx264; // Default to libx264
-  if (targetCodec === 'vp9_vaapi') {
-    selectedEncoderConfig = vp9_vaapi;
-  } else if (targetCodec === 'hevc_vaapi') {
-    selectedEncoderConfig = hevc_vaapi;
-  } else if (targetCodec === 'hevc_nvenc') {
-    selectedEncoderConfig = hevc_nvenc;
-  } else if (targetCodec === 'libx264') {
-    selectedEncoderConfig = libx264;
-  } else {
-    logger.warn(`Unsupported codec "${targetCodec}". Falling back to libx264.`);
-    selectedEncoderConfig = libx264;
-  }
-
-  // 2) Detect HDR
-  const isHDR = await isVideoHDR(inputPath);
-
-  // 3) Pick and optionally override the filter chain
-  let videoFilter;
-  const baseFilter = isHDR && selectedEncoderConfig.hdr_vf
-    ? selectedEncoderConfig.hdr_vf
-    : typeof selectedEncoderConfig.vf === 'function'
-    ? selectedEncoderConfig.vf(isHDR)
-    : selectedEncoderConfig.vf;
-
-  if (scaleOverride && baseFilter) {
-    // Dynamically replace `scale` in the filter chain
-    videoFilter = baseFilter.replace(/scale=\d+:-?\d+/g, `scale=${scaleOverride.width}:${scaleOverride.height || -2}`);
-    logger.info(`Overriding scale parameter in filter chain: ${videoFilter}`);
-  } else {
-    videoFilter = baseFilter; // Use the default filter
-  }
-
-  // 4) Gather additional_args (often a function)
-  let additionalArgs = [];
-  if (typeof selectedEncoderConfig.additional_args === 'function') {
-    additionalArgs = selectedEncoderConfig.additional_args(isHDR);
-  } else if (Array.isArray(selectedEncoderConfig.additional_args)) {
-    additionalArgs = selectedEncoderConfig.additional_args;
-  }
-
-  // 5) Construct FFmpeg arguments
-  const ffmpegArgs = ['-y'];
-
-  // 6) Conditionally add VAAPI device for hardware acceleration
-  if (selectedEncoderConfig.vaapi_device) {
-    ffmpegArgs.push('-vaapi_device', selectedEncoderConfig.vaapi_device);
-  }
-
-  // 7) Input file
-  ffmpegArgs.push('-i', inputPath);
-
-  // 8) Map the chosen tracks
-  ffmpegArgs.push('-map', '0:v:0', '-map', `0:a:${audioTrackIndex}?`);
-
-  // 9) Set video and audio codecs
-  ffmpegArgs.push('-c:v', selectedEncoderConfig.codec, '-c:a', selectedEncoderConfig.audio_codec || 'aac');
-
-  // 10) Add common options
-  ffmpegArgs.push(
-    '-fps_mode', 'cfr',
-    '-avoid_negative_ts', 'make_zero',
-    '-max_muxing_queue_size', '9999'
-  );
-
-  // **Add container-specific flags**
-  const containerExtension = extname(outputPath).toLowerCase();
-  if (containerExtension === '.mp4') {
-    ffmpegArgs.push('-movflags', '+faststart');
-  } else if (containerExtension === '.webm') {
-    // Fragmented WebM flags
-    //ffmpegArgs.push('-g', '30'); // GOP size (30 frames)
-    ffmpegArgs.push('-frag_duration', '1000000'); // Fragment duration in microseconds (1 second)
-  }
-
-  // 11) Add video filter if applicable
-  if (videoFilter && !stringArrayContainsArg(additionalArgs, '-vf')) {
-    ffmpegArgs.push('-vf', videoFilter);
-  }
-
-  // 12) Add channel count if not already in additional_args
-  if (!stringArrayContainsArg(additionalArgs, '-ac')) {
-    ffmpegArgs.push('-ac', channelCount.toString());
-  }
-
-  // 13) Spread additional_args from the config
-  ffmpegArgs.push(...additionalArgs);
-
-  // 14) Output path
-  ffmpegArgs.push(outputPath);
-
-  // For logging/diagnostics
-  logger.info(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
-
-  // 15) Spawn the FFmpeg process
-  return new Promise(async (resolve, reject) => {
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
-    ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg stderr: ${data}`));
-    ffmpeg.on('error', (error) => {
-      logger.error(`Error during FFmpeg process: ${error.message}`);
-      reject(error);
-    });
-    ffmpeg.on('close', async (code) => {
-      if (code === 0) {
-        // Verify the output file
-        if (await fileExists(outputPath)) {
-          logger.info(`Successfully transcoded video: ${outputPath}`);
-          resolve();
-        } else {
-          logger.error(`Transcoded file not found: ${outputPath}`);
-          reject(new Error('Transcoded file not found.'));
-        }
-      } else {
-        logger.error(`FFmpeg exited with code ${code}`);
-        reject(new Error(`FFmpeg exited with code ${code}`));
-      }
-    });
-  });
-}
-
-/**
- * Helper to see if an array of arguments includes a certain argument key (e.g. "-vf").
- * Simple utility so we don’t double-add the same flag.
- */
-function stringArrayContainsArg(argsArray, argKey) {
-  // e.g. argKey = "-vf" or "-ac"
-  return argsArray.some((item) => item.trim().toLowerCase() === argKey);
-}
-
-async function generateModifiedMp4(videoPath, audioTrack, channelCount) {
-  const fileExtension = extname(videoPath);
-  const fileNameWithoutExtension = basename(videoPath, fileExtension);
-  const outputFileName = `${fileNameWithoutExtension}_${channelCount}ch${fileExtension}`;
-  const outputPath = join(dirname(videoPath), outputFileName);
-
-  // Check if the output file already exists
-  try {
-    await fs.access(outputPath);
-    logger.info(`Modified MP4 file already exists: ${outputPath}`);
-    return outputPath;
-  } catch (error) {
-    // File doesn't exist, proceed with generating it
-  }
-
-  return new Promise((resolve, reject) => {
-    const ffmpegCommand = `ffmpeg -i "${videoPath}" -map 0:v -map 0:a:${audioTrack} -c copy "${outputPath}"`;
-
-    const ffmpegProcess = exec(ffmpegCommand);
-
-    ffmpegProcess.on("close", (code) => {
-      if (code === 0) {
-        logger.info(`Modified MP4 saved: ${outputPath}`);
-        resolve(outputPath);
-      } else {
-        logger.error(`FFmpeg process exited with code ${code}`);
-        reject(new Error(`FFmpeg process exited with code ${code}`));
-      }
-    });
-
-    ffmpegProcess.on("error", (error) => {
-      logger.error(`Error generating modified MP4: ${error.message}`);
-      reject(error);
-    });
-  });
 }
 
 /**
@@ -605,7 +420,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     try {
       // Generate the clip
       logger.info(`Generating new clip for caching: ${cacheKey}`);
-      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR);
+      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR, 'clip');
       
       // Serve the newly cached clip
       return serveCachedClip(res, cachedClipPath, type, req);
@@ -623,139 +438,6 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
       res.status(500).send("Internal server error");
     } else {
       res.end();
-    }
-  }
-}
-
-/**
- * Generates a video clip and caches it using FFmpeg.
- * @param {string} videoPath - Path to the input video.
- * @param {number} start - Start time in seconds.
- * @param {number} end - End time in seconds.
- * @param {string} cachedClipPath - Full path to save the cached clip (with extension).
- * @param {Object} selectedEncoderConfig - Configuration for the selected encoder.
- * @param {boolean} isHDR - Flag indicating whether the video is HDR.
- * @returns {Promise<void>}
- */
-async function generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR) {
-  const tmpDir = tmpdir();
-  const tempPrefix = join(tmpDir, `ffmpeg-${Date.now()}`);
-  const rawVideoFile = `${tempPrefix}-raw.mkv`;
-
-  try {
-    // Step 1: Extract the segment
-    const extractArgs = [
-      '-y',
-      '-ss', start.toString(),
-      '-t', (end - start).toString(),
-      '-i', videoPath,
-      '-map', '0:v:0',
-      '-map', '0:a:0?',
-      '-c', 'copy',
-      '-f', 'matroska',
-      rawVideoFile
-    ];
-
-    // Log the ffmpeg extract command
-    logger.info(`Executing FFmpeg extract command: ffmpeg ${extractArgs.join(' ')}`);
-
-    // Extract segment
-    await new Promise((resolve, reject) => {
-      const ffmpeg = spawn('ffmpeg', extractArgs);
-      ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg extract stderr: ${data}`));
-      ffmpeg.on('error', reject);
-      ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg extract exited with code ${code}`)));
-    });
-
-    // Step 2: Encode with appropriate filter chain
-    const encodeArgs = [
-      '-y'
-    ];
-
-    if (selectedEncoderConfig.vaapi_device) {
-      encodeArgs.push('-vaapi_device', selectedEncoderConfig.vaapi_device);
-    }
-
-    encodeArgs.push(
-      '-i', rawVideoFile,
-      '-map', '0:v:0',
-      '-map', '0:a:0?',
-      '-fps_mode', 'cfr',
-      '-avoid_negative_ts', 'make_zero',
-      '-max_muxing_queue_size', '9999'
-    );
-
-    // Add codec
-    if (selectedEncoderConfig.codec) {
-      encodeArgs.push('-c:v', selectedEncoderConfig.codec);
-    }
-
-    // **Handle 'vf' correctly: Check if it's a function or a string**
-    if (isHDR && selectedEncoderConfig.hdr_vf) {
-      encodeArgs.push('-vf', selectedEncoderConfig.hdr_vf);
-    } else if (selectedEncoderConfig.vf) {
-      const vf = typeof selectedEncoderConfig.vf === 'function' 
-        ? selectedEncoderConfig.vf(isHDR) 
-        : selectedEncoderConfig.vf;
-      encodeArgs.push('-vf', vf);
-    }
-
-    // **Handle 'additional_args' correctly**
-    if (typeof selectedEncoderConfig.additional_args === 'function') {
-      // If 'additional_args' is a function, call it with 'isHDR' and spread the resulting array
-      const argsFromFunction = selectedEncoderConfig.additional_args(isHDR);
-      if (Array.isArray(argsFromFunction)) {
-        encodeArgs.push(...argsFromFunction);
-      } else {
-        throw new TypeError('additional_args function must return an array');
-      }
-    } else if (Array.isArray(selectedEncoderConfig.additional_args)) {
-      // If 'additional_args' is an array, spread it directly
-      encodeArgs.push(...selectedEncoderConfig.additional_args);
-    } else if (selectedEncoderConfig.additional_args !== undefined) {
-      // If 'additional_args' exists but is neither a function nor an array, throw an error
-      throw new TypeError('additional_args must be a function or an array if defined');
-    }
-    // If 'additional_args' is undefined, do nothing (it's optional)
-
-    // Add audio codec and output path
-    encodeArgs.push(
-      '-c:a', selectedEncoderConfig.audio_codec,
-      cachedClipPath
-    );
-
-    // Log the ffmpeg encode command
-    logger.info(`Executing FFmpeg encode command: ffmpeg ${encodeArgs.join(' ')}`);
-
-    // Execute encoding
-    await new Promise((resolve, reject) => {
-      const ffmpeg = spawn('ffmpeg', encodeArgs);
-      ffmpeg.stderr.on('data', (data) => logger.error(`FFmpeg encode stderr: ${data}`));
-      ffmpeg.on('error', reject);
-      ffmpeg.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg encode exited with code ${code}`)));
-    });
-
-    // Verify the output
-    const stats = await fs.stat(cachedClipPath);
-    if (stats.size === 0) {
-      throw new Error('Generated file is empty');
-    }
-
-    logger.info(`Successfully generated clip at: ${cachedClipPath}`);
-
-  } catch (error) {
-    logger.error('Error during clip generation:', error);
-    // Cleanup
-    for (const file of [rawVideoFile, cachedClipPath]) {
-      if (existsSync(file)) {
-        unlinkSync(file);
-      }
-    }
-    throw error;
-  } finally {
-    // Clean up temporary files
-    if (existsSync(rawVideoFile)) {
-      unlinkSync(rawVideoFile);
     }
   }
 }

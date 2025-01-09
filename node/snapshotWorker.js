@@ -1,8 +1,7 @@
-const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 const { createCategoryLogger } = require('./lib/logger.mjs');
-const { generateFrame, fileExists } = require('./utils.mjs').default;
+const { generateFrame, fileExists } = require('./utils/utils.mjs').default;
 const logger = createCategoryLogger('snapshotWorker');
 
 process.on('message', async (data) => {

@@ -1,10 +1,11 @@
 import { exec, spawn } from 'child_process';
 import { join } from 'path';
 import { promises as fs } from 'fs';
-import { getVideoDuration, fileExists, convertToAvif } from './utils.mjs';
+import { fileExists, convertToAvif, fileInfo } from './utils/utils.mjs';
 import sharp from 'sharp';
 import { createCategoryLogger } from './lib/logger.mjs';
 import PQueue from 'p-queue';
+import { getVideoDuration, isVideoHDR } from './ffmpeg/ffprobe.mjs';
 
 const logger = createCategoryLogger('sprite');
 
@@ -32,8 +33,8 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
 
   try {
     logger.info('Starting PNG optimization...');
-    logger.info('Input path:', inputPath);
-    logger.info('Output path:', outputPath);
+    logger.info('Input path:' + inputPath);
+    logger.info('Output path:' + outputPath);
 
     const originalStats = await fs.stat(inputPath);
     logger.info(`Original file size: ${(originalStats.size / 1024 / 1024).toFixed(2)}MB`);
@@ -80,7 +81,7 @@ async function optimizePNGSpritesheet(inputPath, outputPath, options = {}) {
     await fs.rename(optimizationTempPath, outputPath);
 
     // Get final results
-    const optimizedStats = await fs.stat(outputPath);
+    const optimizedStats = await fileInfo(outputPath);
     const savings = ((originalStats.size - optimizedStats.size) / originalStats.size * 100).toFixed(2);
 
     const metadata = await sharp(outputPath).metadata();
@@ -200,7 +201,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
           // Clean up FFmpeg output after successful optimization
           await fs.unlink(ffmpegOutputPath).catch(logger.error);
         } catch (optimizeError) {
-          logger.error('PNG optimization failed, using unoptimized PNG:', optimizeError);
+          logger.error('PNG optimization failed, using unoptimized PNG:' + optimizeError.message);
           // If optimization fails, just move the FFmpeg output to final destination
           await fs.rename(ffmpegOutputPath, finalSpriteSheetPath);
         }
@@ -235,33 +236,6 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
     logger.error(`Error in generateSpriteSheet: ${error}`);
     throw error;
   }
-}
-
-/**
- * Checks if the given video file is HDR.
- * @param {string} videoPath - Path to the video file.
- * @returns {Promise<boolean>} - Resolves to true if HDR, else false.
- */
-export async function isVideoHDR(videoPath) {
-  return new Promise((resolve, reject) => {
-    const command = `ffprobe -v error -select_streams v:0 -show_entries stream=color_space,color_transfer,color_primaries -of default=noprint_wrappers=1 "${videoPath}"`;
-    exec(command, (error, stdout, stderr) => {
-      if (error) {
-        logger.error(`ffprobe error: ${stderr}`);
-        return reject(error);
-      }
-
-      const output = stdout.toLowerCase();
-      // Common HDR transfer characteristics
-      const hdrTransferCharacteristics = ['smpte2084', 'arib-std-b67'];
-      const transferCharacteristic = output.match(/color_transfer=([^\n]+)/);
-      const isTransferHDR =
-        transferCharacteristic &&
-        hdrTransferCharacteristics.includes(transferCharacteristic[1]);
-
-      resolve(Boolean(isTransferHDR));
-    });
-  });
 }
 
 /**

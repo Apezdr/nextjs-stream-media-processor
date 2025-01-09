@@ -1,48 +1,10 @@
-import { promisify } from 'node:util';
-import { exec as execCallback } from 'node:child_process';
 import { createCategoryLogger } from './lib/logger.mjs';
+import { getVideoDuration, chapterInfo } from './ffmpeg/ffprobe.mjs';
 const logger = createCategoryLogger('chapter-generator');
-
-const exec = promisify(execCallback);
-const ffprobeBinary = '/usr/bin/ffprobe';
-
-export async function hasChapterInfo(mediaPath) {
-  return new Promise((resolve, reject) => {
-    const ffprobeCommand = `${ffprobeBinary} -show_entries chapter=start_time,metadata -print_format json -v quiet '${mediaPath.replace(/'/g, "'\\''")}'`;
-
-    exec(ffprobeCommand, (error, stdout, stderr) => {
-      if (error) {
-        logger.error(`Error checking chapter information for ${mediaPath}:`, error);
-        reject(error);
-        return;
-      }
-
-      try {
-        const ffprobeOutput = JSON.parse(stdout);
-        const hasChapters = ffprobeOutput.chapters && ffprobeOutput.chapters.length > 0;
-        resolve(hasChapters);
-      } catch (err) {
-        logger.error(`Error parsing ffprobe output for ${mediaPath}:`, err);
-        reject(err);
-      }
-    });
-  });
-}
 
 export async function generateChapters(mediaPath) {
   try {
-    const ffprobeCommand = `${ffprobeBinary} -show_entries chapter=start_time,metadata -print_format json -v quiet '${mediaPath.replace(/'/g, "'\\''")}'`;
-
-    const { stdout, stderr } = await exec(ffprobeCommand);
-
-    if (stderr) {
-      const errorMessage = `Error generating chapters for ${mediaPath}: ${stderr}`;
-      logger.error(errorMessage);
-      throw new Error(errorMessage);
-    }
-
-    const ffprobeOutput = JSON.parse(stdout);
-    const chapters = ffprobeOutput.chapters || [];
+    const chapters = await chapterInfo(mediaPath) || [];
 
     if (chapters.length === 0) {
       logger.warn(`No chapter information found for ${mediaPath}`);
@@ -116,18 +78,4 @@ function formatDuration(durationMillis) {
   const seconds = durationSeconds % 60;
   const formattedDuration = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.000`;
   return formattedDuration;
-}
-
-async function getVideoDuration(mediaPath) {
-  const ffprobeCommand = `${ffprobeBinary} -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '${mediaPath.replace(/'/g, "'\\''")}'`;
-
-  const { stdout, stderr } = await exec(ffprobeCommand);
-
-  if (stderr) {
-    logger.error(`Error getting video duration for ${mediaPath}:`, stderr);
-    throw new Error(stderr);
-  }
-
-  const duration = parseFloat(stdout) * 1000;
-  return duration;
 }

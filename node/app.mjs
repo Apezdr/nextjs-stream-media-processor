@@ -10,16 +10,17 @@ import compression from "compression";
 import axios from "axios";
 import { generateSpriteSheet, generateVttFileFFmpeg } from "./sprite.mjs";
 import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
-import { generateFrame, getVideoDuration, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey } from "./utils.mjs";
-import { generateChapters, hasChapterInfo } from "./chapter-generator.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey } from "./utils/utils.mjs";
+import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
 import sharp from "sharp";
-import { getInfo, getHeaderData } from "./infoManager.mjs";
+import { getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 const logger = createCategoryLogger('main');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
@@ -806,7 +807,7 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
       );
 
       // Check if the media file has chapter information
-      const hasChapters = await hasChapterInfo(mediaPath);
+      const hasChapters = await chapterInfo(mediaPath);
 
       if (hasChapters) {
         // Create the chapters directory if it doesn't exist
@@ -897,7 +898,8 @@ app.get('/processes/:fileKey', async (req, res) => {
 });
 
 //
-// Handle MP4 Audio requests
+// Handle MP4 video requests
+// Enhanced to allow transcoding with video codec desired as well as audio channels exposed
 app.get("/video/movie/:movieName", async (req, res) => {
   await handleVideoRequest(req, res, "movies", BASE_PATH);
 });

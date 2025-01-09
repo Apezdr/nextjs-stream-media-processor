@@ -1,19 +1,25 @@
 import { promisify } from 'util';
 import { exec, spawn } from 'child_process';
-const execAsync = promisify(exec);
-import { promises as fs } from 'fs'; // Use the promise-based version of fs
+export const execAsync = promisify(exec);
+import { promises as fs, stat } from 'fs'; // Use the promise-based version of fs
 import { resolve as _resolve, join, relative, sep, dirname } from 'path';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const scriptsDir = dirname(__filename) + '/../scripts/utils';
 const blurhashCli = join(scriptsDir, 'blurhash_cli.py');
 import { createHash } from 'crypto';
-import { createCategoryLogger } from './lib/logger.mjs';
+import { createCategoryLogger } from '../lib/logger.mjs';
 const logger = createCategoryLogger('utility');
-const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
+//const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
+
+/**
+ * Promisified version of the `fs.stat` function, which retrieves information about a file.
+ * This exported constant can be used to asynchronously get file metadata, such as size, creation/modification times, and file type.
+ */
+export const fileInfo = promisify(stat);
 
 // Define the main cache directory
-export const mainCacheDir = join(dirname(__filename), 'cache');
+export const mainCacheDir = join(dirname(dirname(__filename)), 'cache');
 
 // Define subdirectories for different cache types
 export const generalCacheDir = join(mainCacheDir, 'general');
@@ -135,25 +141,6 @@ async function _generateFrame(videoPath, timestamp, framePath) {
       });
     });
   }));
-}
-
-export function getVideoDuration(videoPath) {
-  return new Promise((resolve, reject) => {
-    const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
-    exec(ffprobeCommand, (error, stdout, stderr) => {
-      if (error) {
-        logger.error(`Error getting video duration: ${error.message}`);
-        reject(error);
-      } else {
-        const duration = parseFloat(stdout.trim());
-        if (!isNaN(duration)) {
-          resolve(duration);
-        } else {
-          reject(new Error('Failed to parse video duration.'));
-        }
-      }
-    });
-  });
 }
 
 // Function to check file existence asynchronously
@@ -534,17 +521,17 @@ export async function getLastModifiedTime(filePath) {
  * @returns {Promise<void>}
  */
 export async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, deleteOriginal = true) {
-  logger.info('Request to convert PNG to AVIF:', pngPath);
+  logger.info('Request to convert PNG to AVIF:' + pngPath);
 
   // If a conversion for this pngPath is already in progress, return the existing Promise
   if (conversionQueue.has(pngPath)) {
-    logger.info('Conversion already in progress for:', pngPath);
+    logger.info('Conversion already in progress for:' + pngPath);
     return conversionQueue.get(pngPath);
   }
 
   // Create a new Promise for the conversion process
   const conversionPromise = new Promise((resolve, reject) => {
-    logger.info('Starting new conversion for:', pngPath);
+    logger.info('Starting new conversion for:' + pngPath);
 
     const args = [
       '--min', '0',
@@ -617,8 +604,25 @@ export async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, 
   // After successful conversion, remove the entry from the Map
   conversionQueue.delete(pngPath);
 }
+
+/**
+ * Generates a frame from a video file at the specified timestamp and saves it to the given path.
+ * 
+ * @param {string} videoPath - The path to the video file.
+ * @param {number} timestamp - The timestamp (in milliseconds) at which to capture the frame.
+ * @param {string} framePath - The path to save the generated frame.
+ * @returns {Promise<void>} - A Promise that resolves when the frame has been generated and saved.
+ */
 export const generateFrame = async (videoPath, timestamp, framePath) => {
   await loadPLimit();
   return _generateFrame(videoPath, timestamp, framePath);
 };
 
+/**
+ * Helper to see if an array of arguments includes a certain argument key (e.g. "-vf").
+ * Simple utility so we don’t double-add the same flag.
+ */
+export function stringArrayContainsArg(argsArray, argKey) {
+  // e.g. argKey = "-vf" or "-ac"
+  return argsArray.some((item) => item.trim().toLowerCase() === argKey);
+}
