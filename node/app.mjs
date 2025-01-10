@@ -1831,6 +1831,7 @@ async function runDownloadTmdbImages(
   fullScan = false
 ) {
   const debugMessage = isDebugMode ? " with debug" : "";
+  const pythonExecutable = process.platform === "win32" ? "python" : "python3";
   logger.info(
     `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ""}${
       specificMovie ? ` for movie "${specificMovie}"` : ""
@@ -1838,7 +1839,7 @@ async function runDownloadTmdbImages(
   );
 
   // Construct the command using cross-platform path handling
-  let command = `python "${downloadTmdbImagesScript}"`;
+  let command = `${pythonExecutable} "${downloadTmdbImagesScript}"`;
 
   // Append arguments
   if (specificShow) {

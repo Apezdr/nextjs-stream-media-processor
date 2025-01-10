@@ -112,7 +112,7 @@ async function generateInfo(episodePath, infoFile) {
 
     return info;
   } catch (error) {
-    logger.error(`Error generating info for ${episodePath}:`, error);
+    logger.error(`Error generating info for ${episodePath}: ${error.message}`);
     throw error; // Rethrow to handle upstream if necessary
   }
 }
@@ -160,7 +160,7 @@ export async function writeInfo(episodePath, info) {
     await fs.writeFile(infoFile, JSON.stringify(info, null, 2));
     logger.info(`Updated info for ${episodePath}`);
   } catch (error) {
-    logger.error(`Error writing info to ${infoFile}:`, error);
+    logger.error(`Error writing info to ${infoFile}: ${error.message}`);
     throw error;
   }
 }

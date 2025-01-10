@@ -1,3 +1,8 @@
+import { createCategoryLogger } from "../lib/logger.mjs";
+import { execAsync } from "../utils/utils.mjs";
+
+const logger = createCategoryLogger('mediaInfo');
+
 /**
  * Extract stable header data using MediaInfo.
  * We'll use a subset of attributes from both the General and Video tracks
@@ -8,7 +13,7 @@
  */
 export async function getHeaderData(episodePath) {
   try {
-    const { stdout } = await exec(`mediainfo --Output=JSON "${episodePath}"`);
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
     const data = JSON.parse(stdout);
 
     // Extract the General track
@@ -75,7 +80,7 @@ export async function getHeaderData(episodePath) {
  */
 export async function extractHDRInfo(episodePath) {
   try {
-    const { stdout } = await exec(`mediainfo --Output=JSON "${episodePath}"`);
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
     const data = JSON.parse(stdout);
 
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
