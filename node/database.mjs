@@ -4,14 +4,26 @@ const logger = createCategoryLogger('mongoDB');
 const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 
+/**
+ * Ensures that an index exists on the specified collection.
+ * If the index does not exist, it creates the index with the provided specifications and options.
+ *
+ * @param {Collection} collection - The MongoDB collection.
+ * @param {Object} indexSpec - The specification of the index fields.
+ * @param {Object} indexOptions - The options for the index (e.g., name, expireAfterSeconds).
+ */
 async function ensureIndex(collection, indexSpec, indexOptions) {
     const indexes = await collection.indexes();
     const indexExists = indexes.some(index => {
+        // Compare index keys
         return JSON.stringify(index.key) === JSON.stringify(indexSpec);
     });
 
     if (!indexExists) {
         await collection.createIndex(indexSpec, indexOptions);
+        logger.info(`Created index: ${indexOptions.name} on collection: ${collection.collectionName}`);
+    } else {
+        logger.info(`Index: ${indexOptions.name} already exists on collection: ${collection.collectionName}`);
     }
 }
 
@@ -19,6 +31,7 @@ export async function initializeMongoDatabase() {
     try {
         await client.connect();
         const mediaDb = client.db("Media");
+        const cacheDB = client.db("Cache");
 
         // Ensure collections in Media database
         const collections = await mediaDb.listCollections().toArray();
@@ -43,6 +56,14 @@ export async function initializeMongoDatabase() {
             logger.info("Created collection: PlaybackStatus");
         }
 
+        // Ensure collections in Cache database
+        const cacheCollections = await cacheDB.listCollections().toArray();
+        const cacheCollectionNames = cacheCollections.map(col => col.name);
+        if (!cacheCollectionNames.includes("cacheEntries")) {
+            await cacheDB.createCollection("cacheEntries");
+            logger.info("Created collection: cacheEntries");
+        }
+
         logger.info("Database and collections have been initialized successfully.");
     } catch (error) {
         logger.error("An error occurred while initializing the database and collections:", error);
@@ -50,10 +71,15 @@ export async function initializeMongoDatabase() {
     }
 }
 
+/**
+ * Initializes the indexes for all relevant collections.
+ * Ensures that each index exists, creating it if necessary.
+ */
 export async function initializeIndexes() {
     try {
         await client.connect();
         const mediaDb = client.db("Media");
+        const cacheDB = client.db("Cache");
 
         // Ensure indexes on Media.Movies collection
         const moviesCollection = mediaDb.collection("Movies");
@@ -76,7 +102,7 @@ export async function initializeIndexes() {
 
         // Ensure indexes on PlaybackStatus collection
         const playbackStatusCollection = mediaDb.collection("PlaybackStatus");
-        // Replace the simple userId index with the compound index
+        // Compound index for user watch history
         await ensureIndex(playbackStatusCollection, 
             { 
                 userId: 1,
@@ -85,6 +111,7 @@ export async function initializeIndexes() {
             { name: "user_watchHistory" }
         );
         
+        // Single field index on userId
         await ensureIndex(playbackStatusCollection, 
             { 
                 userId: 1,
@@ -92,14 +119,23 @@ export async function initializeIndexes() {
             { name: "userId_1" }
         );
 
-        // Optionally, add a TTL index for cleanup if needed
-        // await ensureIndex(playbackStatusCollection,
-        //     { "videosWatched.lastUpdated": 1 },
-        //     { 
-        //         name: "cleanup_old_records",
-        //         expireAfterSeconds: 30 * 24 * 60 * 60  // 30 days
-        //     }
-        // );
+        // Ensure indexes on Cache collection
+        const cacheCollection = cacheDB.collection("cacheEntries");
+
+        // 1. Create a text index on the 'url' field
+        await ensureIndex(cacheCollection,
+            { url: "text" },
+            { name: "url_text_index" , background: true}
+        );
+
+        // 2. Create a TTL index on the 'timestamp' field
+        await ensureIndex(cacheCollection,
+            { timestamp: 1 },
+            { 
+                name: "cache_ttl_index",
+                expireAfterSeconds: 7 * 24 * 60 * 60  // Example: 7 days
+            }
+        );
 
         logger.info("Indexes have been initialized successfully.");
     } catch (error) {

@@ -12,6 +12,7 @@ import { createCategoryLogger } from "./lib/logger.mjs";
 //import { extractHDRInfo } from "./mediaInfo/mediaInfo.mjs";
 import { generateAndCacheClip, generateFullTranscode } from "./ffmpeg/transcode.mjs";
 import { getAudioTracks, getVideoCodec } from "./ffmpeg/ffprobe.mjs";
+import { getInfo } from "./infoManager.mjs";
 
 const logger = createCategoryLogger('videoHandler');
 // Video Clip Generation Version Control (for cache invalidation)
@@ -242,11 +243,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
   let cacheKey;
   try {
     let videoPath;
+    let title;
     let videoID = null;
 
     if (type === "movies") {
       const { movieName } = req.params;
       const movieData = await getMovieByName(db, movieName);
+      title = movieData.name;
       if (!movieData) {
         throw new Error(`Movie not found: ${movieName}`);
       }
@@ -256,6 +259,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     } else if (type === "tv") {
       const { showName, season, episode } = req.params;
       const showData = await getTVShowByName(db, showName);
+      title = showData.name;
 
       if (!showData) {
         throw new Error(`Show not found: ${showName}`);
@@ -380,10 +384,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
         selectedEncoderConfig = libx264;
       }
     }
-
-    // Generate cache key
-    //cacheKey = generateCacheKey(videoPath, start, end);
-    cacheKey = `${videoID}-v${VIDEO_CLIP_VERSION}-s_${start}-e_${end}-${selectedEncoder}`;
+    let videoKey = videoID;
+    // Bypassing the TMDB id
+    if (await fileExists(videoPath)) {
+      const info = await getInfo(videoPath);
+      videoKey = info.uuid;
+    }
+    cacheKey = `${title}-key_${videoKey}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}-${selectedEncoder}`;
     const cachedClipPath = getCachedClipPath(cacheKey, selectedEncoderConfig.extension);
 
     // Check if cached clip exists and is valid
@@ -430,7 +437,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     }
 
   } catch (error) {
-    logger.error('Error in clip generation:', error);
+    logger.error('Error in clip generation:'+ error.message);
     if (cacheKey) {
       ongoingCacheGenerations.delete(cacheKey);
     }
