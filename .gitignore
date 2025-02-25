@@ -70,3 +70,6 @@ temp/
 
 # Cache for Node
 node/cache
+
+# AI model files
+/cline_docs
