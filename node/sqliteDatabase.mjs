@@ -10,12 +10,40 @@ const __dirname = dirname(__filename);
 const dbDirectory = join(__dirname, 'db');
 const dbFilePath = join(dbDirectory, 'media.db');
 
-var hasInitialized = false
+var hasInitialized = false;
+
+/**
+ * Helper function that wraps a database operation.
+ * If a SQLITE_BUSY error is encountered, it retries the operation.
+ */
+async function withRetry(operation, maxRetries = 5, delayMs = 200) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error.code === 'SQLITE_BUSY') {
+        attempt++;
+        console.warn(
+          `SQLITE_BUSY encountered. Retrying ${attempt}/${maxRetries} after ${delayMs}ms...`
+        );
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error('Operation failed after maximum retries');
+}
 
 export async function initializeDatabase() {
   // Create the db directory if it doesn't exist
-  await fs.mkdir(dbDirectory, { recursive: true })
-  const db = await open({ filename: dbFilePath, driver: sqlite3.Database })
+  await fs.mkdir(dbDirectory, { recursive: true });
+  const db = await open({ filename: dbFilePath, driver: sqlite3.Database });
+  
+  // Set SQLite to wait up to 5000ms if the database is locked
+  await db.exec('PRAGMA busy_timeout = 5000');
+  
   if (!hasInitialized) {
     await db.exec(`
         CREATE TABLE IF NOT EXISTS movies (
@@ -31,7 +59,7 @@ export async function initializeDatabase() {
             additional_metadata TEXT,
             _id TEXT
         );
-    `)
+    `);
     await db.exec(`
         CREATE TABLE IF NOT EXISTS tv_shows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,14 +75,14 @@ export async function initializeDatabase() {
             seasons TEXT,
             directory_hash TEXT
         );
-    `)
+    `);
     await db.exec(`
         CREATE TABLE IF NOT EXISTS missing_data_media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE,
             last_attempt TEXT
         );
-    `)
+    `);
     await db.exec(`
       CREATE TABLE IF NOT EXISTS process_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,14 +94,14 @@ export async function initializeDatabase() {
         message TEXT,
         last_updated TEXT DEFAULT CURRENT_TIMESTAMP
       );
-    `)
-    hasInitialized = true
+    `);
+    hasInitialized = true;
   }
-  return db
+  return db;
 }
 
 export async function releaseDatabase(db) {
-  return await db.close()
+  return await db.close();
 }
 
 export async function insertOrUpdateTVShow(
@@ -90,20 +118,26 @@ export async function insertOrUpdateTVShow(
   seasonsObj
 ) {
   const seasonsStr = JSON.stringify(seasonsObj);
-  const existingShow = await db.get('SELECT * FROM tv_shows WHERE name = ?', [showName]);
+  const existingShow = await withRetry(() =>
+    db.get('SELECT * FROM tv_shows WHERE name = ?', [showName])
+  );
 
   if (existingShow) {
-    await db.run(
-      `UPDATE tv_shows 
-       SET metadata = ?, metadata_path = ?, poster = ?, posterBlurhash = ?, logo = ?, logoBlurhash = ?, backdrop = ?, backdropBlurhash = ?, seasons = ? 
-       WHERE name = ?`,
-      [metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr, showName]
+    await withRetry(() =>
+      db.run(
+        `UPDATE tv_shows 
+         SET metadata = ?, metadata_path = ?, poster = ?, posterBlurhash = ?, logo = ?, logoBlurhash = ?, backdrop = ?, backdropBlurhash = ?, seasons = ? 
+         WHERE name = ?`,
+        [metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr, showName]
+      )
     );
   } else {
-    await db.run(
-      `INSERT INTO tv_shows (name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasons) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr]
+    await withRetry(() =>
+      db.run(
+        `INSERT INTO tv_shows (name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasons) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr]
+      )
     );
   }
 }
@@ -131,15 +165,38 @@ export async function insertOrUpdateMovie(
     hdr,
     additional_metadata: JSON.stringify(additionalMetadata),
     _id,
-  }
+  };
 
-  const existingMovie = await db.get('SELECT * FROM movies WHERE name = ?', [name])
+  const existingMovie = await withRetry(() =>
+    db.get('SELECT * FROM movies WHERE name = ?', [name])
+  );
   if (existingMovie) {
     if (existingMovie.directory_hash !== hash) {
-      await db.run(
-        `UPDATE movies 
-         SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ?, _id = ?
-         WHERE name = ?`,
+      await withRetry(() =>
+        db.run(
+          `UPDATE movies 
+           SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ?, _id = ?
+           WHERE name = ?`,
+          [
+            movie.file_names,
+            movie.lengths,
+            movie.dimensions,
+            movie.urls,
+            metadata_url,
+            hash,
+            movie.hdr,
+            movie.additional_metadata,
+            _id,
+            name
+          ]
+        )
+      );
+    }
+  } else {
+    await withRetry(() =>
+      db.run(
+        `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, _id, name) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           movie.file_names,
           movie.lengths,
@@ -153,43 +210,30 @@ export async function insertOrUpdateMovie(
           name
         ]
       )
-    }
-  } else {
-    await db.run(
-      `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, _id, name) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        movie.file_names,
-        movie.lengths,
-        movie.dimensions,
-        movie.urls,
-        metadata_url,
-        hash,
-        movie.hdr,
-        movie.additional_metadata,
-        _id,
-        name
-      ]
-    )
+    );
   }
 }
 
 export async function insertOrUpdateMissingDataMedia(db, name) {
-  const now = new Date().toISOString()
+  const now = new Date().toISOString();
   try {
-    await db.run('INSERT INTO missing_data_media (name, last_attempt) VALUES (?, ?)', [name, now])
+    await withRetry(() =>
+      db.run('INSERT INTO missing_data_media (name, last_attempt) VALUES (?, ?)', [name, now])
+    );
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT') {
       // If the entry already exists, update the last_attempt timestamp
-      await db.run('UPDATE missing_data_media SET last_attempt = ? WHERE name = ?', [now, name])
+      await withRetry(() =>
+        db.run('UPDATE missing_data_media SET last_attempt = ? WHERE name = ?', [now, name])
+      );
     } else {
-      throw error // Re-throw the error if it's not a unique constraint error
+      throw error; // Re-throw if it's not a unique constraint error
     }
   }
 }
 
 export async function getTVShows(db) {
-  const shows = await db.all('SELECT * FROM tv_shows');
+  const shows = await withRetry(() => db.all('SELECT * FROM tv_shows'));
   return shows.map((show) => ({
     id: show.id,
     name: show.name,
@@ -206,7 +250,7 @@ export async function getTVShows(db) {
 }
 
 export async function getMovies(db) {
-  const movies = await db.all('SELECT * FROM movies')
+  const movies = await withRetry(() => db.all('SELECT * FROM movies'));
   return movies.map((movie) => ({
     id: movie.id,
     name: movie.name,
@@ -219,20 +263,20 @@ export async function getMovies(db) {
     hdr: movie.hdr,
     additional_metadata: JSON.parse(movie.additional_metadata),
     _id: movie._id
-  }))
+  }));
 }
 
 export async function getMissingDataMedia(db) {
-  const media = await db.all('SELECT * FROM missing_data_media')
+  const media = await withRetry(() => db.all('SELECT * FROM missing_data_media'));
   return media.map((item) => ({
     id: item.id,
     name: item.name,
     lastAttempt: item.last_attempt,
-  }))
+  }));
 }
 
 export async function getMovieById(db, id) {
-  const movie = await db.get('SELECT * FROM movies WHERE id = ?', [id])
+  const movie = await withRetry(() => db.get('SELECT * FROM movies WHERE id = ?', [id]));
   if (movie) {
     return {
       id: movie.id,
@@ -244,13 +288,13 @@ export async function getMovieById(db, id) {
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
       _id: movie._id,
-    }
+    };
   }
-  return null
+  return null;
 }
 
 export async function getMovieByName(db, name) {
-  const movie = await db.get('SELECT * FROM movies WHERE name = ?', [name])
+  const movie = await withRetry(() => db.get('SELECT * FROM movies WHERE name = ?', [name]));
   if (movie) {
     return {
       id: movie.id,
@@ -262,13 +306,13 @@ export async function getMovieByName(db, name) {
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
       _id: movie._id,
-    }
+    };
   }
-  return null
+  return null;
 }
 
 export async function getTVShowById(db, id) {
-  const show = await db.get('SELECT * FROM tv_shows WHERE id = ?', [id]);
+  const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE id = ?', [id]));
   if (show) {
     return {
       id: show.id,
@@ -289,7 +333,7 @@ export async function getTVShowById(db, id) {
 }
 
 export async function getTVShowByName(db, name) {
-  const show = await db.get('SELECT * FROM tv_shows WHERE name = ?', [name]);
+  const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE name = ?', [name]));
   if (show) {
     return {
       id: show.id,
@@ -310,14 +354,14 @@ export async function getTVShowByName(db, name) {
 }
 
 export async function isDatabaseEmpty(db, tableName = 'movies') {
-  const row = await db.get(`SELECT COUNT(*) as count FROM ${tableName}`)
-  return row.count === 0
+  const row = await withRetry(() => db.get(`SELECT COUNT(*) as count FROM ${tableName}`));
+  return row.count === 0;
 }
 
 export async function deleteMovie(db, name) {
-  await db.run('DELETE FROM movies WHERE name = ?', [name])
+  await withRetry(() => db.run('DELETE FROM movies WHERE name = ?', [name]));
 }
 
 export async function deleteTVShow(db, name) {
-  await db.run('DELETE FROM tv_shows WHERE name = ?', [name])
+  await withRetry(() => db.run('DELETE FROM tv_shows WHERE name = ?', [name]));
 }

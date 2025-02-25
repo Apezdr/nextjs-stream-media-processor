@@ -5,7 +5,7 @@ import { promises as fs, stat } from 'fs'; // Use the promise-based version of f
 import { resolve as _resolve, join, relative, sep, dirname } from 'path';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
-const scriptsDir = dirname(__filename) + '/../scripts/utils';
+const scriptsDir = dirname(__filename) + '/../../scripts/utils';
 const blurhashCli = join(scriptsDir, 'blurhash_cli.py');
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
@@ -469,7 +469,8 @@ export async function getStoredBlurhash(imagePath, basePath) {
     await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
     return relativeUrl;
   } catch (error) {
-    logger.error(`Error executing blurhash_cli.py: ${error}`);
+    logger.error(`Error executing blurhash_cli.py: ${error}}`);
+    logger.error(`Command failed: ${command}`);
     return null;
   }
 }

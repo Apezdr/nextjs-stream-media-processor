@@ -8,25 +8,25 @@ const logger = createCategoryLogger('mediaInfo');
  * We'll use a subset of attributes from both the General and Video tracks
  * that are likely consistent across servers if they have the same exact file.
  *
- * @param {string} episodePath - The path to the media file.
+ * @param {string} filePath - The path to the media file.
  * @returns {Promise<string>} A stable, reproducible string of header info.
  */
-export async function getHeaderData(episodePath) {
+export async function getHeaderData(filePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
     const data = JSON.parse(stdout);
 
     // Extract the General track
     const generalTrack = data.media.track.find(t => t["@type"] === "General");
     if (!generalTrack) {
-      logger.warn(`No general track found in ${episodePath}, cannot form stable header data.`);
+      logger.warn(`No general track found in ${filePath}, cannot form stable header data.`);
       return '';
     }
 
     // Extract the first Video track
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
     if (videoTracks.length === 0) {
-      logger.warn(`No video tracks found in ${episodePath}, cannot form stable header data.`);
+      logger.warn(`No video tracks found in ${filePath}, cannot form stable header data.`);
       return '';
     }
     const video = videoTracks[0];
@@ -68,24 +68,24 @@ export async function getHeaderData(episodePath) {
 
     return stableFields;
   } catch (error) {
-    logger.error(`Error extracting header data with MediaInfo for ${episodePath}: ${error.message}`);
+    logger.error(`Error extracting header data with MediaInfo for ${filePath}: ${error.message}`);
     return '';
   }
 }
 
 /**
  * Extracts HDR information using MediaInfo.
- * @param {string} episodePath - Path to the episode file.
+ * @param {string} filePath - Path to the media file.
  * @returns {Promise<string|null>} - Returns a string of HDR types separated by commas or null if not found.
  */
-export async function extractHDRInfo(episodePath) {
+export async function extractHDRInfo(filePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${episodePath}"`);
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
     const data = JSON.parse(stdout);
 
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
     if (!videoTracks || videoTracks.length === 0) {
-      logger.warn(`No video tracks found in ${episodePath}.`);
+      logger.warn(`No video tracks found in ${filePath}.`);
       return null;
     }
 
@@ -173,7 +173,7 @@ export async function extractHDRInfo(episodePath) {
 
     return Array.from(detectedHDR).join(', ');
   } catch (error) {
-    logger.error(`Error extracting HDR info with MediaInfo for ${episodePath}:`, error);
+    logger.error(`Error extracting HDR info with MediaInfo for ${filePath}:`, error);
     return null;
   }
 }
