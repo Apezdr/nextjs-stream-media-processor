@@ -4,12 +4,12 @@ import { fileExists } from "./utils/utils.mjs";
 import { createHash } from 'crypto';
 import { exec as execCallback } from "child_process";
 import { createCategoryLogger } from "./lib/logger.mjs";
-import { extractHDRInfo, getHeaderData } from "./mediaInfo/mediaInfo.mjs";
+import { extractHDRInfo, extractMediaQuality, getHeaderData } from "./mediaInfo/mediaInfo.mjs";
 const logger = createCategoryLogger('infoFileManager');
 const exec = promisify(execCallback);
 
 // Used to determine if regenerating info is necessary
-const CURRENT_VERSION = 1.0005;
+const CURRENT_VERSION = 1.0007; // Incremented for mediaQuality field
 
 /**
  * Validates basic info object structure
@@ -17,13 +17,24 @@ const CURRENT_VERSION = 1.0005;
  * @returns {boolean} - Whether the info object is valid
  */
 function validateInfo(info) {
-  return (
+  const hasBasicFields = (
     typeof info.version === 'number' &&
     typeof info.length === 'number' &&
     typeof info.dimensions === 'string' &&
     (info.hdr === null || typeof info.hdr === 'string') &&
     typeof info.additionalMetadata === 'object'
   );
+
+  // Check for mediaQuality field in newer versions
+  if (info.version >= 1.0006) {
+    return hasBasicFields && (
+      info.mediaQuality === null || 
+      (typeof info.mediaQuality === 'object' && 
+       typeof info.mediaQuality.isHDR === 'boolean')
+    );
+  }
+
+  return hasBasicFields;
 }
 
 /**
@@ -76,7 +87,7 @@ async function extractAdditionalMetadata(filePath) {
  * Generates the info using ffprobe and writes it to the .info file in JSON format.
  * @param {string} filePath - Path to the media file.
  * @param {string} infoFile - Path to the .info file.
- * @returns {Promise<{length: number, dimensions: string, hdr: string|null, additionalMetadata: object}>}
+ * @returns {Promise<{length: number, dimensions: string, hdr: string|null, mediaQuality: object|null, additionalMetadata: object}>}
  */
 async function generateInfo(filePath, infoFile) {
   try {
@@ -93,7 +104,8 @@ async function generateInfo(filePath, infoFile) {
     const headerData = await getHeaderData(filePath);
     const headerHash = createHash('sha256').update(headerData).digest('hex');
 
-    // Extract HDR and additional metadata
+    // Extract media quality, HDR and additional metadata
+    const mediaQuality = await extractMediaQuality(filePath);
     const hdr = await extractHDRInfo(filePath);
     const additionalMetadata = await extractAdditionalMetadata(filePath);
 
@@ -102,7 +114,8 @@ async function generateInfo(filePath, infoFile) {
       uuid: headerHash,
       length: fileLength,
       dimensions: fileDimensions,
-      hdr: hdr, // Enhanced HDR information
+      hdr: hdr, // For backward compatibility
+      mediaQuality: mediaQuality, // New structured media quality information
       additionalMetadata: additionalMetadata // Additional metadata
     };
 
@@ -121,7 +134,7 @@ async function generateInfo(filePath, infoFile) {
  * Reads the .info file and returns an object.
  * If the file does not exist or is invalid, it generates the info using ffprobe.
  * @param {string} filePath - Path to the media file.
- * @returns {Promise<{length: number, dimensions: string, hdr: string|null, additionalMetadata: object}>}
+ * @returns {Promise<{length: number, dimensions: string, hdr: string|null, mediaQuality: object|null, additionalMetadata: object}>}
  */
 export async function getInfo(filePath) {
   const infoFile = `${filePath}.info`;

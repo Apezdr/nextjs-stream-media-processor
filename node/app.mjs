@@ -1410,14 +1410,52 @@ async function generateListMovies(db, dirPath) {
         const dirHashChanged =
           existingMovie && existingMovie.directory_hash !== hash;
 
+        // Check if we need to regenerate info files due to version updates
+        let needInfoRegeneration = false;
         if (!dirHashChanged && existingMovie) {
-          // If the hash is the same, skip detailed processing and use the existing data.
-          if (isDebugMode) {
-            logger.info(
-              `No changes detected in ${dirName}, skipping processing.`
-            );
+          // Even if directory hasn't changed, we still need to check if info files need to be regenerated
+          // Find all mp4 files and check if their info files need updating
+          const mp4Files = files.filter(file => file.endsWith('.mp4'));
+          
+          for (const mp4File of mp4Files) {
+            const filePath = join(dirPath, dirName, mp4File);
+            const infoFile = `${filePath}.info`;
+            
+            if (await fileExists(infoFile)) {
+              try {
+                const fileInfo = await fs.readFile(infoFile, 'utf-8');
+                const info = JSON.parse(fileInfo);
+                
+                // If info version is outdated, we need to process this movie
+                if (!info.version || info.version < CURRENT_VERSION) {
+                  logger.info(`Info file for ${mp4File} has outdated version (${info.version}), regeneration needed`);
+                  needInfoRegeneration = true;
+                  break;
+                }
+              } catch (error) {
+                logger.warn(`Error reading info file for ${mp4File}, regeneration needed:`, error);
+                needInfoRegeneration = true;
+                break;
+              }
+            } else {
+              // If info file doesn't exist, we need to process this movie
+              logger.info(`Info file for ${mp4File} doesn't exist, regeneration needed`);
+              needInfoRegeneration = true;
+              break;
+            }
           }
-          return; // Use return instead of continue
+          
+          // If we don't need to regenerate info files and directory hasn't changed, skip processing
+          if (!needInfoRegeneration) {
+            if (isDebugMode) {
+              logger.info(
+                `No changes detected in ${dirName}, skipping processing.`
+              );
+            }
+            return; // Use return instead of continue
+          } else {
+            logger.info(`Processing ${dirName} to update info files`);
+          }
         }
 
         logger.info(`Directory Hash invalidated for, ${dirName}`);
