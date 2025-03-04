@@ -2,7 +2,7 @@ import { MongoClient } from 'mongodb';
 import { createCategoryLogger } from './lib/logger.mjs';
 const logger = createCategoryLogger('mongoDB');
 const uri = process.env.MONGODB_URI;
-const client = new MongoClient(uri);
+// Instead of creating a single client, we'll create a new client for each function call
 
 /**
  * Ensures that an index exists on the specified collection.
@@ -28,6 +28,7 @@ async function ensureIndex(collection, indexSpec, indexOptions) {
 }
 
 export async function initializeMongoDatabase() {
+    const client = new MongoClient(uri);
     try {
         await client.connect();
         const mediaDb = client.db("Media");
@@ -76,6 +77,7 @@ export async function initializeMongoDatabase() {
  * Ensures that each index exists, creating it if necessary.
  */
 export async function initializeIndexes() {
+    const client = new MongoClient(uri);
     try {
         await client.connect();
         const mediaDb = client.db("Media");
@@ -88,6 +90,21 @@ export async function initializeIndexes() {
             { name: "video_lookup" }
         );
 
+        // title lookup
+        await ensureIndex(moviesCollection, 
+            { title: 1 }, 
+            { name: "title_lookup" }
+        );
+        
+        // genres id lookup
+        await ensureIndex(moviesCollection, 
+            { 
+                'metadata.genres.id': 1,
+                'title': 1
+            }, 
+            { name: "genres_id_lookup" }
+        );
+
         // Ensure indexes on Media.TV collection
         const tvCollection = mediaDb.collection("TV");
         await ensureIndex(tvCollection, 
@@ -98,6 +115,13 @@ export async function initializeIndexes() {
         await ensureIndex(tvCollection, 
             { title: -1 }, 
             { name: "title_index" }
+        );
+
+        
+        // Genres id lookup
+        await ensureIndex(tvCollection, 
+            { 'metadata.genres.id': 1 }, 
+            { name: "genres_id_index" }
         );
 
         // Ensure indexes on PlaybackStatus collection
@@ -116,7 +140,16 @@ export async function initializeIndexes() {
             { 
                 userId: 1,
             }, 
-            { name: "userId_1" }
+            { name: "user_lookup" }
+        );
+        
+        // Compound index for user video lookup
+        await ensureIndex(playbackStatusCollection, 
+            { 
+                userId: 1,
+                'videosWatched.videoId': 1,
+            }, 
+            { name: "user_videowatched_lookup" }
         );
 
         // Ensure indexes on Cache collection
@@ -148,6 +181,7 @@ export async function initializeIndexes() {
 
 export async function checkAutoSync() {
     let autoSyncResponse = false
+    const client = new MongoClient(uri);
     try {
         await client.connect();
         const database = client.db("app_config");
@@ -179,6 +213,7 @@ export async function checkAutoSync() {
 }
 
 export async function updateLastSyncTime() {
+    const client = new MongoClient(uri);
     try {
         await client.connect();
         const database = client.db("app_config");

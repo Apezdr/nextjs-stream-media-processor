@@ -56,6 +56,7 @@ export async function initializeDatabase() {
             metadata_url TEXT,
             directory_hash TEXT,
             hdr TEXT,
+            media_quality TEXT,
             additional_metadata TEXT,
             _id TEXT
         );
@@ -152,6 +153,7 @@ export async function insertOrUpdateMovie(
   metadata_url,
   hash,
   hdr,
+  mediaQuality,
   additionalMetadata,
   _id,
 ) {
@@ -163,6 +165,7 @@ export async function insertOrUpdateMovie(
     urls: JSON.stringify(urls),
     hash,
     hdr,
+    media_quality: mediaQuality ? JSON.stringify(mediaQuality) : null,
     additional_metadata: JSON.stringify(additionalMetadata),
     _id,
   };
@@ -175,7 +178,7 @@ export async function insertOrUpdateMovie(
       await withRetry(() =>
         db.run(
           `UPDATE movies 
-           SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, additional_metadata = ?, _id = ?
+           SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, media_quality = ?, additional_metadata = ?, _id = ?
            WHERE name = ?`,
           [
             movie.file_names,
@@ -185,6 +188,7 @@ export async function insertOrUpdateMovie(
             metadata_url,
             hash,
             movie.hdr,
+            movie.media_quality,
             movie.additional_metadata,
             _id,
             name
@@ -195,8 +199,8 @@ export async function insertOrUpdateMovie(
   } else {
     await withRetry(() =>
       db.run(
-        `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, additional_metadata, _id, name) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, media_quality, additional_metadata, _id, name) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           movie.file_names,
           movie.lengths,
@@ -205,6 +209,7 @@ export async function insertOrUpdateMovie(
           metadata_url,
           hash,
           movie.hdr,
+          movie.media_quality,
           movie.additional_metadata,
           _id,
           name
@@ -261,6 +266,7 @@ export async function getMovies(db) {
     metadataUrl: movie.metadata_url,
     directory_hash: movie.directory_hash,
     hdr: movie.hdr,
+    mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
     additional_metadata: JSON.parse(movie.additional_metadata),
     _id: movie._id
   }));
@@ -287,6 +293,9 @@ export async function getMovieById(db, id) {
       urls: JSON.parse(movie.urls),
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
+      hdr: movie.hdr,
+      mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
+      additional_metadata: JSON.parse(movie.additional_metadata),
       _id: movie._id,
     };
   }
@@ -305,6 +314,9 @@ export async function getMovieByName(db, name) {
       urls: JSON.parse(movie.urls),
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
+      hdr: movie.hdr,
+      mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
+      additional_metadata: JSON.parse(movie.additional_metadata),
       _id: movie._id,
     };
   }

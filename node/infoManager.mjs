@@ -9,7 +9,7 @@ const logger = createCategoryLogger('infoFileManager');
 const exec = promisify(execCallback);
 
 // Used to determine if regenerating info is necessary
-const CURRENT_VERSION = 1.0007; // Incremented for mediaQuality field
+export const CURRENT_VERSION = 1.0007; // Incremented for mediaQuality field
 
 /**
  * Validates basic info object structure

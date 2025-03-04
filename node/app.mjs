@@ -15,7 +15,7 @@ import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
 import sharp from "sharp";
-import { getInfo } from "./infoManager.mjs";
+import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
@@ -1183,6 +1183,7 @@ async function generateListTV(db, dirPath) {
             let fileLength;
             let fileDimensions;
             let hdrInfo;
+            let mediaQuality;
             let additionalMetadata;
             let uuid;
 
@@ -1191,6 +1192,7 @@ async function generateListTV(db, dirPath) {
               fileLength = info.length;
               fileDimensions = info.dimensions;
               hdrInfo = info.hdr;
+              mediaQuality = info.mediaQuality;
               additionalMetadata = info.additionalMetadata;
               uuid = info.uuid;
             } catch (error) {
@@ -1218,6 +1220,7 @@ async function generateListTV(db, dirPath) {
               videoURL: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
               mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
               hdr: hdrInfo || null,
+              mediaQuality: mediaQuality || null,
               additionalMetadata: additionalMetadata || {},
               episodeNumber: parseInt(episodeNumber, 10),
             };
@@ -1433,7 +1436,7 @@ async function generateListMovies(db, dirPath) {
                   break;
                 }
               } catch (error) {
-                logger.warn(`Error reading info file for ${mp4File}, regeneration needed:`, error);
+                logger.warn(`Error reading info file for ${mp4File}, regeneration needed:` + error);
                 needInfoRegeneration = true;
                 break;
               }
@@ -1475,6 +1478,7 @@ async function generateListMovies(db, dirPath) {
         const fileLengths = {};
         const fileDimensions = {};
         let hdrInfo;
+        let mediaQuality;
         let additionalMetadata;
         const urls = {};
         const subtitles = {};
@@ -1519,6 +1523,7 @@ async function generateListMovies(db, dirPath) {
               fileLength = info.length;
               fileDimensionsStr = info.dimensions;
               hdrInfo = info.hdr;
+              mediaQuality = info.mediaQuality;
               additionalMetadata = info.additionalMetadata;
               _id = info.uuid;
             } catch (error) {
@@ -1788,6 +1793,7 @@ async function generateListMovies(db, dirPath) {
           urls["metadata"] || "", // metadata_url
           final_hash, // directory_hash
           hdrInfo,
+          mediaQuality,
           additionalMetadata,
           _id
         );
@@ -1817,6 +1823,7 @@ app.get("/media/movies", async (req, res) => {
         dimensions: movie.dimensions,
         urls: movie.urls,
         hdr: movie.hdr,
+        mediaQuality: movie.mediaQuality,
         additional_metadata: movie.additional_metadata,
       };
       return acc;
