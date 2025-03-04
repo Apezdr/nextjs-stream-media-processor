@@ -90,10 +90,21 @@ export async function initializeIndexes() {
             { name: "video_lookup" }
         );
 
+        await ensureIndex(moviesCollection, 
+            { mediaLastModified: -1 }, 
+            { name: "mediaLastModified" }
+        );
+
         // title lookup
         await ensureIndex(moviesCollection, 
             { title: 1 }, 
             { name: "title_lookup" }
+        );
+        
+        // release date lookup
+        await ensureIndex(moviesCollection, 
+            { 'metadata.release_date': -1 }, 
+            { name: "release_date" }
         );
         
         // genres id lookup
@@ -117,6 +128,11 @@ export async function initializeIndexes() {
             { name: "title_index" }
         );
 
+        // Track the last modified date of the episodes
+        await ensureIndex(tvCollection, 
+            { 'seasons.episodes.mediaLastModified': -1 }, 
+            { name: "episode_last_modified" }
+        );
         
         // Genres id lookup
         await ensureIndex(tvCollection, 
