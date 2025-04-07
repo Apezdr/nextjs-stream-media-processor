@@ -10,6 +10,9 @@ import compression from "compression";
 import axios from "axios";
 import { generateSpriteSheet, generateVttFileFFmpeg } from "./sprite.mjs";
 import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
+import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash } from "./sqlite/metadataHashes.mjs";
+import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
+import { setupRoutes } from "./routes/index.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
@@ -21,6 +24,7 @@ import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
+import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 const logger = createCategoryLogger('main');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
@@ -901,7 +905,9 @@ app.get('/processes/:fileKey', async (req, res) => {
 // Handle MP4 video requests
 // Enhanced to allow transcoding with video codec desired as well as audio channels exposed
 app.get("/video/movie/:movieName", async (req, res) => {
-  await handleVideoRequest(req, res, "movies", BASE_PATH);
+  const db = await initializeDatabase();
+  await handleVideoRequest(req, res, "movies", BASE_PATH, db);
+  await releaseDatabase(db);
 });
 
 app.get("/rescan/tmdb", async (req, res) => {
@@ -914,58 +920,97 @@ app.get("/rescan/tmdb", async (req, res) => {
   }
 });
 
-// app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
-//  await handleVideoRequest(req, res, "tv");
-// });
+app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
+  const db = await initializeDatabase();
+  await handleVideoRequest(req, res, "tv", BASE_PATH, db);
+  await releaseDatabase(db);
+});
 
-//
-// Clear General Cache every 30 minutes
-setInterval(() => {
-  logger.info("Running General Cache Cleanup...");
-  clearGeneralCache()
-    .then(() => {
-      logger.info("General Cache Cleanup Completed.");
-    })
-    .catch((error) => {
-      logger.error(`General Cache Cleanup Error: ${error.message}`);
-    });
-}, 30 * 60 * 1000); // 30 minutes
+// Instead of using setInterval for cache cleanup, use node-schedule with the task manager
+// This gives better coordination with other tasks and avoids database contention
 
-// Clear Video Clips Cache every 24 hours
-setInterval(() => {
-  logger.info("Running Video Clips Cache Cleanup...");
-  clearVideoClipsCache()
-    .then(() => {
-      logger.info("Video Clips Cache Cleanup Completed.");
-    })
-    .catch((error) => {
-      logger.error(`Video Clips Cache Cleanup Error: ${error.message}`);
-    });
-}, 24 * 60 * 60 * 1000); // 24 hours
+// Clear General Cache every 30 minutes (at 00 and 30 minutes past each hour)
+scheduleJob("0,30 * * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'General Cache Cleanup', async () => {
+    logger.info("Running General Cache Cleanup...");
+    await clearGeneralCache();
+    logger.info("General Cache Cleanup Completed.");
+    return 'General cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue general cache cleanup task: ${error.message}`);
+  });
+});
 
-//Clear Spritesheet Cache every day
-setInterval(() => {
-  logger.info("Running Spritesheet Cache Cleanup...");
-  clearSpritesheetCache()
-    .then(() => {
-      logger.info("Spritesheet Cache Cleanup Completed.");
-    })
-    .catch((error) => {
-      logger.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
-    });
-}, 24 * 60 * 60 * 1000); // 24 hours
+// Clear Video Clips Cache at 1:15 AM daily
+scheduleJob("15 1 * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'Video Clips Cache Cleanup', async () => {
+    logger.info("Running Video Clips Cache Cleanup...");
+    await clearVideoClipsCache();
+    logger.info("Video Clips Cache Cleanup Completed.");
+    return 'Video clips cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue video clips cache cleanup task: ${error.message}`);
+  });
+});
 
-//Clear Frames Cache every day
-setInterval(() => {
-  logger.info("Running Frames Cache Cleanup...");
-  clearFramesCache()
-    .then(() => {
-      logger.info("Frames Cache Cleanup Completed.");
-    })
-    .catch((error) => {
-      logger.error(`Frames Cache Cleanup Error: ${error.message}`);
-    });
-}, 24 * 60 * 60 * 1000); // 24 hours
+// Clear Spritesheet Cache at 2:15 AM daily
+scheduleJob("15 2 * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'Spritesheet Cache Cleanup', async () => {
+    logger.info("Running Spritesheet Cache Cleanup...");
+    await clearSpritesheetCache();
+    logger.info("Spritesheet Cache Cleanup Completed.");
+    return 'Spritesheet cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue spritesheet cache cleanup task: ${error.message}`);
+  });
+});
+
+// Clear Frames Cache at 3:15 AM daily
+scheduleJob("15 3 * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'Frames Cache Cleanup', async () => {
+    logger.info("Running Frames Cache Cleanup...");
+    await clearFramesCache();
+    logger.info("Frames Cache Cleanup Completed.");
+    return 'Frames cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue frames cache cleanup task: ${error.message}`);
+  });
+});
+
+// Update blurhash hashes every 18 minutes to stagger from other tasks
+// Use a scheduled job instead of setInterval for better precision and to coordinate with other scheduled tasks
+scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hour
+  // Use the task manager to handle concurrency and database access
+  enqueueTask(TaskType.BLURHASH_GENERATION, 'Blurhash Hashes Update', async () => {
+    logger.info("Running Blurhash Hashes Update...");
+    const db = await initializeDatabase();
+    
+    try {
+      // Use a timestamp to track changes since last scan
+      const lastScanTime = new Date();
+      lastScanTime.setMinutes(lastScanTime.getMinutes() - 18); // Only process files modified in the last 18 minutes
+      const sinceTimestamp = lastScanTime.toISOString();
+      
+      // Process movies first in a controlled manner
+      logger.info("Starting blurhash update for movies...");
+      await updateAllMovieBlurhashHashes(db, BASE_PATH, sinceTimestamp);
+      logger.info("Movie blurhash hashes completed, processing TV shows...");
+      
+      // Then process TV shows
+      await updateAllTVShowBlurhashHashes(db, BASE_PATH, sinceTimestamp);
+      logger.info("Blurhash Hashes Update Completed.");
+      
+      return 'Blurhash update completed successfully';
+    } catch (error) {
+      logger.error(`Blurhash Hashes Update Error: ${error.message}`);
+      throw error; // Let task manager handle the error
+    } finally {
+      await releaseDatabase(db);
+    }
+  }).catch(error => {
+    logger.error(`Failed to enqueue blurhash task: ${error.message}`);
+  });
+});
 //
 // End Cache Management
 async function generateListTV(db, dirPath) {
@@ -1324,6 +1369,28 @@ async function generateListTV(db, dirPath) {
       // Prepare individual fields for insertion
       const seasonsFinal = sortedSeasons;
 
+      // Extract and store file paths for direct access
+      const posterFilePath = await fileExists(join(showPath, "show_poster.jpg")) ? 
+                             join(showPath, "show_poster.jpg") : null;
+      
+      let logoFilePath = null;
+      for (const ext of logoExtensions) {
+        const logoPath = join(showPath, `show_logo.${ext}`);
+        if (await fileExists(logoPath)) {
+          logoFilePath = logoPath;
+          break;
+        }
+      }
+      
+      let backdropFilePath = null;
+      for (const ext of backdropExtensions) {
+        const backdropPath = join(showPath, `show_backdrop.${ext}`);
+        if (await fileExists(backdropPath)) {
+          backdropFilePath = backdropPath;
+          break;
+        }
+      }
+
       await insertOrUpdateTVShow(
         db,
         showName,
@@ -1335,7 +1402,11 @@ async function generateListTV(db, dirPath) {
         logoBlurhash,
         backdrop,
         backdropBlurhash,
-        seasonsFinal
+        seasonsFinal,
+        posterFilePath,
+        backdropFilePath,
+        logoFilePath,
+        BASE_PATH // Store the base path for future reference
       );
     }
 
@@ -1628,11 +1699,24 @@ async function generateListMovies(db, dirPath) {
         }
 
         if (fileSet.has("movie_logo.png") || fileSet.has("logo.png")) {
+          const logoPath = join(dirPath, dirName, "logo.png");
           urls[
             "logo"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
+            "logo.png"
           )}`;
+          if (await fileExists(`${logoPath}.blurhash`)) {
+            urls[
+              "logoBlurhash"
+            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
+              fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
+            )}.blurhash`;
+          } else {
+            const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
+            if (blurhash) {
+              urls["logoBlurhash"] = blurhash;
+            }
+          }
         } else {
           runDownloadTmdbImagesFlag = true;
         }
@@ -1721,11 +1805,24 @@ async function generateListMovies(db, dirPath) {
             retryFileSet.has("movie_logo.png") ||
             retryFileSet.has("logo.png")
           ) {
+            const logoPath = join(dirPath, dirName, retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png");
             urls[
               "logo"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
               retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
             )}`;
+            if (await fileExists(`${logoPath}.blurhash`)) {
+              urls[
+                "logoBlurhash"
+              ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
+                retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
+              )}.blurhash`;
+            } else {
+              const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
+              if (blurhash) {
+                urls["logoBlurhash"] = blurhash;
+              }
+            }
           }
 
           if (retryFileSet.has("metadata.json")) {
@@ -1782,7 +1879,14 @@ async function generateListMovies(db, dirPath) {
 
         const final_hash = await calculateDirectoryHash(fullDirPath);
 
-        // Always update the database with the latest data
+        // Extract file paths for direct access
+        const posterFilePath = fileSet.has("poster.jpg") ? join(dirPath, dirName, "poster.jpg") : null;
+        const backdropFilePath = fileSet.has("backdrop.jpg") ? join(dirPath, dirName, "backdrop.jpg") : null;
+        const logoFilePath = fileSet.has("movie_logo.png") 
+          ? join(dirPath, dirName, "movie_logo.png") 
+          : (fileSet.has("logo.png") ? join(dirPath, dirName, "logo.png") : null);
+
+        // Always update the database with the latest data including file paths
         await insertOrUpdateMovie(
           db,
           dirName,
@@ -1795,7 +1899,11 @@ async function generateListMovies(db, dirPath) {
           hdrInfo,
           mediaQuality,
           additionalMetadata,
-          _id
+          _id,
+          posterFilePath,
+          backdropFilePath,
+          logoFilePath,
+          BASE_PATH // Store the base path for future reference
         );
       }
     })
@@ -2131,29 +2239,54 @@ app.get("/videoClip/tv/:showName/:season/:episode", async (req, res) => {
 let isScanning = false;
 
 async function runGenerateList() {
-  if (isScanning) {
-    logger.warn(
-      `[${new Date().toISOString()}] Previous scan is still running. Skipping this iteration.`
-    );
-    return;
-  } else {
-    logger.info(`[${new Date().toISOString()}] Generating media list`);
-  }
-
-  isScanning = true;
-
-  try {
-    const db = await initializeDatabase();
-    await generateListMovies(db, `${BASE_PATH}/movies`);
-    await generateListTV(db, `${BASE_PATH}/tv`);
-    logger.info(`[${new Date().toISOString()}] Finished generating media list`);
-    await releaseDatabase(db);
-  } catch (error) {
-    logger.error(`Error generating media list: ${error}`);
-  } finally {
-    isScanning = false;
-    autoSync().catch(logger.error); // Add autoSync to the scheduled tasks
-  }
+  // Use the MEDIA_SCAN task type for overall orchestration
+  return enqueueTask(TaskType.MEDIA_SCAN, 'Media List Generation', async () => {
+    logger.info('Generating media list - controlled by task manager');
+    
+    // Process movies using the specialized MOVIE_SCAN task type
+    await enqueueTask(TaskType.MOVIE_SCAN, 'Movie List Generation', async () => {
+      const movieDb = await initializeDatabase();
+      try {
+        logger.info('Processing movies');
+        await generateListMovies(movieDb, `${BASE_PATH}/movies`);
+        logger.info('Finished processing movies');
+      } catch (error) {
+        logger.error(`Error processing movies: ${error}`);
+        throw error; // Allow task manager to handle the error
+      } finally {
+        await releaseDatabase(movieDb);
+      }
+    });
+    
+    // Process TV shows using the specialized TV_SCAN task type
+    await enqueueTask(TaskType.TV_SCAN, 'TV Show List Generation', async () => {
+      const tvDb = await initializeDatabase();
+      try {
+        logger.info('Processing TV shows');
+        await generateListTV(tvDb, `${BASE_PATH}/tv`);
+        logger.info('Finished processing TV shows');
+      } catch (error) {
+        logger.error(`Error processing TV shows: ${error}`);
+        throw error; // Allow task manager to handle the error
+      } finally {
+        await releaseDatabase(tvDb);
+      }
+    });
+    
+    logger.info('Finished generating complete media list');
+    
+    // Run auto sync as a separate task
+    await enqueueTask(TaskType.API_REQUEST, 'Auto Sync', async () => {
+      try {
+        await autoSync();
+      } catch (error) {
+        logger.error(`Auto sync error: ${error}`);
+        // Don't rethrow this error as it's non-critical
+      }
+    });
+    
+    return 'Media list generation completed';
+  });
 }
 
 async function autoSync() {
@@ -2199,7 +2332,7 @@ async function autoSync() {
         const connectionResetMessage =
           "Connection was reset. Please try again later.";
         logger.error(
-          `${prefix}${connectionResetMessage}`,
+          `${prefix}${connectionResetMessage}` + 
           JSON.stringify(error)
         );
         errorMessage = connectionResetMessage;
@@ -2213,34 +2346,126 @@ async function autoSync() {
 }
 
 function scheduleTasks() {
-  // Schedule for generate_thumbnail_json.sh
-  // Scheduled to run every 6 minutes.
-  // schedule.scheduleJob('*/6 * * * *', () => {
-  //   runGenerateThumbnailJson().catch(logger.error);
-  // });
-  // Disabled because this was the old way of generating
-  // a thumbnail seek option. Instead we now use
-  // a spritesheet for slider previews.
-
-  // Schedule for download_tmdb_images.py
-  // Scheduled to run every 7 minutes.
-  scheduleJob("*/7 * * * *", async () => {
-    try {
+  // Schedule for download_tmdb_images.py - stagger with specific minute patterns
+  // Runs at 7, 25, 43 minutes past the hour to avoid overlapping with other tasks
+  scheduleJob("7,25,43 * * * *", () => {
+    // Use task manager instead of isScanning flag
+    enqueueTask(TaskType.DOWNLOAD, 'TMDB Image Download', async () => {
+      logger.info('Running scheduled TMDB image download with task manager');
       await runDownloadTmdbImages(null, null, true);
-    } catch (error) {
-      logger.error(error);
-    }
+      return 'TMDB image download completed successfully';
+    }).catch(error => {
+      logger.error(`Failed to enqueue TMDB download task: ${error.message}`);
+    });
   });
 
   // Schedule for generate_poster_collage.py
-  // Scheduled to run at 3, 6, 9, 12, 15, 18, 21, 24, 27, and 30 hours of the day.
-  scheduleJob("0 3,6,9,12,15,18,21,24,27,30 * * *", () => {
-    runGeneratePosterCollage().catch(logger.error);
+  // Run at 12, 42 minutes past the hour to avoid overlapping with other tasks
+  scheduleJob("12,42 * * * *", () => {
+    // Use task manager instead of isScanning flag
+    enqueueTask(TaskType.DOWNLOAD, 'Poster Collage Generation', async () => {
+      logger.info('Running scheduled poster collage generation with task manager');
+      await runGeneratePosterCollage();
+      return 'Poster collage generation completed successfully';
+    }).catch(error => {
+      logger.error(`Failed to enqueue poster collage task: ${error.message}`);
+    });
   });
+  
   // Schedule for runGenerateList and autoSync
-  // Scheduled to run every 1 minute
-  scheduleJob("*/1 * * * *", () => {
+  // Run every 3 minutes to balance between freshness and performance
+  // Changed from specific minutes to reduce SQLITE_BUSY errors
+  scheduleJob("*/3 * * * *", () => {
     runGenerateList().catch(logger.error);
+  });
+  
+  // Schedule metadata hash updates - runs at 5, 20, 35, 50 minutes past the hour
+  scheduleJob("5,20,35,50 * * * *", () => {
+    // Use task manager instead of the isScanning flag
+    enqueueTask(TaskType.METADATA_HASH, 'Metadata Hashes Update', async () => {
+      logger.info("Running Metadata Hashes Update...");
+      const db = await initializeDatabase();
+      
+      try {
+        // Use a timestamp to track changes since last scan
+        const lastScanTime = new Date();
+        lastScanTime.setMinutes(lastScanTime.getMinutes() - 16);
+        const sinceTimestamp = lastScanTime.toISOString();
+        
+        // Import hash functions
+        const { updateAllMovieHashes, updateAllTVShowHashes } = await import('./sqlite/metadataHashes.mjs');
+        
+        // Process movies first
+        await updateAllMovieHashes(db, sinceTimestamp);
+        logger.info("Movie metadata hashes completed, processing TV shows...");
+        
+        // Process TV shows second
+        await updateAllTVShowHashes(db, sinceTimestamp);
+        logger.info("Metadata Hashes Update Completed.");
+        
+        return 'Metadata hash update completed successfully';
+      } catch (error) {
+        logger.error(`Metadata Hashes Update Error: ${error.message}`);
+        throw error; // Let task manager handle the error
+      } finally {
+        await releaseDatabase(db);
+      }
+    }).catch(error => {
+      logger.error(`Failed to enqueue metadata hash task: ${error.message}`);
+    });
+  });
+  
+  // Schedule cache cleanups at staggered times
+  // General cache cleanup runs at 15 and 45 past the hour
+  scheduleJob("15,45 * * * *", () => {
+    // Use task manager instead of checking isScanning flag
+    enqueueTask(TaskType.CACHE_CLEANUP, 'General Cache Cleanup (Regular)', async () => {
+      logger.info("Running General Cache Cleanup...");
+      await clearGeneralCache();
+      logger.info("General Cache Cleanup Completed.");
+      return 'Regular general cache cleanup completed successfully';
+    }).catch(error => {
+      logger.error(`Failed to enqueue regular general cache cleanup task: ${error.message}`);
+    });
+  });
+  
+  // Less frequent cache cleanups run at staggered overnight hours
+  // to minimize impact on active usage times
+  
+  // Frames cache cleanup at 1:30 AM
+  scheduleJob("30 1 * * *", () => {
+    logger.info("Running Frames Cache Cleanup...");
+    clearFramesCache()
+      .then(() => {
+        logger.info("Frames Cache Cleanup Completed.");
+      })
+      .catch((error) => {
+        logger.error(`Frames Cache Cleanup Error: ${error.message}`);
+      });
+  });
+  
+  // Sprite sheet cache cleanup at 2:30 AM
+  scheduleJob("30 2 * * *", () => {
+    logger.info("Running Spritesheet Cache Cleanup...");
+    clearSpritesheetCache()
+      .then(() => {
+        logger.info("Spritesheet Cache Cleanup Completed.");
+      })
+      .catch((error) => {
+        logger.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
+      });
+  });
+  
+  // Video clips cache cleanup at 3:30 AM
+  scheduleJob("30 3 * * *", () => {
+    logger.info("Running Video Clips Cache Cleanup...");
+    clearVideoClipsCache()
+      .then(() => {
+        logger.info("Video Clips Cache Cleanup Completed.");
+      })
+      .catch((error) => {
+        logger.error(`Video Clips Cache Cleanup Error: ${error.message}`);
+      });
   });
 }
 
@@ -2252,6 +2477,23 @@ async function initialize() {
     //runGenerateThumbnailJson().catch(logger.error);
     logger.info(`Server running on port ${port}`);
     const db = await initializeDatabase();
+
+    // Initialize blurhash hashes table at startup
+    await initializeBlurhashHashesTable(db);
+    logger.info('Blurhash hashes table initialized at startup');
+    
+    // Perform initial full scan of blurhashes - sequentially to avoid transaction conflicts
+    logger.info('Starting initial blurhash scan of all media files...');
+    try {
+      // Process movies first, then TV shows sequentially to avoid transaction conflicts
+      await updateAllMovieBlurhashHashes(db, BASE_PATH);
+      logger.info("Movie blurhash hashes completed, processing TV shows...");
+      await updateAllTVShowBlurhashHashes(db, BASE_PATH);
+      logger.info('Initial blurhash scan completed successfully');
+    } catch (error) {
+      logger.error(`Error during initial blurhash scan: ${error.message}`);
+    }
+
     // As part of startup clear out any in progress processes
     // This will prevent any processes from being stuck in the queue
     await markInProgressAsInterrupted(db);
@@ -2270,6 +2512,9 @@ async function initialize() {
     runGeneratePosterCollage().catch(logger.error);
   });
 }
+
+// Use the modular route system
+app.use(setupRoutes());
 
 // Initialize the application
 initialize().catch(logger.error);

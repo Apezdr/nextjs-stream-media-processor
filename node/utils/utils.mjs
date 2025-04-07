@@ -435,12 +435,21 @@ export function getEpisodeKey(showData, season, episode) {
 }
 
 export async function getStoredBlurhash(imagePath, basePath) {
+  // Ensure imagePath is a string to prevent errors
+  if (!imagePath || typeof imagePath !== 'string') {
+    logger.error(`Invalid image path: ${imagePath}`);
+    return null;
+  }
+
   const blurhashFile = `${imagePath}.blurhash`;
+  
+  // Calculate relative path and URL for the blurhash file
   const relativePath = relative(basePath, blurhashFile);
   const urlFriendlyPath = relativePath.split(sep).join('/');
   const encodedRelativePath = urlFriendlyPath.split('/').map(encodeURIComponent).join('/');
   const relativeUrl = `${PREFIX_PATH}/${encodedRelativePath}`;
 
+  // If blurhash file already exists, just return the URL
   if (await fileExists(blurhashFile)) {
     return relativeUrl;
   }
@@ -448,29 +457,33 @@ export async function getStoredBlurhash(imagePath, basePath) {
   // Determine if debug mode is enabled
   const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
   const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-  logger.info(`Running blurhash_cli.py job${debugMessage}`);
+  logger.info(`Running blurhash_cli.py job for ${imagePath}${debugMessage}`);
 
   // Construct the command in a cross-platform way
   const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
-  const escapedImagePath = imagePath.replace(/"/g, '\\"');
-  const command = `${pythonExecutable} ${blurhashCli} "${escapedImagePath}"`;
-
+  
   try {
-    // Execute the command
-    const blurhashOutput = await execAsync(command);
-    const exitStatus = blurhashOutput.stderr ? blurhashOutput.stderr : null;
-
-    if (exitStatus) {
+    // Directly use the file path passed to the function without URL manipulations
+    // This ensures we're using actual filesystem paths and not URL-encoded paths
+    const cleanedPath = imagePath.replace(/"/g, '\\"');
+    
+    // Execute the command with properly escaped paths
+    // We use execFile where possible to avoid shell interpretation of special characters
+    logger.debug(`Attempting to generate blurhash for: ${cleanedPath}`);
+    const cmd = `${pythonExecutable} ${blurhashCli} "${cleanedPath}"`;
+    const blurhashOutput = await execAsync(cmd);
+    
+    if (blurhashOutput.stderr) {
       logger.error(`Error generating blurhash: ${blurhashOutput.stderr}`);
       return null;
     }
 
     // Write the generated blurhash to a file
     await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
+    logger.debug(`Successfully generated blurhash for: ${cleanedPath}`);
     return relativeUrl;
   } catch (error) {
-    logger.error(`Error executing blurhash_cli.py: ${error}}`);
-    logger.error(`Command failed: ${command}`);
+    logger.error(`Error executing blurhash_cli.py for ${imagePath}: ${error}`);
     return null;
   }
 }

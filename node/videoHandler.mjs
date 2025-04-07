@@ -52,9 +52,10 @@ function getExtensionFromCodec(codec) {
  * @param {Object} res - Express response object.
  * @param {string} type - Type of media ('movies' or 'tv').
  * @param {string} BASE_PATH - Base path to media files.
+ * @param {Object} db - Database connection.
  * @returns {Promise<void>} - Resolves when the video has been served.
  */
-export async function handleVideoRequest(req, res, type, BASE_PATH) {
+export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
   const { movieName, showName, season, episode } = req.params;
   const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
   const videoCodecParam = req.query.video || false; // No default, use original codec if not specified
@@ -65,10 +66,9 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
       const directoryPath = join(`${BASE_PATH}/movies`, movieName);
       videoPath = await findMp4File(directoryPath);
     } else if (type === "tv") {
-      const showsDataRaw = readFileSync(`${BASE_PATH}/tv_list.json`, "utf8");
-      const showsData = JSON.parse(showsDataRaw);
-      const showData = showsData[showName];
-
+      // Get TV show data from SQLite database
+      const showData = await getTVShowByName(db, showName);
+      
       if (!showData) {
         throw new Error(`Show not found: ${showName}`);
       }
@@ -78,21 +78,38 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
         throw new Error(`Season not found: ${showName} - Season ${season}`);
       }
 
-      // Filter out transcoded audio channel files
-      const originalEpisodeFiles = _season.fileNames.filter(
-        (fileName) => !fileName.includes("_") && !fileName.includes("ch.mp4")
-      );
+      // Get episode keys from the season data
+      const episodeKeys = Object.keys(_season.episodes);
+      
+      // Find the matching episode using S01E01 format pattern
+      const episodeNumber = String(episode).padStart(2, "0");
+      const seasonNumber = String(season).padStart(2, "0");
+      const episodeKey = episodeKeys.find((e) => {
+        // Match S01E01 format
+        const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
+        if (standardMatch) {
+          const matchedSeason = standardMatch[1];
+          const matchedEpisode = standardMatch[2];
+          return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
+        }
 
-      const _episode = originalEpisodeFiles.find((e) =>
-        e.includes(`S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`)
-      );
+        // Match "01 - Episode Name.mp4" format or variations
+        const alternateMatch = e.match(/^(\d{2})\s*-/);
+        if (alternateMatch) {
+          const matchedEpisode = alternateMatch[1];
+          return matchedEpisode === episodeNumber;
+        }
 
-      if (!_episode) {
+        return false;
+      });
+
+      if (!episodeKey) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
       }
 
+      const episodePath = _season.episodes[episodeKey].filename;
       const directoryPath = join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
-      videoPath = await findMp4File(directoryPath, _episode);
+      videoPath = await findMp4File(directoryPath, episodePath);
     }
 
     // If no video path found:
@@ -161,9 +178,11 @@ export async function handleVideoRequest(req, res, type, BASE_PATH) {
             if (await fileExists(transcodedFilePath)) {
               finalVideoPath = transcodedFilePath;
             } else {
+              ongoingCacheGenerations.delete(cacheKey);
               throw new Error('Transcoding failed or timed out.');
             }
           } catch (error) {
+            ongoingCacheGenerations.delete(cacheKey);
             throw new Error('Transcoding timed out.');
           }
         } else {

@@ -3,6 +3,7 @@ import { open } from 'sqlite';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
+import { initializeMetadataHashesTable } from './sqlite/metadataHashes.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -14,20 +15,29 @@ var hasInitialized = false;
 
 /**
  * Helper function that wraps a database operation.
- * If a SQLITE_BUSY error is encountered, it retries the operation.
+ * If a SQLITE_BUSY error is encountered, it retries the operation with exponential backoff.
+ * @param {Function} operation - The database operation to execute
+ * @param {number} maxRetries - Maximum number of retry attempts before failing
+ * @param {number} initialDelayMs - Initial delay between retries in milliseconds
+ * @returns {Promise<any>} - The result of the database operation
  */
-async function withRetry(operation, maxRetries = 5, delayMs = 200) {
+export async function withRetry(operation, maxRetries = 15, initialDelayMs = 200) {
   let attempt = 0;
+  let delay = initialDelayMs;
+  
   while (attempt < maxRetries) {
     try {
       return await operation();
     } catch (error) {
       if (error.code === 'SQLITE_BUSY') {
         attempt++;
+        // Exponential backoff with jitter for better distribution
+        delay = Math.min(delay * 1.5, 5000) * (0.9 + Math.random() * 0.2);
+        
         console.warn(
-          `SQLITE_BUSY encountered. Retrying ${attempt}/${maxRetries} after ${delayMs}ms...`
+          `SQLITE_BUSY encountered. Retrying ${attempt}/${maxRetries} after ${Math.round(delay)}ms...`
         );
-        await new Promise(resolve => setTimeout(resolve, delayMs));
+        await new Promise(resolve => setTimeout(resolve, delay));
       } else {
         throw error;
       }
@@ -41,8 +51,14 @@ export async function initializeDatabase() {
   await fs.mkdir(dbDirectory, { recursive: true });
   const db = await open({ filename: dbFilePath, driver: sqlite3.Database });
   
-  // Set SQLite to wait up to 5000ms if the database is locked
-  await db.exec('PRAGMA busy_timeout = 5000');
+  // Enable WAL mode for better concurrency
+  await db.exec('PRAGMA journal_mode = WAL');
+  
+  // Optimize synchronous setting for better performance with WAL
+  await db.exec('PRAGMA synchronous = NORMAL');
+  
+  // Increase SQLite busy timeout to reduce SQLITE_BUSY errors
+  await db.exec('PRAGMA busy_timeout = 15000');
   
   if (!hasInitialized) {
     await db.exec(`
@@ -58,7 +74,11 @@ export async function initializeDatabase() {
             hdr TEXT,
             media_quality TEXT,
             additional_metadata TEXT,
-            _id TEXT
+            _id TEXT,
+            poster_file_path TEXT,
+            backdrop_file_path TEXT,
+            logo_file_path TEXT,
+            base_path TEXT
         );
     `);
     await db.exec(`
@@ -74,7 +94,11 @@ export async function initializeDatabase() {
             backdrop TEXT,
             backdropBlurhash TEXT,
             seasons TEXT,
-            directory_hash TEXT
+            directory_hash TEXT,
+            poster_file_path TEXT,
+            backdrop_file_path TEXT,
+            logo_file_path TEXT,
+            base_path TEXT
         );
     `);
     await db.exec(`
@@ -96,6 +120,10 @@ export async function initializeDatabase() {
         last_updated TEXT DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    
+    // Initialize metadata_hashes table
+    await initializeMetadataHashesTable(db);
+    
     hasInitialized = true;
   }
   return db;
@@ -116,7 +144,11 @@ export async function insertOrUpdateTVShow(
   logoBlurhash,
   backdrop,
   backdropBlurhash,
-  seasonsObj
+  seasonsObj,
+  posterFilePath = null,
+  backdropFilePath = null,
+  logoFilePath = null,
+  basePath = null
 ) {
   const seasonsStr = JSON.stringify(seasonsObj);
   const existingShow = await withRetry(() =>
@@ -127,17 +159,27 @@ export async function insertOrUpdateTVShow(
     await withRetry(() =>
       db.run(
         `UPDATE tv_shows 
-         SET metadata = ?, metadata_path = ?, poster = ?, posterBlurhash = ?, logo = ?, logoBlurhash = ?, backdrop = ?, backdropBlurhash = ?, seasons = ? 
+         SET metadata = ?, metadata_path = ?, poster = ?, posterBlurhash = ?, logo = ?, logoBlurhash = ?, 
+             backdrop = ?, backdropBlurhash = ?, seasons = ?,
+             poster_file_path = ?, backdrop_file_path = ?, logo_file_path = ?, base_path = ?
          WHERE name = ?`,
-        [metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr, showName]
+        [
+          metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
+          posterFilePath, backdropFilePath, logoFilePath, basePath,
+          showName
+        ]
       )
     );
   } else {
     await withRetry(() =>
       db.run(
-        `INSERT INTO tv_shows (name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasons) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr]
+        `INSERT INTO tv_shows (name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasons,
+                               poster_file_path, backdrop_file_path, logo_file_path, base_path) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
+          posterFilePath, backdropFilePath, logoFilePath, basePath
+        ]
       )
     );
   }
@@ -156,6 +198,10 @@ export async function insertOrUpdateMovie(
   mediaQuality,
   additionalMetadata,
   _id,
+  posterFilePath = null,
+  backdropFilePath = null,
+  logoFilePath = null,
+  basePath = null
 ) {
   const movie = {
     name,
@@ -168,6 +214,10 @@ export async function insertOrUpdateMovie(
     media_quality: mediaQuality ? JSON.stringify(mediaQuality) : null,
     additional_metadata: JSON.stringify(additionalMetadata),
     _id,
+    poster_file_path: posterFilePath,
+    backdrop_file_path: backdropFilePath,
+    logo_file_path: logoFilePath,
+    base_path: basePath
   };
 
   const existingMovie = await withRetry(() =>
@@ -178,7 +228,9 @@ export async function insertOrUpdateMovie(
       await withRetry(() =>
         db.run(
           `UPDATE movies 
-           SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, hdr = ?, media_quality = ?, additional_metadata = ?, _id = ?
+           SET file_names = ?, lengths = ?, dimensions = ?, urls = ?, metadata_url = ?, directory_hash = ?, 
+               hdr = ?, media_quality = ?, additional_metadata = ?, _id = ?,
+               poster_file_path = ?, backdrop_file_path = ?, logo_file_path = ?, base_path = ?
            WHERE name = ?`,
           [
             movie.file_names,
@@ -191,6 +243,10 @@ export async function insertOrUpdateMovie(
             movie.media_quality,
             movie.additional_metadata,
             _id,
+            posterFilePath,
+            backdropFilePath,
+            logoFilePath,
+            basePath,
             name
           ]
         )
@@ -199,8 +255,9 @@ export async function insertOrUpdateMovie(
   } else {
     await withRetry(() =>
       db.run(
-        `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, media_quality, additional_metadata, _id, name) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO movies (file_names, lengths, dimensions, urls, metadata_url, directory_hash, hdr, media_quality, additional_metadata, _id, 
+                            poster_file_path, backdrop_file_path, logo_file_path, base_path, name) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           movie.file_names,
           movie.lengths,
@@ -212,6 +269,10 @@ export async function insertOrUpdateMovie(
           movie.media_quality,
           movie.additional_metadata,
           _id,
+          posterFilePath,
+          backdropFilePath,
+          logoFilePath,
+          basePath,
           name
         ]
       )
@@ -250,7 +311,11 @@ export async function getTVShows(db) {
     logoBlurhash: show.logoBlurhash,
     backdrop: show.backdrop,
     backdropBlurhash: show.backdropBlurhash,
-    seasons: JSON.parse(show.seasons)
+    seasons: JSON.parse(show.seasons),
+    posterFilePath: show.poster_file_path,
+    backdropFilePath: show.backdrop_file_path,
+    logoFilePath: show.logo_file_path,
+    basePath: show.base_path
   }));
 }
 
@@ -268,7 +333,11 @@ export async function getMovies(db) {
     hdr: movie.hdr,
     mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
     additional_metadata: JSON.parse(movie.additional_metadata),
-    _id: movie._id
+    _id: movie._id,
+    posterFilePath: movie.poster_file_path,
+    backdropFilePath: movie.backdrop_file_path,
+    logoFilePath: movie.logo_file_path,
+    basePath: movie.base_path
   }));
 }
 
@@ -297,6 +366,10 @@ export async function getMovieById(db, id) {
       mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
       additional_metadata: JSON.parse(movie.additional_metadata),
       _id: movie._id,
+      posterFilePath: movie.poster_file_path,
+      backdropFilePath: movie.backdrop_file_path,
+      logoFilePath: movie.logo_file_path,
+      basePath: movie.base_path
     };
   }
   return null;
@@ -318,6 +391,10 @@ export async function getMovieByName(db, name) {
       mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
       additional_metadata: JSON.parse(movie.additional_metadata),
       _id: movie._id,
+      posterFilePath: movie.poster_file_path,
+      backdropFilePath: movie.backdrop_file_path,
+      logoFilePath: movie.logo_file_path,
+      basePath: movie.base_path
     };
   }
   return null;
@@ -339,6 +416,10 @@ export async function getTVShowById(db, id) {
       backdropBlurhash: show.backdropBlurhash,
       seasons: JSON.parse(show.seasons),
       directory_hash: show.directory_hash,
+      posterFilePath: show.poster_file_path,
+      backdropFilePath: show.backdrop_file_path,
+      logoFilePath: show.logo_file_path,
+      basePath: show.base_path
     };
   }
   return null;
@@ -360,6 +441,10 @@ export async function getTVShowByName(db, name) {
       backdropBlurhash: show.backdropBlurhash,
       seasons: JSON.parse(show.seasons),
       directory_hash: show.directory_hash,
+      posterFilePath: show.poster_file_path,
+      backdropFilePath: show.backdrop_file_path,
+      logoFilePath: show.logo_file_path,
+      basePath: show.base_path
     };
   }
   return null;
@@ -376,4 +461,29 @@ export async function deleteMovie(db, name) {
 
 export async function deleteTVShow(db, name) {
   await withRetry(() => db.run('DELETE FROM tv_shows WHERE name = ?', [name]));
+}
+
+/**
+ * Execute multiple database operations in a single transaction.
+ * @param {Object} db - SQLite database connection
+ * @param {Function[]} operations - Array of functions that return Promises for DB operations
+ * @param {boolean} readOnly - Whether the transaction is read-only (uses DEFERRED if true)
+ * @returns {Promise<any[]>} - Array of results from each operation
+ */
+export async function withTransaction(db, operations, readOnly = false) {
+  // Begin transaction with appropriate mode
+  await db.exec('BEGIN' + (readOnly ? ' DEFERRED' : ''));
+  
+  try {
+    const results = [];
+    for (const op of operations) {
+      results.push(await op());
+    }
+    await db.exec('COMMIT');
+    return results;
+  } catch (error) {
+    // Always rollback on any error
+    await db.exec('ROLLBACK');
+    throw error;
+  }
 }
