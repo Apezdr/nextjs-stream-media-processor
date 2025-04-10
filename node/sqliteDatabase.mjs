@@ -4,6 +4,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
 import { initializeMetadataHashesTable } from './sqlite/metadataHashes.mjs';
+import { createHash } from 'crypto';
+import { fileExists } from './utils/utils.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -298,47 +300,170 @@ export async function insertOrUpdateMissingDataMedia(db, name) {
   }
 }
 
+/**
+ * Utility function to refresh image URL hashes based on current file modification times
+ * @param {string} url - The original image URL
+ * @param {string} filePath - Path to the actual image file
+ * @returns {string} - Updated URL with a fresh hash parameter
+ */
+async function refreshImageUrlHash(url, filePath) {
+  // If there's no file path or URL, return the original URL
+  if (!filePath || !url) return url;
+  
+  try {
+    // Check if the file exists
+    if (await fileExists(filePath)) {
+      // Get the file's current stats
+      const stats = await fs.stat(filePath);
+      // Create a hash from the modification time
+      const imageHash = createHash('md5').update(stats.mtime.toISOString()).digest('hex').substring(0, 10);
+      
+      // If the URL already has a hash parameter, replace it
+      if (url.includes('?hash=')) {
+        return url.replace(/\?hash=[a-f0-9]+/, `?hash=${imageHash}`);
+      }
+      // Otherwise, add the hash parameter
+      else {
+        return `${url}?hash=${imageHash}`;
+      }
+    }
+  } catch (error) {
+    console.error(`Error refreshing image hash for ${filePath}: ${error.message}`);
+  }
+  
+  // Return the original URL if anything fails
+  return url;
+}
+
+/**
+ * Updates all image URLs in a TV show season with fresh hash parameters
+ * @param {Object} season - Season object with episodes
+ * @param {string} basePath - Base path for resolving file paths
+ * @returns {Object} - Updated season with fresh image URL hashes
+ */
+async function refreshSeasonImageHashes(season, basePath, showPath, seasonName) {
+  // Skip if it's not a valid season or there's no base path
+  if (!season || !basePath) return season;
+  
+  const updatedSeason = { ...season };
+  
+  // Update season poster if available
+  if (season.season_poster) {
+    const seasonPosterPath = join(showPath, seasonName, "season_poster.jpg");
+    updatedSeason.season_poster = await refreshImageUrlHash(season.season_poster, seasonPosterPath);
+  }
+  
+  // Update episode thumbnails if available
+  if (season.episodes) {
+    const updatedEpisodes = { ...season.episodes };
+    
+    for (const [episodeKey, episode] of Object.entries(season.episodes)) {
+      const updatedEpisode = { ...episode };
+      
+      // Update thumbnail URL if available
+      if (episode.thumbnail) {
+        // Extract episode number from key (e.g., "S01E02" -> "02")
+        const episodeNumber = episodeKey.match(/E(\d+)/i)?.[1] || "";
+        const thumbnailPath = join(showPath, seasonName, `${episodeNumber} - Thumbnail.jpg`);
+        updatedEpisode.thumbnail = await refreshImageUrlHash(episode.thumbnail, thumbnailPath);
+      }
+      
+      updatedEpisodes[episodeKey] = updatedEpisode;
+    }
+    
+    updatedSeason.episodes = updatedEpisodes;
+  }
+  
+  return updatedSeason;
+}
+
 export async function getTVShows(db) {
   const shows = await withRetry(() => db.all('SELECT * FROM tv_shows'));
-  return shows.map((show) => ({
-    id: show.id,
-    name: show.name,
-    metadata: show.metadata,
-    metadata_path: show.metadata_path,
-    poster: show.poster,
-    posterBlurhash: show.posterBlurhash,
-    logo: show.logo,
-    logoBlurhash: show.logoBlurhash,
-    backdrop: show.backdrop,
-    backdropBlurhash: show.backdropBlurhash,
-    seasons: JSON.parse(show.seasons),
-    posterFilePath: show.poster_file_path,
-    backdropFilePath: show.backdrop_file_path,
-    logoFilePath: show.logo_file_path,
-    basePath: show.base_path
+  
+  // Process each show to update image URL hashes
+  const updatedShows = await Promise.all(shows.map(async (show) => {
+    // Parse seasons now so we can update them
+    const seasons = JSON.parse(show.seasons);
+    const basePath = show.base_path;
+    const showPath = join(basePath, 'tv', show.name);
+    
+    // Update show-level image URLs with fresh hashes
+    const poster = await refreshImageUrlHash(show.poster, show.poster_file_path);
+    const logo = await refreshImageUrlHash(show.logo, show.logo_file_path);
+    const backdrop = await refreshImageUrlHash(show.backdrop, show.backdrop_file_path);
+    
+    // Update each season's image URLs
+    const updatedSeasons = {};
+    for (const [seasonName, season] of Object.entries(seasons)) {
+      updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
+    }
+    
+    // Return updated show object
+    return {
+      id: show.id,
+      name: show.name,
+      metadata: show.metadata,
+      metadata_path: show.metadata_path,
+      poster: poster,
+      posterBlurhash: show.posterBlurhash,
+      logo: logo,
+      logoBlurhash: show.logoBlurhash,
+      backdrop: backdrop,
+      backdropBlurhash: show.backdropBlurhash,
+      seasons: updatedSeasons,
+      posterFilePath: show.poster_file_path,
+      backdropFilePath: show.backdrop_file_path,
+      logoFilePath: show.logo_file_path,
+      basePath: show.base_path
+    };
   }));
+  
+  return updatedShows;
 }
 
 export async function getMovies(db) {
   const movies = await withRetry(() => db.all('SELECT * FROM movies'));
-  return movies.map((movie) => ({
-    id: movie.id,
-    name: movie.name,
-    fileNames: JSON.parse(movie.file_names),
-    lengths: JSON.parse(movie.lengths),
-    dimensions: JSON.parse(movie.dimensions),
-    urls: JSON.parse(movie.urls),
-    metadataUrl: movie.metadata_url,
-    directory_hash: movie.directory_hash,
-    hdr: movie.hdr,
-    mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
-    additional_metadata: JSON.parse(movie.additional_metadata),
-    _id: movie._id,
-    posterFilePath: movie.poster_file_path,
-    backdropFilePath: movie.backdrop_file_path,
-    logoFilePath: movie.logo_file_path,
-    basePath: movie.base_path
+  
+  // Process each movie to update image URL hashes
+  const updatedMovies = await Promise.all(movies.map(async (movie) => {
+    // Parse the URLs so we can update them
+    const urls = JSON.parse(movie.urls);
+    
+    // Update image URLs with fresh hashes
+    if (urls.poster) {
+      urls.poster = await refreshImageUrlHash(urls.poster, movie.poster_file_path);
+    }
+    
+    if (urls.logo) {
+      urls.logo = await refreshImageUrlHash(urls.logo, movie.logo_file_path);
+    }
+    
+    if (urls.backdrop) {
+      urls.backdrop = await refreshImageUrlHash(urls.backdrop, movie.backdrop_file_path);
+    }
+    
+    // Return updated movie object
+    return {
+      id: movie.id,
+      name: movie.name,
+      fileNames: JSON.parse(movie.file_names),
+      lengths: JSON.parse(movie.lengths),
+      dimensions: JSON.parse(movie.dimensions),
+      urls: urls,
+      metadataUrl: movie.metadata_url,
+      directory_hash: movie.directory_hash,
+      hdr: movie.hdr,
+      mediaQuality: movie.media_quality ? JSON.parse(movie.media_quality) : null,
+      additional_metadata: JSON.parse(movie.additional_metadata),
+      _id: movie._id,
+      posterFilePath: movie.poster_file_path,
+      backdropFilePath: movie.backdrop_file_path,
+      logoFilePath: movie.logo_file_path,
+      basePath: movie.base_path
+    };
   }));
+  
+  return updatedMovies;
 }
 
 export async function getMissingDataMedia(db) {
@@ -353,13 +478,29 @@ export async function getMissingDataMedia(db) {
 export async function getMovieById(db, id) {
   const movie = await withRetry(() => db.get('SELECT * FROM movies WHERE id = ?', [id]));
   if (movie) {
+    // Parse the URLs so we can update them
+    const urls = JSON.parse(movie.urls);
+    
+    // Update image URLs with fresh hashes
+    if (urls.poster) {
+      urls.poster = await refreshImageUrlHash(urls.poster, movie.poster_file_path);
+    }
+    
+    if (urls.logo) {
+      urls.logo = await refreshImageUrlHash(urls.logo, movie.logo_file_path);
+    }
+    
+    if (urls.backdrop) {
+      urls.backdrop = await refreshImageUrlHash(urls.backdrop, movie.backdrop_file_path);
+    }
+    
     return {
       id: movie.id,
       name: movie.name,
       fileNames: JSON.parse(movie.file_names),
       lengths: JSON.parse(movie.lengths),
       dimensions: JSON.parse(movie.dimensions),
-      urls: JSON.parse(movie.urls),
+      urls: urls,
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
       hdr: movie.hdr,
@@ -378,13 +519,29 @@ export async function getMovieById(db, id) {
 export async function getMovieByName(db, name) {
   const movie = await withRetry(() => db.get('SELECT * FROM movies WHERE name = ?', [name]));
   if (movie) {
+    // Parse the URLs so we can update them
+    const urls = JSON.parse(movie.urls);
+    
+    // Update image URLs with fresh hashes
+    if (urls.poster) {
+      urls.poster = await refreshImageUrlHash(urls.poster, movie.poster_file_path);
+    }
+    
+    if (urls.logo) {
+      urls.logo = await refreshImageUrlHash(urls.logo, movie.logo_file_path);
+    }
+    
+    if (urls.backdrop) {
+      urls.backdrop = await refreshImageUrlHash(urls.backdrop, movie.backdrop_file_path);
+    }
+    
     return {
       id: movie.id,
       name: movie.name,
       fileNames: JSON.parse(movie.file_names),
       lengths: JSON.parse(movie.lengths),
       dimensions: JSON.parse(movie.dimensions),
-      urls: JSON.parse(movie.urls),
+      urls: urls,
       metadataUrl: movie.metadata_url,
       directory_hash: movie.directory_hash,
       hdr: movie.hdr,
@@ -403,18 +560,34 @@ export async function getMovieByName(db, name) {
 export async function getTVShowById(db, id) {
   const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE id = ?', [id]));
   if (show) {
+    // Parse seasons now so we can update them
+    const seasons = JSON.parse(show.seasons);
+    const basePath = show.base_path;
+    const showPath = join(basePath, 'tv', show.name);
+    
+    // Update show-level image URLs with fresh hashes
+    const poster = await refreshImageUrlHash(show.poster, show.poster_file_path);
+    const logo = await refreshImageUrlHash(show.logo, show.logo_file_path);
+    const backdrop = await refreshImageUrlHash(show.backdrop, show.backdrop_file_path);
+    
+    // Update each season's image URLs
+    const updatedSeasons = {};
+    for (const [seasonName, season] of Object.entries(seasons)) {
+      updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
+    }
+    
     return {
       id: show.id,
       name: show.name,
       metadata: show.metadata,
       metadata_path: show.metadata_path,
-      poster: show.poster,
+      poster: poster,
       posterBlurhash: show.posterBlurhash,
-      logo: show.logo,
+      logo: logo,
       logoBlurhash: show.logoBlurhash,
-      backdrop: show.backdrop,
+      backdrop: backdrop,
       backdropBlurhash: show.backdropBlurhash,
-      seasons: JSON.parse(show.seasons),
+      seasons: updatedSeasons,
       directory_hash: show.directory_hash,
       posterFilePath: show.poster_file_path,
       backdropFilePath: show.backdrop_file_path,
@@ -428,18 +601,34 @@ export async function getTVShowById(db, id) {
 export async function getTVShowByName(db, name) {
   const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE name = ?', [name]));
   if (show) {
+    // Parse seasons now so we can update them
+    const seasons = JSON.parse(show.seasons);
+    const basePath = show.base_path;
+    const showPath = join(basePath, 'tv', show.name);
+    
+    // Update show-level image URLs with fresh hashes
+    const poster = await refreshImageUrlHash(show.poster, show.poster_file_path);
+    const logo = await refreshImageUrlHash(show.logo, show.logo_file_path);
+    const backdrop = await refreshImageUrlHash(show.backdrop, show.backdrop_file_path);
+    
+    // Update each season's image URLs
+    const updatedSeasons = {};
+    for (const [seasonName, season] of Object.entries(seasons)) {
+      updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
+    }
+    
     return {
       id: show.id,
       name: show.name,
       metadata: show.metadata,
       metadata_path: show.metadata_path,
-      poster: show.poster,
+      poster: poster,
       posterBlurhash: show.posterBlurhash,
-      logo: show.logo,
+      logo: logo,
       logoBlurhash: show.logoBlurhash,
-      backdrop: show.backdrop,
+      backdrop: backdrop,
       backdropBlurhash: show.backdropBlurhash,
-      seasons: JSON.parse(show.seasons),
+      seasons: updatedSeasons,
       directory_hash: show.directory_hash,
       posterFilePath: show.poster_file_path,
       backdropFilePath: show.backdrop_file_path,

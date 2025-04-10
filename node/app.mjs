@@ -1065,7 +1065,9 @@ async function generateListTV(db, dirPath) {
       // Handle show poster
       const posterPath = join(showPath, "show_poster.jpg");
       if (await fileExists(posterPath)) {
-        poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
+        const posterStats = await fs.stat(posterPath);
+        const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
+        poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg?hash=${posterImageHash}`;
         const blurhash = await getStoredBlurhash(posterPath, BASE_PATH);
         if (blurhash) {
           posterBlurhash = blurhash;
@@ -1080,7 +1082,9 @@ async function generateListTV(db, dirPath) {
       for (const ext of logoExtensions) {
         const logoPath = join(showPath, `show_logo.${ext}`);
         if (await fileExists(logoPath)) {
-          logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
+          const logoStats = await fs.stat(logoPath);
+          const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
+          logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}?hash=${logoImageHash}`;
           if (ext !== "svg") {
             const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
             if (blurhash) {
@@ -1101,7 +1105,9 @@ async function generateListTV(db, dirPath) {
       for (const ext of backdropExtensions) {
         const backdropPath = join(showPath, `show_backdrop.${ext}`);
         if (await fileExists(backdropPath)) {
-          backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
+          const backdropStats = await fs.stat(backdropPath);
+          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
+          backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}?hash=${backdropImageHash}`;
           const blurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
           if (blurhash) {
             backdropBlurhash = blurhash;
@@ -1144,11 +1150,11 @@ async function generateListTV(db, dirPath) {
 
         // Retry poster
         if (retryFileSet.has("show_poster.jpg")) {
-          poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg`;
-          const blurhash = await getStoredBlurhash(
-            join(showPath, "show_poster.jpg"),
-            BASE_PATH
-          );
+          const posterPath = join(showPath, "show_poster.jpg");
+          const posterStats = await fs.stat(posterPath);
+          const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
+          poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg?hash=${posterImageHash}`;
+          const blurhash = await getStoredBlurhash(posterPath, BASE_PATH);
           if (blurhash) {
             posterBlurhash = blurhash;
           }
@@ -1156,11 +1162,13 @@ async function generateListTV(db, dirPath) {
 
         // Retry logo
         for (const ext of logoExtensions) {
-          const lPath = join(showPath, `show_logo.${ext}`);
+          const logoPath = join(showPath, `show_logo.${ext}`);
           if (retryFileSet.has(`show_logo.${ext}`)) {
-            logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}`;
+            const logoStats = await fs.stat(logoPath);
+            const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
+            logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}?hash=${logoImageHash}`;
             if (ext !== "svg") {
-              const blurhash = await getStoredBlurhash(lPath, BASE_PATH);
+              const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
               if (blurhash) {
                 logoBlurhash = blurhash;
               }
@@ -1171,10 +1179,12 @@ async function generateListTV(db, dirPath) {
 
         // Retry backdrop
         for (const ext of backdropExtensions) {
-          const bPath = join(showPath, `show_backdrop.${ext}`);
+          const backdropPath = join(showPath, `show_backdrop.${ext}`);
           if (retryFileSet.has(`show_backdrop.${ext}`)) {
-            backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}`;
-            const blurhash = await getStoredBlurhash(bPath, BASE_PATH);
+            const backdropStats = await fs.stat(backdropPath);
+            const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
+            backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}?hash=${backdropImageHash}`;
+            const blurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
             if (blurhash) {
               backdropBlurhash = blurhash;
             }
@@ -1214,7 +1224,9 @@ async function generateListTV(db, dirPath) {
           // Handle season poster
           const seasonPosterPath = join(seasonPath, "season_poster.jpg");
           if (await fileExists(seasonPosterPath)) {
-            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg`;
+            const seasonPosterStats = await fs.stat(seasonPosterPath);
+            const seasonPosterImageHash = createHash('md5').update(seasonPosterStats.mtime.toISOString()).digest('hex').substring(0, 10);
+            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg?hash=${seasonPosterImageHash}`;
             const blurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
             if (blurhash) {
               seasonData.seasonPosterBlurhash = blurhash;
@@ -1273,9 +1285,11 @@ async function generateListTV(db, dirPath) {
             // Handle thumbnail
             const thumbnailPath = join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
             if (await fileExists(thumbnailPath)) {
+              const thumbnailStats = await fs.stat(thumbnailPath);
+              const thumbnailImageHash = createHash('md5').update(thumbnailStats.mtime.toISOString()).digest('hex').substring(0, 10);
               episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
                 `${episodeNumber} - Thumbnail.jpg`
-              )}`;
+              )}?hash=${thumbnailImageHash}`;
               const blurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
               if (blurhash) {
                 episodeData.thumbnailBlurhash = blurhash;
@@ -1640,11 +1654,13 @@ async function generateListMovies(db, dirPath) {
         // Check for required files using the set
         if (fileSet.has("backdrop.jpg")) {
           const backdropPath = join(dirPath, dirName, "backdrop.jpg");
+          const backdropStats = await fs.stat(backdropPath);
+          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
           urls[
             "backdrop"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
             "backdrop.jpg"
-          )}`;
+          )}?hash=${backdropImageHash}`;
           if (await fileExists(`${backdropPath}.blurhash`)) {
             urls[
               "backdropBlurhash"
@@ -1670,11 +1686,13 @@ async function generateListMovies(db, dirPath) {
 
         if (fileSet.has("poster.jpg")) {
           const posterPath = join(dirPath, dirName, "poster.jpg");
+          const posterStats = await fs.stat(posterPath);
+          const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
           urls[
             "poster"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
             "poster.jpg"
-          )}`;
+          )}?hash=${posterImageHash}`;
           if (await fileExists(`${posterPath}.blurhash`)) {
             urls[
               "posterBlurhash"
@@ -1699,12 +1717,14 @@ async function generateListMovies(db, dirPath) {
         }
 
         if (fileSet.has("movie_logo.png") || fileSet.has("logo.png")) {
-          const logoPath = join(dirPath, dirName, "logo.png");
+          const logoPath = join(dirPath, dirName, fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png");
+          const logoStats = await fs.stat(logoPath);
+          const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
           urls[
             "logo"
           ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            "logo.png"
-          )}`;
+            fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
+          )}?hash=${logoImageHash}`;
           if (await fileExists(`${logoPath}.blurhash`)) {
             urls[
               "logoBlurhash"
@@ -1766,30 +1786,34 @@ async function generateListMovies(db, dirPath) {
           const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
 
           if (retryFileSet.has("backdrop.jpg")) {
-            const backdropPath = join(dirPath, dirName, "backdrop.jpg");
+          const backdropPath = join(dirPath, dirName, "backdrop.jpg");
+          const backdropStats = await fs.stat(backdropPath);
+          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
+          urls[
+            "backdrop"
+          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
+            "backdrop.jpg"
+          )}?hash=${backdropImageHash}`;
+          if (await fileExists(`${backdropPath}.blurhash`)) {
             urls[
-              "backdrop"
+              "backdropBlurhash"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
               "backdrop.jpg"
-            )}`;
-            if (await fileExists(`${backdropPath}.blurhash`)) {
-              urls[
-                "backdropBlurhash"
-              ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-                "backdrop.jpg"
-              )}.blurhash`;
-            } else {
-              await getStoredBlurhash(backdropPath, BASE_PATH);
-            }
+            )}.blurhash`;
+          } else {
+            await getStoredBlurhash(backdropPath, BASE_PATH);
+          }
           }
 
           if (retryFileSet.has("poster.jpg")) {
             const posterPath = join(dirPath, dirName, "poster.jpg");
+            const posterStats = await fs.stat(posterPath);
+            const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
             urls[
               "poster"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
               "poster.jpg"
-            )}`;
+            )}?hash=${posterImageHash}`;
             if (await fileExists(`${posterPath}.blurhash`)) {
               urls[
                 "posterBlurhash"
@@ -1806,11 +1830,13 @@ async function generateListMovies(db, dirPath) {
             retryFileSet.has("logo.png")
           ) {
             const logoPath = join(dirPath, dirName, retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png");
+            const logoStats = await fs.stat(logoPath);
+            const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
             urls[
               "logo"
             ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
               retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
-            )}`;
+            )}?hash=${logoImageHash}`;
             if (await fileExists(`${logoPath}.blurhash`)) {
               urls[
                 "logoBlurhash"
