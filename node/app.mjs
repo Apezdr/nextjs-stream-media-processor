@@ -25,6 +25,7 @@ import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
+import { createHash } from "crypto";
 const logger = createCategoryLogger('main');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
