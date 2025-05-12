@@ -5,6 +5,7 @@ const logger = createCategoryLogger('taskManager');
 // Task types with priority levels (lower number = higher priority)
 export const TaskType = {
   API_REQUEST: 1,        // Highest priority - user-facing requests
+  SYSTEM_MONITORING: 1.5, // System health monitoring - high priority
   MEDIA_SCAN: 2,         // General media scanning operations
   MOVIE_SCAN: 2.1,       // Movie scanning specifically 
   TV_SCAN: 2.2,          // TV show scanning specifically
@@ -21,14 +22,15 @@ let taskIdCounter = 0;
 
 // Configure which task types can run concurrently
 const concurrencyLimits = {
-  [TaskType.API_REQUEST]: 5,    // Allow multiple API requests
-  [TaskType.MEDIA_SCAN]: 1,     // Only one general media scan at a time
-  [TaskType.MOVIE_SCAN]: 1,     // Only one movie scan at a time
-  [TaskType.TV_SCAN]: 1,        // Only one TV scan at a time
-  [TaskType.METADATA_HASH]: 1,  // Only one metadata hash operation
-  [TaskType.BLURHASH]: 1,       // Only one blurhash operation
-  [TaskType.DOWNLOAD]: 2,       // Allow 2 download operations
-  [TaskType.CACHE_CLEANUP]: 1   // Only one cleanup at a time
+  [TaskType.API_REQUEST]: 5,        // Allow multiple API requests
+  [TaskType.SYSTEM_MONITORING]: 1,  // Only one system monitoring task at a time
+  [TaskType.MEDIA_SCAN]: 1,         // Only one general media scan at a time
+  [TaskType.MOVIE_SCAN]: 1,         // Only one movie scan at a time
+  [TaskType.TV_SCAN]: 1,            // Only one TV scan at a time
+  [TaskType.METADATA_HASH]: 1,      // Only one metadata hash operation
+  [TaskType.BLURHASH]: 1,           // Only one blurhash operation
+  [TaskType.DOWNLOAD]: 2,           // Allow 2 download operations
+  [TaskType.CACHE_CLEANUP]: 1       // Only one cleanup at a time
 };
 
 // Configure which tasks are mutually exclusive

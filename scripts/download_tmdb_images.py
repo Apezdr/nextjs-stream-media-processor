@@ -54,13 +54,28 @@ stderr_handler.setFormatter(stderr_formatter)
 logger.addHandler(stdout_handler)
 logger.addHandler(stderr_handler)
 
-# Set UID and GID to the current user
-try:
-    os.setgid(os.getgid())  # Set GID
-    os.setuid(os.getuid())  # Set UID
-except AttributeError:
-    # os.setgid and os.setuid may not be available on some systems (e.g., Windows)
-    logger.warning("UID and GID setting is not supported on this platform.")
+# Only use environment PUID/PGID if they're explicitly set
+# puid_str = os.getenv('PUID')
+# pgid_str = os.getenv('PGID')
+
+# try:
+#     # If environment variables are set, use them
+#     if puid_str is not None and pgid_str is not None:
+#         puid = int(puid_str)
+#         pgid = int(pgid_str)
+#         os.setgid(pgid)  # Set GID
+#         os.setuid(puid)  # Set UID
+#         logger.info(f"Using environment-specified UID {puid} and GID {pgid}")
+#     else:
+#         # Otherwise use current user (existing behavior)
+#         os.setgid(os.getgid())
+#         os.setuid(os.getuid())
+#         logger.info(f"Using current process UID {os.getuid()} and GID {os.getgid()}")
+# except AttributeError:
+#     # os.setgid and os.setuid may not be available on some systems (e.g., Windows)
+#     logger.warning("UID and GID setting is not supported on this platform.")
+# except PermissionError as e:
+#     logger.warning(f"Permission error when setting UID/GID: {str(e)}")
 
 parser = argparse.ArgumentParser(description='Download TMDB images for TV shows and movies.')
 parser.add_argument('--show', type=str, help='Specific TV show to scan')

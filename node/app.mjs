@@ -685,10 +685,21 @@ async function handleChapterRequest(
       const showData = shows.find((show) => show.name === showName);
 
       if (showData) {
-        for (const seasonName in showData.metadata.seasons) {
-          const season = showData.metadata.seasons[seasonName];
-          for (const episodeFileName of season.fileNames) {
-            const episodeNumber = getEpisodeNumber(episodeFileName);
+        for (const seasonName in showData.seasons) {
+          const season = showData.seasons[seasonName];
+          for (const episodeKey in season.episodes) {
+            const episode = season.episodes[episodeKey];
+            const episodeFileName = episode.filename;
+            
+            // Extract episode number from the episode key (SxxEyy format)
+            const episodeMatch = episodeKey.match(/E(\d+)/i);
+            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
+            
+            if (!episodeNumber) {
+              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
+              continue;
+            }
+            
             const seasonNumber = seasonName.replace("Season ", "");
             const chapterFilePath = join(
               `${BASE_PATH}/tv`,
@@ -707,7 +718,7 @@ async function handleChapterRequest(
             );
             const mediaPath = join(directoryPath, episodeFileName);
 
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
+            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
           }
         }
 
@@ -721,10 +732,21 @@ async function handleChapterRequest(
       const showData = shows.find((show) => show.name === showName);
 
       if (showData) {
-        for (const seasonName in showData.metadata.seasons) {
-          const season = showData.metadata.seasons[seasonName];
-          for (const episodeFileName of season.fileNames) {
-            const episodeNumber = getEpisodeNumber(episodeFileName);
+        for (const seasonName in showData.seasons) {
+          const season = showData.seasons[seasonName];
+          for (const episodeKey in season.episodes) {
+            const episode = season.episodes[episodeKey];
+            const episodeFileName = episode.filename;
+            
+            // Extract episode number from the episode key (SxxEyy format)
+            const episodeMatch = episodeKey.match(/E(\d+)/i);
+            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
+            
+            if (!episodeNumber) {
+              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
+              continue;
+            }
+            
             const seasonNumber = seasonName.replace("Season ", "");
             const chapterFilePath = join(
               `${BASE_PATH}/tv`,
@@ -743,7 +765,7 @@ async function handleChapterRequest(
             );
             const mediaPath = join(directoryPath, episodeFileName);
 
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
+            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
           }
         }
 
@@ -800,16 +822,20 @@ function getEpisodeNumber(episodeFileName) {
   return match ? match[1] : null;
 }
 
-async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
+async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietMode = false) {
   try {
     if (await fileExists(chapterFilePath)) {
-      logger.info(
-        `Serving chapter file from cache: ${basename(chapterFilePath)}`
-      );
+      if (!quietMode) {
+        logger.info(
+          `Serving chapter file from cache: ${basename(chapterFilePath)}`
+        );
+      }
     } else {
-      logger.info(
-        `Chapter file not found in cache: ${basename(chapterFilePath)}`
-      );
+      if (!quietMode) {
+        logger.info(
+          `Chapter file not found in cache: ${basename(chapterFilePath)}`
+        );
+      }
 
       // Check if the media file has chapter information
       const hasChapters = await chapterInfo(mediaPath);
@@ -823,12 +849,16 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath) {
 
         // Save the generated chapter content to the file
         await fs.writeFile(chapterFilePath, chapterContent);
-        logger.info("The file has been saved!");
+        if (!quietMode) {
+          logger.info("The file has been saved!");
+        }
       } else {
         // If the media file doesn't have chapter information, send a 404 response
-        logger.warn(
-          `Chapter information not found for ${basename(mediaPath)}`
-        );
+        if (!quietMode) {
+          logger.warn(
+            `Chapter information not found for ${basename(mediaPath)}`
+          );
+        }
       }
     }
   } catch (error) {
@@ -1311,6 +1341,10 @@ async function generateListTV(db, dirPath) {
               "chapters",
               `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
             );
+            
+            // Generate chapter file before checking if it exists
+            await generateChapterFileIfNotExists(chaptersPath, episodePath, true); // Use quietMode for bulk operations
+            
             if (await fileExists(chaptersPath)) {
               episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
                 `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
@@ -1879,6 +1913,19 @@ async function generateListMovies(db, dirPath) {
           "chapters",
           `${mp4Filename}_chapters.vtt`
         );
+        
+        // Generate chapter files if the media exists
+        if (mp4Filename) {
+          const mediaPath = join(dirPath, dirName, `${mp4Filename}.mp4`);
+          if (await fileExists(mediaPath)) {
+            await generateChapterFileIfNotExists(chaptersPath, mediaPath, true);
+            // Only try the second path if the first one didn't work or doesn't exist
+            if (!await fileExists(chaptersPath)) {
+              await generateChapterFileIfNotExists(chaptersPath2, mediaPath, true);
+            }
+          }
+        }
+        
         if (await fileExists(chaptersPath)) {
           urls[
             "chapters"
@@ -2214,7 +2261,7 @@ const streamLogs = async (req, res, category) => {
 
 // Enhanced /api/logs endpoint
 app.get("/api/logs", async (req, res) => {
-  res.header("Access-Control-Allow-Origin", process.env.FRONT_END);
+  res.header("Access-Control-Allow-Origin", process.env.FRONT_END_1);
   res.header("Access-Control-Allow-Methods", "GET");
   res.header("Access-Control-Allow-Headers", "Content-Type");
 
@@ -2243,7 +2290,7 @@ app.get("/api/logs", async (req, res) => {
 
 // Log Categories
 app.get('/api/logs/categories', (req, res) => {
-  res.header("Access-Control-Allow-Origin", process.env.FRONT_END);
+  res.header("Access-Control-Allow-Origin", process.env.FRONT_END_1);
   res.header("Access-Control-Allow-Methods", "GET");
   res.header("Access-Control-Allow-Headers", "Content-Type");
   res.json(getCategories());
@@ -2325,7 +2372,7 @@ async function autoSync() {
 
     try {
       const headers = {
-        "X-Webhook-ID": process.env.WEBHOOK_ID,
+        "X-Webhook-ID": process.env.WEBHOOK_ID_1,
         "Content-Type": "application/json",
       };
 
@@ -2334,7 +2381,7 @@ async function autoSync() {
       }
 
       const response = await axios.post(
-        `${process.env.FRONT_END}/api/authenticated/admin/sync`,
+        `${process.env.FRONT_END_1}/api/authenticated/admin/sync`,
         {},
         { headers }
       );
@@ -2352,7 +2399,7 @@ async function autoSync() {
         logger.error(`${prefix}${JSON.stringify(error.response.data)}`);
         errorMessage = error.response.data;
       } else if (error.response && error.response.status === 404) {
-        const unavailableMessage = `${process.env.FRONT_END}/api/authenticated/admin/sync is unavailable`;
+        const unavailableMessage = `${process.env.FRONT_END_1}/api/authenticated/admin/sync is unavailable`;
         logger.error(`${prefix}${unavailableMessage}`);
         errorMessage = unavailableMessage;
       } else if (error.code === "ECONNRESET") {
