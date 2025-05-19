@@ -117,14 +117,29 @@ async def check_utime_support(base_dir: str):
             pass
 
 async def touch(path: str):
-    """Only call utime if the FS actually supports it—and guard again."""
+    """
+    Update the atime/mtime only if:
+      - utime is supported on this FS
+      - the file actually exists
+    Swallow PermissionError and FileNotFoundError.
+    """
     if not UTIME_SUPPORTED:
         return
+
+    # guard a non‑existent file
+    if not os.path.exists(path):
+        logger.debug("touch: %s does not exist, skipping", path)
+        return
+
     try:
+        # run utime in a thread, since it's blocking
         await asyncio.to_thread(os.utime, path, None)
     except PermissionError:
-        # extremely unlikely after our check, but just in case
+        # filesystem doesn’t support utime (we already warned once at startup)
         logger.debug("Skipping utime on %s (PermissionError)", path)
+    except FileNotFoundError:
+        # race: file vanished between os.path.exists check and os.utime call
+        logger.debug("Skipping utime on %s (FileNotFound)", path)
 
 async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
     """
