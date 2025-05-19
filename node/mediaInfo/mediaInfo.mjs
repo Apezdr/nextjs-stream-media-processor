@@ -231,7 +231,7 @@ export async function extractMediaQuality(filePath) {
       }
     };
   } catch (error) {
-    logger.error(`Error extracting media quality info with MediaInfo for ${filePath}:`, error);
+    logger.error(`Error extracting media quality info with MediaInfo for ${filePath}:` + error);
     return null;
   }
 }
@@ -261,7 +261,7 @@ export async function extractHDRInfo(filePath) {
     
     return mediaQuality.format;
   } catch (error) {
-    logger.error(`Error in extractHDRInfo for ${filePath}:`, error);
+    logger.error(`Error in extractHDRInfo for ${filePath}:` + error);
     return null;
   }
 }

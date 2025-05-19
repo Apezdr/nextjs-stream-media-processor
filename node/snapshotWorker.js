@@ -50,6 +50,6 @@ process.on('message', async (data) => {
     logger.info(`Worker ${process.pid} completed processing. Generated ${frames.length} frames.`);
     process.send({ frames });
   } catch (error) {
-    logger.error(`Worker ${process.pid} encountered an error:`, error);
+    logger.error(`Worker ${process.pid} encountered an error:` + error);
   }
 });

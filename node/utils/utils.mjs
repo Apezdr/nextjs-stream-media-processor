@@ -222,11 +222,11 @@ export async function clearGeneralCache() {
           logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
         }
       } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
       }
     }
   } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:`, err);
+    logger.error(`Error reading ${cacheType} cache directory:` + err);
   }
 }
 
@@ -252,11 +252,11 @@ export async function clearVideoClipsCache() {
           logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
         }
       } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
       }
     }
   } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:`, err);
+    logger.error(`Error reading ${cacheType} cache directory:` + err);
   }
 }
 /**
@@ -282,11 +282,11 @@ export async function clearSpritesheetCache() {
           logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
         }
       } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
       }
     }
   } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:`, err);
+    logger.error(`Error reading ${cacheType} cache directory:` + err);
   }
 }
 /**
@@ -312,11 +312,11 @@ export async function clearFramesCache() {
           logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
         }
       } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:`, err);
+        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
       }
     }
   } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:`, err);
+    logger.error(`Error reading ${cacheType} cache directory:` + err);
   }
 }
 

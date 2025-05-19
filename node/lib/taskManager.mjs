@@ -108,7 +108,7 @@ function processQueues() {
             processQueues();
           })
           .catch(error => {
-            logger.error(`Task failed: ${task.name}`, error);
+            logger.error(`Task failed: ${task.name}` + error);
             activeTasks.delete(taskId);
             if (task.reject) task.reject(error);
             
@@ -118,7 +118,7 @@ function processQueues() {
         
         break; // Only start one task per type per cycle
       } catch (error) {
-        logger.error(`Error starting task ${task.name}:`, error);
+        logger.error(`Error starting task ${task.name}:` + error);
         if (task.reject) task.reject(error);
       }
     }
@@ -165,7 +165,7 @@ export function enqueueTask(type, name, fn, immediate = false) {
           processQueues();
         })
         .catch(error => {
-          logger.error(`Task failed: ${name}`, error);
+          logger.error(`Task failed: ${name}` + error);
           activeTasks.delete(taskId);
           reject(error);
           

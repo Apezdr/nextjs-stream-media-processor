@@ -113,9 +113,9 @@ Blur: ${enableBlur ? blur : 'disabled'}
     };
 
   } catch (error) {
-    logger.error('PNG optimization error:', error);
+    logger.error('PNG optimization error:' + error);
     if (error.stack) {
-      logger.error('Error stack:', error.stack);
+      logger.error('Error stack:' + error.stack);
     }
     throw error;
   }

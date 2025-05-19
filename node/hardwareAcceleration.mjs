@@ -78,7 +78,7 @@ async function getSupportedHardwareEncoders() {
 
     return availableEncoders;
   } catch (error) {
-    logger.error('Error checking ffmpeg encoders:', error);
+    logger.error('Error checking ffmpeg encoders:' + error);
     return [];
   }
 }
@@ -162,7 +162,7 @@ async function getSystemGPUs() {
       return [];
     }
   } catch (error) {
-    logger.error('Error detecting system GPUs:', error);
+    logger.error('Error detecting system GPUs:' + error);
     return [];
   }
 }

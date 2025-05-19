@@ -20,16 +20,18 @@ import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
 import sharp from "sharp";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
-import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
+import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
+import { runPython } from "./lib/processRunner.mjs";
 const logger = createCategoryLogger('main');
+const posterLogger = createPythonLogger('GeneratePosterCollage');
+const tmdbLogger   = createPythonLogger('DownloadTMDBImages');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
-const execAsync = promisify(exec);
 const app = express();
 //const { handleVideoRequest } = require("./videoHandler");
 const logDirectory = resolve('logs');
@@ -346,12 +348,12 @@ async function handleSpriteSheetRequest(req, res, type) {
                 `Background conversion to AVIF successful: ${avifPath}`
               );
             } catch (error) {
-              logger.error("Background AVIF conversion failed:", error);
+              logger.error("Background AVIF conversion failed:" + error);
             }
             return;
           }
         } catch (error) {
-          logger.error("Error checking PNG dimensions:", error);
+          logger.error("Error checking PNG dimensions:" + error);
         }
       }
 
@@ -1470,7 +1472,7 @@ async function generateListTV(db, dirPath) {
   } catch (error) {
     // Rollback the transaction in case of error
     await db.run("ROLLBACK");
-    logger.error("Error during database update:", error);
+    logger.error("Error during database update:" + error);
   }
 }
 
@@ -2032,98 +2034,51 @@ app.post("/media/scan", async (req, res) => {
 });
 
 async function runGeneratePosterCollage() {
-  logger.info(`Running generate_poster_collage.py job${debugMessage}`);
-  // Use custom Python executable if provided in environment (for debug with virtual env)
-  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
-  const escapedScript =
-    process.platform === "win32"
-      ? generatePosterCollageScript.replace(/"/g, '\\"')
-      : generatePosterCollageScript.replace(/(["\s'\\])/g, "\\$1");
-  const command = isDebugMode
-    ? `${pythonExecutable} "${escapedScript}" >> "${LOG_FILE}" 2>&1`
-    : `${pythonExecutable} "${escapedScript}"`;
-
-  try {
-    const env = {
+  const debugMessage = isDebugMode ? ' with debug' : '';
+  posterLogger.info(`Running generate_poster_collage.py job${debugMessage}`);
+  await runPython({
+    scriptPath: generatePosterCollageScript,
+    args: [],                       // no extra flags
+    label: 'GeneratePosterCollage', // appears in the log prefix
+    logger: posterLogger,          
+    logFile: LOG_FILE,              // python-<date>.log and fallback file
+    debug: isDebugMode,             // redirect to file when true
+    env: {
       ...process.env,
       DEBUG: process.env.DEBUG,
       TMDB_API_KEY: process.env.TMDB_API_KEY,
-    };
-    await execAsync(command, { env });
-  } catch (error) {
-    logger.error(`Error executing generate_poster_collage.py: ${error}`);
-  }
+    }
+  });
 }
 async function runDownloadTmdbImages(
   specificShow = null,
   specificMovie = null,
   fullScan = false
 ) {
-  const debugMessage = isDebugMode ? " with debug" : "";
-  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
-  logger.info(
-    `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ""}${
-      specificMovie ? ` for movie "${specificMovie}"` : ""
-    }${fullScan ? " with full scan" : ""}`
+  const debugMessage = isDebugMode ? ' with debug' : '';
+  tmdbLogger.info(
+    `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ''}` +
+    `${specificMovie ? ` for movie "${specificMovie}"` : ''}` +
+    `${fullScan ? ' with full scan' : ''}` +
+    `${debugMessage}`
   );
+  const args = [];
+  if (specificShow)  args.push('--show', specificShow);
+  if (specificMovie) args.push('--movie', specificMovie);
 
-  // Construct the command using cross-platform path handling
-  let command = `${pythonExecutable} "${downloadTmdbImagesScript}"`;
-
-  // Append arguments
-  if (specificShow) {
-    command += ` --show "${specificShow}"`;
-  } else if (specificMovie) {
-    command += ` --movie "${specificMovie}"`;
-  }
-
-  // Handle logging if in debug mode
-  let logRedirect = "";
-  if (isDebugMode) {
-    try {
-      await fs.access(LOG_FILE, fs.constants.W_OK);
-      logRedirect =
-        process.platform === "win32"
-          ? ` >> "${LOG_FILE}" 2>&1`
-          : ` >> "${LOG_FILE}" 2>&1`;
-    } catch (err) {
-      logger.warn(
-        `No write access to ${LOG_FILE}. Logging to console instead.`
-      );
+  await runPython({
+    scriptPath: downloadTmdbImagesScript,
+    args,
+    label: 'DownloadTMDBImages',
+    logger: tmdbLogger,
+    logFile: LOG_FILE,
+    debug: isDebugMode,
+    env: {
+      ...process.env,
+      DEBUG: process.env.DEBUG,
+      TMDB_API_KEY: process.env.TMDB_API_KEY,
     }
-  }
-
-  try {
-    logger.info(
-      `Running download_tmdb_images.py job${debugMessage}${
-        specificShow ? ` for show "${specificShow}"` : ""
-      }${specificMovie ? ` for movie "${specificMovie}"` : ""}${
-        fullScan ? " with full scan" : ""
-      }`
-    );
-    const { stdout, stderr } = await execAsync(command + logRedirect, {
-      env: {
-        ...process.env,
-        DEBUG: process.env.DEBUG,
-        TMDB_API_KEY: process.env.TMDB_API_KEY,
-      },
-    });
-
-    if (stderr) {
-      logger.error(`download_tmdb_images.py error: ${stderr}`);
-    }
-    logger.info(
-      `Finished running download_tmdb_images.py job${debugMessage}${
-        specificShow ? ` for show "${specificShow}"` : ""
-      }${
-        specificMovie
-          ? ` for movie "${specificMovie}"${fullScan ? " with full scan" : ""}`
-          : ""
-      }`
-    );
-  } catch (error) {
-    logger.error(`Error executing download_tmdb_images.py: ${error}`);
-  }
+  });
 }
 // async function runGenerateThumbnailJson() {
 //   logger.info(`Running generate_thumbnail_json.sh job${debugMessage}`);
