@@ -7,13 +7,27 @@ import { initializeMetadataHashesTable } from './sqlite/metadataHashes.mjs';
 import { createHash } from 'crypto';
 import { fileExists } from './utils/utils.mjs';
 
+// Need to implement connection pooling and connection handling
+// to avoid SQLITE_BUSY errors
+// and to ensure that the database is not locked by other processes
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const dbDirectory = join(__dirname, 'db');
-const dbFilePath = join(dbDirectory, 'media.db');
+const dbFilePaths = {
+  main: join(dbDirectory, 'media.db'),
+  processTracking: join(dbDirectory, 'process_tracking.db')
+};
 
-var hasInitialized = false;
+// Track initialization status for each database type
+var hasInitialized = {
+  main: false,
+  processTracking: false
+};
+
+// Cache for database connections
+const dbConnections = {};
 
 /**
  * Helper function that wraps a database operation.
@@ -48,9 +62,24 @@ export async function withRetry(operation, maxRetries = 15, initialDelayMs = 200
   throw new Error('Operation failed after maximum retries');
 }
 
-export async function initializeDatabase() {
+/**
+ * Initialize a SQLite database connection.
+ * @param {string} dbType - Type of database to initialize ('main' or 'processTracking')
+ * @returns {Promise<Object>} - The database connection
+ */
+export async function initializeDatabase(dbType = 'main') {
+  // Check if we already have a cached connection
+  if (dbConnections[dbType]) {
+    return dbConnections[dbType];
+  }
+
   // Create the db directory if it doesn't exist
   await fs.mkdir(dbDirectory, { recursive: true });
+  
+  // Get the appropriate database file path
+  const dbFilePath = dbFilePaths[dbType] || dbFilePaths.main;
+  
+  // Open the database connection
   const db = await open({ filename: dbFilePath, driver: sqlite3.Database });
   
   // Enable WAL mode for better concurrency
@@ -62,7 +91,8 @@ export async function initializeDatabase() {
   // Increase SQLite busy timeout to reduce SQLITE_BUSY errors
   await db.exec('PRAGMA busy_timeout = 15000');
   
-  if (!hasInitialized) {
+  // Initialize tables based on database type
+  if (dbType === 'main' && !hasInitialized.main) {
     await db.exec(`
         CREATE TABLE IF NOT EXISTS movies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +140,14 @@ export async function initializeDatabase() {
             last_attempt TEXT
         );
     `);
+    
+    // Initialize metadata_hashes table
+    await initializeMetadataHashesTable(db);
+    
+    hasInitialized.main = true;
+  }
+  // Initialize process tracking database
+  else if (dbType === 'processTracking' && !hasInitialized.processTracking) {
     await db.exec(`
       CREATE TABLE IF NOT EXISTS process_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,10 +161,7 @@ export async function initializeDatabase() {
       );
     `);
     
-    // Initialize metadata_hashes table
-    await initializeMetadataHashesTable(db);
-    
-    hasInitialized = true;
+    hasInitialized.processTracking = true;
   }
   return db;
 }

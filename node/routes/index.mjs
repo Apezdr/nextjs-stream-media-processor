@@ -1,6 +1,7 @@
 import express from 'express';
 import blurhashRoutes from './blurhash.mjs';
 import metadataHashesRoutes from './metadataHashes.mjs';
+import systemStatusRoutes from './systemStatus.mjs';
 
 /**
  * Initialize and configure all API routes
@@ -12,6 +13,7 @@ export function setupRoutes() {
   // Mount route modules
   router.use('/api', blurhashRoutes);
   router.use('/api', metadataHashesRoutes);
+  router.use('/api', systemStatusRoutes);
   
   return router;
 }

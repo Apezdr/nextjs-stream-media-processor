@@ -1,6 +1,7 @@
 import json
 import argparse
 import os
+import tempfile
 import aiohttp
 import asyncio
 import sys
@@ -93,6 +94,38 @@ BASE_PATH = os.getenv('BASE_PATH', '/var/www/html')
 SHOWS_DIR = os.path.join(BASE_PATH, 'tv')
 MOVIES_DIR = os.path.join(BASE_PATH, 'movies')
 
+# Global flag, flipped if utime fails
+UTIME_SUPPORTED = True
+
+async def check_utime_support(base_dir: str):
+    """Try a single utime; if it fails, disable further utime calls."""
+    global UTIME_SUPPORTED
+    fd, path = tempfile.mkstemp(dir=base_dir)
+    os.close(fd)
+    try:
+        await asyncio.to_thread(os.utime, path, None)
+    except PermissionError:
+        UTIME_SUPPORTED = False
+        logger.warning(
+            "Filesystem at %s does not support os.utime(); "
+            "future timestamp touches will be skipped.", base_dir
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+async def touch(path: str):
+    """Only call utime if the FS actually supports it—and guard again."""
+    if not UTIME_SUPPORTED:
+        return
+    try:
+        await asyncio.to_thread(os.utime, path, None)
+    except PermissionError:
+        # extremely unlikely after our check, but just in case
+        logger.debug("Skipping utime on %s (PermissionError)", path)
+
 async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
     """
     Processes seasons and episodes for a TV show, including metadata and images.
@@ -110,6 +143,7 @@ async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
         if refresh_season_poster:
             season_poster_url = f'https://image.tmdb.org/t/p/original{season.get("poster_path", "")}'
             await download_image_file(session, season_poster_url, season_poster_path)
+            await touch(season_poster_path)
 
         for episode_number in range(1, season.get('episode_count', 0) + 1):
             episode_metadata_file = os.path.join(season_dir, f'{episode_number:02d}_metadata.json')
@@ -130,7 +164,7 @@ async def process_seasons_and_episodes(session, show_data, show_dir, show_name):
                 episode_thumbnail_url = await fetch_episode_thumbnail_url(session, show_data["id"], season_number, episode_number)
                 if episode_thumbnail_url:
                     await download_image_file(session, episode_thumbnail_url, episode_thumbnail_path)
-                    await asyncio.to_thread(os.utime, episode_thumbnail_path, None)
+                    await touch(episode_thumbnail_path)
 
 async def process_media_images(session, media_data, media_dir, tmdb_config, existing_metadata, media_type):
     """
@@ -300,6 +334,10 @@ print("Processing TMDB Updates")
 
 # Main execution
 async def main():
+    # detect once per run whether utime works
+    await check_utime_support(SHOWS_DIR)
+    await check_utime_support(MOVIES_DIR)
+    # Process shows and movies
     async with aiohttp.ClientSession() as session:
         if args.show:
             logger.info(f"--Processing Show: {args.show}")

@@ -460,7 +460,7 @@ export async function getStoredBlurhash(imagePath, basePath) {
   logger.info(`Running blurhash_cli.py job for ${imagePath}${debugMessage}`);
 
   // Construct the command in a cross-platform way
-  const pythonExecutable = process.platform === 'win32' ? 'python' : 'python3';
+  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
   
   try {
     // Directly use the file path passed to the function without URL manipulations

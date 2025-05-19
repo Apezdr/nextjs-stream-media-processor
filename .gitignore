@@ -31,6 +31,7 @@ dist/
 out/
 
 # Python virtual environment
+.venv
 venv/
 __pycache__/
 *.py[cod]

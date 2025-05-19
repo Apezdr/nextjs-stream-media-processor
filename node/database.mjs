@@ -67,7 +67,7 @@ export async function initializeMongoDatabase() {
 
         logger.info("Database and collections have been initialized successfully.");
     } catch (error) {
-        logger.error("An error occurred while initializing the database and collections:", error);
+        logger.error("An error occurred while initializing the database and collections:" + error);
         process.exit(1); // Exit with error
     }
 }
@@ -188,7 +188,7 @@ export async function initializeIndexes() {
 
         logger.info("Indexes have been initialized successfully.");
     } catch (error) {
-        logger.error("An error occurred while initializing indexes:", error);
+        logger.error("An error occurred while initializing indexes:" + error);
         process.exit(1); // Exit with error
     } finally {
         await client.close();
@@ -220,7 +220,7 @@ export async function checkAutoSync() {
             autoSyncResponse = false;
         }
     } catch (error) {
-        logger.error("An error occurred:", error);
+        logger.error("An error occurred:" + error);
         //process.exit(1); // Exit with error
     } finally {
         await client.close();

@@ -80,5 +80,10 @@ RUN apk add --no-cache \
 RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py && \
     dos2unix /usr/src/app/scripts/*.sh
 
+# The default user of node:18.17.0-alpine is 'node' with UID/GID 1000
+# Create the logs directory and set its ownership to the 'node' user
+RUN mkdir -p /usr/src/app/logs && chown 1000:1000 /usr/src/app/logs
+# ---------------------------------------------------------------------------
+
 # Command to run your Node.js app
 CMD ["sh", "-c", "node /usr/src/app/node/app.mjs --max-old-space-size=6144"]

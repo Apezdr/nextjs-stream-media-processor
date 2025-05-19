@@ -22,7 +22,7 @@ import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
-import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
@@ -293,6 +293,7 @@ async function getVideoPath(
 async function handleSpriteSheetRequest(req, res, type) {
   try {
     const db = await initializeDatabase();
+    const processDB = await getProcessTrackingDb();
     const { movieName, showName, season, episode } = req.params;
     let spriteSheetFileName;
 
@@ -382,10 +383,10 @@ async function handleSpriteSheetRequest(req, res, type) {
     }
 
     spriteSheetProcessingFiles.add(fileKey);
-
+    
     // -- Step 0: Create a process queue entry with totalSteps = 3
     await createOrUpdateProcessQueue(
-      db,
+      processDB,
       fileKey + "_spritesheet",
       "spritesheet",
       3,        // total steps
@@ -414,7 +415,7 @@ async function handleSpriteSheetRequest(req, res, type) {
         cacheDir: spritesheetCacheDir,
         onProgress: async (stepNumber, message) => {
           // Utility callback to track each step
-          const dbInner = await initializeDatabase();
+          const dbInner = await getProcessTrackingDb();
           await updateProcessQueue(dbInner, fileKey + "_spritesheet", stepNumber, "in-progress", message);
           await releaseDatabase(dbInner);
         },
@@ -473,6 +474,7 @@ async function handleSpriteSheetRequest(req, res, type) {
 
 async function handleVttRequest(req, res, type) {
   const db = await initializeDatabase();
+  const processDB = await getProcessTrackingDb();
   const { movieName, showName, season, episode } = req.params;
   let vttFileName;
 
@@ -511,7 +513,7 @@ async function handleVttRequest(req, res, type) {
 
       // Create or update the queue record for the VTT process
       await createOrUpdateProcessQueue(
-        db,
+        processDB,
         fileKey + "_vtt",  // so we don't conflict with the sprite sheet queue
         "vtt",
         3, // total steps for VTT
@@ -576,7 +578,7 @@ async function handleVttRequest(req, res, type) {
 
       // Create a queue for the spritesheet process
       await createOrUpdateProcessQueue(
-        db,
+        processDB,
         fileKey + "_spritesheet",
         "spritesheet",
         3,        // total steps
@@ -585,7 +587,6 @@ async function handleVttRequest(req, res, type) {
         "Starting sprite sheet creation"
       );
 
-      await releaseDatabase(db);
       await generateSpriteSheet({
         videoPath,
         type,
@@ -595,14 +596,14 @@ async function handleVttRequest(req, res, type) {
         cacheDir: spritesheetCacheDir,
         onProgress: async (stepNumber, message) => {
           // Utility callback to track each step
-          const dbInner = await initializeDatabase();
+          const dbInner = await getProcessTrackingDb();
           await updateProcessQueue(dbInner, fileKey + "_vtt", stepNumber, "in-progress", message);
           await updateProcessQueue(dbInner, fileKey + "_spritesheet", stepNumber, "in-progress", message);
           await releaseDatabase(dbInner);
         },
       });
 
-      const finalizeDBqueue = await initializeDatabase();
+      const finalizeDBqueue = await getProcessTrackingDb();
       // Finalize the queue
       await finalizeProcessQueue(finalizeDBqueue, fileKey + "_vtt", "completed", "VTT generation done");
       await finalizeProcessQueue(finalizeDBqueue, fileKey + "_spritesheet", "completed", "Spritesheet generation done");
@@ -885,7 +886,7 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietM
  */
 app.get('/processes', async (req, res) => {
   try {
-    const db = await initializeDatabase();
+    const db = await getProcessTrackingDb();
 
     // Extract query parameters for filtering
     const { processType, status } = req.query;
@@ -915,7 +916,7 @@ app.get('/processes', async (req, res) => {
 app.get('/processes/:fileKey', async (req, res) => {
   try {
     const { fileKey } = req.params;
-    const db = await initializeDatabase();
+    const db = await getProcessTrackingDb();
 
     const process = await getProcessByFileKey(db, fileKey);
 
@@ -2032,7 +2033,8 @@ app.post("/media/scan", async (req, res) => {
 
 async function runGeneratePosterCollage() {
   logger.info(`Running generate_poster_collage.py job${debugMessage}`);
-  const pythonExecutable = process.platform === "win32" ? "python" : "python3";
+  // Use custom Python executable if provided in environment (for debug with virtual env)
+  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
   const escapedScript =
     process.platform === "win32"
       ? generatePosterCollageScript.replace(/"/g, '\\"')
@@ -2058,7 +2060,7 @@ async function runDownloadTmdbImages(
   fullScan = false
 ) {
   const debugMessage = isDebugMode ? " with debug" : "";
-  const pythonExecutable = process.platform === "win32" ? "python" : "python3";
+  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
   logger.info(
     `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ""}${
       specificMovie ? ` for movie "${specificMovie}"` : ""
@@ -2568,10 +2570,10 @@ async function initialize() {
       logger.error(`Error during initial blurhash scan: ${error.message}`);
     }
 
-    // As part of startup clear out any in progress processes
-    // This will prevent any processes from being stuck in the queue
-    await markInProgressAsInterrupted(db);
-    logger.info('Process queue has been reset.');
+  // As part of startup clear out any in progress processes from the process tracking database
+  // This will prevent any processes from being stuck in the queue
+  await markInProgressAsInterrupted(); // This will use the dedicated processTracking database
+  logger.info('Process queue has been reset.');
     initializeMongoDatabase()
       .then(() => {
         return initializeIndexes();
