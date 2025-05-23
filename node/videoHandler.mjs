@@ -347,8 +347,12 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     const videoStream = videoMetadata.streams.find(s => s.codec_type === 'video');
     const sourceCodec = videoStream.codec_name.toLowerCase();
+    const inputPixFmt = videoStream.pix_fmt;
     const isHDR = videoStream.color_transfer?.includes('smpte2084') || 
                   videoStream.color_space?.includes('bt2020');
+
+    logger.info(`Video analysis: Codec=${sourceCodec}, PixFmt=${inputPixFmt}, HDR=${isHDR}, ` +
+               `Profile=${videoStream.profile}, ColorSpace=${videoStream.color_space}`);
     
     // Determine best encoder based on source and capabilities
     let selectedEncoderConfig;
@@ -379,18 +383,28 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
           logger.info('Using HEVC NVENC encoder based on hardware info');
           break;
         default:
-          // Fallback to software encoding if no suitable hardware encoder is found
           selectedEncoderConfig = libx264;
           selectedEncoder = 'libx264';
           logger.info('Falling back to H.264 encoder (no suitable hardware encoder found)');
       }
+    }
 
-      // If HDR content and using vp9_vaapi, use HDR video filter chain
-      if (isHDR && selectedEncoderConfig.codec === 'vp9_vaapi') {
-        logger.info('Using HDR conversion filter chain');
-        selectedEncoderConfig = { ...selectedEncoderConfig }; // Create a copy
-        selectedEncoderConfig.vf = selectedEncoderConfig.hdr_vf;
-      }
+    // Create copy and pass pixel format to filter functions
+    selectedEncoderConfig = { ...selectedEncoderConfig };
+    
+    // Update vf function to include inputPixFmt
+    const originalVf = selectedEncoderConfig.vf;
+    selectedEncoderConfig.vf = (isHDRParam) => originalVf(isHDRParam, inputPixFmt);
+    
+    if (selectedEncoderConfig.hdr_vf) {
+      const originalHdrVf = selectedEncoderConfig.hdr_vf;
+      selectedEncoderConfig.hdr_vf = (isHDRParam) => originalHdrVf(isHDRParam, inputPixFmt);
+    }
+
+    // Apply HDR processing if needed
+    if (isHDR && selectedEncoderConfig.hdr_vf) {
+      logger.info('Applying HDR processing');
+      selectedEncoderConfig.vf = selectedEncoderConfig.hdr_vf;
     }
 
     // Verify VAAPI device availability (if applicable)

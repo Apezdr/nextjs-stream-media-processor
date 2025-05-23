@@ -13,7 +13,7 @@ import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, ge
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { setupRoutes } from "./routes/index.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -841,14 +841,14 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietM
       }
 
       // Check if the media file has chapter information
-      const hasChapters = await chapterInfo(mediaPath);
+      const chapterData = await chapterInfo(mediaPath);
 
-      if (hasChapters) {
+      if (chapterData) {
         // Create the chapters directory if it doesn't exist
         await fs.mkdir(dirname(chapterFilePath), { recursive: true });
 
         // If the media file has chapter information, generate the chapter file
-        const chapterContent = await generateChapters(mediaPath);
+        const chapterContent = await generateChapters(mediaPath, chapterData);
 
         // Save the generated chapter content to the file
         await fs.writeFile(chapterFilePath, chapterContent);
@@ -1271,6 +1271,7 @@ async function generateListTV(db, dirPath) {
             const episodePath = join(seasonPath, episode);
             const encodedEpisodePath = encodeURIComponent(episode);
 
+            let derivedEpisodeName = deriveEpisodeTitle(episode);
             let fileLength;
             let fileDimensions;
             let hdrInfo;
@@ -1314,6 +1315,7 @@ async function generateListTV(db, dirPath) {
               mediaQuality: mediaQuality || null,
               additionalMetadata: additionalMetadata || {},
               episodeNumber: parseInt(episodeNumber, 10),
+              derivedEpisodeName: derivedEpisodeName,
             };
 
             // Handle thumbnail

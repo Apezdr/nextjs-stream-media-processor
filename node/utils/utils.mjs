@@ -1,8 +1,9 @@
 import { promisify } from 'util';
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 export const execAsync = promisify(exec);
+export const execFileAsync = promisify(execFile);
 import { promises as fs, stat } from 'fs'; // Use the promise-based version of fs
-import { resolve as _resolve, join, relative, sep, dirname } from 'path';
+import { resolve as _resolve, join, relative, sep, dirname, basename, extname } from 'path';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const scriptsDir = dirname(__filename) + '/../../scripts/utils';
@@ -349,6 +350,78 @@ export async function findMp4File(directory, specificFileName = null, extraData 
     logger.error(error.message);
     throw error; // Rethrow the error to be handled by the caller
   }
+}
+
+/**
+ * Derive a human‑readable episode title from a filename.
+ *
+ * @param {string} filename      - The media file’s basename (including extension).
+ * @param {Object} [options]     - Optional overrides.
+ * @param {string[]} [options.delimiters] 
+ *        – Strings to split sections (default: [' - ', '_']).
+ * @param {RegExp[]} [options.stripPatterns] 
+ *        – Regexes to strip out tokens (default: quality & release tags).
+ * @param {RegExp} [options.fallbackRegex] 
+ *        – Regex for fallback (default: between SxxExx and next delimiter).
+ * @returns {string}             - The extracted episode title, or '' if none found.
+ */
+export function deriveEpisodeTitle(
+  filename,
+  {
+    delimiters = [' - ', '_'],
+    stripPatterns = [
+      // Quality/release tags
+      /\b(BluRay|WEBRip|WEB|WEBDL|HDTV|DVDRip|BRRip|Remux)\b/gi,
+      /\b(480p|720p|1080p|2160p|4K)\b/gi,
+      /\b(x264|x265|H\.264|HEVC)\b/gi,
+      // source
+      /\b(unknown|cam|telesync|telecine|workprint|dvd|tv|webdl|webrip|bluray)\b/gi,
+      // modifier
+      /\b(none|regional|screener|rawhd|brdisk|remux)\b/gi,
+      //
+      /\b(Proper)\b/gi,
+    ],
+    fallbackRegex = /S\d{1,2}E\d{1,2}\s*[-_. ]\s*(.+?)(?:[-_. ]|$)/i
+  } = {}
+) {
+  const base = basename(filename, extname(filename));
+
+  // 1) Try splitting on delimiters
+  for (const delim of delimiters) {
+    const parts = base.split(delim);
+    if (parts.length >= 3) {
+      let candidate = parts.slice(2).join(delim);
+
+      // 2) Strip known tokens
+      for (const rx of stripPatterns) {
+        candidate = candidate.replace(rx, '');
+      }
+
+      // 3) Trim whitespace, then remove any leftover leading/trailing punctuation
+      candidate = candidate
+        .trim()
+        // strip leading hyphens/underscores/spaces
+        .replace(/^[\s\-_.–—]+/, '')
+        // strip trailing hyphens/underscores/spaces
+        .replace(/[\s\-_.–—]+$/, '');
+
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+
+  // 4) Fallback to regex
+  const m = base.match(fallbackRegex);
+  if (m?.[1]) {
+    return m[1]
+      .trim()
+      .replace(/^[\s\-_.–—]+/, '')
+      .replace(/[\s\-_.–—]+$/, '');
+  }
+
+  // 5) Nothing matched
+  return null;
 }
 
 /**

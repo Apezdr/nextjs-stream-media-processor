@@ -26,35 +26,33 @@ export const libx264 = {
   /**
    * Base Video Filters for libx264
    * Excludes scaling to retain original dimensions by default.
-   * Includes HDR handling if applicable.
+   * Includes HDR handling if applicable; handles both 8-bit and 10-bit SDR input
    * @param {boolean} isHDR - Indicates if the video is HDR.
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string} - Comma-separated FFmpeg video filters.
    */
-  vf: (isHDR) => [
-    ...(isHDR
-      ? [
-          'zscale=t=linear:npl=100,format=gbrp16le',
-          'zscale=p=bt709',
-          'tonemap=tonemap=hable:peak=100',
-          'zscale=t=bt709:m=bt709:r=tv',
-          'format=yuv420p',
-        ]
-      : [
-          'zscale=t=linear:npl=100,format=gbrp',
-          'zscale=p=bt709',
-          'format=yuv420p',
-        ]
-    ),
-    'pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2', // Ensure dimensions are even
-  ].join(','),
+  vf: (isHDR, inputPixFmt) => {
+    if (isHDR) {
+      return 'zscale=tin=smpte2084:min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0:peak=100,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2';
+    }
+    // Handle 10 bit SDR input
+    // This will force scaling to occur within the zscale filter chain
+    // and will ensure the output is 8 bit SDR
+    else if (inputPixFmt && inputPixFmt.includes('10le')) {
+      return 'zscale=tin=bt709:min=bt709:pin=bt709:rin=tv:t=bt709:m=bt709:p=bt709:r=tv:w=1280:h=-2:dither=ordered,format=yuv420p,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2';
+    } else {
+      return 'scale=1280:-2,format=yuv420p,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2';
+    }
+  },
   /**
    * Alternative Video Filters for HDR content in libx264
    * Can be used if different HDR processing is required.
    * Currently, it's identical to the base `vf` but can be customized.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  hdr_vf: (isHDR) => libx264.vf(isHDR),
+  hdr_vf: (isHDR, inputPixFmt) => libx264.vf(isHDR, inputPixFmt),
   profiles: {
     full: {
       encoderFlags: {
@@ -93,7 +91,7 @@ export const libx264 = {
     },
     clip: {
       encoderFlags: {
-        '-crf': '23',
+        '-crf': '18',
         '-preset': 'fast',
         '-b:v': '800K',
       },
@@ -104,7 +102,7 @@ export const libx264 = {
        * @returns {Array<string>}
        */
       additionalArgs: (isHDR) => [
-        '-crf', '23',
+        '-crf', '18',
         '-preset', 'fast',
         '-b:v', '800K',
         '-g', '48',
@@ -153,9 +151,10 @@ export const vp9_vaapi = {
    * Excludes scaling to retain original dimensions by default.
    * Includes HDR handling if applicable.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  vf: (isHDR) => [
+  vf: (isHDR, inputPixFmt) => [
     ...(isHDR
       ? [
           'zscale=t=linear:npl=100,format=gbrp16le',
@@ -173,9 +172,10 @@ export const vp9_vaapi = {
    * Alternative Video Filters for HDR content in vp9_vaapi
    * Customized to retain HDR metadata effectively.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  hdr_vf: (isHDR) => vp9_vaapi.vf(isHDR),
+  hdr_vf: (isHDR, inputPixFmt) => vp9_vaapi.vf(isHDR, inputPixFmt),
   profiles: {
     full: {
       twoPass: true,
@@ -306,9 +306,10 @@ export const hevc_vaapi = {
    * Excludes scaling to retain original dimensions by default.
    * Includes HDR handling if applicable.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  vf: (isHDR) => [
+  vf: (isHDR, inputPixFmt) => [
     ...(isHDR
       ? [
           'zscale=t=linear:npl=100,format=gbrp16le',
@@ -326,9 +327,10 @@ export const hevc_vaapi = {
    * Alternative Video Filters for HDR content in hevc_vaapi
    * Currently identical to base `vf`, but can be customized.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  hdr_vf: (isHDR) => hevc_vaapi.vf(isHDR),
+  hdr_vf: (isHDR, inputPixFmt) => hevc_vaapi.vf(isHDR, inputPixFmt),
   profiles: {
     full: {
       encoderFlags: {
@@ -373,9 +375,10 @@ export const hevc_nvenc = {
    * Excludes scaling to retain original dimensions by default.
    * Includes HDR handling if applicable.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  vf: (isHDR) => [
+  vf: (isHDR, inputPixFmt) => [
     ...(isHDR
       ? [
           'zscale=t=linear:npl=100,format=gbrp16le',
@@ -395,9 +398,10 @@ export const hevc_nvenc = {
    * Can be used if different HDR processing is required.
    * Currently, it's identical to the base `vf` but can be customized.
    * @param {boolean} isHDR
+   * @param {string} inputPixFmt - Input pixel format.
    * @returns {string}
    */
-  hdr_vf: (isHDR) => hevc_nvenc.vf(isHDR),
+  hdr_vf: (isHDR, inputPixFmt) => hevc_nvenc.vf(isHDR, inputPixFmt),
   profiles: {
     full: {
       encoderFlags: {
@@ -429,6 +433,75 @@ export const hevc_nvenc = {
         )
       ],
       // No scaling; retain original dimensions
+    },
+    clip: {
+      encoderFlags: {
+        '-preset': 'medium',
+        '-cq': '28',
+        '-b:v': '800K',
+      },
+      /**
+       * Additional FFmpeg Arguments for 'clip' profile in hevc_nvenc
+       * Moderate quality settings suitable for clips.
+       * @param {boolean} isHDR
+       * @returns {Array<string>}
+       */
+      additionalArgs: (isHDR) => [
+        '-preset', 'medium',
+        '-cq', '28',
+        '-rc', 'vbr',
+        '-b:v', '800K',
+        '-g', '48',
+        '-keyint_min', '48',
+        '-b:a', '128k',
+        '-ar', '44100',
+        '-ac', '2',
+        ...(isHDR
+          ? [
+              '-color_primaries', 'bt709',
+              '-color_trc', 'bt709',
+              '-colorspace', 'bt709',
+              // HEVC-specific HDR metadata
+              '-metadata:s:v:0', 'master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(40000000,50)',
+              '-metadata:s:v:0', 'max-cll=400,50',
+            ]
+          : []
+        )
+      ],
+      scale: { width: 1280, height: -2 }, // Standard clip scaling
+    },
+    preview: {
+      encoderFlags: {
+        '-preset': 'fast',
+        '-cq': '32',
+        '-b:v': '400K',
+      },
+      /**
+       * Additional FFmpeg Arguments for 'preview' profile in hevc_nvenc
+       * Lower quality settings for previews.
+       * @param {boolean} isHDR
+       * @returns {Array<string>}
+       */
+      additionalArgs: (isHDR) => [
+        '-preset', 'fast',
+        '-cq', '32',
+        '-rc', 'vbr',
+        '-b:v', '400K',
+        '-g', '48',
+        '-keyint_min', '48',
+        '-b:a', '96k',
+        '-ar', '22050',
+        '-ac', '2',
+        ...(isHDR
+          ? [
+              '-color_primaries', 'bt709',
+              '-color_trc', 'bt709',
+              '-colorspace', 'bt709',
+            ]
+          : []
+        )
+      ],
+      scale: { width: 640, height: -2 }, // Lower resolution for previews
     }
     // Add more profiles if needed
   }

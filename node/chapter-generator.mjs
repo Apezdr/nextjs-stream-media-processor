@@ -2,9 +2,9 @@ import { createCategoryLogger } from './lib/logger.mjs';
 import { getVideoDuration, chapterInfo } from './ffmpeg/ffprobe.mjs';
 const logger = createCategoryLogger('chapter-generator');
 
-export async function generateChapters(mediaPath) {
+export async function generateChapters(mediaPath, chapterData = null) {
   try {
-    const chapters = await chapterInfo(mediaPath) || [];
+    const chapters = chapterData || await chapterInfo(mediaPath) || [];
 
     if (chapters.length === 0) {
       logger.warn(`No chapter information found for ${mediaPath}`);
@@ -71,11 +71,20 @@ function formatTime(timeString) {
   return formattedTime;
 }
 
-function formatDuration(durationMillis) {
-  const durationSeconds = Math.floor(durationMillis / 1000);
-  const hours = Math.floor(durationSeconds / 3600);
-  const minutes = Math.floor((durationSeconds % 3600) / 60);
-  const seconds = durationSeconds % 60;
-  const formattedDuration = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.000`;
-  return formattedDuration;
+function formatDuration(totalSecondsInput) {
+  // Ensure the input is treated as a floating-point number
+  const totalSeconds = parseFloat(totalSecondsInput);
+
+  if (isNaN(totalSeconds) || totalSeconds < 0) {
+    logger.warn(`Invalid duration value: ${totalSecondsInput}, returning default timestamp.`);
+    return '00:00:00.000'; // Or handle error as appropriate
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60); // Integer part of seconds
+  const milliseconds = Math.floor((totalSeconds % 1) * 1000); // Fractional part as milliseconds
+
+  const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
+  return formattedTime;
 }
