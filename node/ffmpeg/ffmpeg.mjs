@@ -1,3 +1,5 @@
+// ffmpeg/ffmpeg.mjs
+// This module provides a function to execute FFmpeg commands using Node.js.
 import { spawn } from 'child_process';
 import { createCategoryLogger } from '../lib/logger.mjs';
 

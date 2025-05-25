@@ -178,7 +178,7 @@ export const vp9_vaapi = {
   hdr_vf: (isHDR, inputPixFmt) => vp9_vaapi.vf(isHDR, inputPixFmt),
   profiles: {
     full: {
-      twoPass: true,
+      twoPass: false,
       encoderFlags: {
         '-deadline': 'good',
         '-b:v': '8M',
@@ -217,7 +217,7 @@ export const vp9_vaapi = {
       //scale: { width: 1280, height: -2 }, // Example scaling for 'full' profile
     },
     clip: {
-      twoPass: true,
+      twoPass: false,
       encoderFlags: {
         '-deadline': 'good',
         '-b:v': '1900K',

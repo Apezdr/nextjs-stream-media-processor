@@ -1,3 +1,5 @@
+// ffmpeg/ffprobe.mjs
+// This module provides functions to interact with ffprobe for video metadata extraction.
 import { createCategoryLogger } from "../lib/logger.mjs";
 import { execFileAsync } from "../utils/utils.mjs"; // Make sure this is correctly imported and promisifies execFile
 import path from "path";
