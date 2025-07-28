@@ -260,6 +260,55 @@ export async function clearVideoClipsCache() {
     logger.error(`Error reading ${cacheType} cache directory:` + err);
   }
 }
+
+/**
+ * Clears expired original video segment files from the Video Clips Cache.
+ * These are fast to generate but take up significant space, so we keep them for a shorter time.
+ * Uses access time (atimeMs) to preserve recently accessed files regardless of creation time.
+ * Max Age: 8 minutes since last access
+ */
+export async function clearOriginalSegmentsCache() {
+  const now = Date.now();
+  const cacheType = 'original_segments';
+  const maxAge = 8 * 60; // 8 minutes in seconds
+  const dir = videoClipsCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    let deletedCount = 0;
+    let totalSize = 0;
+    
+    for (const file of files) {
+      // Only process files that match the original segment naming pattern
+      if (file.includes('-original.mp4')) {
+        const filePath = join(dir, file);
+        try {
+          const stats = await fs.stat(filePath);
+          const timeSinceLastAccess = (now - stats.atimeMs) / 1000; // Time since last access in seconds
+          
+          if (timeSinceLastAccess > maxAge) {
+            const fileSize = stats.size;
+            await fs.unlink(filePath);
+            deletedCount++;
+            totalSize += fileSize;
+            logger.info(`Deleted expired original segment cache file: ${file} (${(fileSize / 1024 / 1024).toFixed(2)} MB, last accessed: ${(timeSinceLastAccess / 60).toFixed(1)}min ago)`);
+          }
+        } catch (err) {
+          logger.error(`Error processing original segment file ${file} in ${cacheType} cache: ${err.message}`);
+        }
+      }
+    }
+    
+    if (deletedCount > 0) {
+      logger.info(`Original segments cleanup completed: ${deletedCount} files deleted, ${(totalSize / 1024 / 1024).toFixed(2)} MB freed`);
+    } else {
+      logger.debug('No expired original segment files found for cleanup');
+    }
+  } catch (err) {
+    logger.error(`Error reading ${cacheType} cache directory: ${err.message}`);
+  }
+}
+
 /**
  * Clears expired files from the Spritesheet Cache.
  * Adjust the maxAge as per your requirement.

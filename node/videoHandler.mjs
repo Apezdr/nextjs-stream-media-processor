@@ -1,4 +1,4 @@
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { join, extname, basename } from "path";
 import { promises as fs } from "fs";
 import { readFileSync, createReadStream } from "fs";
@@ -251,6 +251,255 @@ function getHighestChannelTrack(audioTracks) {
 }
 
 /**
+ * Serves a specific time segment from the original video using FFmpeg stream copy
+ * This extracts the exact time segment without re-encoding, preserving original quality
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ * @param {string} videoPath - Path to the video file
+ * @param {number} start - Start time in seconds
+ * @param {number} end - End time in seconds
+ * @param {string} title - Video title for logging
+ */
+async function serveOriginalVideoWithRanges(req, res, videoPath, start, end, title, videoID) {
+  try {
+    const duration = end - start;
+    
+    // Get video UUID for cache invalidation (same approach as handleVideoClipRequest)
+    let videoKey = videoID;
+    if (await fileExists(videoPath)) {
+      const info = await getInfo(videoPath);
+      videoKey = info.uuid;
+    }
+    
+    // Check if this is a range request from the browser
+    const range = req.headers.range;
+    if (range) {
+      // For range requests, we need to serve the pre-generated segment file
+      // Instead of trying to stream FFmpeg output with ranges
+      logger.info(`Range request detected for original video: ${range}`);
+      
+      // Generate cache key including video UUID for cache invalidation (same pattern as handleVideoClipRequest)
+      const originalCacheKey = `${title}-key_${videoKey}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}-original`;
+      const cachedOriginalPath = getCachedClipPath(originalCacheKey, '.mp4');
+      
+      // Check if cached original segment already exists
+      const cacheExists = await fileExists(cachedOriginalPath);
+      
+      if (!cacheExists) {
+        // Check if another request is already generating this original segment
+        if (ongoingCacheGenerations.has(originalCacheKey)) {
+          logger.info(`Waiting for ongoing generation of original cache key: ${originalCacheKey}`);
+          try {
+            await waitForCache(cachedOriginalPath, 500, 45000);
+            return serveVideoWithRange(req, res, cachedOriginalPath);
+          } catch (error) {
+            throw new Error('Original segment cache generation timeout');
+          }
+        }
+        
+        // Add to ongoing generations
+        ongoingCacheGenerations.add(originalCacheKey);
+        
+        try {
+          // Generate the segment file using existing cache system
+          const mimeType = getMimeType(videoPath);
+          const outputFormat = getOutputFormat(videoPath);
+          
+          const ffmpegArgs = [
+            '-ss', start.toString(),
+            '-i', videoPath,
+            '-t', duration.toString(),
+            '-c', 'copy',
+            '-avoid_negative_ts', 'make_zero',
+            '-f', outputFormat
+          ];
+          
+          if (outputFormat === 'mp4') {
+            ffmpegArgs.push('-movflags', 'faststart'); // Better for range requests
+          }
+          
+          ffmpegArgs.push(cachedOriginalPath);
+          
+          logger.info(`Generating original segment for cache: ${originalCacheKey}`);
+          logger.debug(`FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
+          
+          return new Promise((resolve, reject) => {
+            const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+              stdio: ['ignore', 'pipe', 'pipe']
+            });
+            
+            let stderrData = '';
+            ffmpeg.stderr.on('data', (data) => {
+              stderrData += data.toString();
+            });
+            
+            ffmpeg.on('exit', (code) => {
+              ongoingCacheGenerations.delete(originalCacheKey);
+              
+              if (code === 0) {
+                logger.info(`Original segment cached successfully: ${cachedOriginalPath}`);
+                // Now serve the file with range support
+                serveVideoWithRange(req, res, cachedOriginalPath).then(resolve).catch(reject);
+              } else {
+                logger.error(`FFmpeg failed to generate original segment: ${stderrData}`);
+                reject(new Error('Failed to generate original video segment'));
+              }
+            });
+            
+            ffmpeg.on('error', (error) => {
+              ongoingCacheGenerations.delete(originalCacheKey);
+              logger.error(`FFmpeg spawn error: ${error.message}`);
+              reject(error);
+            });
+          });
+        } catch (error) {
+          ongoingCacheGenerations.delete(originalCacheKey);
+          throw error;
+        }
+      } else {
+        // Serve existing cached original segment with range support
+        logger.info(`Serving existing cached original segment: ${cachedOriginalPath}`);
+        return serveVideoWithRange(req, res, cachedOriginalPath);
+      }
+    }
+    
+    // For non-range requests, stream directly from FFmpeg
+    const mimeType = getMimeType(videoPath);
+    const outputFormat = getOutputFormat(videoPath);
+    
+    const ffmpegArgs = [
+      '-ss', start.toString(),
+      '-i', videoPath,
+      '-t', duration.toString(),
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
+      '-f', outputFormat
+    ];
+    
+    if (outputFormat === 'mp4') {
+      ffmpegArgs.push('-movflags', 'frag_keyframe+empty_moov');
+    }
+    
+    ffmpegArgs.push('pipe:1');
+    
+    logger.info(`Starting FFmpeg direct stream for ${title}: ${start}s-${end}s (duration: ${duration}s)`);
+    logger.debug(`FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
+    
+    // Set response headers
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Content-Disposition', `inline; filename="${title}_${start}-${end}.${outputFormat}"`);
+    
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    
+    let hasStarted = false;
+    let stderrData = '';
+    
+    ffmpeg.stderr.on('data', (data) => {
+      stderrData += data.toString();
+    });
+    
+    ffmpeg.stdout.on('data', (chunk) => {
+      if (!hasStarted) {
+        hasStarted = true;
+        if (!res.headersSent) {
+          res.writeHead(200);
+        }
+      }
+      if (!res.finished) {
+        res.write(chunk);
+      }
+    });
+    
+    ffmpeg.on('exit', (code, signal) => {
+      if (code === 0) {
+        logger.info(`Successfully served original video segment via direct stream: ${title} ${start}s-${end}s`);
+      } else if (signal !== 'SIGTERM') {
+        logger.error(`FFmpeg exited with code ${code}, signal ${signal}`);
+        logger.error(`FFmpeg stderr: ${stderrData}`);
+      }
+      
+      if (!res.finished) {
+        res.end();
+      }
+    });
+    
+    ffmpeg.on('error', (error) => {
+      logger.error(`FFmpeg spawn error: ${error.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Error processing video segment');
+      } else if (!res.finished) {
+        res.end();
+      }
+    });
+    
+    // Handle client disconnect
+    req.on('close', () => {
+      if (!ffmpeg.killed && ffmpeg.exitCode === null) {
+        try {
+          ffmpeg.kill('SIGTERM');
+        } catch (error) {
+          // Ignore errors
+        }
+      }
+    });
+    
+    // Timeout after 15 seconds
+    const timeout = setTimeout(() => {
+      if (!hasStarted && !ffmpeg.killed) {
+        logger.error(`FFmpeg timeout for ${title} ${start}s-${end}s`);
+        try {
+          ffmpeg.kill('SIGTERM');
+        } catch (error) {
+          // Ignore errors
+        }
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Video processing timeout');
+        }
+      }
+    }, 15000);
+    
+    ffmpeg.on('exit', () => {
+      clearTimeout(timeout);
+    });
+    
+  } catch (error) {
+    logger.error(`Error in serveOriginalVideoWithRanges: ${error.message}`);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Internal server error');
+    }
+  }
+}
+
+/**
+ * Determines the output format based on the input video file extension
+ * @param {string} videoPath - Path to the video file
+ * @returns {string} Output format for FFmpeg
+ */
+function getOutputFormat(videoPath) {
+  const ext = extname(videoPath).toLowerCase();
+  switch (ext) {
+    case '.mp4':
+    case '.m4v':
+      return 'mp4';
+    case '.mkv':
+      return 'matroska';
+    case '.webm':
+      return 'webm';
+    case '.avi':
+      return 'avi';
+    default:
+      return 'mp4'; // Default to MP4
+  }
+}
+
+/**
  * Handles video clip requests by streaming a specific segment of the video.
  * @param {Object} req - Express request object.
  * @param {Object} res - Express response object.
@@ -326,6 +575,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     // Parse and validate start and end parameters
     const start = parseFloat(req.query.start);
     const end = parseFloat(req.query.end);
+    const useOriginalVideo = req.query.useOriginalVideo === 'true';
     const MAX_CLIP_DURATION = 600; // 10 minutes
 
     if (isNaN(start) || isNaN(end) || start < 0 || end <= start) {
@@ -334,6 +584,22 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     if ((end - start) > MAX_CLIP_DURATION) {
       return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
+    }
+
+    // Check if video file exists
+    if (!await fileExists(videoPath)) {
+      return res.status(404).send('Video not found.');
+    }
+
+    // If useOriginalVideo is true, serve byte ranges directly from original file
+    if (useOriginalVideo) {
+      logger.info(`Serving original video with range support for ${title}: ${start}s-${end}s`);
+      try {
+        return await serveOriginalVideoWithRanges(req, res, videoPath, start, end, title, videoID);
+      } catch (error) {
+        logger.error(`Error serving original video with ranges: ${error.message}`);
+        return res.status(500).send('Error serving original video with ranges.');
+      }
     }
 
     // Get source video codec and HDR information
@@ -430,11 +696,6 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     if (await fileExists(cachedClipPath)) {
       logger.info(`Serving existing cached clip: ${cachedClipPath}`);
       return serveCachedClip(res, cachedClipPath, type, req);
-    }
-
-    // Check if video file exists
-    if (!await fileExists(videoPath)) {
-      return res.status(404).send('Video not found.');
     }
 
     // Get video duration to validate end time

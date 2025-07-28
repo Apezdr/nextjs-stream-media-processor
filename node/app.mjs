@@ -13,7 +13,7 @@ import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, ge
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { setupRoutes } from "./routes/index.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -260,7 +260,8 @@ async function getVideoPath(
     if (!movie) {
       throw new Error(`Movie not found: ${movieName}`);
     }
-    const videoMp4 = decodeURIComponent(JSON.parse(movie.urls).mp4);
+    const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
+    const videoMp4 = decodeURIComponent(urls.mp4);
     return join(BASE_PATH, videoMp4);
   } else {
     const showData = await getTVShowByName(db, showName);
@@ -428,7 +429,7 @@ async function handleSpriteSheetRequest(req, res, type) {
       spriteSheetRequestQueues.delete(fileKey);
       spriteSheetProcessingFiles.delete(fileKey);
       // -- Mark the process as completed
-      const dbFinal = await initializeDatabase();
+      const dbFinal = await getProcessTrackingDb();
       await finalizeProcessQueue(dbFinal, fileKey + "_spritesheet");
       await releaseDatabase(dbFinal);
 
@@ -460,7 +461,7 @@ async function handleSpriteSheetRequest(req, res, type) {
     } catch (error) {
       spriteSheetProcessingFiles.delete(fileKey);
       // Mark the queue as errored
-      const dbErr = await initializeDatabase();
+      const dbErr = await getProcessTrackingDb();
       await finalizeProcessQueue(dbErr, fileKey + "_spritesheet", "error", error.message);
       await releaseDatabase(dbErr);
 
@@ -532,7 +533,8 @@ async function handleVttRequest(req, res, type) {
           vttProcessingFiles.delete(fileKey);
           return res.status(404).send(`Movie not found: ${movieName}`);
         }
-        let videoMp4 = movie.urls.mp4;
+        const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
+        let videoMp4 = urls.mp4;
         videoMp4 = decodeURIComponent(videoMp4);
         videoPath = join(BASE_PATH, videoMp4);
         // await generateSpriteSheet({
@@ -665,7 +667,8 @@ async function handleChapterRequest(
     if (!movie) {
       return res.status(404).send(`Movie not found: ${movieName}`);
     }
-    let videoMp4 = JSON.parse(movie.urls).mp4;
+    const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
+    let videoMp4 = urls.mp4;
     videoMp4 = decodeURIComponent(videoMp4);
     let videoPath = join(BASE_PATH, videoMp4);
     const movieFileName = basename(videoPath, extname(videoPath));
@@ -1008,6 +1011,18 @@ scheduleJob("15 3 * * *", () => {
     return 'Frames cache cleanup completed successfully';
   }).catch(error => {
     logger.error(`Failed to enqueue frames cache cleanup task: ${error.message}`);
+  });
+});
+
+// Clear Original Segments Cache every 10 minutes (aggressive cleanup due to large file sizes)
+scheduleJob("*/10 * * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'Original Segments Cache Cleanup', async () => {
+    logger.info("Running Original Segments Cache Cleanup...");
+    await clearOriginalSegmentsCache();
+    logger.info("Original Segments Cache Cleanup Completed.");
+    return 'Original segments cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue original segments cache cleanup task: ${error.message}`);
   });
 });
 
