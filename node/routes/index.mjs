@@ -2,6 +2,7 @@ import express from 'express';
 import blurhashRoutes from './blurhash.mjs';
 import metadataHashesRoutes from './metadataHashes.mjs';
 import systemStatusRoutes from './systemStatus.mjs';
+import tmdbRoutes from './tmdb.mjs';
 
 /**
  * Initialize and configure all API routes
@@ -14,6 +15,7 @@ export function setupRoutes() {
   router.use('/api', blurhashRoutes);
   router.use('/api', metadataHashesRoutes);
   router.use('/api', systemStatusRoutes);
+  router.use('/api/tmdb', tmdbRoutes);
   
   return router;
 }

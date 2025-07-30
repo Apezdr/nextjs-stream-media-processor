@@ -17,13 +17,15 @@ const __dirname = dirname(__filename);
 const dbDirectory = join(__dirname, 'db');
 const dbFilePaths = {
   main: join(dbDirectory, 'media.db'),
-  processTracking: join(dbDirectory, 'process_tracking.db')
+  processTracking: join(dbDirectory, 'process_tracking.db'),
+  tmdbCache: join(dbDirectory, 'tmdb_cache.db')
 };
 
 // Track initialization status for each database type
 var hasInitialized = {
   main: false,
-  processTracking: false
+  processTracking: false,
+  tmdbCache: false
 };
 
 // Cache for database connections
@@ -162,6 +164,34 @@ export async function initializeDatabase(dbType = 'main') {
     `);
     
     hasInitialized.processTracking = true;
+  }
+  // Initialize TMDB cache database
+  else if (dbType === 'tmdbCache' && !hasInitialized.tmdbCache) {
+    // Create TMDB cache table with TTL functionality for the exposed API endpoint
+    await db.exec(`
+        CREATE TABLE IF NOT EXISTS tmdb_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key TEXT UNIQUE,
+            endpoint TEXT,
+            request_params TEXT,
+            response_data TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT,
+            last_accessed TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+    `);
+    
+    // Create index for TMDB cache efficient cache lookups
+    await db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_tmdb_cache_key ON tmdb_cache(cache_key);
+    `);
+    
+    // Create index for TMDB cache for TTL cleanup
+    await db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expires ON tmdb_cache(expires_at);
+    `);
+    
+    hasInitialized.tmdbCache = true;
   }
   return db;
 }
@@ -709,5 +739,212 @@ export async function withTransaction(db, operations, readOnly = false) {
     // Always rollback on any error
     await db.exec('ROLLBACK');
     throw error;
+  }
+}
+
+/**
+ * Generate a cache key for TMDB API requests
+ * @param {string} endpoint - TMDB API endpoint
+ * @param {Object} params - Request parameters
+ * @returns {string} - Cache key
+ */
+function generateTmdbCacheKey(endpoint, params = {}) {
+  // Sort params for consistent cache keys
+  const sortedParams = Object.keys(params)
+    .sort()
+    .reduce((result, key) => {
+      result[key] = params[key];
+      return result;
+    }, {});
+  
+  return createHash('md5')
+    .update(`${endpoint}:${JSON.stringify(sortedParams)}`)
+    .digest('hex');
+}
+
+/**
+ * Get cached TMDB response
+ * @param {Object} db - SQLite database connection
+ * @param {string} endpoint - TMDB API endpoint
+ * @param {Object} params - Request parameters
+ * @returns {Promise<Object|null>} - Cached response or null if not found/expired
+ */
+export async function getTmdbCache(db, endpoint, params = {}) {
+  const cacheKey = generateTmdbCacheKey(endpoint, params);
+  const now = new Date().toISOString();
+  
+  try {
+    const cached = await withRetry(() =>
+      db.get(
+        'SELECT * FROM tmdb_cache WHERE cache_key = ? AND expires_at > ?',
+        [cacheKey, now]
+      )
+    );
+    
+    if (cached) {
+      // Update last accessed time
+      await withRetry(() =>
+        db.run(
+          'UPDATE tmdb_cache SET last_accessed = ? WHERE cache_key = ?',
+          [now, cacheKey]
+        )
+      );
+      
+      return {
+        data: JSON.parse(cached.response_data),
+        cached: true,
+        cachedAt: cached.created_at,
+        expiresAt: cached.expires_at
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error getting TMDB cache:', error);
+    return null;
+  }
+}
+
+/**
+ * Store TMDB response in cache
+ * @param {Object} db - SQLite database connection
+ * @param {string} endpoint - TMDB API endpoint
+ * @param {Object} params - Request parameters
+ * @param {Object} responseData - TMDB API response data
+ * @param {number} ttlHours - Time to live in hours (default: 1440 = 60 days)
+ * @returns {Promise<void>}
+ */
+export async function setTmdbCache(db, endpoint, params = {}, responseData, ttlHours = 1440) {
+  const cacheKey = generateTmdbCacheKey(endpoint, params);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + (ttlHours * 60 * 60 * 1000));
+  
+  try {
+    await withRetry(() =>
+      db.run(
+        `INSERT OR REPLACE INTO tmdb_cache
+         (cache_key, endpoint, request_params, response_data, created_at, expires_at, last_accessed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          cacheKey,
+          endpoint,
+          JSON.stringify(params),
+          JSON.stringify(responseData),
+          now.toISOString(),
+          expiresAt.toISOString(),
+          now.toISOString()
+        ]
+      )
+    );
+  } catch (error) {
+    console.error('Error setting TMDB cache:', error);
+  }
+}
+
+/**
+ * Clear expired TMDB cache entries
+ * @param {Object} db - SQLite database connection
+ * @returns {Promise<number>} - Number of entries deleted
+ */
+export async function clearExpiredTmdbCache(db) {
+  const now = new Date().toISOString();
+  
+  try {
+    const result = await withRetry(() =>
+      db.run('DELETE FROM tmdb_cache WHERE expires_at <= ?', [now])
+    );
+    
+    return result.changes || 0;
+  } catch (error) {
+    console.error('Error clearing expired TMDB cache:', error);
+    return 0;
+  }
+}
+
+/**
+ * Clear all TMDB cache entries (admin function)
+ * @param {Object} db - SQLite database connection
+ * @param {string} pattern - Optional pattern to match endpoints (e.g., '/search/%')
+ * @returns {Promise<number>} - Number of entries deleted
+ */
+export async function clearTmdbCache(db, pattern = null) {
+  try {
+    let result;
+    if (pattern) {
+      result = await withRetry(() =>
+        db.run('DELETE FROM tmdb_cache WHERE endpoint LIKE ?', [pattern])
+      );
+    } else {
+      result = await withRetry(() =>
+        db.run('DELETE FROM tmdb_cache')
+      );
+    }
+    
+    return result.changes || 0;
+  } catch (error) {
+    console.error('Error clearing TMDB cache:', error);
+    return 0;
+  }
+}
+
+/**
+ * Get TMDB cache statistics
+ * @param {Object} db - SQLite database connection
+ * @returns {Promise<Object>} - Cache statistics
+ */
+export async function getTmdbCacheStats(db) {
+  try {
+    const now = new Date().toISOString();
+    
+    const [total, expired, byEndpoint] = await Promise.all([
+      withRetry(() => db.get('SELECT COUNT(*) as count FROM tmdb_cache')),
+      withRetry(() => db.get('SELECT COUNT(*) as count FROM tmdb_cache WHERE expires_at <= ?', [now])),
+      withRetry(() => db.all(`
+        SELECT endpoint, COUNT(*) as count,
+               MIN(created_at) as oldest,
+               MAX(last_accessed) as most_recent
+        FROM tmdb_cache
+        WHERE expires_at > ?
+        GROUP BY endpoint
+        ORDER BY count DESC
+      `, [now]))
+    ]);
+    
+    return {
+      total: total.count,
+      expired: expired.count,
+      active: total.count - expired.count,
+      byEndpoint: byEndpoint
+    };
+  } catch (error) {
+    console.error('Error getting TMDB cache stats:', error);
+    return {
+      total: 0,
+      expired: 0,
+      active: 0,
+      byEndpoint: []
+    };
+  }
+}
+
+/**
+ * Force refresh a specific TMDB cache entry
+ * @param {Object} db - SQLite database connection
+ * @param {string} endpoint - TMDB API endpoint
+ * @param {Object} params - Request parameters
+ * @returns {Promise<boolean>} - True if entry was deleted
+ */
+export async function refreshTmdbCacheEntry(db, endpoint, params = {}) {
+  const cacheKey = generateTmdbCacheKey(endpoint, params);
+  
+  try {
+    const result = await withRetry(() =>
+      db.run('DELETE FROM tmdb_cache WHERE cache_key = ?', [cacheKey])
+    );
+    
+    return (result.changes || 0) > 0;
+  } catch (error) {
+    console.error('Error refreshing TMDB cache entry:', error);
+    return false;
   }
 }

@@ -250,3 +250,190 @@ export async function updateLastSyncTime() {
         await client.close();
     }
 }
+
+/**
+ * Authenticate user using mobile token from authSessions collection
+ * @param {string} mobileToken - The mobile session token
+ * @returns {Object|null} User object or null if authentication fails
+ */
+export async function authenticateWithMobileToken(mobileToken) {
+    const client = new MongoClient(uri);
+    try {
+        await client.connect();
+        const db = client.db("Users");
+        
+        const authSession = await db.collection("authSessions").findOne({
+            'tokens.mobileSessionToken': mobileToken,
+            status: 'complete'
+        });
+        
+        if (authSession && authSession.tokens?.user?.id) {
+            // Get fresh user data from AuthenticatedUsers
+            const { ObjectId } = await import('mongodb');
+            const userObjectId = new ObjectId(authSession.tokens.user.id);
+            const userData = await db.collection("AuthenticatedUsers").findOne({ _id: userObjectId });
+            
+            if (userData) {
+                return {
+                    id: userData._id.toString(),
+                    email: userData.email,
+                    name: userData.name,
+                    image: userData.image,
+                    approved: userData.approved || false,
+                    limitedAccess: userData.limitedAccess || false,
+                    admin: userData.admin || false
+                };
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        logger.error("Error authenticating with mobile token:" + error);
+        return null;
+    } finally {
+        await client.close();
+    }
+}
+
+/**
+ * Authenticate user using regular Next.js session token
+ * @param {string} token - The session token or session ID
+ * @returns {Object|null} User object or null if authentication fails
+ */
+export async function authenticateWithSessionToken(token) {
+    const client = new MongoClient(uri);
+    try {
+        await client.connect();
+        const db = client.db("Users");
+        
+        // Try to find session by sessionToken (Next.js session)
+        let session = await db.collection("session").findOne({
+            sessionToken: token,
+            expires: { $gt: new Date() }
+        });
+        
+        // If not found, try by ObjectId (session ID)
+        if (!session) {
+            try {
+                const { ObjectId } = await import('mongodb');
+                const sessionId = new ObjectId(token);
+                session = await db.collection("session").findOne({
+                    _id: sessionId,
+                    expires: { $gt: new Date() }
+                });
+            } catch (error) {
+                // Invalid ObjectId format, return null
+                return null;
+            }
+        }
+        
+        if (!session) {
+            return null;
+        }
+        
+        // Get user details
+        const userData = await db.collection("AuthenticatedUsers").findOne({ _id: session.userId });
+        
+        if (!userData) {
+            return null;
+        }
+        
+        return {
+            id: userData._id.toString(),
+            email: userData.email,
+            name: userData.name,
+            image: userData.image,
+            approved: userData.approved || false,
+            limitedAccess: userData.limitedAccess || false,
+            admin: userData.admin || false
+        };
+    } catch (error) {
+        logger.error("Error authenticating with session token:" + error);
+        return null;
+    } finally {
+        await client.close();
+    }
+}
+
+/**
+ * Get user by session ID for real-time updates
+ * @param {string} sessionId - The session ID
+ * @returns {Object|null} User object or null if not found
+ */
+export async function getUserBySessionId(sessionId) {
+    const client = new MongoClient(uri);
+    try {
+        await client.connect();
+        const db = client.db("Users");
+        
+        const { ObjectId } = await import('mongodb');
+        const sessionIdObjectId = new ObjectId(sessionId);
+        const session = await db.collection("session").findOne({ _id: sessionIdObjectId });
+        
+        if (!session) return null;
+
+        const user = await db.collection("AuthenticatedUsers").findOne({ _id: session.userId });
+
+        if (!user) return null;
+
+        return {
+            id: user._id.toString(),
+            email: user.email,
+            name: user.name,
+            image: user.image,
+            approved: user.approved || false,
+            limitedAccess: user.limitedAccess || false,
+            admin: user.admin || false,
+        };
+    } catch (error) {
+        logger.error("Error getting user by session ID:" + error);
+        return null;
+    } finally {
+        await client.close();
+    }
+}
+
+/**
+ * Get user by mobile token
+ * @param {string} mobileToken - The mobile session token
+ * @returns {Object|null} User object or null if not found
+ */
+export async function getUserByMobileToken(mobileToken) {
+    const client = new MongoClient(uri);
+    try {
+        await client.connect();
+        const db = client.db("Users");
+        
+        // Find the auth session that contains this mobile token
+        const authSession = await db.collection("authSessions").findOne({
+            'tokens.mobileSessionToken': mobileToken,
+            status: 'complete'
+        });
+        
+        if (!authSession || !authSession.tokens?.user?.id) {
+            return null;
+        }
+        
+        // Get the fresh user data from AuthenticatedUsers (single source of truth)
+        const { ObjectId } = await import('mongodb');
+        const userObjectId = new ObjectId(authSession.tokens.user.id);
+        const user = await db.collection("AuthenticatedUsers").findOne({ _id: userObjectId });
+
+        if (!user) return null;
+
+        return {
+            id: user._id.toString(),
+            email: user.email,
+            name: user.name,
+            image: user.image,
+            approved: user.approved || false,
+            limitedAccess: user.limitedAccess || false,
+            admin: user.admin || false,
+        };
+    } catch (error) {
+        logger.error("Error getting user by mobile token:" + error);
+        return null;
+    } finally {
+        await client.close();
+    }
+}
