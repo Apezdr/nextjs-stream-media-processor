@@ -6,6 +6,32 @@ import {
 
 const logger = createCategoryLogger('auth-middleware');
 
+// Enhanced cookie extraction for cross-domain scenarios
+const extractSessionTokenFromCookies = (cookies) => {
+  if (!cookies) return null;
+  
+  // Try multiple cookie patterns for better compatibility
+  const patterns = [
+    /__Secure-authjs\.session-token=([^;]+)/,
+    /next-auth\.session-token=([^;]+)/,
+    /authjs\.session-token=([^;]+)/,
+    /session-token=([^;]+)/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = cookies.match(pattern);
+    if (match) {
+      try {
+        return decodeURIComponent(match[1]);
+      } catch (error) {
+        logger.warn(`Failed to decode cookie value: ${error.message}`);
+      }
+    }
+  }
+  
+  return null;
+};
+
 /**
  * Express middleware for authenticating Next.js frontend users
  * Supports multiple authentication methods:
@@ -20,28 +46,44 @@ export const authenticateUser = async (req, res, next) => {
     const sessionToken = req.headers['x-session-token'];
     const mobileToken = req.headers['x-mobile-token'];
     
-    // Extract session token from cookies (Next.js session)
-    const cookies = req.headers.cookie;
-    let sessionTokenFromCookie = null;
+    // Enhanced cookie extraction
+    const sessionTokenFromCookie = extractSessionTokenFromCookies(req.headers.cookie);
     
-    if (cookies) {
-      // Look for authjs session token in cookies (matches your format)
-      const sessionCookieMatch = cookies.match(/__Secure-authjs\.session-token=([^;]+)/);
-      const sessionCookieAltMatch = cookies.match(/next-auth\.session-token=([^;]+)/);
-      
-      sessionTokenFromCookie = sessionCookieMatch?.[1] || sessionCookieAltMatch?.[1];
-      
-      if (sessionTokenFromCookie) {
-        // URL decode the cookie value
-        sessionTokenFromCookie = decodeURIComponent(sessionTokenFromCookie);
-        logger.debug(`Found session token in cookie: ${sessionTokenFromCookie.substring(0, 10)}...`);
-      }
+    // Log authentication attempt for debugging
+    const origin = req.headers.origin || req.headers.referer || 'unknown';
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    
+    if (sessionTokenFromCookie) {
+      logger.debug(`Found session token in cookie: ${sessionTokenFromCookie.substring(0, 10)}...`);
     }
     
+    logger.debug(`Authentication attempt from origin: ${origin}, User-Agent: ${userAgent.substring(0, 50)}...`);
+    
     if (!authHeader && !sessionToken && !mobileToken && !sessionTokenFromCookie) {
+      logger.warn(`No authentication provided from origin: ${origin}`);
+      
+      // Determine if this is likely a cross-domain request
+      const isCrossDomain = origin && origin !== 'unknown' && !origin.includes('localhost');
+      const corsAdvice = isCrossDomain ?
+        'For cross-domain requests, use Authorization header or x-session-token header instead of cookies.' :
+        'For same-domain requests, session cookies should work automatically.';
+      
       return res.status(401).json({
         error: 'No authentication provided',
-        debug: 'Expected Authorization header, x-session-token header, x-mobile-token header, or session cookie'
+        message: 'Authentication is required to access this endpoint.',
+        crossDomainAdvice: corsAdvice,
+        supportedMethods: [
+          'Authorization: Bearer <token> (recommended for cross-domain)',
+          'x-session-token: <token> (alternative for cross-domain)',
+          'x-mobile-token: <token> (for mobile apps)',
+          'Cookie: session-token=<token> (same-domain only)'
+        ],
+        origin: origin,
+        isCrossDomain: isCrossDomain,
+        documentation: {
+          cors: 'Cross-domain requests require explicit headers due to browser security policies',
+          headers: 'Include your session token in Authorization header: "Authorization: Bearer YOUR_TOKEN"'
+        }
       });
     }
 
@@ -72,9 +114,16 @@ export const authenticateUser = async (req, res, next) => {
     }
     
     if (!user) {
+      const isCrossDomain = origin && origin !== 'unknown' && !origin.includes('localhost');
+      const failureAdvice = isCrossDomain ?
+        'Cross-domain authentication failed. Ensure you are sending a valid token in the Authorization header.' :
+        'Authentication failed. Check your session token or login again.';
+        
       return res.status(401).json({
         error: 'Authentication failed',
-        debug: 'No valid session found in headers or cookies'
+        message: failureAdvice,
+        debug: 'No valid session found in headers or cookies',
+        isCrossDomain: isCrossDomain
       });
     }
     
@@ -86,7 +135,13 @@ export const authenticateUser = async (req, res, next) => {
     // Add user info to request
     req.user = user;
     
-    logger.info(`Authenticated user: ${user.email} (ID: ${user.id})`);
+    // Enhanced logging with origin information
+    const authMethod = authHeader ? 'Authorization header' :
+                      sessionToken ? 'x-session-token header' :
+                      mobileToken ? 'x-mobile-token header' :
+                      'session cookie';
+    
+    logger.info(`Authenticated user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
     next();
   } catch (error) {
     logger.error('Authentication error:', error);

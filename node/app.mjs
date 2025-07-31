@@ -7,6 +7,7 @@ import { join, resolve, basename, extname, dirname, normalize } from "path";
 import { createReadStream } from "fs"; // Callback-based version of fs
 import { promises as fs } from "fs"; // Use the promise-based version of fs
 import compression from "compression";
+import cors from "cors";
 import axios from "axios";
 import { generateSpriteSheet, generateVttFileFFmpeg } from "./sprite.mjs";
 import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
@@ -70,6 +71,130 @@ const MOVIE_LIST_VERSION = 1.0000;
 
 // Enable compression for all responses
 app.use(compression());
+
+// Helper function to check if origin is related to server domain
+function isRelatedDomain(origin, serverDomain) {
+  try {
+    const originUrl = new URL(origin);
+    const originDomain = originUrl.hostname;
+    
+    // Same domain
+    if (originDomain === serverDomain) return true;
+    
+    // Subdomain relationship (both directions)
+    if (originDomain.endsWith(`.${serverDomain}`) ||
+        serverDomain.endsWith(`.${originDomain}`)) {
+      return true;
+    }
+    
+    // Same root domain (e.g., app.example.com and api.example.com)
+    const originParts = originDomain.split('.');
+    const serverParts = serverDomain.split('.');
+    
+    if (originParts.length >= 2 && serverParts.length >= 2) {
+      const originRoot = originParts.slice(-2).join('.');
+      const serverRoot = serverParts.slice(-2).join('.');
+      return originRoot === serverRoot;
+    }
+    
+    return false;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Helper function to check if origin is localhost/development
+function isLocalhost(origin) {
+  try {
+    const url = new URL(origin);
+    return url.hostname === 'localhost' ||
+           url.hostname === '127.0.0.1' ||
+           url.hostname === '0.0.0.0' ||
+           url.hostname.endsWith('.local');
+  } catch (error) {
+    return false;
+  }
+}
+
+// Enhanced Dynamic CORS configuration for flexible cross-domain authentication
+const configureCORS = () => {
+  // Get explicitly configured origins from environment variables
+  const explicitOrigins = [];
+  let index = 1;
+  while (process.env[`FRONT_END_${index}`]) {
+    explicitOrigins.push(process.env[`FRONT_END_${index}`]);
+    index++;
+  }
+  
+  // Add current server URL if available
+  if (process.env.FILE_SERVER_NODE_URL) {
+    try {
+      const serverUrl = new URL(process.env.FILE_SERVER_NODE_URL);
+      explicitOrigins.push(serverUrl.origin);
+    } catch (error) {
+      logger.warn(`Invalid FILE_SERVER_NODE_URL: ${process.env.FILE_SERVER_NODE_URL}`);
+    }
+  }
+  
+  // Get server domain for intelligent subdomain matching
+  const serverDomain = process.env.FILE_SERVER_NODE_URL ?
+    new URL(process.env.FILE_SERVER_NODE_URL).hostname : null;
+  
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  
+  logger.info(`CORS configured for explicit origins: ${explicitOrigins.join(', ') || 'none'}`);
+  if (serverDomain) {
+    logger.info(`CORS intelligent domain matching enabled for: ${serverDomain}`);
+  }
+  
+  return cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile apps, Postman, curl, etc.)
+      if (!origin) return callback(null, true);
+      
+      // Check explicit allowed origins first
+      if (explicitOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      
+      // Intelligent subdomain matching if server domain is known
+      if (serverDomain && isRelatedDomain(origin, serverDomain)) {
+        logger.info(`CORS auto-allowing related domain: ${origin} (related to ${serverDomain})`);
+        return callback(null, true);
+      }
+      
+      // Development mode - dynamically allow localhost origins
+      if ((isDevelopment || isDebugMode) && isLocalhost(origin)) {
+        logger.debug(`CORS allowing localhost in development: ${origin}`);
+        return callback(null, true);
+      }
+      
+      // Log blocked requests for debugging
+      logger.warn(`CORS blocked origin: ${origin}. Add to FRONT_END_# env vars or ensure it's a related domain if this should be allowed.`);
+      return callback(new Error('Not allowed by CORS'), false);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'x-session-token',
+      'x-mobile-token',
+      'x-webhook-id',
+      'Cookie',
+      'Origin',
+      'X-Requested-With',
+      'Accept',
+      'Cache-Control'
+    ],
+    exposedHeaders: ['Set-Cookie', 'X-Total-Count', 'Content-Range'],
+    maxAge: 86400, // 24 hours
+    optionsSuccessStatus: 200 // Support legacy browsers
+  });
+};
+
+// Apply CORS middleware
+app.use(configureCORS());
 
 ensureCacheDirs();
 
