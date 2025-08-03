@@ -4,14 +4,15 @@ This document describes the TMDB (The Movie Database) API endpoints available in
 
 ## Overview
 
-The TMDB API integration provides access to movie and TV show information, including:
-- Search functionality
+The TMDB API integration provides access to movie, TV show, and collection information, including:
+- Search functionality for movies, TV shows, and collections
 - Detailed media information
 - Cast and crew data
 - Trailers and videos
 - Images and logos
 - Content ratings
 - TV episode details
+- **Movie collection support** for franchises and series
 - **Intelligent caching system** with 60-day TTL to reduce API calls
 - **Admin cache management** for performance optimization
 
@@ -355,7 +356,126 @@ GET /api/tmdb/episode/1399/1/1/images
 }
 ```
 
-### 10. Get TMDB Configuration (Admin Only)
+### 10. Search Collections
+
+Search for movie collections (franchises, series).
+
+**Endpoint**: `GET /api/tmdb/search/collection`
+
+**Parameters**:
+- `query` (query): Search term (required)
+- `page` (query): Page number (optional, default: 1)
+
+**Example**:
+```http
+GET /api/tmdb/search/collection?query=marvel&page=1
+```
+
+**Response**:
+```json
+{
+  "page": 1,
+  "results": [
+    {
+      "id": 86311,
+      "name": "The Avengers Collection",
+      "overview": "A superhero film series based on the Marvel Comics superhero team of the same name.",
+      "poster_path": "/yFSIUVTCvgYrpalUktulvk3Gi5Y.jpg",
+      "backdrop_path": "/zuW6fOiusv4X9nnW3paHGfXcSll.jpg"
+    }
+  ],
+  "total_pages": 1,
+  "total_results": 12
+}
+```
+
+### 11. Get Collection Details
+
+Get detailed information for a specific movie collection.
+
+**Endpoint**: `GET /api/tmdb/collection/:id`
+
+**Parameters**:
+- `id` (path): Collection ID (required)
+
+**Example**:
+```http
+GET /api/tmdb/collection/86311
+```
+
+**Response**:
+```json
+{
+  "id": 86311,
+  "name": "The Avengers Collection",
+  "overview": "A superhero film series based on the Marvel Comics superhero team of the same name.",
+  "poster_path": "https://image.tmdb.org/t/p/original/yFSIUVTCvgYrpalUktulvk3Gi5Y.jpg",
+  "backdrop_path": "https://image.tmdb.org/t/p/original/zuW6fOiusv4X9nnW3paHGfXcSll.jpg",
+  "parts": [
+    {
+      "id": 24428,
+      "title": "The Avengers",
+      "overview": "When an unexpected enemy emerges...",
+      "release_date": "2012-04-25",
+      "poster_path": "https://image.tmdb.org/t/p/original/RYMX2wcKCBAr24UyPD7xwmjaTn.jpg",
+      "backdrop_path": "https://image.tmdb.org/t/p/original/9BBTo63ANSmhC4e6r62OJFuK2GL.jpg"
+    },
+    {
+      "id": 299536,
+      "title": "Avengers: Infinity War",
+      "overview": "As the Avengers and their allies...",
+      "release_date": "2018-04-25",
+      "poster_path": "https://image.tmdb.org/t/p/original/7WsyChQLEftFiDOVTGkv3hFpyyt.jpg",
+      "backdrop_path": "https://image.tmdb.org/t/p/original/bOGkgRGdhrBYJSLpXaxhXVstddV.jpg"
+    }
+  ],
+  "last_updated": "2025-01-28T02:00:00.000Z"
+}
+```
+
+### 12. Get Collection Images
+
+Get images (posters and backdrops) for a movie collection.
+
+**Endpoint**: `GET /api/tmdb/collection/:id/images`
+
+**Parameters**:
+- `id` (path): Collection ID (required)
+
+**Example**:
+```http
+GET /api/tmdb/collection/86311/images
+```
+
+**Response**:
+```json
+{
+  "backdrops": [
+    {
+      "aspect_ratio": 1.778,
+      "file_path": "https://image.tmdb.org/t/p/original/zuW6fOiusv4X9nnW3paHGfXcSll.jpg",
+      "height": 2160,
+      "width": 3840,
+      "iso_639_1": null,
+      "vote_average": 5.388,
+      "vote_count": 4
+    }
+  ],
+  "posters": [
+    {
+      "aspect_ratio": 0.667,
+      "file_path": "https://image.tmdb.org/t/p/original/yFSIUVTCvgYrpalUktulvk3Gi5Y.jpg",
+      "height": 3000,
+      "width": 2000,
+      "iso_639_1": "en",
+      "vote_average": 5.312,
+      "vote_count": 1
+    }
+  ]
+}
+```
+
+### 13. Get TMDB Configuration (Admin Only)
 
 Get TMDB API configuration and cache statistics.
 
@@ -398,7 +518,7 @@ GET /api/tmdb/config
 }
 ```
 
-### 11. Get Cache Statistics (Admin Only)
+### 14. Get Cache Statistics (Admin Only)
 
 Get detailed cache statistics.
 
@@ -434,7 +554,7 @@ GET /api/tmdb/cache/stats
 }
 ```
 
-### 12. Clear Cache (Admin Only)
+### 15. Clear Cache (Admin Only)
 
 Clear all or specific cache entries.
 
@@ -463,7 +583,7 @@ DELETE /api/tmdb/cache?pattern=/search/%
 }
 ```
 
-### 13. Clear Expired Cache (Admin Only)
+### 16. Clear Expired Cache (Admin Only)
 
 Clear only expired cache entries.
 
@@ -485,7 +605,7 @@ DELETE /api/tmdb/cache/expired
 }
 ```
 
-### 14. Force Refresh Cache Entry (Admin Only)
+### 17. Force Refresh Cache Entry (Admin Only)
 
 Force refresh a specific cache entry.
 
@@ -512,7 +632,7 @@ Force refresh a specific cache entry.
 }
 ```
 
-### 15. Health Check
+### 18. Health Check
 
 Check the health and status of the TMDB API service.
 
@@ -618,6 +738,43 @@ const getMovieDetails = async (movieId) => {
 // Get comprehensive details
 const getComprehensiveDetails = async (name, type = 'movie') => {
   const response = await fetch(`/api/tmdb/comprehensive/${type}?name=${encodeURIComponent(name)}`, {
+    headers: {
+      'Authorization': `Bearer ${sessionToken}`
+    }
+  });
+  
+  return response.json();
+};
+
+// Search collections
+const searchCollections = async (query) => {
+  const response = await fetch('/api/tmdb/search/collection?query=' + encodeURIComponent(query), {
+    headers: {
+      'Authorization': `Bearer ${sessionToken}`
+    }
+  });
+  
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+  
+  return response.json();
+};
+
+// Get collection details
+const getCollectionDetails = async (collectionId) => {
+  const response = await fetch(`/api/tmdb/collection/${collectionId}`, {
+    headers: {
+      'Authorization': `Bearer ${sessionToken}`
+    }
+  });
+  
+  return response.json();
+};
+
+// Get collection images
+const getCollectionImages = async (collectionId) => {
+  const response = await fetch(`/api/tmdb/collection/${collectionId}/images`, {
     headers: {
       'Authorization': `Bearer ${sessionToken}`
     }

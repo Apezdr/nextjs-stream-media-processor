@@ -10,7 +10,10 @@ import {
   getMediaRating,
   getEpisodeDetails,
   getEpisodeImages,
-  fetchComprehensiveMediaDetails
+  fetchComprehensiveMediaDetails,
+  searchCollections,
+  getCollectionDetails,
+  getCollectionImages
 } from '../utils/tmdb.mjs';
 import {
   initializeDatabase,
@@ -164,6 +167,51 @@ router.get('/episode/:showId/:season/:episode/images', authenticateUser, rateLim
     res.json(images);
   } catch (error) {
     logger.error('Episode images error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Search movie collections
+router.get('/search/collection', authenticateUser, rateLimiter, async (req, res) => {
+  try {
+    const { query, page = 1 } = req.query;
+    
+    const data = await searchCollections(query, page);
+    
+    logger.info(`User ${req.user.email} searched for collections: "${query}"`);
+    res.json(data);
+  } catch (error) {
+    logger.error('Collection search error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get detailed information for movie collection
+router.get('/collection/:id', authenticateUser, rateLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const data = await getCollectionDetails(id);
+    
+    logger.info(`User ${req.user.email} requested collection details for ID: ${id}`);
+    res.json(data);
+  } catch (error) {
+    logger.error('Collection details error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get images for movie collection
+router.get('/collection/:id/images', authenticateUser, rateLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const images = await getCollectionImages(id);
+    
+    logger.info(`User ${req.user.email} requested collection images for ID: ${id}`);
+    res.json(images);
+  } catch (error) {
+    logger.error('Collection images error:', error);
     res.status(400).json({ error: error.message });
   }
 });

@@ -332,3 +332,72 @@ export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId =
     last_updated: new Date().toISOString()
   };
 };
+
+/**
+ * Search for movie collections
+ * @param {string} query - Search query
+ * @param {number} page - Page number (default: 1)
+ * @returns {Promise<Object>} Collection search results
+ */
+export const searchCollections = async (query, page = 1) => {
+  if (!query) {
+    throw new Error('Query parameter is required');
+  }
+  
+  return await makeTmdbRequest('/search/collection', { query, page });
+};
+
+/**
+ * Get detailed information for a movie collection
+ * @param {string|number} id - Collection ID
+ * @returns {Promise<Object>} Collection details with last_updated timestamp
+ */
+export const getCollectionDetails = async (id) => {
+  const data = await makeTmdbRequest(`/collection/${id}`);
+  
+  // Add last updated timestamp like the Python script
+  data.last_updated = new Date().toISOString();
+  
+  // Format parts (movies in collection) with full poster URLs
+  if (data.parts) {
+    data.parts = data.parts.map(movie => ({
+      ...movie,
+      poster_path: movie.poster_path ? `https://image.tmdb.org/t/p/original${movie.poster_path}` : null,
+      backdrop_path: movie.backdrop_path ? `https://image.tmdb.org/t/p/original${movie.backdrop_path}` : null
+    }));
+  }
+  
+  // Format main collection poster and backdrop
+  if (data.poster_path) {
+    data.poster_path = `https://image.tmdb.org/t/p/original${data.poster_path}`;
+  }
+  if (data.backdrop_path) {
+    data.backdrop_path = `https://image.tmdb.org/t/p/original${data.backdrop_path}`;
+  }
+  
+  return data;
+};
+
+/**
+ * Get images for a movie collection
+ * @param {string|number} id - Collection ID
+ * @returns {Promise<Object>} Collection images with formatted URLs
+ */
+export const getCollectionImages = async (id) => {
+  const data = await makeTmdbRequest(`/collection/${id}/images`, {
+    include_image_language: 'en,null'
+  });
+  
+  // Format all image paths to full URLs
+  const formatImages = (images) => {
+    return images?.map(image => ({
+      ...image,
+      file_path: `https://image.tmdb.org/t/p/original${image.file_path}`
+    })) || [];
+  };
+  
+  return {
+    backdrops: formatImages(data.backdrops),
+    posters: formatImages(data.posters)
+  };
+};
