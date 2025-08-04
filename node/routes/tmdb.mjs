@@ -13,7 +13,8 @@ import {
   fetchComprehensiveMediaDetails,
   searchCollections,
   getCollectionDetails,
-  getCollectionImages
+  getCollectionImages,
+  fetchEnhancedCollectionData
 } from '../utils/tmdb.mjs';
 import {
   initializeDatabase,
@@ -190,10 +191,17 @@ router.get('/search/collection', authenticateUser, rateLimiter, async (req, res)
 router.get('/collection/:id', authenticateUser, rateLimiter, async (req, res) => {
   try {
     const { id } = req.params;
+    const { enhanced } = req.query;
     
-    const data = await getCollectionDetails(id);
+    let data;
+    if (enhanced === 'true') {
+      logger.info(`User ${req.user.email} requested enhanced collection details for ID: ${id}`);
+      data = await fetchEnhancedCollectionData(id);
+    } else {
+      data = await getCollectionDetails(id);
+    }
     
-    logger.info(`User ${req.user.email} requested collection details for ID: ${id}`);
+    logger.info(`User ${req.user.email} requested ${enhanced === 'true' ? 'enhanced ' : ''}collection details for ID: ${id}`);
     res.json(data);
   } catch (error) {
     logger.error('Collection details error:', error);
