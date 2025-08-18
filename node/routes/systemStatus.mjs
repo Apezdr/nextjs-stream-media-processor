@@ -5,6 +5,7 @@ import axios from 'axios';
 import { createHash } from 'crypto';
 import { scheduleJob } from 'node-schedule';
 import { enqueueTask, TaskType } from '../lib/taskManager.mjs';
+import { getAllValidWebhookIds, validateWebhookAuth } from '../middleware/webhookAuth.mjs';
 
 const router = express.Router();
 const logger = createCategoryLogger('systemStatusRoutes');
@@ -205,10 +206,8 @@ function updateIncidentStatus(systemStatus) {
  */
 router.get('/system-status', async (req, res) => {
   try {
-    // Support multiple webhook IDs from environment variables
-    const validWebhookIds = (process.env.WEBHOOK_ID_1 || '').split(',')
-      .map(id => id.trim())
-      .filter(id => id);
+    // Get ALL valid webhook IDs from environment variables
+    const validWebhookIds = getAllValidWebhookIds();
 
     // Verify webhook authentication against any valid ID
     if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
@@ -543,10 +542,8 @@ async function sendNotificationToFrontend(webhookId, frontendUrl, status, messag
  */
 router.post('/trigger-system-status', async (req, res) => {
   try {
-    // Support multiple webhook IDs from environment variables
-    const validWebhookIds = (process.env.WEBHOOK_ID_1 || '').split(',')
-      .map(id => id.trim())
-      .filter(id => id);
+    // Get ALL valid webhook IDs from environment variables
+    const validWebhookIds = getAllValidWebhookIds();
 
     // Verify webhook authentication against any valid ID
     if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
