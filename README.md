@@ -11,6 +11,13 @@
 - LOG_PATH=<your_log_path>
 - DEBUG=TRUE  # Set this to TRUE to enable debugging logs, or omit it/set to false to disable logging
 
+### AVIF Configuration (for low-resource servers)
+
+- ENABLE_AVIF_CONVERSION=false  # Disable AVIF conversion to prevent server stalls on low-resource servers
+- AVIF_CONCURRENCY=1  # Limit concurrent AVIF conversions (default: 1, recommended for most servers)
+
+**Note for low-resource servers:** Set `ENABLE_AVIF_CONVERSION=false` to disable resource-intensive AVIF conversion. The system will automatically fall back to optimized PNG sprite sheets, which provide excellent quality with significantly lower CPU and memory usage. But higher frontend/browser memory requirements for spritesheets.
+
 ### Multi-Frontend Support
 
 For setups with multiple frontends, you can use numbered environment variables:

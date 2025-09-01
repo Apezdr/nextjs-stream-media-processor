@@ -1,7 +1,7 @@
 import { exec, spawn } from 'child_process';
 import { join } from 'path';
 import { promises as fs } from 'fs';
-import { fileExists, convertToAvif, fileInfo } from './utils/utils.mjs';
+import { fileExists, convertToAvif, fileInfo, shouldUseAvif } from './utils/utils.mjs';
 import sharp from 'sharp';
 import { createCategoryLogger } from './lib/logger.mjs';
 import PQueue from 'p-queue';
@@ -136,12 +136,11 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
     const rows = Math.ceil(totalFrames / columns);
     const thumbHeight = 180; // Each thumbnail is 320x180
     const totalHeight = rows * thumbHeight;
-    const maxAvifHeight = 30780;
     
-    // Calculate dimensions and determine format
-    const useAvif = totalHeight <= maxAvifHeight;
+    // Determine format based on AVIF configuration and height
+    const useAvif = shouldUseAvif(totalHeight);
     logger.info(`Sprite sheet dimensions: ${columns} columns x ${rows} rows = ${totalHeight}px height`);
-    logger.info(`Using ${useAvif ? 'AVIF' : 'PNG'} format`);
+    logger.info(`Using ${useAvif ? 'AVIF' : 'PNG'} format (AVIF ${shouldUseAvif() ? 'enabled' : 'disabled'} globally)`);
 
     // Define filenames
     let spriteSheetFileNameBase, vttFileName;
@@ -153,8 +152,9 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
       vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
     }
 
-    const finalSpriteSheetPath = join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
+    let finalSpriteSheetPath = join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
     const vttFilePath = join(cacheDir, vttFileName);
+    let actualFormat = useAvif ? 'avif' : 'png'; // Track the actual format used
 
     // Check if we need to generate the spritesheet
     if (!await fileExists(finalSpriteSheetPath)) {
@@ -172,20 +172,47 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
         'png'
       );
 
-      // Step 2: AVIF or PNG optimization
+      // Step 2: AVIF conversion or PNG optimization based on configuration
       await onProgress(2, useAvif
         ? "Converting PNG to AVIF"
         : "Optimizing PNG"
       );
 
       if (useAvif) {
-        // Convert to AVIF
-        await convertToAvif(ffmpegOutputPath, finalSpriteSheetPath, 90, 6, true);
-        // Clean up FFmpeg output
-        await fs.unlink(ffmpegOutputPath).catch(logger.error);
+        // Convert to AVIF with queue management
+        try {
+          await convertToAvif(ffmpegOutputPath, finalSpriteSheetPath, 90, 6, true);
+          logger.info(`AVIF conversion completed: ${finalSpriteSheetPath}`);
+          actualFormat = 'avif';
+        } catch (avifError) {
+          logger.error(`AVIF conversion failed, falling back to PNG optimization: ${avifError.message}`);
+          // Fallback to PNG optimization
+          const pngFallbackPath = join(cacheDir, spriteSheetFileNameBase + '.png');
+          try {
+            await optimizePNGSpritesheet(
+              ffmpegOutputPath,
+              pngFallbackPath,
+              {
+                quality: 65,
+                compressionLevel: 9,
+                colors: 256,
+                dither: 0.9,
+                usePalette: true
+              }
+            );
+            finalSpriteSheetPath = pngFallbackPath;
+            actualFormat = 'png';
+            await fs.unlink(ffmpegOutputPath).catch(logger.error);
+          } catch (pngError) {
+            logger.error('PNG optimization also failed, using unoptimized PNG:' + pngError.message);
+            await fs.rename(ffmpegOutputPath, pngFallbackPath);
+            finalSpriteSheetPath = pngFallbackPath;
+            actualFormat = 'png';
+          }
+        }
       } else {
-        // Optimize PNG
-        logger.info('Optimizing PNG spritesheet...');
+        // Optimize PNG when AVIF is disabled or not suitable
+        logger.info('Using PNG optimization (AVIF disabled or unsuitable)...');
         try {
           await optimizePNGSpritesheet(
             ffmpegOutputPath,  // Input is FFmpeg output
@@ -200,14 +227,18 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
           );
           // Clean up FFmpeg output after successful optimization
           await fs.unlink(ffmpegOutputPath).catch(logger.error);
+          actualFormat = 'png';
         } catch (optimizeError) {
           logger.error('PNG optimization failed, using unoptimized PNG:' + optimizeError.message);
           // If optimization fails, just move the FFmpeg output to final destination
           await fs.rename(ffmpegOutputPath, finalSpriteSheetPath);
+          actualFormat = 'png';
         }
       }
     } else {
       logger.info('Using existing sprite sheet');
+      // Determine actual format from existing file
+      actualFormat = finalSpriteSheetPath.endsWith('.avif') ? 'avif' : 'png';
     }
 
     // Generate VTT if needed
@@ -230,7 +261,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
     return {
       spriteSheetPath: finalSpriteSheetPath,
       vttFilePath,
-      format: useAvif ? 'avif' : 'png'
+      format: actualFormat
     };
   } catch (error) {
     logger.error(`Error in generateSpriteSheet: ${error}`);

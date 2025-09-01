@@ -10,8 +10,19 @@ const scriptsDir = dirname(__filename) + '/../../scripts/utils';
 const blurhashCli = join(scriptsDir, 'blurhash_cli.py');
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
+import PQueue from 'p-queue';
 const logger = createCategoryLogger('utility');
 //const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
+
+// Simple AVIF Configuration
+const ENABLE_AVIF_CONVERSION = process.env.ENABLE_AVIF_CONVERSION !== 'false'; // Default: enabled
+const AVIF_CONCURRENCY = parseInt(process.env.AVIF_CONCURRENCY) || 1; // Default: 1 for server safety
+
+// Log configuration on startup
+logger.info(`AVIF Configuration: ${ENABLE_AVIF_CONVERSION ? 'ENABLED' : 'DISABLED'}, Concurrency: ${AVIF_CONCURRENCY}`);
+
+// Create AVIF conversion queue with concurrency limit
+const avifQueue = new PQueue({ concurrency: AVIF_CONCURRENCY });
 
 /**
  * Promisified version of the `fs.stat` function, which retrieves information about a file.
@@ -34,6 +45,21 @@ const conversionQueue = new Map();
 
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || '';
+
+/**
+ * Strips PREFIX_PATH from a video URL to get a clean file path for file system operations
+ * @param {string} videoUrl - URL from database (may contain PREFIX_PATH)
+ * @returns {string} - Clean relative path for file system operations
+ */
+export function getCleanVideoPath(videoUrl) {
+  // If PREFIX_PATH exists and videoUrl starts with it, strip it
+  if (PREFIX_PATH && videoUrl?.startsWith(PREFIX_PATH)) {
+    return videoUrl.substring(PREFIX_PATH.length);
+  }
+  
+  // Otherwise return as-is (handles empty PREFIX_PATH or already clean URLs)
+  return videoUrl;
+}
 
 let limit;
 
@@ -647,7 +673,22 @@ export async function getLastModifiedTime(filePath) {
 }
 
 /**
- * Converts a PNG file to AVIF using avifenc with a per-file queue to prevent duplicate conversions.
+ * Helper function to check if AVIF conversion should be used
+ * @param {number} imageHeight - Height of the image to be converted
+ * @returns {boolean} - Whether to use AVIF conversion
+ */
+export function shouldUseAvif(imageHeight = 0) {
+  if (!ENABLE_AVIF_CONVERSION) {
+    return false;
+  }
+  
+  // Chrome's height limit for AVIF images
+  const CHROME_HEIGHT_LIMIT = 30780;
+  return imageHeight <= CHROME_HEIGHT_LIMIT;
+}
+
+/**
+ * Converts a PNG file to AVIF using avifenc with concurrency control and configuration flags.
  *
  * @param {string} pngPath - The file path of the input PNG image.
  * @param {string} avifPath - The desired file path for the output AVIF image.
@@ -657,6 +698,12 @@ export async function getLastModifiedTime(filePath) {
  * @returns {Promise<void>}
  */
 export async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, deleteOriginal = true) {
+  // Check if AVIF conversion is enabled
+  if (!ENABLE_AVIF_CONVERSION) {
+    logger.info(`AVIF conversion disabled - skipping conversion for: ${pngPath}`);
+    throw new Error('AVIF conversion is disabled via ENABLE_AVIF_CONVERSION environment variable');
+  }
+
   logger.info('Request to convert PNG to AVIF:' + pngPath);
 
   // If a conversion for this pngPath is already in progress, return the existing Promise
@@ -665,63 +712,64 @@ export async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, 
     return conversionQueue.get(pngPath);
   }
 
-  // Create a new Promise for the conversion process
-  const conversionPromise = new Promise((resolve, reject) => {
-    logger.info('Starting new conversion for:' + pngPath);
+  // Queue the conversion to respect concurrency limits
+  const conversionPromise = avifQueue.add(async () => {
+    return new Promise((resolve, reject) => {
+      logger.info(`Starting AVIF conversion (queue position processed): ${pngPath}`);
 
-    const args = [
-      '--min', '0',
-      '--max', quality,
-      '-s', speed,
-      pngPath,
-      avifPath
-    ];
+      const args = [
+        '--min', '0',
+        '--max', quality.toString(),
+        '-s', speed.toString(),
+        pngPath,
+        avifPath
+      ];
 
-    // Spawn the avifenc process
-    const avifencProcess = spawn('avifenc', args, {
-      stdio: ['ignore', 'pipe', 'pipe'] // Ignore stdin, capture stdout and stderr
-    });
+      // Spawn the avifenc process
+      const avifencProcess = spawn('avifenc', args, {
+        stdio: ['ignore', 'pipe', 'pipe'] // Ignore stdin, capture stdout and stderr
+      });
 
-    // Collect stdout data
-    avifencProcess.stdout.on('data', (data) => {
-      logger.info(`avifenc stdout: ${data}`);
-    });
+      // Collect stdout data
+      avifencProcess.stdout.on('data', (data) => {
+        logger.info(`avifenc stdout: ${data}`);
+      });
 
-    // Collect stderr data
-    avifencProcess.stderr.on('data', (data) => {
-      logger.error(`avifenc stderr: ${data}`);
-    });
+      // Collect stderr data
+      avifencProcess.stderr.on('data', (data) => {
+        logger.error(`avifenc stderr: ${data}`);
+      });
 
-    // Handle process exit
-    avifencProcess.on('close', async (code) => {
-      if (code === 0) {
-        logger.info(`avifenc completed successfully for: ${pngPath}`);
-        
-        // If deletion is enabled, attempt to delete the original PNG
-        if (deleteOriginal) {
-          try {
-            await fs.unlink(pngPath);
-            logger.info(`Deleted original PNG file: ${pngPath}`);
-          } catch (unlinkError) {
-            logger.error(`Failed to delete original PNG file (${pngPath}): ${unlinkError}`);
-            // Depending on requirements, you might choose to reject here
-            // For now, we'll resolve even if deletion fails
+      // Handle process exit
+      avifencProcess.on('close', async (code) => {
+        if (code === 0) {
+          logger.info(`avifenc completed successfully for: ${pngPath}`);
+          
+          // If deletion is enabled, attempt to delete the original PNG
+          if (deleteOriginal) {
+            try {
+              await fs.unlink(pngPath);
+              logger.info(`Deleted original PNG file: ${pngPath}`);
+            } catch (unlinkError) {
+              logger.error(`Failed to delete original PNG file (not an issue, file is deleted anyway) (${pngPath}): ${unlinkError}`);
+              // Resolve even if deletion fails
+            }
           }
-        }
 
-        resolve();
-      } else {
-        const errorMsg = `avifenc exited with code ${code} for: ${pngPath}`;
+          resolve();
+        } else {
+          const errorMsg = `avifenc exited with code ${code} for: ${pngPath}`;
+          logger.error(errorMsg);
+          reject(new Error(errorMsg));
+        }
+      });
+
+      // Handle process errors
+      avifencProcess.on('error', (err) => {
+        const errorMsg = `Failed to start avifenc for: ${pngPath} - ${err.message}`;
         logger.error(errorMsg);
         reject(new Error(errorMsg));
-      }
-    });
-
-    // Handle process errors
-    avifencProcess.on('error', (err) => {
-      const errorMsg = `Failed to start avifenc for: ${pngPath} - ${err.message}`;
-      logger.error(errorMsg);
-      reject(new Error(errorMsg));
+      });
     });
   });
 

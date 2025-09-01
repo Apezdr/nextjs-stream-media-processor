@@ -14,7 +14,7 @@ import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, ge
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { setupRoutes } from "./routes/index.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -387,7 +387,8 @@ async function getVideoPath(
     }
     const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
     const videoMp4 = decodeURIComponent(urls.mp4);
-    return join(BASE_PATH, videoMp4);
+    const cleanPath = getCleanVideoPath(videoMp4);
+    return join(BASE_PATH, cleanPath);
   } else {
     const showData = await getTVShowByName(db, showName);
     if (!showData) {
@@ -469,10 +470,17 @@ async function handleSpriteSheetRequest(req, res, type) {
             res.sendFile(existingPath);
 
             try {
-              await convertToAvif(existingPath, avifPath, 60, 4, false);
-              logger.info(
-                `Background conversion to AVIF successful: ${avifPath}`
-              );
+              // Only attempt AVIF conversion if enabled
+              if (shouldUseAvif(metadata.height)) {
+                await convertToAvif(existingPath, avifPath, 60, 4, false);
+                logger.info(
+                  `Background conversion to AVIF successful: ${avifPath}`
+                );
+              } else {
+                logger.info(
+                  `Background AVIF conversion skipped (disabled or height ${metadata.height}px exceeds limit)`
+                );
+              }
             } catch (error) {
               logger.error("Background AVIF conversion failed:" + error);
             }
@@ -661,7 +669,8 @@ async function handleVttRequest(req, res, type) {
         const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
         let videoMp4 = urls.mp4;
         videoMp4 = decodeURIComponent(videoMp4);
-        videoPath = join(BASE_PATH, videoMp4);
+        const cleanPath = getCleanVideoPath(videoMp4);
+        videoPath = join(BASE_PATH, cleanPath);
         // await generateSpriteSheet({
         //   videoPath,
         //   type,
@@ -795,7 +804,8 @@ async function handleChapterRequest(
     const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
     let videoMp4 = urls.mp4;
     videoMp4 = decodeURIComponent(videoMp4);
-    let videoPath = join(BASE_PATH, videoMp4);
+    const cleanPath = getCleanVideoPath(videoMp4);
+    let videoPath = join(BASE_PATH, cleanPath);
     const movieFileName = basename(videoPath, extname(videoPath));
     chapterFileName = `${movieFileName}_chapters.vtt`;
     mediaPath = join(
