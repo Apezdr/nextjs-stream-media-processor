@@ -68,6 +68,8 @@ temp/
 *.sqlite-journal
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # Cache for Node
 node/cache

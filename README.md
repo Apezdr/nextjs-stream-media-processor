@@ -31,6 +31,27 @@ WEBHOOK_ID_2=o4jsi82ksjLowQ910PXosEas5S0eopqS
 
 See [.env.example](.env.example) for a complete configuration example.
 
+## Development Setup
+
+### Local Development (Windows)
+
+If you're developing locally on Windows, you'll need to install Python dependencies including the `blurhash-python` package which requires compilation:
+
+1. **Install Microsoft C++ Build Tools**:
+   - Download "Build Tools for Visual Studio 2022" from https://visualstudio.microsoft.com/visual-cpp-build-tools/
+   - Select: **C++ build tools** workload, **Windows 11 SDK**, and **MSVC v143 build tools**
+
+2. **Install Python dependencies**:
+   - Open **"x64 Native Tools Command Prompt for VS 2022"**
+   - Navigate to your project directory and run:
+   ```cmd
+   set INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um;%INCLUDE%
+   set LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;%LIB%
+   set PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64;%PATH%
+   pip install -r requirements.txt
+   ```
+
+**Note**: Docker users don't need this setup - all dependencies are handled automatically in the container.
 
 ## Features
 

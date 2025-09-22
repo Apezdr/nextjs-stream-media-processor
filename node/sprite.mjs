@@ -6,8 +6,80 @@ import sharp from 'sharp';
 import { createCategoryLogger } from './lib/logger.mjs';
 import PQueue from 'p-queue';
 import { getVideoDuration, isVideoHDR } from './ffmpeg/ffprobe.mjs';
+import { getInfo } from './infoManager.mjs';
 
 const logger = createCategoryLogger('sprite');
+
+// Sprite Sheet Generation Version Control (for cache invalidation)
+const SPRITE_VERSION = 1.0001;
+
+/**
+ * Sanitizes a name for safe filename usage
+ * @param {string} name - The name to sanitize
+ * @returns {string} - Sanitized name
+ */
+function sanitizeName(name) {
+  return name.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+
+/**
+ * Generates a sprite sheet filename with UUID versioning
+ * @param {string} type - 'movies' or 'tv'
+ * @param {string} name - Movie name or show name
+ * @param {string} season - Season number (for TV)
+ * @param {string} episode - Episode identifier (for TV)
+ * @param {string} videoUUID - Video UUID (first 8 chars)
+ * @param {string} extension - File extension (.avif, .png, .vtt)
+ * @returns {string} - Generated filename
+ */
+function generateSpriteFilename(type, name, season, episode, videoUUID, extension) {
+  const sanitizedName = sanitizeName(name);
+  const shortUUID = videoUUID.substring(0, 8);
+  const version = Math.floor(SPRITE_VERSION * 10000).toString().padStart(4, '0');
+  
+  if (type === 'movies') {
+    return `movie_${sanitizedName}_spritesheet_${shortUUID}_v${version}${extension}`;
+  } else {
+    const sanitizedSeason = sanitizeName(season);
+    const sanitizedEpisode = sanitizeName(episode);
+    return `tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_${shortUUID}_v${version}${extension}`;
+  }
+}
+
+/**
+ * Finds existing sprite sheet files with different UUIDs for cleanup
+ * @param {string} cacheDir - Cache directory
+ * @param {string} type - 'movies' or 'tv'
+ * @param {string} name - Movie name or show name
+ * @param {string} season - Season number (for TV)
+ * @param {string} episode - Episode identifier (for TV)
+ * @param {string} currentUUID - Current video UUID to exclude
+ * @returns {Promise<string[]>} - Array of old files to clean up
+ */
+async function findOldSpriteFiles(cacheDir, type, name, season, episode, currentUUID) {
+  try {
+    const files = await fs.readdir(cacheDir);
+    const sanitizedName = sanitizeName(name);
+    const currentShortUUID = currentUUID.substring(0, 8);
+    
+    let pattern;
+    if (type === 'movies') {
+      pattern = new RegExp(`^movie_${sanitizedName}_spritesheet_([a-f0-9]{8})_v\\d{4}\\.(avif|png|vtt)$`);
+    } else {
+      const sanitizedSeason = sanitizeName(season);
+      const sanitizedEpisode = sanitizeName(episode);
+      pattern = new RegExp(`^tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_([a-f0-9]{8})_v\\d{4}\\.(avif|png|vtt)$`);
+    }
+    
+    return files.filter(file => {
+      const match = file.match(pattern);
+      return match && match[1] !== currentShortUUID;
+    });
+  } catch (error) {
+    logger.warn(`Error reading cache directory for cleanup: ${error.message}`);
+    return [];
+  }
+}
 
 const FFMPEG_CONCURRENCY = parseInt(process.env.FFMPEG_CONCURRENCY) || 2;
 
@@ -123,7 +195,12 @@ Blur: ${enableBlur ? blur : 'disabled'}
 
 export async function generateSpriteSheet({ videoPath, type, name, season, episode, cacheDir, onProgress = async () => {} }) {
   try {
-    // Step 1: FFmpeg (generating the raw spritesheet)
+    // Step 1: Get video UUID for filename versioning
+    await onProgress(1, "Analyzing video file for versioning");
+    const videoInfo = await getInfo(videoPath);
+    const videoUUID = videoInfo.uuid;
+    
+    // Step 2: FFmpeg (generating the raw spritesheet)
     await onProgress(1, "Running FFmpeg to create raw sprite sheet");
 
     const duration = await getVideoDuration(videoPath);
@@ -142,26 +219,33 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
     logger.info(`Sprite sheet dimensions: ${columns} columns x ${rows} rows = ${totalHeight}px height`);
     logger.info(`Using ${useAvif ? 'AVIF' : 'PNG'} format (AVIF ${shouldUseAvif() ? 'enabled' : 'disabled'} globally)`);
 
-    // Define filenames
-    let spriteSheetFileNameBase, vttFileName;
-    if (type === 'movies') {
-      spriteSheetFileNameBase = `movie_${name}_spritesheet`;
-      vttFileName = `movie_${name}_spritesheet.vtt`;
-    } else if (type === 'tv') {
-      spriteSheetFileNameBase = `tv_${name}_${season}_${episode}_spritesheet`;
-      vttFileName = `tv_${name}_${season}_${episode}_spritesheet.vtt`;
-    }
+    // Generate UUID-based filenames
+    const spriteExtension = useAvif ? '.avif' : '.png';
+    const spriteSheetFileName = generateSpriteFilename(type, name, season, episode, videoUUID, spriteExtension);
+    const vttFileName = generateSpriteFilename(type, name, season, episode, videoUUID, '.vtt');
 
-    let finalSpriteSheetPath = join(cacheDir, spriteSheetFileNameBase + (useAvif ? '.avif' : '.png'));
+    let finalSpriteSheetPath = join(cacheDir, spriteSheetFileName);
     const vttFilePath = join(cacheDir, vttFileName);
     let actualFormat = useAvif ? 'avif' : 'png'; // Track the actual format used
 
-    // Check if we need to generate the spritesheet
+    // Clean up old sprite sheet files with different UUIDs
+    const oldFiles = await findOldSpriteFiles(cacheDir, type, name, season, episode, videoUUID);
+    for (const oldFile of oldFiles) {
+      try {
+        await fs.unlink(join(cacheDir, oldFile));
+        logger.info(`Cleaned up old sprite file: ${oldFile}`);
+      } catch (error) {
+        logger.warn(`Failed to clean up old sprite file ${oldFile}: ${error.message}`);
+      }
+    }
+
+    // Check if we need to generate the spritesheet (UUID-based filename)
     if (!await fileExists(finalSpriteSheetPath)) {
-      logger.info('Generating new sprite sheet...');
+      logger.info(`Generating new sprite sheet with UUID versioning: ${spriteSheetFileName}`);
       
-      // Generate initial PNG with FFmpeg
-      const ffmpegOutputPath = join(cacheDir, `${spriteSheetFileNameBase}_ffmpeg.png`);
+      // Generate initial PNG with FFmpeg (using temporary filename based on UUID)
+      const tempFileName = `temp_${generateSpriteFilename(type, name, season, episode, videoUUID, '.png')}`;
+      const ffmpegOutputPath = join(cacheDir, tempFileName);
       
       await generateSpriteSheetWithFFmpeg(
         videoPath,
@@ -186,8 +270,8 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
           actualFormat = 'avif';
         } catch (avifError) {
           logger.error(`AVIF conversion failed, falling back to PNG optimization: ${avifError.message}`);
-          // Fallback to PNG optimization
-          const pngFallbackPath = join(cacheDir, spriteSheetFileNameBase + '.png');
+          // Fallback to PNG optimization - use correct PNG filename with UUID
+          const pngFallbackPath = join(cacheDir, generateSpriteFilename(type, name, season, episode, videoUUID, '.png'));
           try {
             await optimizePNGSpritesheet(
               ffmpegOutputPath,
@@ -216,7 +300,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
         try {
           await optimizePNGSpritesheet(
             ffmpegOutputPath,  // Input is FFmpeg output
-            finalSpriteSheetPath,  // Output is final destination
+            finalSpriteSheetPath,  // Output is final destination (UUID-based)
             {
               quality: 65,
               compressionLevel: 9,
@@ -236,7 +320,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
         }
       }
     } else {
-      logger.info('Using existing sprite sheet');
+      logger.info(`Using existing sprite sheet: ${spriteSheetFileName}`);
       // Determine actual format from existing file
       actualFormat = finalSpriteSheetPath.endsWith('.avif') ? 'avif' : 'png';
     }
