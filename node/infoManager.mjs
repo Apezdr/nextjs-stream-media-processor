@@ -9,7 +9,7 @@ const logger = createCategoryLogger('infoFileManager');
 const exec = promisify(execCallback);
 
 // Used to determine if regenerating info is necessary
-export const CURRENT_VERSION = 1.0007; // Incremented for mediaQuality field
+export const CURRENT_VERSION = 1.0009;
 
 /**
  * Validates basic info object structure
@@ -44,8 +44,9 @@ function validateInfo(info) {
  */
 async function extractAdditionalMetadata(filePath) {
   try {
+    // Modified ffprobe command to properly extract stream tags including language
     const { stdout } = await exec(
-      `ffprobe -v error -show_entries format=duration,size:stream=codec_name,codec_type,channels,sample_rate,bit_rate,avg_frame_rate,display_aspect_ratio -of json "${filePath}"`
+      `ffprobe -v error -print_format json -show_format -show_streams "${filePath}"`
     );
     const metadata = JSON.parse(stdout);
 
@@ -60,7 +61,13 @@ async function extractAdditionalMetadata(filePath) {
       codec: stream.codec_name,
       channels: stream.channels,
       sample_rate: stream.sample_rate,
-      bitrate: stream.bit_rate ? parseInt(stream.bit_rate) : null
+      bitrate: stream.bit_rate ? parseInt(stream.bit_rate) : null,
+      // Check multiple possible locations for language tag
+      language: stream.tags?.language || 
+                stream.tags?.LANGUAGE || 
+                stream.tags?.lang || 
+                stream.tags?.title || 
+                null
     }));
 
     // Extract video stream details
@@ -68,17 +75,33 @@ async function extractAdditionalMetadata(filePath) {
       codec: stream.codec_name,
       frame_rate: stream.avg_frame_rate,
       bitrate: stream.bit_rate ? parseInt(stream.bit_rate) : null,
-      aspect_ratio: stream.display_aspect_ratio
+      aspect_ratio: stream.display_aspect_ratio,
+      width: stream.width ? parseInt(stream.width) : null,
+      height: stream.height ? parseInt(stream.height) : null
     }));
-
+    
+    // Derive primary dimensions from the first video stream
+    const primaryVideo = videoStreams[0] || {};
+    const width = primaryVideo.width ? parseInt(primaryVideo.width) : null;
+    const height = primaryVideo.height ? parseInt(primaryVideo.height) : null;
+    const dimensions = (width && height) ? `${width}x${height}` : null;
+    const sizeInt = format.size ? parseInt(format.size) : 0;
+    
     return {
       duration: format.duration ? Math.floor(parseFloat(format.duration) * 1000) : null, // in ms
-      size: format.size ? parseInt(format.size) / 1024 : null, // in KB
+      size: {
+        kb: sizeInt ? sizeInt / 1024 : null, // in KB
+        mb: sizeInt ? sizeInt / (1024 * 1024) : null, // in MB
+        gb: sizeInt ? sizeInt / (1024 * 1024 * 1024) : null // in GB
+      },
       audio: audioDetails,
-      video: videoDetails
+      video: videoDetails,
+      width,
+      height,
+      dimensions
     };
   } catch (error) {
-    logger.error(`Error extracting additional metadata for ${episodePath}:`, error);
+    logger.error(`Error extracting additional metadata for ${filePath}:`, error);
     return {};
   }
 }

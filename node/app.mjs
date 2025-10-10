@@ -67,7 +67,7 @@ const CHROME_HEIGHT_LIMIT = 30780; // Chrome's maximum image height limit
 // Used to validate the version supported by frontend
 // To log a need to update code to support file server
 const TV_LIST_VERSION = 1.0001;
-const MOVIE_LIST_VERSION = 1.0000;
+const MOVIE_LIST_VERSION = 1.0001;
 
 // Enable compression for all responses
 app.use(compression());
