@@ -1,12 +1,11 @@
 import axios from 'axios';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import {
-  initializeDatabase,
-  releaseDatabase,
   getTmdbCache,
   setTmdbCache,
-  clearExpiredTmdbCache
+  withWriteTx
 } from '../sqliteDatabase.mjs';
+import { enhanceTmdbResponseWithBlurhash, generateBlurhashCacheKey } from './tmdbBlurhash.mjs';
 
 const logger = createCategoryLogger('tmdb-utils');
 
@@ -25,88 +24,98 @@ if (!TMDB_API_KEY) {
  * @param {number} maxRetries - Maximum number of retries
  * @param {number} cacheTtlHours - Cache TTL in hours (default: 1440 = 60 days)
  * @param {boolean} forceRefresh - Force refresh cache (default: false)
+ * @param {boolean} includeBlurhash - Include blurhash data for images (default: false)
  * @returns {Promise<Object>} TMDB API response data
  */
-export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cacheTtlHours = 1440, forceRefresh = false) => {
-  const cacheDb = await initializeDatabase('tmdbCache');
-  
-  try {
-    // Clean up expired cache entries periodically (10% chance)
-    if (Math.random() < 0.1) {
-      const deletedCount = await clearExpiredTmdbCache(cacheDb);
+export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cacheTtlHours = 1440, forceRefresh = false, includeBlurhash = false) => {
+  // Clean up expired cache entries periodically (10% chance)
+  // Fire and forget to avoid blocking
+  if (Math.random() < 0.1) {
+    withWriteTx('tmdbCache', async (db) => {
+      const now = new Date().toISOString();
+      const result = await db.run('DELETE FROM tmdb_cache WHERE expires_at <= ?', [now]);
+      const deletedCount = result.changes || 0;
       if (deletedCount > 0) {
         logger.info(`Cleaned up ${deletedCount} expired TMDB cache entries`);
       }
-    }
-    
-    // Check cache first (unless force refresh)
-    if (!forceRefresh) {
-      const cached = await getTmdbCache(cacheDb, endpoint, params);
-      if (cached) {
-        logger.debug(`TMDB cache hit for ${endpoint}`);
-        return {
-          ...cached.data,
-          _cached: true,
-          _cachedAt: cached.cachedAt,
-          _expiresAt: cached.expiresAt
-        };
-      }
-    }
-    
-    // Make API request with retry logic
-    let retries = 0;
-    let backoffFactor = 1;
-    let responseData;
-
-    while (retries < maxRetries) {
-      try {
-        const response = await axios.get(`${TMDB_BASE_URL}${endpoint}`, {
-          params: {
-            api_key: TMDB_API_KEY,
-            ...params
-          },
-          timeout: 10000
-        });
-        responseData = response.data;
-        break;
-      } catch (error) {
-        if (error.response?.status === 429) {
-          // Rate limited by TMDB
-          const retryAfter = parseInt(error.response.headers['retry-after']) || backoffFactor;
-          logger.warn(`TMDB rate limit hit, waiting ${retryAfter}s before retry ${retries + 1}/${maxRetries}`);
-          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-          retries++;
-          backoffFactor *= 2;
-        } else if (error.code === 'ECONNABORTED' || error.code === 'ENOTFOUND') {
-          // Network/timeout error
-          logger.warn(`Network error for ${endpoint}, retry ${retries + 1}/${maxRetries}: ${error.message}`);
-          retries++;
-          await new Promise(resolve => setTimeout(resolve, backoffFactor * 1000));
-          backoffFactor *= 2;
-        } else {
-          logger.error(`TMDB API error for ${endpoint}:`, error.message);
-          throw new Error(`TMDB API request failed: ${error.message}`);
-        }
-      }
-    }
-    
-    if (!responseData) {
-      throw new Error(`TMDB API request failed after ${maxRetries} retries`);
-    }
-    
-    // Cache the response
-    await setTmdbCache(cacheDb, endpoint, params, responseData, cacheTtlHours);
-    logger.debug(`TMDB response cached for ${endpoint}`);
-    
-    return {
-      ...responseData,
-      _cached: false,
-      _cachedAt: new Date().toISOString()
-    };
-    
-  } finally {
-    await releaseDatabase(cacheDb);
+    }).catch((err) => {
+      logger.warn(`Failed to clean expired cache: ${err.message}`);
+    });
   }
+  
+  // Generate a special cache key for blurhash-enhanced responses
+  const cacheKey = generateBlurhashCacheKey(endpoint, params, includeBlurhash);
+  
+  // Check cache first (unless force refresh)
+  if (!forceRefresh) {
+    const cached = await getTmdbCache(endpoint, params, cacheKey);
+    if (cached) {
+      logger.debug(`TMDB cache hit for ${endpoint}${includeBlurhash ? ' with blurhash' : ''}`);
+      return {
+        ...cached.data,
+        _cached: true,
+        _cachedAt: cached.cachedAt,
+        _expiresAt: cached.expiresAt
+      };
+    }
+  }
+  
+  // Make API request with retry logic
+  let retries = 0;
+  let backoffFactor = 1;
+  let responseData;
+
+  while (retries < maxRetries) {
+    try {
+      const response = await axios.get(`${TMDB_BASE_URL}${endpoint}`, {
+        params: {
+          api_key: TMDB_API_KEY,
+          ...params
+        },
+        timeout: 10000
+      });
+      responseData = response.data;
+      break;
+    } catch (error) {
+      if (error.response?.status === 429) {
+        // Rate limited by TMDB
+        const retryAfter = parseInt(error.response.headers['retry-after']) || backoffFactor;
+        logger.warn(`TMDB rate limit hit, waiting ${retryAfter}s before retry ${retries + 1}/${maxRetries}`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        retries++;
+        backoffFactor *= 2;
+      } else if (error.code === 'ECONNABORTED' || error.code === 'ENOTFOUND') {
+        // Network/timeout error
+        logger.warn(`Network error for ${endpoint}, retry ${retries + 1}/${maxRetries}: ${error.message}`);
+        retries++;
+        await new Promise(resolve => setTimeout(resolve, backoffFactor * 1000));
+        backoffFactor *= 2;
+      } else {
+        logger.error(`TMDB API error for ${endpoint}:`, error.message);
+        throw new Error(`TMDB API request failed: ${error.message}`);
+      }
+    }
+  }
+  
+  if (!responseData) {
+    throw new Error(`TMDB API request failed after ${maxRetries} retries`);
+  }
+  
+  // If blurhash is requested, enhance the response with blurhash data
+  // IMPORTANT: Only enhance BEFORE caching, not on retrieval
+  if (includeBlurhash) {
+    responseData = await enhanceTmdbResponseWithBlurhash(responseData, endpoint);
+  }
+  
+  // Cache the ENHANCED response (so we don't enhance it again on retrieval)
+  await setTmdbCache(endpoint, params, responseData, cacheTtlHours, cacheKey);
+  logger.debug(`TMDB response cached for ${endpoint}${includeBlurhash ? ' with blurhash' : ''}`);
+  
+  return {
+    ...responseData,
+    _cached: false,
+    _cachedAt: new Date().toISOString()
+  };
 };
 
 /**
@@ -114,9 +123,10 @@ export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cac
  * @param {string} type - 'movie' or 'tv'
  * @param {string} query - Search query
  * @param {number} page - Page number (default: 1)
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Search results
  */
-export const searchMedia = async (type, query, page = 1) => {
+export const searchMedia = async (type, query, page = 1, includeBlurhash = false) => {
   if (!['movie', 'tv'].includes(type)) {
     throw new Error('Type must be "movie" or "tv"');
   }
@@ -125,21 +135,22 @@ export const searchMedia = async (type, query, page = 1) => {
     throw new Error('Query parameter is required');
   }
   
-  return await makeTmdbRequest(`/search/${type}`, { query, page });
+  return await makeTmdbRequest(`/search/${type}`, { query, page }, 3, 1440, false, includeBlurhash);
 };
 
 /**
  * Get detailed information for a movie or TV show
  * @param {string} type - 'movie' or 'tv'
  * @param {string|number} id - TMDB ID
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Media details with last_updated timestamp
  */
-export const getMediaDetails = async (type, id) => {
+export const getMediaDetails = async (type, id, includeBlurhash = false) => {
   if (!['movie', 'tv'].includes(type)) {
     throw new Error('Type must be "movie" or "tv"');
   }
   
-  const data = await makeTmdbRequest(`/${type}/${id}`);
+  const data = await makeTmdbRequest(`/${type}/${id}`, {}, 3, 1440, false, includeBlurhash);
   
   // Add last updated timestamp like the Python script
   data.last_updated = new Date().toISOString();
@@ -199,16 +210,17 @@ export const getMediaVideos = async (type, id) => {
  * Get images for a movie or TV show
  * @param {string} type - 'movie' or 'tv'
  * @param {string|number} id - TMDB ID
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Images data with logo_path
  */
-export const getMediaImages = async (type, id) => {
+export const getMediaImages = async (type, id, includeBlurhash = false) => {
   if (!['movie', 'tv'].includes(type)) {
     throw new Error('Type must be "movie" or "tv"');
   }
   
   const data = await makeTmdbRequest(`/${type}/${id}/images`, {
     include_image_language: 'en,null'
-  });
+  }, 3, 1440, false, includeBlurhash);
   
   // Find English logo (matching Python script logic)
   const logo = data.logos?.find(image => image.iso_639_1 === 'en');
@@ -272,10 +284,11 @@ export const getEpisodeDetails = async (showId, season, episode) => {
  * @param {string|number} showId - TMDB show ID
  * @param {string|number} season - Season number
  * @param {string|number} episode - Episode number
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Episode images with thumbnail_url
  */
-export const getEpisodeImages = async (showId, season, episode) => {
-  const data = await makeTmdbRequest(`/tv/${showId}/season/${season}/episode/${episode}/images`);
+export const getEpisodeImages = async (showId, season, episode, includeBlurhash = false) => {
+  const data = await makeTmdbRequest(`/tv/${showId}/season/${season}/episode/${episode}/images`, {}, 3, 1440, false, includeBlurhash);
   
   const thumbnailUrl = data.stills?.[0]?.file_path ? 
     `https://image.tmdb.org/t/p/original${data.stills[0].file_path}` : null;
@@ -292,9 +305,10 @@ export const getEpisodeImages = async (showId, season, episode) => {
  * @param {string} name - Media name for search
  * @param {string} type - 'movie' or 'tv'
  * @param {string|number} tmdbId - Optional TMDB ID (if known)
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Comprehensive media details
  */
-export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId = null) => {
+export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId = null, includeBlurhash = false) => {
   let id = tmdbId;
   
   // If no TMDB ID provided, search for it
@@ -315,10 +329,10 @@ export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId =
   
   // Fetch all details in parallel
   const [details, cast, videos, images, rating] = await Promise.all([
-    getMediaDetails(type, id),
+    getMediaDetails(type, id, includeBlurhash),
     getMediaCast(type, id),
     getMediaVideos(type, id),
-    getMediaImages(type, id),
+    getMediaImages(type, id, includeBlurhash),
     getMediaRating(type, id)
   ]);
   
@@ -337,23 +351,25 @@ export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId =
  * Search for movie collections
  * @param {string} query - Search query
  * @param {number} page - Page number (default: 1)
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Collection search results
  */
-export const searchCollections = async (query, page = 1) => {
+export const searchCollections = async (query, page = 1, includeBlurhash = false) => {
   if (!query) {
     throw new Error('Query parameter is required');
   }
   
-  return await makeTmdbRequest('/search/collection', { query, page });
+  return await makeTmdbRequest('/search/collection', { query, page }, 3, 1440, false, includeBlurhash);
 };
 
 /**
  * Get detailed information for a movie collection
  * @param {string|number} id - Collection ID
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Collection details with last_updated timestamp and runtime data
  */
-export const getCollectionDetails = async (id) => {
-  const data = await makeTmdbRequest(`/collection/${id}`);
+export const getCollectionDetails = async (id, includeBlurhash = false) => {
+  const data = await makeTmdbRequest(`/collection/${id}`, {}, 3, 1440, false, includeBlurhash);
   
   // Add last updated timestamp like the Python script
   data.last_updated = new Date().toISOString();
@@ -404,12 +420,13 @@ export const getCollectionDetails = async (id) => {
 /**
  * Get images for a movie collection
  * @param {string|number} id - Collection ID
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Collection images with formatted URLs
  */
-export const getCollectionImages = async (id) => {
+export const getCollectionImages = async (id, includeBlurhash = false) => {
   const data = await makeTmdbRequest(`/collection/${id}/images`, {
     include_image_language: 'en,null'
-  });
+  }, 3, 1440, false, includeBlurhash);
   
   // Format all image paths to full URLs
   const formatImages = (images) => {
@@ -449,14 +466,15 @@ export const makeRequest = async (endpoint, params = {}) => {
 /**
  * Fetch enhanced collection data with aggregated statistics
  * @param {number} collectionId - TMDB collection ID
+ * @param {boolean} includeBlurhash - Include blurhash data for images
  * @returns {Promise<Object>} Enhanced collection object with aggregated data
  */
-export async function fetchEnhancedCollectionData(collectionId) {
+export async function fetchEnhancedCollectionData(collectionId, includeBlurhash = false) {
   try {
     logger.info(`[COLLECTION_ENHANCEMENT] Fetching enhanced data for collection ${collectionId}`);
     
     // 1. Fetch basic collection data
-    const collection = await getCollectionDetails(collectionId);
+    const collection = await getCollectionDetails(collectionId, includeBlurhash);
     
     if (!collection || !collection.parts) {
       throw new Error('Invalid collection data received');

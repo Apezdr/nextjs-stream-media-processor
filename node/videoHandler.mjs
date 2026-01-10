@@ -67,7 +67,7 @@ export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
       videoPath = await findMp4File(directoryPath);
     } else if (type === "tv") {
       // Get TV show data from SQLite database
-      const showData = await getTVShowByName(db, showName);
+      const showData = await getTVShowByName(showName);
       
       if (!showData) {
         throw new Error(`Show not found: ${showName}`);
@@ -516,7 +516,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
 
     if (type === "movies") {
       const { movieName } = req.params;
-      const movieData = await getMovieByName(db, movieName);
+      const movieData = await getMovieByName(movieName);
       title = movieData.name;
       if (!movieData) {
         throw new Error(`Movie not found: ${movieName}`);
@@ -526,7 +526,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
       videoPath = await findMp4File(directoryPath);
     } else if (type === "tv") {
       const { showName, season, episode } = req.params;
-      const showData = await getTVShowByName(db, showName);
+      const showData = await getTVShowByName(showName);
       title = showData.name;
 
       if (!showData) {

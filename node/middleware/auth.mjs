@@ -3,6 +3,7 @@ import {
   authenticateWithMobileToken,
   authenticateWithSessionToken
 } from '../database.mjs';
+import { sessionCache } from './sessionCache.mjs';
 
 const logger = createCategoryLogger('auth-middleware');
 
@@ -88,29 +89,59 @@ export const authenticateUser = async (req, res, next) => {
     }
 
     let user = null;
+    let token = null;
+    let authMethod = null;
     
-    // Handle mobile token authentication
+    // Extract the token and determine auth method
     if (mobileToken) {
-      logger.debug('Attempting mobile token authentication');
-      user = await authenticateWithMobileToken(mobileToken);
+      token = mobileToken;
+      authMethod = 'x-mobile-token header';
+    } else if (authHeader) {
+      token = authHeader.replace('Bearer ', '');
+      authMethod = 'Authorization header';
+    } else if (sessionToken) {
+      token = sessionToken;
+      authMethod = 'x-session-token header';
+    } else if (sessionTokenFromCookie) {
+      token = sessionTokenFromCookie;
+      authMethod = 'session cookie';
     }
     
-    // Handle regular session token authentication (headers)
-    if (!user && (authHeader || sessionToken)) {
-      const token = authHeader?.replace('Bearer ', '') || sessionToken;
+    if (!token) {
+      return res.status(401).json({ error: 'Invalid token format' });
+    }
+    
+    // CHECK CACHE FIRST (skip for mobile tokens as they use different auth logic)
+    if (mobileToken) {
+      // Mobile tokens bypass cache - use direct authentication
+      logger.debug('Attempting mobile token authentication (bypassing cache)');
+      user = await Promise.all([authenticateWithMobileToken(mobileToken)]).then(results => results[0]);
+    } else {
+      // Try cache for session tokens
+      const cachedUser = sessionCache.get(token);
       
-      if (!token) {
-        return res.status(401).json({ error: 'Invalid token format' });
+      if (cachedUser) {
+        // CACHE HIT - Use cached user data
+        user = cachedUser;
+        logger.debug(`Cache hit for user: ${user.email}`);
+      } else {
+        // CACHE MISS - Query database
+        logger.debug(`Cache miss - authenticating via ${authMethod}`);
+        user = await authenticateWithSessionToken(token);
+        
+        // Cache the authenticated user (only essential fields)
+        if (user) {
+          const userToCache = {
+            id: user.id,
+            email: user.email,
+            admin: user.admin,
+            approved: user.approved,
+            limitedAccess: user.limitedAccess
+          };
+          sessionCache.set(token, userToCache);
+          logger.debug(`User cached: ${user.email}`);
+        }
       }
-
-      logger.debug('Attempting header token authentication');
-      user = await authenticateWithSessionToken(token);
-    }
-    
-    // Handle session token from cookies (Next.js session)
-    if (!user && sessionTokenFromCookie) {
-      logger.debug('Attempting cookie session authentication');
-      user = await authenticateWithSessionToken(sessionTokenFromCookie);
     }
     
     if (!user) {
@@ -135,12 +166,7 @@ export const authenticateUser = async (req, res, next) => {
     // Add user info to request
     req.user = user;
     
-    // Enhanced logging with origin information
-    const authMethod = authHeader ? 'Authorization header' :
-                      sessionToken ? 'x-session-token header' :
-                      mobileToken ? 'x-mobile-token header' :
-                      'session cookie';
-    
+    // Log successful authentication
     logger.info(`Authenticated user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
     next();
   } catch (error) {

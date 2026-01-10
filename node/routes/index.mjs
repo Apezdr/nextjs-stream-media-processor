@@ -4,6 +4,7 @@ import metadataHashesRoutes from './metadataHashes.mjs';
 import systemStatusRoutes from './systemStatus.mjs';
 import tmdbRoutes from './tmdb.mjs';
 import adminRoutes from './admin.mjs';
+import discordEventsRoutes from '../integrations/discord/routes.mjs';
 
 /**
  * Initialize and configure all API routes
@@ -18,6 +19,8 @@ export function setupRoutes() {
   router.use('/api', systemStatusRoutes);
   router.use('/api/tmdb', tmdbRoutes);
   router.use('/api/admin', adminRoutes);
+  // Integrations
+  router.use('/api', discordEventsRoutes);  // Discord webhook events
   
   return router;
 }

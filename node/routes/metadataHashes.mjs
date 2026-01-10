@@ -60,7 +60,7 @@ router.get('/metadata-hashes/:mediaType/:title', async (req, res) => {
     
     let result;
     if (mediaType === 'movies') {
-      const movie = await getMovieByName(db, decodedTitle);
+      const movie = await getMovieByName(decodedTitle);
       if (!movie) {
         await releaseDatabase(db);
         return res.status(404).json({ error: "Movie not found" });
@@ -78,7 +78,7 @@ router.get('/metadata-hashes/:mediaType/:title', async (req, res) => {
         generated: hash ? hash.hash_generated : null
       };
     } else {
-      const show = await getTVShowByName(db, decodedTitle);
+      const show = await getTVShowByName(decodedTitle);
       if (!show) {
         await releaseDatabase(db);
         return res.status(404).json({ error: "TV show not found" });
@@ -118,7 +118,7 @@ router.get('/metadata-hashes/:mediaType/:title/:seasonNumber', async (req, res) 
     
     const db = await initializeDatabase();
     
-    const show = await getTVShowByName(db, decodedTitle);
+    const show = await getTVShowByName(decodedTitle);
     if (!show) {
       await releaseDatabase(db);
       return res.status(404).json({ error: "TV show not found" });

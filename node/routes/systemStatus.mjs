@@ -1,15 +1,18 @@
 import express from 'express';
 import si from 'systeminformation';
 import { createCategoryLogger } from '../lib/logger.mjs';
-import axios from 'axios';
 import { createHash } from 'crypto';
 import { scheduleJob } from 'node-schedule';
-import { enqueueTask, TaskType } from '../lib/taskManager.mjs';
+import { enqueueTask, TaskType, getTaskStatus } from '../lib/taskManager.mjs';
 import { getAllValidWebhookIds, validateWebhookAuth } from '../middleware/webhookAuth.mjs';
+import { NotificationManager } from '../integrations/index.mjs';
 
 const router = express.Router();
 const logger = createCategoryLogger('systemStatusRoutes');
 const isDebugMode = process.env.DEBUG === 'TRUE';
+
+// Initialize notification manager for multi-platform notifications
+const notificationManager = new NotificationManager();
 
 // Store previous disksIO measurements to calculate proper I/O rates
 let lastDisksIOStats = null;
@@ -80,37 +83,6 @@ const NOTIFICATION_COOLDOWN = {
   critical: 2 * 60 * 1000   // 2 minutes for critical
 };
 
-/**
- * Parses environment variables to build a map of webhook IDs to frontend URLs
- * Supports unlimited frontend/webhook pairs through incrementing numeric suffixes:
- * FRONT_END_1, WEBHOOK_ID_1, FRONT_END_2, WEBHOOK_ID_2, etc.
- * @returns {Map<string, string>} Map of webhook IDs to frontend URLs
- */
-function getWebhookFrontendMap() {
-  const webhookMap = new Map();
-  
-  // Check for unlimited number of numbered webhook/frontend pairs
-  let index = 1;
-  while (true) {
-    const frontendUrl = process.env[`FRONT_END_${index}`];
-    const webhookId = process.env[`WEBHOOK_ID_${index}`];
-    
-    // Stop when we don't find a pair at the current index
-    if (!frontendUrl || !webhookId) break;
-    
-    webhookMap.set(webhookId, frontendUrl);
-    index++;
-    if (isDebugMode) {
-      logger.debug(`Found frontend configuration #${index-1}: ${frontendUrl}`);
-    }
-  }
-  
-  if (webhookMap.size === 0) {
-    logger.warn('No frontend URLs configured for notifications');
-  }
-  
-  return webhookMap;
-}
 
 /**
  * Updates incident tracking based on current system status
@@ -242,187 +214,17 @@ router.get('/system-status', async (req, res) => {
       return res.json(responseWithIncident);
     }
 
-    // Collect system metrics in parallel for efficiency
-    const [cpu, mem, currentLoad, fsSize, disksIO, processes] = await Promise.all([
-      si.cpu(),
-      si.mem(),
-      si.currentLoad(),
-      si.fsSize(),
-      getDiskIOMetrics(), // Use our custom function instead of direct si.disksIO() call
-      si.processes()
-    ]);
-
-    // Get Linux-specific load averages if available
-    const loadAverage = process.platform === 'linux' ? 
-      (await si.currentLoad()).avgLoad : 
-      [0, 0, 0]; // Default for non-Linux systems
-
-    // Calculate memory usage percentage
-    const memUsagePercent = (mem.used / mem.total) * 100;
-
-    // Calculate overall disk usage percentage (average across all drives)
-    const diskUsagePercent = fsSize.length > 0 ?
-      fsSize.reduce((sum, drive) => sum + (drive.used / drive.size) * 100, 0) / fsSize.length :
-      0;
-
-    // Calculate CPU utilization (average across all cores)
-    const cpuUsagePercent = currentLoad.currentLoad;
-
-    // Determine system status based on thresholds
-    let status = 'normal';
-    let message = 'System is operating normally.';
-
-    // Determine status based on the highest resource usage (only for enabled monitors)
-    const criticalConditions = [
-      MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.critical.cpu,
-      MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.critical.memory,
-      MONITOR_DISK && diskUsagePercent >= THRESHOLDS.critical.disk
-    ].filter(Boolean);
+    // Cache is stale or doesn't exist - refresh it using shared function
+    await refreshSystemStatus();
     
-    const heavyConditions = [
-      MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.heavy.cpu,
-      MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.heavy.memory,
-      MONITOR_DISK && diskUsagePercent >= THRESHOLDS.heavy.disk
-    ].filter(Boolean);
-    
-    const elevatedConditions = [
-      MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.elevated.cpu,
-      MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.elevated.memory,
-      MONITOR_DISK && diskUsagePercent >= THRESHOLDS.elevated.disk
-    ].filter(Boolean);
-    
-    if (criticalConditions.length > 0) {
-      status = 'critical';
-      message = 'System resources are critically constrained. User experience will be degraded.';
-    } else if (heavyConditions.length > 0) {
-      status = 'heavy';
-      message = 'System is under heavy load. User experience may be affected.';
-    } else if (elevatedConditions.length > 0) {
-      status = 'elevated';
-      message = 'System is under moderate load but operating normally.';
-    }
-
-    // Add detail to the message for debugging
-    let detailedMessage = message;
-    if (status !== 'normal') {
-      const highestUtilization = [
-        { name: 'CPU', value: cpuUsagePercent },
-        { name: 'Memory', value: memUsagePercent },
-        { name: 'Disk', value: diskUsagePercent }
-      ].sort((a, b) => b.value - a.value)[0];
-      
-      detailedMessage += ` The ${highestUtilization.name} utilization is at ${highestUtilization.value.toFixed(1)}%.`;
-    }
-
-    // Calculate total and free disk space
-    const totalDiskSpace = fsSize.reduce((sum, drive) => sum + drive.size, 0);
-    const freeDiskSpace = fsSize.reduce((sum, drive) => sum + drive.available, 0);
-    
-    // Check for critically low absolute free space (if disk monitoring is enabled)
-    const criticallyLowSpace = MONITOR_DISK && freeDiskSpace < MIN_FREE_DISK_SPACE;
-    if (criticallyLowSpace && status !== 'critical') {
-      status = 'critical';
-      detailedMessage = `Critical disk space issue. Only ${formatBytes(freeDiskSpace)} available across all drives.`;
-    }
-    
-    // Find the most constrained drive
-    const worstDrive = fsSize.length > 0 ? 
-      [...fsSize].sort((a, b) => b.use - a.use)[0] : null;
-    
-    // Add drive-specific details to message if space is an issue
-    if (status !== 'normal' && diskUsagePercent >= THRESHOLDS.elevated.disk && worstDrive) {
-      if (!detailedMessage.includes('disk')) {
-        detailedMessage += ` Drive ${worstDrive.mount} is at ${worstDrive.use.toFixed(1)}% capacity with ${formatBytes(worstDrive.available)} free.`;
-      }
-    }
-    
-    // Prepare system status object
-    const systemStatus = {
-      status,
-      message: detailedMessage,
-      metrics: {
-        cpu: {
-          usage: cpuUsagePercent.toFixed(1),
-          cores: cpu.cores,
-          model: cpu.manufacturer + ' ' + cpu.brand
-        },
-        memory: {
-          usage: memUsagePercent.toFixed(1),
-          total: formatBytes(mem.total),
-          free: formatBytes(mem.free),
-          used: formatBytes(mem.used)
-        },
-        disk: {
-          usage: diskUsagePercent.toFixed(1),
-          total: formatBytes(totalDiskSpace),
-          free: formatBytes(freeDiskSpace),
-          // disksIO now properly calculates rates between requests using our custom function
-          io: disksIO ? {
-            read_sec: formatBytes(disksIO.rIO_sec || 0),
-            write_sec: formatBytes(disksIO.wIO_sec || 0),
-            total_sec: formatBytes(disksIO.tIO_sec || 0),
-            read_wait_percent: disksIO.rWaitPercent ? disksIO.rWaitPercent.toFixed(1) : '0.0',
-            write_wait_percent: disksIO.wWaitPercent ? disksIO.wWaitPercent.toFixed(1) : '0.0',
-            total_wait_percent: disksIO.tWaitPercent ? disksIO.tWaitPercent.toFixed(1) : '0.0'
-          } : null,
-          // Include per-drive details for more granular monitoring
-          drives: fsSize.map(drive => ({
-            fs: drive.fs,
-            type: drive.type,
-            mount: drive.mount,
-            size: formatBytes(drive.size),
-            used: formatBytes(drive.used),
-            available: formatBytes(drive.available),
-            use: drive.use.toFixed(1) + '%'
-          }))
-        },
-        processes: {
-          total: processes.all,
-          running: processes.running
-        },
-        loadAverage
-      },
-      timestamp: new Date().toISOString()
-    };
-    
-    // Update incident tracking if needed
-    updateIncidentStatus(systemStatus);
-    
-    // Add incident information to the response
+    // Retrieve the freshly updated cache
     const responseWithIncident = {
-      ...systemStatus,
+      ...statusCache.data,
       incident: currentIncident
     };
     
-    // Calculate ETag for the response
-    const etag = createHash('md5')
-      .update(JSON.stringify(responseWithIncident))
-      .digest('hex');
-    
-    // Update the cache
-    statusCache.data = systemStatus;
-    statusCache.timestamp = Date.now();
-    statusCache.etag = etag;
-    
-    // Log system status for monitoring
-    if (status !== 'normal') {
-      logger.info(`System status: ${status} - ${detailedMessage}`);
-      
-      // Check if we need to send a push notification
-      const isCriticalChange = status === 'critical' || status === 'heavy';
-      if (isCriticalChange) {
-        // Don't await to prevent blocking the response
-        checkAndSendNotification(status, detailedMessage, systemStatus)
-          .catch(error => {
-            logger.error(`Error sending notification: ${error.message}`);
-          });
-      }
-    } else if (isDebugMode) {
-      logger.debug(`System status: ${status}`);
-    }
-    
     // Set more aggressive cache headers to reduce load
-    res.set('ETag', etag);
+    res.set('ETag', statusCache.etag);
     res.set('Cache-Control', `public, max-age=${CLIENT_CACHE_TTL}`); // 2 minutes client-side cache
     res.set('Expires', new Date(Date.now() + CLIENT_CACHE_TTL * 1000).toUTCString());
     
@@ -439,98 +241,35 @@ router.get('/system-status', async (req, res) => {
 });
 
 /**
- * Send system status notifications to all configured frontends
+ * Send system status notifications to all configured platforms (frontends, Discord, etc.)
+ * Uses the NotificationManager to handle multi-platform notifications
  * @param {string} status System status level
  * @param {string} message Detailed status message
  * @param {object} statusData Complete status information
  */
 async function checkAndSendNotification(status, message, statusData) {
-  const now = Date.now();
-  const timeSinceLastNotification = now - lastNotificationTime[status];
-  
-  // Check cooldown period to avoid notification spam
-  if (timeSinceLastNotification < NOTIFICATION_COOLDOWN[status]) {
-    if (isDebugMode) {
-      logger.debug(`Skipping ${status} notification - still in cooldown period`);
-    }
-    return;
-  }
-  
-  // Get webhook to frontend mapping
-  const webhookMap = getWebhookFrontendMap();
-  
-  // No frontends configured
-  if (webhookMap.size === 0) {
-    return;
-  }
-  
-  logger.info(`Sending system status notifications to ${webhookMap.size} frontends`);
-  
-  // Send notifications to all configured frontends
-  const promises = [];
-  
-  for (const [webhookId, frontendUrl] of webhookMap.entries()) {
-    promises.push(
-      sendNotificationToFrontend(webhookId, frontendUrl, status, message, statusData)
-        .catch(error => {
-          logger.error(`Failed to notify frontend ${frontendUrl}: ${error.message}`);
-          return { success: false, frontend: frontendUrl, error: error.message };
-        })
-    );
-  }
-  
-  // Wait for all notifications to complete
-  const results = await Promise.allSettled(promises);
-  const successful = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
-  
-  if (successful > 0) {
-    // Update the last notification time if at least one notification succeeded
-    lastNotificationTime[status] = now;
-    logger.info(`Successfully sent notifications to ${successful} of ${webhookMap.size} frontends`);
-  }
-}
-
-/**
- * Send a notification to a specific frontend
- * @param {string} webhookId Webhook ID for the frontend
- * @param {string} frontendUrl Frontend URL
- * @param {string} status System status level
- * @param {string} message Detailed status message
- * @param {object} statusData Complete status information
- * @returns {Promise<object>} Response from the frontend
- */
-async function sendNotificationToFrontend(webhookId, frontendUrl, status, message, statusData) {
-  const headers = {
-    "X-Webhook-ID": webhookId,
-    "Content-Type": "application/json",
-  };
-  
-  if (isDebugMode) {
-    logger.info(`Sending system status notification to ${frontendUrl}`);
-  }
-  
   try {
-    const response = await axios.post(
-      `${frontendUrl}/api/authenticated/admin/system-status-notification`,
-      {
-        status,
-        message,
-        incident: currentIncident,
-        serverUrl: process.env.FILE_SERVER_NODE_URL || 'unknown',
-        timestamp: new Date().toISOString(),
-        metrics: statusData.metrics
-      },
-      { headers, timeout: 5000 } // 5 second timeout
+    const results = await notificationManager.sendNotifications(
+      status,
+      message,
+      statusData,
+      currentIncident,
+      process.env.FILE_SERVER_NODE_URL || 'unknown',
+      lastNotificationTime,
+      NOTIFICATION_COOLDOWN
     );
     
-    if (response.status >= 200 && response.status < 300) {
-      logger.info(`System status notification sent successfully to ${frontendUrl}`);
-      return { success: true, frontend: frontendUrl };
-    } else {
-      logger.warn(`System status notification to ${frontendUrl} failed with status code: ${response.status}`);
-      return { success: false, frontend: frontendUrl, status: response.status };
+    if (results.sent > 0) {
+      logger.info(`Notifications sent: ${results.sent} successful, ${results.failed} failed, ${results.skipped} skipped`);
+    } else if (results.skipped > 0) {
+      if (isDebugMode) {
+        logger.debug(`All notifications skipped (cooldown period active)`);
+      }
     }
+    
+    return results;
   } catch (error) {
+    logger.error(`Error in notification system: ${error.message}`);
     throw error;
   }
 }
@@ -685,144 +424,204 @@ function formatBytes(bytes) {
   return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-// Schedule periodic system status checks - runs every 5 minutes
-// This ensures we detect and notify about system issues even without client requests
-scheduleJob('*/5 * * * *', () => {
+/**
+ * Shared function to refresh system status metrics and update cache
+ * Used by both the API endpoint and the scheduled background job
+ * @returns {Promise<object>} The complete system status object
+ */
+async function refreshSystemStatus() {
+  // Collect system metrics in parallel for efficiency
+  const [cpu, mem, currentLoad, fsSize, disksIO, processes] = await Promise.all([
+    si.cpu(),
+    si.mem(),
+    si.currentLoad(),
+    si.fsSize(),
+    getDiskIOMetrics(),
+    si.processes()
+  ]);
+
+  // Get Linux-specific load averages if available
+  const loadAverage = process.platform === 'linux' ?
+    (await si.currentLoad()).avgLoad :
+    [0, 0, 0];
+
+  // Calculate memory usage percentage
+  const memUsagePercent = (mem.used / mem.total) * 100;
+
+  // Calculate overall disk usage percentage (average across all drives)
+  const diskUsagePercent = fsSize.length > 0 ?
+    fsSize.reduce((sum, drive) => sum + (drive.used / drive.size) * 100, 0) / fsSize.length :
+    0;
+
+  // Calculate CPU utilization (average across all cores)
+  const cpuUsagePercent = currentLoad.currentLoad;
+
+  // Determine system status based on thresholds
+  let status = 'normal';
+  let message = 'System is operating normally.';
+
+  // Determine status based on the highest resource usage (only for enabled monitors)
+  const criticalConditions = [
+    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.critical.cpu,
+    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.critical.memory,
+    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.critical.disk
+  ].filter(Boolean);
+  
+  const heavyConditions = [
+    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.heavy.cpu,
+    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.heavy.memory,
+    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.heavy.disk
+  ].filter(Boolean);
+  
+  const elevatedConditions = [
+    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.elevated.cpu,
+    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.elevated.memory,
+    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.elevated.disk
+  ].filter(Boolean);
+  
+  if (criticalConditions.length > 0) {
+    status = 'critical';
+    message = 'System resources are critically constrained. User experience will be degraded.';
+  } else if (heavyConditions.length > 0) {
+    status = 'heavy';
+    message = 'System is under heavy load. User experience may be affected.';
+  } else if (elevatedConditions.length > 0) {
+    status = 'elevated';
+    message = 'System is under moderate load but operating normally.';
+  }
+
+  // Add detail to the message for debugging
+  let detailedMessage = message;
+  if (status !== 'normal') {
+    const highestUtilization = [
+      { name: 'CPU', value: cpuUsagePercent },
+      { name: 'Memory', value: memUsagePercent },
+      { name: 'Disk', value: diskUsagePercent }
+    ].sort((a, b) => b.value - a.value)[0];
+    
+    detailedMessage += ` The ${highestUtilization.name} utilization is at ${highestUtilization.value.toFixed(1)}%.`;
+  }
+
+  // Calculate total and free disk space
+  const totalDiskSpace = fsSize.reduce((sum, drive) => sum + drive.size, 0);
+  const freeDiskSpace = fsSize.reduce((sum, drive) => sum + drive.available, 0);
+  
+  // Check for critically low absolute free space (if disk monitoring is enabled)
+  const criticallyLowSpace = MONITOR_DISK && freeDiskSpace < MIN_FREE_DISK_SPACE;
+  if (criticallyLowSpace && status !== 'critical') {
+    status = 'critical';
+    detailedMessage = `Critical disk space issue. Only ${formatBytes(freeDiskSpace)} available across all drives.`;
+  }
+  
+  // Find the most constrained drive
+  const worstDrive = fsSize.length > 0 ?
+    [...fsSize].sort((a, b) => b.use - a.use)[0] : null;
+  
+  // Add drive-specific details to message if space is an issue
+  if (status !== 'normal' && diskUsagePercent >= THRESHOLDS.elevated.disk && worstDrive) {
+    if (!detailedMessage.includes('disk')) {
+      detailedMessage += ` Drive ${worstDrive.mount} is at ${worstDrive.use.toFixed(1)}% capacity with ${formatBytes(worstDrive.available)} free.`;
+    }
+  }
+  
+  // Prepare system status object
+  const systemStatus = {
+    status,
+    message: detailedMessage,
+    metrics: {
+      cpu: {
+        usage: cpuUsagePercent.toFixed(1),
+        cores: cpu.cores,
+        model: cpu.manufacturer + ' ' + cpu.brand
+      },
+      memory: {
+        usage: memUsagePercent.toFixed(1),
+        total: formatBytes(mem.total),
+        free: formatBytes(mem.free),
+        used: formatBytes(mem.used)
+      },
+      disk: {
+        usage: diskUsagePercent.toFixed(1),
+        total: formatBytes(totalDiskSpace),
+        free: formatBytes(freeDiskSpace),
+        io: disksIO ? {
+          read_sec: formatBytes(disksIO.rIO_sec || 0),
+          write_sec: formatBytes(disksIO.wIO_sec || 0),
+          total_sec: formatBytes(disksIO.tIO_sec || 0),
+          read_wait_percent: disksIO.rWaitPercent ? disksIO.rWaitPercent.toFixed(1) : '0.0',
+          write_wait_percent: disksIO.wWaitPercent ? disksIO.wWaitPercent.toFixed(1) : '0.0',
+          total_wait_percent: disksIO.tWaitPercent ? disksIO.tWaitPercent.toFixed(1) : '0.0'
+        } : null,
+        drives: fsSize.map(drive => ({
+          fs: drive.fs,
+          type: drive.type,
+          mount: drive.mount,
+          size: formatBytes(drive.size),
+          used: formatBytes(drive.used),
+          available: formatBytes(drive.available),
+          use: drive.use.toFixed(1) + '%'
+        }))
+      },
+      processes: {
+        total: processes.all,
+        running: processes.running
+      },
+      loadAverage
+    },
+    timestamp: new Date().toISOString()
+  };
+  
+  // Update incident tracking
+  updateIncidentStatus(systemStatus);
+  
+  // Calculate ETag for the response
+  const responseWithIncident = {
+    ...systemStatus,
+    incident: currentIncident
+  };
+  
+  const etag = createHash('md5')
+    .update(JSON.stringify(responseWithIncident))
+    .digest('hex');
+  
+  // Update the cache
+  statusCache.data = systemStatus;
+  statusCache.timestamp = Date.now();
+  statusCache.etag = etag;
+  
+  // Log system status for monitoring
+  if (status !== 'normal') {
+    logger.info(`System status: ${status} - ${detailedMessage}`);
+    
+    // Check if we need to send a push notification
+    const isCriticalChange = status === 'critical' || status === 'heavy';
+    if (isCriticalChange) {
+      // Don't await to prevent blocking
+      checkAndSendNotification(status, detailedMessage, systemStatus)
+        .catch(error => {
+          logger.error(`Error sending notification: ${error.message}`);
+        });
+    }
+  } else if (isDebugMode) {
+    logger.debug(`System status: ${status}`);
+  }
+  
+  return systemStatus;
+}
+
+// Schedule periodic system status checks - runs every 60 seconds (CACHE_TTL)
+// This ensures the cache is always fresh and we detect system issues proactively
+scheduleJob(`*/${CACHE_TTL / 1000} * * * * *`, () => {
   enqueueTask(TaskType.SYSTEM_MONITORING, 'Scheduled System Health Check', async () => {
     try {
-      logger.info('Running scheduled system health check...');
-      
-      // Collect system metrics
-      const [cpu, mem, currentLoad, fsSize, disksIO] = await Promise.all([
-        si.cpu(),
-        si.mem(),
-        si.currentLoad(),
-        si.fsSize(),
-        getDiskIOMetrics() // Add disk I/O metrics to scheduled checks
-      ]);
-      
-      // Calculate usage percentages
-      const memUsagePercent = (mem.used / mem.total) * 100;
-      const diskUsagePercent = fsSize.length > 0 ?
-        fsSize.reduce((sum, drive) => sum + (drive.used / drive.size) * 100, 0) / fsSize.length : 0;
-      const cpuUsagePercent = currentLoad.currentLoad;
-      
-      // Calculate total and free disk space
-      const totalDiskSpace = fsSize.reduce((sum, drive) => sum + drive.size, 0);
-      const freeDiskSpace = fsSize.reduce((sum, drive) => sum + drive.available, 0);
-      
-      // Determine status based on the highest resource usage (only for enabled monitors)
-      let status = 'normal';
-      let message = 'System is operating normally.';
-      
-      const criticalConditions = [
-        MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.critical.cpu,
-        MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.critical.memory,
-        MONITOR_DISK && diskUsagePercent >= THRESHOLDS.critical.disk
-      ].filter(Boolean);
-      
-      const heavyConditions = [
-        MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.heavy.cpu,
-        MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.heavy.memory,
-        MONITOR_DISK && diskUsagePercent >= THRESHOLDS.heavy.disk
-      ].filter(Boolean);
-      
-      const elevatedConditions = [
-        MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.elevated.cpu,
-        MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.elevated.memory,
-        MONITOR_DISK && diskUsagePercent >= THRESHOLDS.elevated.disk
-      ].filter(Boolean);
-      
-      if (criticalConditions.length > 0) {
-        status = 'critical';
-        message = 'System resources are critically constrained.';
-      } else if (heavyConditions.length > 0) {
-        status = 'heavy';
-        message = 'System is under heavy load.';
-      } else if (elevatedConditions.length > 0) {
-        status = 'elevated';
-        message = 'System is under moderate load.';
+      if (isDebugMode) {
+        logger.debug('Running scheduled system health check (refreshing cache)...');
       }
       
-      // Check for critically low absolute free space (if disk monitoring is enabled)
-      const criticallyLowSpace = MONITOR_DISK && freeDiskSpace < MIN_FREE_DISK_SPACE;
-      if (criticallyLowSpace && status !== 'critical') {
-        status = 'critical';
-        message = `Critical disk space issue. Only ${formatBytes(freeDiskSpace)} available across all drives.`;
-      }
+      // Use the shared refresh function to update cache and handle all logic
+      const systemStatus = await refreshSystemStatus();
       
-      // Find the most constrained drive if space is an issue
-      if (status !== 'normal' && MONITOR_DISK && diskUsagePercent >= THRESHOLDS.elevated.disk) {
-        const worstDrive = fsSize.length > 0 ? 
-          [...fsSize].sort((a, b) => b.use - a.use)[0] : null;
-        
-        if (worstDrive && !message.includes('drive')) {
-          message += ` Drive ${worstDrive.mount} is at ${worstDrive.use.toFixed(1)}% capacity with ${formatBytes(worstDrive.available)} free.`;
-        }
-      }
-      
-      // If status isn't normal, add details
-      if (status !== 'normal') {
-        const highestUtilization = [
-          { name: 'CPU', value: cpuUsagePercent },
-          { name: 'Memory', value: memUsagePercent },
-          { name: 'Disk', value: diskUsagePercent }
-        ].sort((a, b) => b.value - a.value)[0];
-        
-        message += ` The ${highestUtilization.name} utilization is at ${highestUtilization.value.toFixed(1)}%.`;
-        
-        // Prepare system status object
-        const systemStatus = {
-          status,
-          message,
-          metrics: {
-            cpu: { 
-              usage: cpuUsagePercent.toFixed(1), 
-              cores: cpu.cores 
-            },
-            memory: { 
-              usage: memUsagePercent.toFixed(1), 
-              total: formatBytes(mem.total),
-              free: formatBytes(mem.free),
-              used: formatBytes(mem.used)
-            },
-            disk: {
-              usage: diskUsagePercent.toFixed(1),
-              total: formatBytes(totalDiskSpace),
-              free: formatBytes(freeDiskSpace),
-              io: disksIO ? {
-                read_sec: formatBytes(disksIO.rIO_sec || 0),
-                write_sec: formatBytes(disksIO.wIO_sec || 0),
-                total_sec: formatBytes(disksIO.tIO_sec || 0),
-                read_wait_percent: disksIO.rWaitPercent ? disksIO.rWaitPercent.toFixed(1) : '0.0',
-                write_wait_percent: disksIO.wWaitPercent ? disksIO.wWaitPercent.toFixed(1) : '0.0',
-                total_wait_percent: disksIO.tWaitPercent ? disksIO.tWaitPercent.toFixed(1) : '0.0'
-              } : null,
-              drives: fsSize.map(drive => ({
-                mount: drive.mount,
-                size: formatBytes(drive.size),
-                available: formatBytes(drive.available),
-                use: drive.use.toFixed(1) + '%'
-              }))
-            }
-          },
-          timestamp: new Date().toISOString()
-        };
-        
-        // Update incident tracking
-        updateIncidentStatus(systemStatus);
-        
-        // Log and send notifications for critical/heavy load
-        logger.info(`Scheduled check: System status: ${status} - ${message}`);
-        
-        if (status === 'critical' || status === 'heavy') {
-          await checkAndSendNotification(status, message, systemStatus);
-        }
-      } else if (isDebugMode) {
-        logger.debug('Scheduled check: System status normal');
-      }
-      
-      return `Scheduled system health check completed: ${status}`;
+      return `Scheduled system health check completed: ${systemStatus.status}`;
     } catch (error) {
       logger.error(`Error in scheduled system health check: ${error.message}`);
       return `Error in scheduled system health check: ${error.message}`;
@@ -830,6 +629,88 @@ scheduleJob('*/5 * * * *', () => {
   }).catch(error => {
     logger.error(`Failed to enqueue system health check task: ${error.message}`);
   });
+});
+
+/**
+ * Get current task manager status
+ * @route GET /api/tasks
+ * @security X-Webhook-ID
+ */
+router.get('/tasks', async (req, res) => {
+  try {
+    // Get ALL valid webhook IDs from environment variables
+    const validWebhookIds = getAllValidWebhookIds();
+
+    // Verify webhook authentication against any valid ID
+    if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
+      logger.warn('Unauthorized tasks request attempted');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Get task status from task manager
+    const taskStatus = getTaskStatus();
+    
+    // Convert task type numbers to readable names
+    const taskTypeNames = {
+      [TaskType.API_REQUEST]: 'API Request',
+      [TaskType.SYSTEM_MONITORING]: 'System Monitoring',
+      [TaskType.MEDIA_SCAN]: 'Media Scan',
+      [TaskType.MOVIE_SCAN]: 'Movie Scan',
+      [TaskType.TV_SCAN]: 'TV Show Scan',
+      [TaskType.METADATA_HASH]: 'Metadata Hash',
+      [TaskType.BLURHASH]: 'Blurhash',
+      [TaskType.DOWNLOAD]: 'TMDB Download',
+      [TaskType.CACHE_CLEANUP]: 'Cache Cleanup'
+    };
+    
+    // Format active tasks with readable type names
+    const formattedActiveTasks = taskStatus.activeTasks.map(task => ({
+      id: task.id,
+      type: taskTypeNames[task.type] || `Unknown (${task.type})`,
+      typeValue: task.type,
+      name: task.name,
+      runningForMs: task.runningForMs,
+      runningForSeconds: Math.floor(task.runningForMs / 1000)
+    }));
+    
+    // Format queue sizes with readable type names
+    const formattedQueues = {};
+    Object.entries(taskStatus.queueSizes).forEach(([type, size]) => {
+      const typeName = taskTypeNames[type] || `Unknown (${type})`;
+      formattedQueues[typeName] = {
+        size,
+        type: parseFloat(type)
+      };
+    });
+    
+    // Format completion history with readable type names
+    const formattedHistory = {};
+    Object.entries(taskStatus.completionHistory || {}).forEach(([type, history]) => {
+      const typeName = taskTypeNames[type] || `Unknown (${type})`;
+      formattedHistory[typeName] = history.map(completion => ({
+        name: completion.name,
+        durationMs: completion.durationMs,
+        durationSeconds: Math.floor(completion.durationMs / 1000),
+        completedAt: completion.completedAt,
+        completedAgo: completion.completedAgo
+      }));
+    });
+    
+    res.json({
+      success: true,
+      activeTasks: formattedActiveTasks,
+      queueSizes: formattedQueues,
+      completionHistory: formattedHistory,
+      summary: {
+        totalActiveTasks: formattedActiveTasks.length,
+        totalQueued: Object.values(taskStatus.queueSizes).reduce((sum, count) => sum + count, 0)
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error(`Error retrieving task status: ${error.message}`);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 export default router;

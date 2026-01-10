@@ -8,10 +8,40 @@ import asyncio
 import os
 
 # Async function to generate a blurhash from an image file
-async def generate_blurhash(image_path, x_components=4, y_components=3):
+async def generate_blurhash(image_path, x_components=8, y_components=6, max_encode_size=200):
+    """
+    Generate blurhash from an image file.
+    
+    PERFORMANCE OPTIMIZATION: Resize image to max_encode_size before encoding.
+    Blurhash doesn't need high resolution - encoding from 200px is 10-20x faster
+    than encoding from 2000px with virtually identical visual results.
+    
+    Args:
+        image_path: Path to the image file
+        x_components: Horizontal blurhash components (default: 8)
+        y_components: Vertical blurhash components (default: 6)
+        max_encode_size: Max dimension for encoding (default: 200px)
+    """
     try:
         # Use asyncio.to_thread to open the image without blocking the event loop
         img = await asyncio.to_thread(Image.open, image_path)
+        
+        # Store original dimensions (for aspect ratio calculation)
+        original_width, original_height = img.size
+        
+        # PERFORMANCE OPTIMIZATION: Resize before encoding
+        # Encoding blurhash from 200px is 10-20x faster than from 2000px
+        if max(original_width, original_height) > max_encode_size:
+            # Calculate new size maintaining aspect ratio
+            if original_width > original_height:
+                new_width = max_encode_size
+                new_height = int(original_height * (max_encode_size / original_width))
+            else:
+                new_height = max_encode_size
+                new_width = int(original_width * (max_encode_size / original_height))
+            
+            # Resize using high-quality LANCZOS resampling
+            img = await asyncio.to_thread(img.resize, (new_width, new_height), Image.Resampling.LANCZOS)
         
         # Convert to RGBA if the image has transparency
         if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
@@ -21,23 +51,18 @@ async def generate_blurhash(image_path, x_components=4, y_components=3):
         if img.mode != 'RGB':
             img = await asyncio.to_thread(img.convert, 'RGB')
 
-        # Get original image dimensions
-        width, height = img.size
-
-        # Save the image to an in-memory buffer
-        buffered = io.BytesIO()
-        await asyncio.to_thread(img.save, buffered, format="JPEG")  # Save image to buffer as JPEG
-        buffered.seek(0)
-
-        # Use this buffer with blurhash (non-blocking)
-        hash = await asyncio.to_thread(blurhash.encode, buffered, x_components, y_components)
+        # Generate blurhash from the (now smaller) image
+        hash = await asyncio.to_thread(blurhash.encode, img, x_components, y_components)
         
         # Close the image (clean up)
         img.close()
 
-        return hash, width, height
+        # Return hash with ORIGINAL dimensions (not resized dimensions)
+        return hash, original_width, original_height
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         return None
 
 # Async function to convert a blurhash string to a base64-encoded image
@@ -53,38 +78,63 @@ async def blurhash_to_base64(hash, width, height):
     except Exception as e:
         print(f"Error converting blurhash to base64: {e}", file=sys.stderr)
         return None
-
 # Async function to process an image (generate blurhash and convert to base64)
 async def process_image(image_path):
+    return await process_image_with_size(image_path, 150)  # Default size
+
+# Async function to process an image with custom size
+async def process_image_with_size(image_path, max_height=150):
     result = await generate_blurhash(image_path)
     if result:
         blurhash_string, original_width, original_height = result
-        max_height = 80
+        
         if original_height == 0:
             print(f"Error: Original image height is zero.", file=sys.stderr)
             return None
-        output_height = min(original_height, max_height)
-        scale_factor = output_height / original_height
-        output_width = int(original_width * scale_factor)
-        # Ensure output_width is at least 1
+            
+        # Calculate output dimensions maintaining aspect ratio
+        if original_height > max_height:
+            scale_factor = max_height / original_height
+            output_height = max_height
+            output_width = int(original_width * scale_factor)
+        else:
+            # Use original dimensions if smaller than max
+            output_width = original_width
+            output_height = original_height
+            
+        # Ensure minimum dimensions
         output_width = max(output_width, 1)
-        output_height = int(output_height)
+        output_height = max(output_height, 1)
+        
         base64_image = await blurhash_to_base64(blurhash_string, width=output_width, height=output_height)
         return base64_image
     return None
-
 # Main function to handle command-line execution
 async def main():
-    if len(sys.argv) != 2:
-        print("Usage: blurhash-cli <image_path>")
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print("Usage: blurhash-cli <image_path> [size]")
+        print("  size: 'small' (64px), 'medium' (100px), 'large' (150px, default)")
         sys.exit(1)
 
     image_path = sys.argv[1]
+    size_option = sys.argv[2] if len(sys.argv) == 3 else 'large'
+    
     if not os.path.exists(image_path):
         print(f"Error: The file '{image_path}' does not exist.", file=sys.stderr)
         sys.exit(1)
 
-    result = await process_image(image_path)
+    # Set max height based on size option
+    if size_option == 'small':
+        max_height = 64
+    elif size_option == 'medium':
+        max_height = 100
+    elif size_option == 'large':
+        max_height = 150
+    else:
+        print(f"Error: Invalid size option '{size_option}'. Use 'small', 'medium', or 'large'.", file=sys.stderr)
+        sys.exit(1)
+
+    result = await process_image_with_size(image_path, max_height)
     if result:
         print(result)
 
@@ -94,4 +144,4 @@ if __name__ == "__main__":
     asyncio.run(main())
 else:
     # Export functions for use in other Python scripts
-    __all__ = ['generate_blurhash', 'blurhash_to_base64', 'process_image']
+    __all__ = ['generate_blurhash', 'blurhash_to_base64', 'process_image', 'process_image_with_size']

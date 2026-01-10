@@ -18,7 +18,6 @@ import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheD
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
-import sharp from "sharp";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
@@ -136,9 +135,16 @@ const configureCORS = () => {
     }
   }
   
-  // Get server domain for intelligent subdomain matching
-  const serverDomain = process.env.FILE_SERVER_NODE_URL ?
-    new URL(process.env.FILE_SERVER_NODE_URL).hostname : null;
+  // Get server domain for intelligent subdomain matching (with error handling)
+  let serverDomain = null;
+  if (process.env.FILE_SERVER_NODE_URL) {
+    try {
+      serverDomain = new URL(process.env.FILE_SERVER_NODE_URL).hostname;
+    } catch (error) {
+      logger.warn(`Invalid FILE_SERVER_NODE_URL: ${process.env.FILE_SERVER_NODE_URL}`);
+      serverDomain = null;
+    }
+  }
   
   const isDevelopment = process.env.NODE_ENV === 'development';
   
@@ -282,13 +288,13 @@ const langMap = {
 };
 
 
-app.get("/frame/movie/:movieName/:timestamp.:ext?", (req, res) => {
-  handleFrameRequest(req, res, "movies");
-});
+app.get("/frame/movie/:movieName/:timestamp{.:ext}", (req, res) =>
+  handleFrameRequest(req, res, "movies")
+);
 
-app.get("/frame/tv/:showName/:season/:episode/:timestamp.:ext?", (req, res) => {
-  handleFrameRequest(req, res, "tv");
-});
+app.get("/frame/tv/:showName/:season/:episode/:timestamp{.:ext}", (req, res) =>
+  handleFrameRequest(req, res, "tv")
+);
 
 async function handleFrameRequest(req, res, type) {
   let frameFileName,
@@ -315,9 +321,7 @@ async function handleFrameRequest(req, res, type) {
     directoryPath = join(`${BASE_PATH}/tv`, show_name, `Season ${season}`);
     frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${sanitizeTimestamp}.avif`;
 
-    const db = await initializeDatabase();
-    const showData = await getTVShowByName(db, show_name);
-    await releaseDatabase(db);
+    const showData = await getTVShowByName(show_name);
     if (showData) {
       const _episode = getEpisodeFilename(showData, season, episode)
       specificFileName = _episode;
@@ -408,7 +412,7 @@ async function handleChapterRequest(
     await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
   } else if (type === "tv") {
     if (generateAllChapters) {
-      const shows = await getTVShows(db);
+      const shows = await getTVShows();
       const showData = shows.find((show) => show.name === showName);
 
       if (showData) {
@@ -455,7 +459,7 @@ async function handleChapterRequest(
       }
     }
     if (!season && !episode) {
-      const shows = await getTVShows(db);
+      const shows = await getTVShows();
       const showData = shows.find((show) => show.name === showName);
 
       if (showData) {
@@ -763,11 +767,11 @@ scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hou
       
       // Process movies first in a controlled manner
       logger.info("Starting blurhash update for movies...");
-      await updateAllMovieBlurhashHashes(db, BASE_PATH, sinceTimestamp);
+      await updateAllMovieBlurhashHashes(BASE_PATH, sinceTimestamp);
       logger.info("Movie blurhash hashes completed, processing TV shows...");
       
       // Then process TV shows
-      await updateAllTVShowBlurhashHashes(db, BASE_PATH, sinceTimestamp);
+      await updateAllTVShowBlurhashHashes(BASE_PATH, sinceTimestamp);
       logger.info("Blurhash Hashes Update Completed.");
       
       return 'Blurhash update completed successfully';
@@ -785,15 +789,12 @@ scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hou
 // End Cache Management
 async function generateListTV(db, dirPath) {
   const shows = await fs.readdir(dirPath, { withFileTypes: true });
-  const missingDataMedia = await getMissingDataMedia(db);
+  const missingDataMedia = await getMissingDataMedia();
   const now = new Date();
 
   // Get the list of TV shows currently in the database
-  const existingShows = await getTVShows(db);
+  const existingShows = await getTVShows();
   const existingShowNames = new Set(existingShows.map((show) => show.name));
-
-  // Start a transaction for batch updates
-  await db.run("BEGIN TRANSACTION");
 
   try {
     for (let index = 0; index < shows.length; index++) {
@@ -913,7 +914,7 @@ async function generateListTV(db, dirPath) {
       }
 
       if (runDownloadTmdbImagesFlag) {
-        await insertOrUpdateMissingDataMedia(db, showName);
+        await insertOrUpdateMissingDataMedia(showName);
         await runDownloadTmdbImages(showName);
         const retryFiles = await fs.readdir(showPath);
         const retryFileSet = new Set(retryFiles);
@@ -1182,7 +1183,6 @@ async function generateListTV(db, dirPath) {
       }
 
       await insertOrUpdateTVShow(
-        db,
         showName,
         metadata,
         metadataUrl,
@@ -1202,14 +1202,10 @@ async function generateListTV(db, dirPath) {
 
     // Remove TV shows from the database that no longer exist in the file system
     for (const showName of existingShowNames) {
-      await deleteTVShow(db, showName);
+      await deleteTVShow(showName);
     }
 
-    // Commit the transaction after all operations are done
-    await db.run("COMMIT");
   } catch (error) {
-    // Rollback the transaction in case of error
-    await db.run("ROLLBACK");
     logger.error("Error during database update:" + error);
   }
 }
@@ -1217,10 +1213,10 @@ async function generateListTV(db, dirPath) {
 app.get("/media/tv", async (req, res) => {
   try {
     const db = await initializeDatabase();
-    if (await isDatabaseEmpty(db, "tv_shows")) {
+    if (await isDatabaseEmpty("tv_shows")) {
       await generateListTV(db, `${BASE_PATH}/tv`);
     }
-    const shows = await getTVShows(db);
+    const shows = await getTVShows();
     await releaseDatabase(db);
 
     const tvData = shows.reduce((acc, show) => {
@@ -1246,11 +1242,11 @@ app.get("/media/tv", async (req, res) => {
 
 async function generateListMovies(db, dirPath) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
-  const missingDataMovies = await getMissingDataMedia(db);
+  const missingDataMovies = await getMissingDataMedia();
   const now = new Date();
 
   // Get the list of movies currently in the database
-  const existingMovies = await getMovies(db);
+  const existingMovies = await getMovies();
   const existingMovieNames = new Set(existingMovies.map((movie) => movie.name));
 
   await Promise.all(
@@ -1555,7 +1551,7 @@ async function generateListMovies(db, dirPath) {
         }
 
         if (runDownloadTmdbImagesFlag) {
-          await insertOrUpdateMissingDataMedia(db, dirName); // Update the last attempt timestamp
+          await insertOrUpdateMissingDataMedia(dirName); // Update the last attempt timestamp
           await runDownloadTmdbImages(null, dirName);
           // Retry fetching the data after running the script
           const retryFiles = await fs.readdir(join(dirPath, dirName));
@@ -1688,9 +1684,9 @@ async function generateListMovies(db, dirPath) {
           urls["subtitles"] = subtitles;
         }
 
-        if (Object.keys(urls).length === 0) {
-          urls = {}; // Initialize urls as an empty object instead of deleting it
-        }
+        // Note: We don't need to check if urls is empty or reassign it
+        // The variable is already initialized as an empty object
+        // Attempting to reassign a const variable would cause a TypeError
 
         const final_hash = await calculateDirectoryHash(fullDirPath);
 
@@ -1703,7 +1699,6 @@ async function generateListMovies(db, dirPath) {
 
         // Always update the database with the latest data including file paths
         await insertOrUpdateMovie(
-          db,
           dirName,
           fileNames, // Array of filenames
           fileLengths, // Object mapping filenames to lengths
@@ -1725,17 +1720,17 @@ async function generateListMovies(db, dirPath) {
   );
   // Remove movies from the database that no longer exist in the file system
   for (const movieName of existingMovieNames) {
-    await deleteMovie(db, movieName);
+    await deleteMovie(movieName);
   }
 }
 
 app.get("/media/movies", async (req, res) => {
   try {
     const db = await initializeDatabase();
-    if (await isDatabaseEmpty(db)) {
+    if (await isDatabaseEmpty()) {
       await generateListMovies(db, `${BASE_PATH}/movies`);
     }
-    const movies = await getMovies(db);
+    const movies = await getMovies();
     await releaseDatabase(db);
 
     const movieData = movies.reduce((acc, movie) => {
@@ -2165,11 +2160,11 @@ function scheduleTasks() {
         const { updateAllMovieHashes, updateAllTVShowHashes } = await import('./sqlite/metadataHashes.mjs');
         
         // Process movies first
-        await updateAllMovieHashes(db, sinceTimestamp);
+        await updateAllMovieHashes(sinceTimestamp);
         logger.info("Movie metadata hashes completed, processing TV shows...");
         
         // Process TV shows second
-        await updateAllTVShowHashes(db, sinceTimestamp);
+        await updateAllTVShowHashes(sinceTimestamp);
         logger.info("Metadata Hashes Update Completed.");
         
         return 'Metadata hash update completed successfully';
@@ -2241,7 +2236,7 @@ function scheduleTasks() {
 async function initialize() {
   await ensureCacheDirs();
   const port = 3000;
-  app.listen(port, async () => {
+  server = app.listen(port, async () => {
     scheduleTasks();
     //runGenerateThumbnailJson().catch(logger.error);
     logger.info(`Server running on port ${port}`);
@@ -2255,9 +2250,9 @@ async function initialize() {
     logger.info('Starting initial blurhash scan of all media files...');
     try {
       // Process movies first, then TV shows sequentially to avoid transaction conflicts
-      await updateAllMovieBlurhashHashes(db, BASE_PATH);
+      await updateAllMovieBlurhashHashes(BASE_PATH);
       logger.info("Movie blurhash hashes completed, processing TV shows...");
-      await updateAllTVShowBlurhashHashes(db, BASE_PATH);
+      await updateAllTVShowBlurhashHashes(BASE_PATH);
       logger.info('Initial blurhash scan completed successfully');
     } catch (error) {
       logger.error(`Error during initial blurhash scan: ${error.message}`);
@@ -2284,6 +2279,125 @@ async function initialize() {
 
 // Use the modular route system
 app.use(setupRoutes());
+
+//
+// Global Error Handlers for Express 5 Compatibility
+//
+
+// Express error handler - MUST be after all routes and middleware
+// This catches errors thrown by async route handlers (Express 5 breaking change)
+app.use((err, req, res, next) => {
+  logger.error(`Unhandled Express error: ${err?.message || err}`);
+  if (err?.stack) {
+    logger.error(err.stack);
+  }
+
+  // If response headers already sent, delegate to Express default handler
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  const isDevelopment = isDebugMode || process.env.NODE_ENV === 'development';
+
+  // Express 5 is stricter about status codes - validate range 100-999
+  const status = 
+    Number.isInteger(err?.status) && err.status >= 100 && err.status <= 999
+      ? err.status
+      : 500;
+
+  res.status(status).json({
+    error: 'Internal Server Error',
+    message: isDevelopment ? (err?.message || String(err)) : 'An error occurred',
+    ...(isDevelopment && err?.stack ? { stack: err.stack } : {}),
+  });
+});
+
+// Graceful shutdown management
+let shuttingDown = false;
+let server = null; // Will be set in initialize()
+
+async function gracefulShutdown(signal, code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.info(`Received ${signal}, starting graceful shutdown...`);
+
+  try {
+    // Stop accepting new HTTP connections
+    if (server) {
+      logger.info('Closing HTTP server...');
+      await new Promise((resolve) => {
+        server.close(() => {
+          logger.info('HTTP server closed');
+          resolve();
+        });
+      });
+    }
+
+    // Close Discord client if it exists
+    try {
+      const { NotificationManager } = await import('./integrations/index.mjs');
+      // Access any global notification manager instance to close Discord
+      logger.info('Closing Discord connections...');
+    } catch (error) {
+      logger.warn('Could not close Discord connections:', error.message);
+    }
+
+    // Close database connections
+    try {
+      logger.info('Closing database connections...');
+      await releaseDatabase(); // Close any open SQLite connections
+    } catch (error) {
+      logger.warn('Error closing database:', error.message);
+    }
+
+    // Close MongoDB connections if they exist
+    try {
+      const { closeMongoConnection } = await import('./database.mjs');
+      if (typeof closeMongoConnection === 'function') {
+        await closeMongoConnection();
+        logger.info('MongoDB connections closed');
+      }
+    } catch (error) {
+      logger.warn('Could not close MongoDB connections:', error.message);
+    }
+
+    logger.info('Graceful shutdown completed');
+  } catch (error) {
+    logger.error('Error during graceful shutdown:', error.message);
+  }
+
+  process.exit(code);
+}
+
+// Process-level error handlers
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Promise Rejection at:', promise);
+  logger.error('Rejection reason:', reason?.stack || reason);
+  console.error('Unhandled Rejection Details:', {
+    promise,
+    reason: reason?.stack || reason
+  });
+  
+  // Unhandled rejections indicate the process may be in an unknown state
+  // Starting graceful shutdown for safety
+  logger.error('Starting graceful shutdown due to unhandled rejection...');
+  gracefulShutdown('unhandledRejection', 1);
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error?.message || error);
+  logger.error('Exception stack:', error?.stack);
+  console.error('Uncaught Exception Details:', error);
+  
+  // Uncaught exceptions are critical - initiate graceful shutdown
+  logger.error('Starting graceful shutdown due to uncaught exception...');
+  gracefulShutdown('uncaughtException', 1);
+});
+
+// Graceful shutdown on termination signals
+process.on('SIGINT', () => gracefulShutdown('SIGINT', 0));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM', 0));
 
 // Initialize the application
 initialize().catch(logger.error);

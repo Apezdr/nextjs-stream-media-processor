@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
-import { withRetry } from '../sqliteDatabase.mjs';
+import { withRetry, withDb, withWriteTx, getMovies, getTVShows, getTVShowByName } from '../sqliteDatabase.mjs';
 
 const logger = createCategoryLogger('metadataHashes');
 
@@ -193,8 +193,7 @@ export async function getShowHashes(db, title) {
     if (!showHash) {
       // If no show hash exists, generate it
       logger.info(`No hash found for TV show: ${title}, generating now`);
-      const { getTVShowByName } = await import('../sqliteDatabase.mjs');
-      const show = await getTVShowByName(db, title);
+      const show = await getTVShowByName(title);
       
       if (show) {
         await generateTVShowHashes(db, show);
@@ -252,8 +251,7 @@ export async function getSeasonHashes(db, title, seasonNumber) {
     if (!seasonHash) {
       // If no season hash exists, generate it
       logger.info(`No hash found for season ${seasonNumber} of ${title}, generating now`);
-      const { getTVShowByName } = await import('../sqliteDatabase.mjs');
-      const show = await getTVShowByName(db, title);
+      const show = await getTVShowByName(title);
       
       if (show) {
         // Check if this season exists
@@ -438,10 +436,9 @@ export async function generateTVShowHashes(db, show) {
  * @param {string} sinceTimestamp - ISO timestamp to filter by
  * @returns {Promise<Array>} - Array of movies modified since the timestamp
  */
-export async function getMoviesModifiedSince(db, sinceTimestamp) {
+export async function getMoviesModifiedSince(sinceTimestamp) {
   try {
-    const { getMovies } = await import('../sqliteDatabase.mjs');
-    const allMovies = await getMovies(db);
+    const allMovies = await getMovies();
     
     // Filter movies that have been modified since the timestamp
     return allMovies.filter(movie => {
@@ -459,41 +456,31 @@ export async function getMoviesModifiedSince(db, sinceTimestamp) {
  * @param {Object} db - SQLite database connection
  * @param {string} sinceTimestamp - Optional timestamp to filter movies modified since
  */
-export async function updateAllMovieHashes(db, sinceTimestamp = null) {
-  try {
-    const { getMovies } = await import('../sqliteDatabase.mjs');
-    
-    // Get movies to process - either all movies or only recently modified ones
-    const movies = sinceTimestamp 
-      ? await getMoviesModifiedSince(db, sinceTimestamp)
-      : await getMovies(db);
-    
-    if (movies.length === 0) {
-      logger.info('No movies to update metadata hashes for');
-      return;
-    }
-    
-    logger.info(`Updating hashes for ${movies.length} movies${sinceTimestamp ? ` modified since ${sinceTimestamp}` : ''}`);
-    
-    // Use a single transaction for better performance
-    await db.exec('BEGIN TRANSACTION');
-    
+export async function updateAllMovieHashes(sinceTimestamp = null) {
+  return withWriteTx("main", async (db) => {
     try {
+      // Get movies to process - either all movies or only recently modified ones
+      const movies = sinceTimestamp
+        ? await getMoviesModifiedSince(sinceTimestamp)
+        : await getMovies();
+      
+      if (movies.length === 0) {
+        logger.info('No movies to update metadata hashes for');
+        return;
+      }
+      
+      logger.info(`Updating hashes for ${movies.length} movies${sinceTimestamp ? ` modified since ${sinceTimestamp}` : ''}`);
+      
       for (const movie of movies) {
         await generateMovieHashes(db, movie);
       }
       
-      await db.exec('COMMIT');
       logger.info('Movie hashes update completed successfully');
     } catch (error) {
-      // Rollback the transaction on error
-      await db.exec('ROLLBACK');
-      logger.error(`Error processing metadata hashes: ${error.message}`);
+      logger.error(`Error updating movie hashes: ${error.message}`);
       throw error;
     }
-  } catch (error) {
-    logger.error(`Error updating movie hashes: ${error.message}`);
-  }
+  });
 }
 
 /**
@@ -502,10 +489,9 @@ export async function updateAllMovieHashes(db, sinceTimestamp = null) {
  * @param {string} sinceTimestamp - ISO timestamp to filter by
  * @returns {Promise<Array>} - Array of TV shows with modified episodes
  */
-export async function getTVShowsModifiedSince(db, sinceTimestamp) {
+export async function getTVShowsModifiedSince(sinceTimestamp) {
   try {
-    const { getTVShows } = await import('../sqliteDatabase.mjs');
-    const allShows = await getTVShows(db);
+    const allShows = await getTVShows();
     
     // Filter shows that have episodes modified since the timestamp
     return allShows.filter(show => {
@@ -533,14 +519,12 @@ export async function getTVShowsModifiedSince(db, sinceTimestamp) {
  * @param {Object} db - SQLite database connection
  * @param {string} sinceTimestamp - Optional timestamp to filter shows modified since
  */
-export async function updateAllTVShowHashes(db, sinceTimestamp = null) {
+export async function updateAllTVShowHashes(sinceTimestamp = null) {
   try {
-    const { getTVShows } = await import('../sqliteDatabase.mjs');
-    
     // Get shows to process - either all shows or only those with recently modified episodes
-    const shows = sinceTimestamp 
-      ? await getTVShowsModifiedSince(db, sinceTimestamp)
-      : await getTVShows(db);
+    const shows = sinceTimestamp
+      ? await getTVShowsModifiedSince(sinceTimestamp)
+      : await getTVShows();
     
     if (shows.length === 0) {
       logger.info('No TV shows to update metadata hashes for');
@@ -549,19 +533,12 @@ export async function updateAllTVShowHashes(db, sinceTimestamp = null) {
     
     logger.info(`Updating hashes for ${shows.length} TV shows${sinceTimestamp ? ` modified since ${sinceTimestamp}` : ''}`);
     
-    // Process each show in its own transaction to keep transactions smaller
+    // Process each show in its own write transaction
     for (const show of shows) {
       try {
-        // Start a transaction for this show
-        await db.exec('BEGIN TRANSACTION');
-        
-        try {
+        await withWriteTx("main", async (db) => {
           await generateTVShowHashes(db, show);
-          await db.exec('COMMIT');
-        } catch (error) {
-          await db.exec('ROLLBACK');
-          throw error;
-        }
+        });
         
         logger.debug(`Processed TV show: ${show.name}`);
       } catch (error) {

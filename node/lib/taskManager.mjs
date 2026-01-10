@@ -20,6 +20,10 @@ const activeTasks = new Map();
 const taskQueues = new Map();
 let taskIdCounter = 0;
 
+// Track last 3 completions for each task type
+const completionHistory = new Map();
+const MAX_HISTORY_PER_TYPE = 3;
+
 // Configure which task types can run concurrently
 const concurrencyLimits = {
   [TaskType.API_REQUEST]: 5,        // Allow multiple API requests
@@ -98,10 +102,18 @@ function processQueues() {
         });
         
         // Execute the task
+        const startTime = Date.now();
         Promise.resolve(task.fn())
           .then(result => {
-            logger.debug(`Task completed: ${task.name}`);
+            const endTime = Date.now();
+            const duration = endTime - startTime;
+            
+            logger.debug(`Task completed: ${task.name} (took ${duration}ms)`);
             activeTasks.delete(taskId);
+            
+            // Track completion in history
+            addCompletionToHistory(type, task.name, duration, endTime);
+            
             if (task.resolve) task.resolve(result);
             
             // Process queues again after task completes
@@ -155,10 +167,18 @@ export function enqueueTask(type, name, fn, immediate = false) {
       });
       
       // Execute the task
+      const startTime = Date.now();
       Promise.resolve(fn())
         .then(result => {
-          logger.debug(`Task completed: ${name}`);
+          const endTime = Date.now();
+          const duration = endTime - startTime;
+          
+          logger.debug(`Task completed: ${name} (took ${duration}ms)`);
           activeTasks.delete(taskId);
+          
+          // Track completion in history
+          addCompletionToHistory(type, name, duration, endTime);
+          
           resolve(result);
           
           // Process queues after task completes
@@ -186,6 +206,34 @@ export function enqueueTask(type, name, fn, immediate = false) {
 }
 
 /**
+ * Add a task completion to the history
+ * Maintains last 3 completions per task type
+ * @param {number} type - Task type
+ * @param {string} name - Task name
+ * @param {number} durationMs - Duration in milliseconds
+ * @param {number} completedAt - Completion timestamp
+ */
+function addCompletionToHistory(type, name, durationMs, completedAt) {
+  if (!completionHistory.has(type)) {
+    completionHistory.set(type, []);
+  }
+  
+  const history = completionHistory.get(type);
+  
+  // Add new completion to the front
+  history.unshift({
+    name,
+    durationMs,
+    completedAt
+  });
+  
+  // Keep only last 3
+  if (history.length > MAX_HISTORY_PER_TYPE) {
+    history.pop();
+  }
+}
+
+/**
  * Get current status of active tasks and queues
  * @returns {Object} - Status information
  */
@@ -199,6 +247,18 @@ export function getTaskStatus() {
     })),
     queueSizes: Object.values(TaskType).reduce((acc, type) => {
       acc[type] = (taskQueues.get(type) || []).length;
+      return acc;
+    }, {}),
+    completionHistory: Object.values(TaskType).reduce((acc, type) => {
+      const history = completionHistory.get(type);
+      if (history && history.length > 0) {
+        acc[type] = history.map(completion => ({
+          name: completion.name,
+          durationMs: completion.durationMs,
+          completedAt: completion.completedAt,
+          completedAgo: Date.now() - completion.completedAt
+        }));
+      }
       return acc;
     }, {})
   };

@@ -4,6 +4,7 @@ import { join, dirname } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
 import { fileExists } from '../utils/utils.mjs';
+import { sessionCache } from '../middleware/sessionCache.mjs';
 
 const router = express.Router();
 const logger = createCategoryLogger('admin-routes');
@@ -141,6 +142,95 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         logger.error(`Error saving subtitle changes: ${error.message}`);
         return res.status(500).json({ 
             error: 'Failed to save subtitle changes',
+            message: error.message
+        });
+    }
+});
+
+/**
+ * Route to get session cache statistics
+ * GET /admin/cache/session-stats
+ * Requires authentication and admin privileges
+ *
+ * Returns statistics about the in-memory session cache including:
+ * - Total cached sessions
+ * - Active vs expired sessions
+ * - Cache hit rate
+ * - Configuration details
+ */
+router.get('/cache/session-stats', authenticateUser, requireAdmin, (req, res) => {
+    try {
+        const stats = sessionCache.getStats();
+        
+        logger.info(`Admin ${req.user.email} requested session cache statistics`);
+        
+        return res.status(200).json({
+            success: true,
+            cache: stats,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error(`Error fetching session cache statistics: ${error.message}`);
+        return res.status(500).json({
+            error: 'Failed to fetch session cache statistics',
+            message: error.message
+        });
+    }
+});
+
+/**
+ * Route to clear all session cache entries
+ * DELETE /admin/cache/session-cache
+ * Requires authentication and admin privileges
+ *
+ * This will force all users to re-authenticate on their next request.
+ * Useful for security events or when user permissions have been changed.
+ */
+router.delete('/cache/session-cache', authenticateUser, requireAdmin, (req, res) => {
+    try {
+        const statsBefore = sessionCache.getStats();
+        sessionCache.clear();
+        
+        logger.warn(`Admin ${req.user.email} cleared all session cache entries (${statsBefore.total} entries removed)`);
+        
+        return res.status(200).json({
+            success: true,
+            message: 'All session cache entries cleared',
+            entriesRemoved: statsBefore.total,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error(`Error clearing session cache: ${error.message}`);
+        return res.status(500).json({
+            error: 'Failed to clear session cache',
+            message: error.message
+        });
+    }
+});
+
+/**
+ * Route to reset session cache statistics counters
+ * POST /admin/cache/session-stats/reset
+ * Requires authentication and admin privileges
+ *
+ * Resets the hit/miss counters without clearing cached sessions.
+ * Useful for monitoring cache performance over specific time periods.
+ */
+router.post('/cache/session-stats/reset', authenticateUser, requireAdmin, (req, res) => {
+    try {
+        sessionCache.resetStats();
+        
+        logger.info(`Admin ${req.user.email} reset session cache statistics`);
+        
+        return res.status(200).json({
+            success: true,
+            message: 'Session cache statistics reset',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        logger.error(`Error resetting session cache statistics: ${error.message}`);
+        return res.status(500).json({
+            error: 'Failed to reset session cache statistics',
             message: error.message
         });
     }

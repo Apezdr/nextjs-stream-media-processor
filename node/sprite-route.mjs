@@ -27,7 +27,7 @@ const vttRequestQueues = new Map();
  */
 async function getVideoPath(type, db, { movieName, showName, season, episode }, BASE_PATH) {
   if (type === "movies") {
-    const movie = await getMovieByName(db, movieName);
+    const movie = await getMovieByName(movieName);
     if (!movie) {
       throw new Error(`Movie not found: ${movieName}`);
     }
@@ -36,7 +36,7 @@ async function getVideoPath(type, db, { movieName, showName, season, episode }, 
     const cleanPath = getCleanVideoPath(videoMp4);
     return join(BASE_PATH, cleanPath);
   } else {
-    const showData = await getTVShowByName(db, showName);
+    const showData = await getTVShowByName(showName);
     if (!showData) {
       throw new Error(`Show not found: ${showName}`);
     }

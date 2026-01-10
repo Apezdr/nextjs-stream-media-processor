@@ -1,7 +1,7 @@
 import path from 'path';
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
-import { getMovies, getTVShows, withRetry } from '../sqliteDatabase.mjs';
+import { getMovies, getTVShows, withRetry, withWriteTx } from '../sqliteDatabase.mjs';
 import { getStoredBlurhash } from '../utils/utils.mjs';
 
 const PREFIX_PATH = process.env.PREFIX_PATH || '';
@@ -689,46 +689,38 @@ export async function generateTVShowBlurhashHashes(db, show, basePath) {
  * @param {string} basePath - Base path to media files
  * @param {string|null} sinceTimestamp - Optional timestamp to filter movies modified since this time
  */
-export async function updateAllMovieBlurhashHashes(db, basePath, sinceTimestamp = null) {
-  try {
-    const movies = await getMovies(db);
-    
-    // If sinceTimestamp is provided, filter movies that were modified since that time
-    let moviesToProcess = movies;
-    if (sinceTimestamp) {
-      moviesToProcess = movies.filter(movie => {
-        const mediaLastModified = movie.urls?.mediaLastModified;
-        return !mediaLastModified || new Date(mediaLastModified) >= new Date(sinceTimestamp);
-      });
-      logger.info(`Processing ${moviesToProcess.length} of ${movies.length} movies modified since ${sinceTimestamp}`);
-    }
-    
-    if (moviesToProcess.length === 0) {
-      logger.info('No movies to update blurhash hashes for');
-      return;
-    }
-    
-    logger.info(`Updating blurhash hashes for ${moviesToProcess.length} movies`);
-    
-    // Use a single transaction for better performance
-    await db.exec('BEGIN TRANSACTION');
-    
+export async function updateAllMovieBlurhashHashes(basePath, sinceTimestamp = null) {
+  return withWriteTx("main", async (db) => {
     try {
+      const movies = await getMovies();
+      
+      // If sinceTimestamp is provided, filter movies that were modified since that time
+      let moviesToProcess = movies;
+      if (sinceTimestamp) {
+        moviesToProcess = movies.filter(movie => {
+          const mediaLastModified = movie.urls?.mediaLastModified;
+          return !mediaLastModified || new Date(mediaLastModified) >= new Date(sinceTimestamp);
+        });
+        logger.info(`Processing ${moviesToProcess.length} of ${movies.length} movies modified since ${sinceTimestamp}`);
+      }
+      
+      if (moviesToProcess.length === 0) {
+        logger.info('No movies to update blurhash hashes for');
+        return;
+      }
+      
+      logger.info(`Updating blurhash hashes for ${moviesToProcess.length} movies`);
+      
       for (const movie of moviesToProcess) {
         await generateMovieBlurhashHashes(db, movie, basePath);
       }
       
-      await db.exec('COMMIT');
       logger.info('Movie blurhash hashes update completed successfully');
     } catch (error) {
-      // Rollback the transaction on error
-      await db.exec('ROLLBACK');
-      logger.error(`Error processing blurhash hashes: ${error.message}`);
+      logger.error(`Error updating movie blurhash hashes: ${error.message}`);
       throw error;
     }
-  } catch (error) {
-    logger.error(`Error updating movie blurhash hashes: ${error.message}`);
-  }
+  });
 }
 
 /**
@@ -737,9 +729,9 @@ export async function updateAllMovieBlurhashHashes(db, basePath, sinceTimestamp 
  * @param {string} basePath - Base path to media files
  * @param {string|null} sinceTimestamp - Optional timestamp to filter shows modified since this time
  */
-export async function updateAllTVShowBlurhashHashes(db, basePath, sinceTimestamp = null) {
+export async function updateAllTVShowBlurhashHashes(basePath, sinceTimestamp = null) {
   try {
-    const shows = await getTVShows(db);
+    const shows = await getTVShows();
     
     // If sinceTimestamp is provided, filter shows or episodes that were modified since that time
     // This is more complex for TV shows as episodes have their own modification timestamps
@@ -770,19 +762,12 @@ export async function updateAllTVShowBlurhashHashes(db, basePath, sinceTimestamp
     
     logger.info(`Updating blurhash hashes for ${showsToProcess.length} TV shows`);
     
-    // Process each show in its own transaction to keep transactions smaller
+    // Process each show in its own write transaction
     for (const show of showsToProcess) {
       try {
-        // Start transaction for this show
-        await db.exec('BEGIN TRANSACTION');
-        
-        try {
+        await withWriteTx("main", async (db) => {
           await generateTVShowBlurhashHashes(db, show, basePath);
-          await db.exec('COMMIT');
-        } catch (error) {
-          await db.exec('ROLLBACK');
-          throw error;
-        }
+        });
         
         logger.debug(`Processed TV show: ${show.name}`);
       } catch (error) {
@@ -803,10 +788,11 @@ export async function updateAllTVShowBlurhashHashes(db, basePath, sinceTimestamp
  * @param {string} movieId - Movie ID
  * @returns {Promise<Object|null>} - The movie blurhash data or null if not found
  */
-export async function getMovieBlurhashData(db, movieId) {
-  try {
-    const movies = await getMovies(db);
-    const movie = movies.find(m => m._id === movieId);
+export async function getMovieBlurhashData(movieId) {
+  return withDb("main", async (db) => {
+    try {
+      const movies = await getMovies();
+      const movie = movies.find(m => m._id === movieId);
     
     if (!movie) {
       return null;
@@ -919,10 +905,11 @@ export async function getMovieBlurhashData(db, movieId) {
       logoBlurhash: movie.urls?.logoBlurhash,
       imageHashes: imageHashes
     };
-  } catch (error) {
-    logger.error(`Error getting movie blurhash data for ${movieId}: ${error.message}`);
-    throw error;
-  }
+    } catch (error) {
+      logger.error(`Error getting movie blurhash data for ${movieId}: ${error.message}`);
+      throw error;
+    }
+  });
 }
 
 /**
@@ -931,11 +918,12 @@ export async function getMovieBlurhashData(db, movieId) {
  * @param {string} showId - TV show ID
  * @returns {Promise<Object|null>} - The TV show blurhash data or null if not found
  */
-export async function getTVShowBlurhashData(db, showId) {
-  try {
-    const shows = await getTVShows(db);
-    const show = shows.find(s => s._id === showId || 
-                                `tv_${s.name.replace(/[^a-zA-Z0-9]/g, '_')}` === showId);
+export async function getTVShowBlurhashData(showId) {
+  return withDb("main", async (db) => {
+    try {
+      const shows = await getTVShows();
+      const show = shows.find(s => s._id === showId ||
+                                  `tv_${s.name.replace(/[^a-zA-Z0-9]/g, '_')}` === showId);
     
     if (!show) {
       return null;
@@ -1033,8 +1021,9 @@ export async function getTVShowBlurhashData(db, showId) {
       imageHashes: showLevelHashes,
       seasons: seasonsMap
     };
-  } catch (error) {
-    logger.error(`Error getting TV show blurhash data for ${showId}: ${error.message}`);
-    throw error;
-  }
+    } catch (error) {
+      logger.error(`Error getting TV show blurhash data for ${showId}: ${error.message}`);
+      throw error;
+    }
+  });
 }

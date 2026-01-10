@@ -76,3 +76,4 @@ node/cache
 
 # AI model files
 /cline_docs
+/.roo

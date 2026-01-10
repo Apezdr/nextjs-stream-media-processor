@@ -49,7 +49,7 @@ router.get('/blurhash-changes', async (req, res) => {
     // Only fetch the movies and TV shows that are referenced in changes
     if (movieIds.size > 0) {
       // For movies, we need to get all and filter manually since mediaId is stored as additional_metadata
-      const allMovies = await getMovies(db);
+      const allMovies = await getMovies();
       
       for (const movie of allMovies) {
         // Parse the _id from additional_metadata if available
@@ -67,7 +67,7 @@ router.get('/blurhash-changes', async (req, res) => {
     
     if (tvShowIds.size > 0) {
       // Get all TV shows and filter them
-      const allShows = await getTVShows(db);
+      const allShows = await getTVShows();
       
       for (const show of allShows) {
         // Generate standardized ID
@@ -200,7 +200,7 @@ router.get('/blurhash/movie/:movieName', async (req, res) => {
     const db = await initializeDatabase();
     
     // Get movie data from database
-    const movie = await getMovieByName(db, movieName);
+    const movie = await getMovieByName(movieName);
     
     if (!movie) {
       await releaseDatabase(db);
@@ -210,7 +210,7 @@ router.get('/blurhash/movie/:movieName', async (req, res) => {
     // Get blurhash data by movie ID (if available) or by name
     let blurhashData;
     if (movie._id) {
-      blurhashData = await getMovieBlurhashData(db, movie._id);
+      blurhashData = await getMovieBlurhashData(movie._id);
     } else {
       // Fallback to query by title directly from the blurhash_hashes table
       const blurhashRecords = await db.all(
@@ -270,7 +270,7 @@ router.get('/blurhash/tv/:showName', async (req, res) => {
     const db = await initializeDatabase();
     
     // Get TV show data from database
-    const show = await getTVShowByName(db, showName);
+    const show = await getTVShowByName(showName);
     
     if (!show) {
       await releaseDatabase(db);
@@ -281,7 +281,7 @@ router.get('/blurhash/tv/:showName', async (req, res) => {
     const showId = show._id || `tv_${showName.replace(/[^a-zA-Z0-9]/g, '_')}`;
     
     // Get blurhash data by show ID
-    const blurhashData = await getTVShowBlurhashData(db, showId);
+    const blurhashData = await getTVShowBlurhashData(showId);
     await releaseDatabase(db);
     
     if (!blurhashData) {
@@ -338,20 +338,20 @@ router.post('/blurhash/bulk', express.json(), async (req, res) => {
       
       try {
         if (type === 'tv') {
-          const show = await getTVShowByName(db, name);
+          const show = await getTVShowByName(name);
           if (show) {
             const showId = show._id || `tv_${name.replace(/[^a-zA-Z0-9]/g, '_')}`;
-            const tvData = await getTVShowBlurhashData(db, showId);
+            const tvData = await getTVShowBlurhashData(showId);
             if (tvData) {
               results[resultKey] = tvData;
             }
           }
         } else if (type === 'movie') {
-          const movie = await getMovieByName(db, name);
+          const movie = await getMovieByName(name);
           if (movie) {
             let blurhashData;
             if (movie._id) {
-              blurhashData = await getMovieBlurhashData(db, movie._id);
+              blurhashData = await getMovieBlurhashData(movie._id);
             } else {
               // Fallback to query by title
               const blurhashRecords = await db.all(

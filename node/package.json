@@ -7,26 +7,33 @@
     "start": "node app.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "axios": "^1.7.9",
+    "axios": "^1.13.2",
+    "blurhash": "^2.0.5",
     "chokidar": "^4.0.1",
-    "compression": "^1.7.5",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
+    "discord-interactions": "^4.4.0",
+    "discord.js": "^14.25.1",
+    "express": "^5.2.1",
     "ffprobe": "^1.1.2",
-    "mongodb": "^6.12.0",
+    "mongodb": "^7.0.0",
     "node-schedule": "^2.1.1",
     "p-limit": "^6.1.0",
     "p-queue": "^8.0.1",
     "pm2": "^5.4.3",
-    "sharp": "^0.33.5",
+    "sharp": "^0.34.5",
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7",
-    "winston": "^3.17.0",
+    "systeminformation": "^5.30.2",
+    "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0"
   }
 }
