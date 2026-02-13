@@ -204,7 +204,54 @@ export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
     return serveVideoWithRange(req, res, finalVideoPath);
   } catch (error) {
     logger.error(`Error in handleVideoRequest: ${error.message}`);
-    res.status(500).send("Internal server error");
+    
+    // Provide helpful error responses based on error type
+    // Use 4xx status codes to avoid Apache error page interception
+    let statusCode = 422; // Unprocessable Entity - for processing failures
+    let errorMessage = "Failed to process video request";
+    let details = {};
+    
+    if (error.message.includes("not found")) {
+      statusCode = 404;
+      errorMessage = error.message;
+      details = {
+        suggestion: "Verify the media exists in the library and the path is correct"
+      };
+    } else if (error.message.includes("Stereo track not found")) {
+      statusCode = 400;
+      errorMessage = "No stereo audio track available";
+      details = {
+        suggestion: "Try using ?audio=max to select the highest quality track, or specify a track index",
+        availableOptions: ["audio=max", "audio=stereo", "audio=0", "audio=1"]
+      };
+    } else if (error.message.includes("Invalid audio track")) {
+      statusCode = 400;
+      errorMessage = "Invalid audio track specified";
+      details = {
+        suggestion: "Use ?audio=max, ?audio=stereo, or ?audio=N where N is a valid track index"
+      };
+    } else if (error.message.includes("Transcoding")) {
+      statusCode = 429; // Too Many Requests - indicates server is busy
+      errorMessage = "Video transcoding failed or timed out";
+      details = {
+        suggestion: "The server may be under heavy load. Try again in a few moments",
+        hint: "If this persists, the video file may have compatibility issues",
+        retryAfter: "30 seconds"
+      };
+    }
+    
+    // Ensure proper Content-Type to prevent Apache interception
+    res.setHeader('Content-Type', 'application/json');
+    if (statusCode === 429) {
+      res.setHeader('Retry-After', '30');
+    }
+    res.status(statusCode).json({
+      error: errorMessage,
+      statusCode,
+      timestamp: new Date().toISOString(),
+      type: type,
+      ...(Object.keys(details).length > 0 && { details })
+    });
   }
 }
 
@@ -736,7 +783,47 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
       ongoingCacheGenerations.delete(cacheKey);
     }
     if (!res.headersSent) {
-      res.status(500).send("Internal server error");
+      // Provide helpful error responses based on error type
+      // Use 4xx status codes to avoid Apache error page interception
+      let statusCode = 422; // Unprocessable Entity - for processing failures
+      let errorMessage = "Failed to generate video clip";
+      let details = {};
+      
+      if (error.message.includes("not found")) {
+        statusCode = 404;
+        errorMessage = error.message;
+        details = {
+          suggestion: "Verify the media exists in the library"
+        };
+      } else if (error.message.includes("Cache generation timeout")) {
+        statusCode = 429; // Too Many Requests - server is busy
+        errorMessage = "Video clip generation timed out";
+        details = {
+          suggestion: "The server may be processing other clips. Try again in a few moments",
+          clipParameters: { start: req.query.start, end: req.query.end },
+          retryAfter: "30 seconds"
+        };
+      } else if (error.message.includes("FFmpeg")) {
+        statusCode = 422; // Unprocessable Entity - can't process this video
+        errorMessage = "Video encoding error";
+        details = {
+          suggestion: "The video file may have encoding issues or unsupported format",
+          hint: "Try using ?useOriginalVideo=true to serve without re-encoding"
+        };
+      }
+      
+      // Ensure proper Content-Type to prevent Apache interception
+      res.setHeader('Content-Type', 'application/json');
+      if (statusCode === 429) {
+        res.setHeader('Retry-After', '30');
+      }
+      res.status(statusCode).json({
+        error: errorMessage,
+        statusCode,
+        timestamp: new Date().toISOString(),
+        type: type,
+        ...(Object.keys(details).length > 0 && { details })
+      });
     } else {
       res.end();
     }

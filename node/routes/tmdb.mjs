@@ -5,6 +5,7 @@ import {
   searchMedia,
   getMediaDetails,
   getMediaCast,
+  getStructuredMediaCast,
   getMediaVideos,
   getMediaImages,
   getMediaRating,
@@ -25,16 +26,22 @@ import {
   refreshTmdbCacheEntry
 } from '../sqliteDatabase.mjs';
 
-const router = express.Router();
 const logger = createCategoryLogger('tmdb-api');
 
-// Create rate limiter middleware (100 requests per minute)
-const rateLimiter = createRateLimiter(100, 60000);
+// Create rate limiter middleware (800 requests per minute)
+const rateLimiter = createRateLimiter(800, 60000);
 
-// STANDARDIZED ENDPOINTS - All use query parameters consistently
+/**
+ * Initialize and configure TMDB API routes
+ * @returns {object} Configured Express router
+ */
+export function setupTmdbRoutes() {
+  const router = express.Router();
 
-// Search movies or TV shows
-router.get('/search/:type', authenticateUser, rateLimiter, async (req, res) => {
+  // STANDARDIZED ENDPOINTS - All use query parameters consistently
+
+  // Search movies or TV shows
+  router.get('/search/:type', authenticateUser, rateLimiter, async (req, res) => {
   try {
     const { type } = req.params;
     const { query, page = 1, blurhash } = req.query;
@@ -108,6 +115,27 @@ router.get('/cast/:type', authenticateUser, rateLimiter, async (req, res) => {
     res.json(cast);
   } catch (error) {
     logger.error('Cast error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get structured cast information (with recurring and optionally guest cast)
+router.get('/structured-cast/:type', authenticateUser, rateLimiter, async (req, res) => {
+  try {
+    const { type } = req.params;
+    const { tmdb_id, include_guest } = req.query;
+    
+    if (!tmdb_id) {
+      return res.status(400).json({ error: 'tmdb_id parameter is required' });
+    }
+    
+    const includeGuestCast = include_guest === 'true';
+    const castData = await getStructuredMediaCast(type, tmdb_id, includeGuestCast);
+    
+    logger.info(`User ${req.user.email} requested structured cast for ${type} ID: ${tmdb_id}${includeGuestCast ? ' with guest cast' : ''}`);
+    res.json(castData);
+  } catch (error) {
+    logger.error('Structured cast error:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -383,4 +411,7 @@ router.get('/health', (req, res) => {
   });
 });
 
-export default router;
+  return router;
+}
+
+export default setupTmdbRoutes();

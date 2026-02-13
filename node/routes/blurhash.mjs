@@ -7,15 +7,21 @@ import {
   getTVShowBlurhashData
 } from '../sqlite/blurhashHashes.mjs';
 
-const router = express.Router();
 const logger = createCategoryLogger('blurhashRoutes');
 
 /**
- * Get changes since a specific timestamp
- * @route GET /api/blurhash-changes
- * @param {string} since - ISO timestamp to filter by
+ * Initialize and configure blurhash routes
+ * @returns {object} Configured Express router
  */
-router.get('/blurhash-changes', async (req, res) => {
+export function setupBlurhashRoutes() {
+  const router = express.Router();
+
+  /**
+   * Get changes since a specific timestamp
+   * @route GET /api/blurhash-changes
+   * @param {string} since - ISO timestamp to filter by
+   */
+  router.get('/blurhash-changes', async (req, res) => {
   try {
     const { since } = req.query;
     
@@ -410,4 +416,7 @@ router.post('/blurhash/bulk', express.json(), async (req, res) => {
   }
 });
 
-export default router;
+  return router;
+}
+
+export default setupBlurhashRoutes();

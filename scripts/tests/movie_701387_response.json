@@ -1,0 +1,273 @@
+{
+    "adult": false,
+    "backdrop_path": "/tN3pTxkQoP96wtaEahYuRVdUWb2.jpg",
+    "belongs_to_collection": null,
+    "budget": 50000000,
+    "cast": [
+        {
+            "character": "Michelle",
+            "id": 54693,
+            "name": "Emma Stone",
+            "profile_path": "https://image.tmdb.org/t/p/original/8NwSfyYWIIUE1cI9Xhz92b0w7WD.jpg"
+        },
+        {
+            "character": "Teddy",
+            "id": 88124,
+            "name": "Jesse Plemons",
+            "profile_path": "https://image.tmdb.org/t/p/original/og4I51GsuwohdPgoELOHVMMqMre.jpg"
+        },
+        {
+            "character": "Don",
+            "id": 5212114,
+            "name": "Aidan Delbis",
+            "profile_path": "https://image.tmdb.org/t/p/original/cM1I9bAUlkxSxAvtjnSOu3cICt6.jpg"
+        },
+        {
+            "character": "Casey",
+            "id": 1400595,
+            "name": "Stavros Halkias",
+            "profile_path": "https://image.tmdb.org/t/p/original/9QB7YGMk6O7hRgGWvK0OimTVzl7.jpg"
+        },
+        {
+            "character": "Sandy",
+            "id": 5588,
+            "name": "Alicia Silverstone",
+            "profile_path": "https://image.tmdb.org/t/p/original/pyxqkP4i0ubVdoRe5hoiiiwkHkb.jpg"
+        },
+        {
+            "character": "Ricky / Security Guard",
+            "id": 5105206,
+            "name": "J. Carmen Galindez Barrera",
+            "profile_path": "https://image.tmdb.org/t/p/original/2ktCkWgexsBTbh0UFsbdKoHX4D1.jpg"
+        },
+        {
+            "character": "Tony",
+            "id": 5105205,
+            "name": "Marc T. Lewis",
+            "profile_path": "https://image.tmdb.org/t/p/original/rrwyDxRMfnPnRvFEX1uuvdRq9WQ.jpg"
+        },
+        {
+            "character": "Corey",
+            "id": 4986018,
+            "name": "Vanessa Eng",
+            "profile_path": "https://image.tmdb.org/t/p/original/3HYU97U1wKR9byRBvu5SVpvifeH.jpg"
+        },
+        {
+            "character": "Chris",
+            "id": 2978859,
+            "name": "Cedric Dumornay",
+            "profile_path": "https://image.tmdb.org/t/p/original/t8YtnWbZV8To3PGLE6xHUB6o8Sm.jpg"
+        },
+        {
+            "character": "Tina",
+            "id": 5446529,
+            "name": "Momma Cherri",
+            "profile_path": null
+        },
+        {
+            "character": "Fredricka Whitfield",
+            "id": 5643272,
+            "name": "Fredricka Whitfield",
+            "profile_path": null
+        },
+        {
+            "character": "Carlos",
+            "id": 5643274,
+            "name": "Rafael Lopez Bravo",
+            "profile_path": null
+        },
+        {
+            "character": "EMT",
+            "id": 5497686,
+            "name": "Yaisa",
+            "profile_path": null
+        },
+        {
+            "character": "Detective",
+            "id": 4332316,
+            "name": "Teneise Mitchell Ellis",
+            "profile_path": null
+        },
+        {
+            "character": "Young Detective",
+            "id": 1365648,
+            "name": "Roger Carvalho",
+            "profile_path": null
+        },
+        {
+            "character": "Chief Andromedan",
+            "id": 1193622,
+            "name": "Atsushi Nishijima",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 4832206,
+            "name": "Janlyn Bales",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682662,
+            "name": "Andy Blackburn",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682665,
+            "name": "Stella Bizirtsaki",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 4185137,
+            "name": "Diana Duah",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682667,
+            "name": "Adam Esufali",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 4091704,
+            "name": "Jerskin Fendrix",
+            "profile_path": "https://image.tmdb.org/t/p/original/pF2Di6ubMSJonFgNxFnUVS8yMA6.jpg"
+        },
+        {
+            "character": "Andromedan",
+            "id": 2810554,
+            "name": "Aiecia Harper",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682671,
+            "name": "Sally Kennington",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682672,
+            "name": "Paul Mansell",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 2800780,
+            "name": "Harith Mohammed",
+            "profile_path": null
+        },
+        {
+            "character": "Andromedan",
+            "id": 5682673,
+            "name": "Zawadi Phillimore",
+            "profile_path": null
+        },
+        {
+            "character": "Doctor (uncredited)",
+            "id": 3111812,
+            "name": "Parvinder Shergill",
+            "profile_path": null
+        }
+    ],
+    "genres": [
+        {
+            "id": 878,
+            "name": "Science Fiction"
+        },
+        {
+            "id": 80,
+            "name": "Crime"
+        }
+    ],
+    "homepage": "https://www.focusfeatures.com/bugonia",
+    "id": 701387,
+    "imdb_id": "tt12300742",
+    "last_updated": "2026-01-12T10:25:37.611658",
+    "logo_path": "https://image.tmdb.org/t/p/original/zt1aSeO7YVSmBj4Dh0eTeSGYthO.png",
+    "origin_country": [
+        "US"
+    ],
+    "original_language": "en",
+    "original_title": "Bugonia",
+    "overview": "Two conspiracy obsessed young men kidnap the high-powered CEO of a major company, convinced that she is an alien intent on destroying planet Earth.",
+    "popularity": 41.6547,
+    "poster_path": "/oxgsAQDAAxA92mFGYCZllgWkH9J.jpg",
+    "production_companies": [
+        {
+            "id": 3353,
+            "logo_path": "/hUw1iTY3hdjyb2zXT9KxupHbL4M.png",
+            "name": "Element Pictures",
+            "origin_country": "IE"
+        },
+        {
+            "id": 123620,
+            "logo_path": "/ePRhZ3yb09Ya6WMzCCBYopwIYbE.png",
+            "name": "Square Peg",
+            "origin_country": "US"
+        },
+        {
+            "id": 121813,
+            "logo_path": "/7OwtRpQAFKU3KWA7InBg3h3PxqI.png",
+            "name": "Fremantle",
+            "origin_country": "US"
+        },
+        {
+            "id": 264539,
+            "logo_path": null,
+            "name": "Pith Quest Films",
+            "origin_country": "CA"
+        },
+        {
+            "id": 138287,
+            "logo_path": "/3I1k679J7ZLQtVFM23dJhFZQQCH.png",
+            "name": "Fruit Tree",
+            "origin_country": "US"
+        },
+        {
+            "id": 128404,
+            "logo_path": "/dP3usmr6di1jMPH738rvbxdkmSQ.png",
+            "name": "CJ ENM",
+            "origin_country": "KR"
+        }
+    ],
+    "production_countries": [
+        {
+            "iso_3166_1": "IE",
+            "name": "Ireland"
+        },
+        {
+            "iso_3166_1": "KR",
+            "name": "South Korea"
+        },
+        {
+            "iso_3166_1": "US",
+            "name": "United States of America"
+        },
+        {
+            "iso_3166_1": "CA",
+            "name": "Canada"
+        }
+    ],
+    "rating": "R",
+    "release_date": "2025-10-23",
+    "revenue": 40293453,
+    "runtime": 119,
+    "spoken_languages": [
+        {
+            "english_name": "English",
+            "iso_639_1": "en",
+            "name": "English"
+        }
+    ],
+    "status": "Released",
+    "tagline": "Of all the abductions, this one is different.",
+    "title": "Bugonia",
+    "trailer_url": "https://www.youtube.com/watch?v=7VBigr-JHB0",
+    "video": false,
+    "vote_average": 7.394,
+    "vote_count": 1131
+}

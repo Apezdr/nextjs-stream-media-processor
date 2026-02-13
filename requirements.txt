@@ -6,4 +6,5 @@ aiohttp
 aiohttp_client_cache
 aiofiles
 python-dotenv
+cairosvg
 # Add any other dependencies your Python scripts require

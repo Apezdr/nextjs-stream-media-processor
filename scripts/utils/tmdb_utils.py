@@ -67,7 +67,7 @@ async def make_tmdb_api_request(
 async def fetch_tmdb_media_details(
     session: aiohttp.ClientSession,
     name: str,
-    tmdb_id: int = None,
+    tmdb_id: Optional[int] = None,
     media_type: str = 'tv'
 ) -> Optional[Dict]:
     params = {'api_key': TMDB_API_KEY}
@@ -91,8 +91,21 @@ async def fetch_tmdb_media_details(
     if not media_details:
         return None
 
+    # At this point, tmdb_id is guaranteed to be an int
+    assert tmdb_id is not None
+    
     # Fetch and integrate additional details
-    media_details['cast'] = await fetch_tmdb_cast_details(session, tmdb_id, media_type)
+    cast_data = await fetch_tmdb_cast_details(session, tmdb_id, media_type)
+    
+    # Handle structured cast data for TV shows
+    if media_type == 'tv' and isinstance(cast_data, dict):
+        # TV shows return dict with cast and recurring_cast
+        media_details['cast'] = cast_data.get('cast', [])
+        media_details['recurring_cast'] = cast_data.get('recurring_cast', [])
+    else:
+        # Movies return list (backward compatible)
+        media_details['cast'] = cast_data if cast_data else []
+    
     media_details['trailer_url'] = await fetch_tmdb_trailer_url(session, tmdb_id, media_type)
     media_details['logo_path'] = await fetch_tmdb_logo_path(session, tmdb_id, media_type)
     media_details['rating'] = await fetch_tmdb_rating(session, tmdb_id, media_type)
@@ -121,21 +134,88 @@ async def fetch_tmdb_rating(session: aiohttp.ClientSession, tmdb_id: int, media_
                     return rating_info['rating']
     return None
 
-async def fetch_tmdb_cast_details(session: aiohttp.ClientSession, tmdb_id: int, media_type: str) -> Optional[Dict]:
-    credits_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/credits'
+async def fetch_tmdb_cast_details(session: aiohttp.ClientSession, tmdb_id: int, media_type: str):
+    """
+    Fetch cast details for a movie or TV show.
+    For TV shows, uses aggregate_credits to get comprehensive cast with episode counts.
+    For movies, uses standard credits endpoint.
+    
+    Returns:
+        For TV shows: Dict with 'cast' (all cast), 'recurring_cast' (3-7 eps)
+        For movies: List of cast members (backward compatible)
+    """
     params = {'api_key': TMDB_API_KEY}
-    credits_data = await make_tmdb_api_request(session, credits_url, params)
-    if credits_data and 'cast' in credits_data:
-        cast_details = []
-        for member in credits_data['cast']:
-            cast_details.append({
-                'id': member['id'],
-                'name': member['name'],
-                'character': member.get('character', ''),
-                'profile_path': f'https://image.tmdb.org/t/p/original{member["profile_path"]}' if member.get('profile_path') else None
-            })
-        return cast_details
+    
+    if media_type == 'tv':
+        # Use aggregate_credits for TV shows to get episode counts
+        credits_url = f'https://api.themoviedb.org/3/tv/{tmdb_id}/aggregate_credits'
+        credits_data = await make_tmdb_api_request(session, credits_url, params)
+        
+        if credits_data and 'cast' in credits_data:
+            # Format all cast members with enhanced TV data
+            all_cast = []
+            for member in credits_data['cast']:
+                episode_count = member.get('total_episode_count', 0)
+                cast_member = {
+                    'id': member['id'],
+                    'name': member['name'],
+                    'character': member.get('roles', [{}])[0].get('character', '') if member.get('roles') else '',
+                    'profile_path': f'https://image.tmdb.org/t/p/original{member["profile_path"]}' if member.get('profile_path') else None,
+                    'roles': member.get('roles', []),
+                    'total_episode_count': episode_count,
+                    'type': classify_role(episode_count),
+                    'known_for_department': member.get('known_for_department')
+                }
+                all_cast.append(cast_member)
+            
+            # Separate recurring cast (3-7 episodes)
+            recurring_cast = [member for member in all_cast if member['type'] == 'Recurring']
+            
+            # Return structured data for TV shows
+            return {
+                'cast': all_cast,
+                'recurring_cast': recurring_cast
+            }
+    else:
+        # For movies, use standard credits endpoint (backward compatible)
+        credits_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/credits'
+        credits_data = await make_tmdb_api_request(session, credits_url, params)
+        
+        if credits_data and 'cast' in credits_data:
+            cast_details = []
+            for member in credits_data['cast']:
+                cast_details.append({
+                    'id': member['id'],
+                    'name': member['name'],
+                    'character': member.get('character', ''),
+                    'profile_path': f'https://image.tmdb.org/t/p/original{member["profile_path"]}' if member.get('profile_path') else None
+                })
+            return cast_details
+    
     return None
+
+
+def classify_role(episode_count: int) -> str:
+    """
+    Classify role type based on episode count for TV shows.
+    
+    Args:
+        episode_count: Number of episodes appeared in
+    
+    Returns:
+        Role classification: 'Season Regular', 'Recurring', or 'Guest Star'
+    """
+    if not episode_count or episode_count <= 0:
+        return 'Guest Star'
+    
+    # Classification thresholds
+    if episode_count >= 8:
+        return 'Season Regular'
+    
+    if episode_count >= 3:
+        return 'Recurring'
+    
+    return 'Guest Star'
 
 async def fetch_tmdb_trailer_url(session: aiohttp.ClientSession, tmdb_id: int, media_type: str) -> Optional[str]:
     videos_url = f'https://api.themoviedb.org/3/{media_type}/{tmdb_id}/videos'

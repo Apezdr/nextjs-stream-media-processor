@@ -4,10 +4,9 @@ import { createCategoryLogger } from '../lib/logger.mjs';
 import { createHash } from 'crypto';
 import { scheduleJob } from 'node-schedule';
 import { enqueueTask, TaskType, getTaskStatus } from '../lib/taskManager.mjs';
-import { getAllValidWebhookIds, validateWebhookAuth } from '../middleware/webhookAuth.mjs';
+import { authenticateWebhookOrUser } from '../middleware/auth.mjs';
 import { NotificationManager } from '../integrations/index.mjs';
 
-const router = express.Router();
 const logger = createCategoryLogger('systemStatusRoutes');
 const isDebugMode = process.env.DEBUG === 'TRUE';
 
@@ -28,6 +27,13 @@ const statusCache = {
 
 // Cache TTL in milliseconds (60 seconds for general requests)
 const CACHE_TTL = 60 * 1000;
+
+/**
+ * Initialize and configure system status routes
+ * @returns {object} Configured Express router
+ */
+export function setupSystemStatusRoutes() {
+  const router = express.Router();
 
 // Longer TTL for polling clients - they should respect this and avoid frequent requests
 const CLIENT_CACHE_TTL = 120; // 2 minutes
@@ -174,18 +180,10 @@ function updateIncidentStatus(systemStatus) {
 /**
  * Check if the system is under heavy load and provide metrics
  * @route GET /api/system-status
- * @security X-Webhook-ID
+ * @security Webhook OR Admin
  */
-router.get('/system-status', async (req, res) => {
+router.get('/system-status', authenticateWebhookOrUser, async (req, res) => {
   try {
-    // Get ALL valid webhook IDs from environment variables
-    const validWebhookIds = getAllValidWebhookIds();
-
-    // Verify webhook authentication against any valid ID
-    if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
-      logger.warn('Unauthorized system status request attempted');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
 
     // Check for If-None-Match header for conditional requests
     const requestEtag = req.headers['if-none-match'];
@@ -241,6 +239,54 @@ router.get('/system-status', async (req, res) => {
 });
 
 /**
+ * Get last reported system health (public endpoint, no authentication required)
+ * This endpoint returns the cached system status for quick health checks
+ * @route GET /api/health
+ * @public
+ */
+router.get('/health', async (req, res) => {
+  try {
+    // Check if we have cached data
+    if (!statusCache.data) {
+      // No cache available yet - return a basic response
+      return res.json({
+        status: 'unknown',
+        message: 'System health data not yet available. Please try again in a moment.',
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    // Return lightweight health status from cache
+    const healthResponse = {
+      status: statusCache.data.status,
+      message: statusCache.data.message,
+      timestamp: statusCache.data.timestamp,
+      // Include incident information if there's an active or recently resolved incident
+      incident: currentIncident ? {
+        id: currentIncident.id,
+        status: currentIncident.status,
+        startTime: currentIncident.startTime,
+        latestUpdate: currentIncident.latestUpdate,
+        resolvedTime: currentIncident.resolvedTime
+      } : null
+    };
+    
+    // Set cache headers to reduce server load from frequent polling
+    res.set('Cache-Control', `public, max-age=${CLIENT_CACHE_TTL}`);
+    res.set('Expires', new Date(Date.now() + CLIENT_CACHE_TTL * 1000).toUTCString());
+    
+    res.json(healthResponse);
+  } catch (error) {
+    logger.error(`Error retrieving public health status: ${error.message}`);
+    res.status(500).json({
+      status: 'error',
+      message: 'Unable to retrieve system health status',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
  * Send system status notifications to all configured platforms (frontends, Discord, etc.)
  * Uses the NotificationManager to handle multi-platform notifications
  * @param {string} status System status level
@@ -277,18 +323,10 @@ async function checkAndSendNotification(status, message, statusData) {
 /**
  * Manual endpoint to trigger system status check and notifications
  * @route POST /api/trigger-system-status
- * @security X-Webhook-ID
+ * @security Webhook OR Admin
  */
-router.post('/trigger-system-status', async (req, res) => {
+router.post('/trigger-system-status', authenticateWebhookOrUser, async (req, res) => {
   try {
-    // Get ALL valid webhook IDs from environment variables
-    const validWebhookIds = getAllValidWebhookIds();
-
-    // Verify webhook authentication against any valid ID
-    if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
-      logger.warn('Unauthorized system status trigger attempted');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
     
     // Collect system metrics to get current status
     const [cpu, mem, currentLoad, fsSize, disksIO] = await Promise.all([
@@ -634,18 +672,10 @@ scheduleJob(`*/${CACHE_TTL / 1000} * * * * *`, () => {
 /**
  * Get current task manager status
  * @route GET /api/tasks
- * @security X-Webhook-ID
+ * @security Webhook OR Admin
  */
-router.get('/tasks', async (req, res) => {
+router.get('/tasks', authenticateWebhookOrUser, async (req, res) => {
   try {
-    // Get ALL valid webhook IDs from environment variables
-    const validWebhookIds = getAllValidWebhookIds();
-
-    // Verify webhook authentication against any valid ID
-    if (!validWebhookIds.includes(req.headers['x-webhook-id'])) {
-      logger.warn('Unauthorized tasks request attempted');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
 
     // Get task status from task manager
     const taskStatus = getTaskStatus();
@@ -713,4 +743,7 @@ router.get('/tasks', async (req, res) => {
   }
 });
 
-export default router;
+  return router;
+}
+
+export default setupSystemStatusRoutes();

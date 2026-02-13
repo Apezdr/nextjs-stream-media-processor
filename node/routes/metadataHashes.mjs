@@ -9,14 +9,20 @@ import {
   getHash 
 } from '../sqlite/metadataHashes.mjs';
 
-const router = express.Router();
 const logger = createCategoryLogger('metadataHashesRoutes');
 
 /**
- * Get all media type hashes
- * @route GET /api/metadata-hashes/:mediaType
+ * Initialize and configure metadata hashes routes
+ * @returns {object} Configured Express router
  */
-router.get('/metadata-hashes/:mediaType', async (req, res) => {
+export function setupMetadataHashesRoutes() {
+  const router = express.Router();
+
+  /**
+   * Get all media type hashes
+   * @route GET /api/metadata-hashes/:mediaType
+   */
+  router.get('/metadata-hashes/:mediaType', async (req, res) => {
   try {
     const { mediaType } = req.params;
     
@@ -146,4 +152,7 @@ router.get('/metadata-hashes/:mediaType/:title/:seasonNumber', async (req, res) 
   }
 });
 
-export default router;
+  return router;
+}
+
+export default setupMetadataHashesRoutes();

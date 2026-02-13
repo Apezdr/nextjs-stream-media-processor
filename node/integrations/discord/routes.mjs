@@ -3,13 +3,19 @@ import { verifyKey } from 'discord-interactions';
 import { createCategoryLogger } from '../../lib/logger.mjs';
 import { sendIntroductionDM } from './utils/introductionDM.mjs';
 
-const router = express.Router();
 const logger = createCategoryLogger('discordWebhookEvents');
 const isDebugMode = process.env.DEBUG === 'TRUE';
 
 // Store seen event IDs for idempotency (prevent duplicate processing)
 const processedEvents = new Set();
 const MAX_PROCESSED_EVENTS = 1000; // Limit memory usage
+
+/**
+ * Initialize and configure Discord webhook routes
+ * @returns {object} Configured Express router
+ */
+export function setupDiscordRoutes() {
+  const router = express.Router();
 
 /**
  * Discord Webhook Events endpoint
@@ -246,5 +252,7 @@ function getConfiguredDiscordBots() {
   return bots;
 }
 
+  return router;
+}
 
-export default router;
+export default setupDiscordRoutes();

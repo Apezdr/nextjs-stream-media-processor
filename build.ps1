@@ -17,20 +17,11 @@ Get-Content .env.local | ForEach-Object {
     } 
 }
 
-# Build the Docker image
-Write-Host "Building Docker image..." -ForegroundColor Cyan
+# Build the Docker image using BuildKit secrets (prevents API key from leaking into image history)
+Write-Host "Building Docker image with BuildKit secrets..." -ForegroundColor Cyan
+$env:DOCKER_BUILDKIT=1
 docker build --no-cache `
-  --build-arg DEBUG=${env:DEBUG} `
-  --build-arg TMDB_API_KEY=${env:TMDB_API_KEY} `
-  --build-arg FILE_SERVER_NODE_URL=${env:FILE_SERVER_NODE_URL} `
-  --build-arg FRONT_END_1=${env:FRONT_END_1} `
-  --build-arg WEBHOOK_ID_1=${env:WEBHOOK_ID_1} `
-  --build-arg MONGODB_URI=${env:MONGODB_URI} `
-  --build-arg TZ=${env:TZ} `
-  --build-arg BASE_PATH=${env:BASE_PATH} `
-  --build-arg LOG_PATH=${env:LOG_PATH} `
-  --build-arg FFMPEG_CONCURRENCY=${env:FFMPEG_CONCURRENCY} `
-  --build-arg PREFIX_PATH=${env:PREFIX_PATH} `
+  --secret id=tmdb_api_key,env=TMDB_API_KEY `
   -t $version -t $latest .
 
 # Check if build was successful

@@ -1,0 +1,26 @@
+# Test Dependencies for TMDB Metadata Processing
+# Install with: pip install -r test-requirements.txt
+
+# Core testing framework
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+pytest-timeout>=2.1.0
+pytest-xdist>=3.3.0  # For parallel test execution
+
+# Async support
+aiohttp>=3.8.0
+asyncio>=3.4.3
+
+# Mocking and fixtures
+pytest-mock>=3.11.0
+
+# Code quality
+pytest-pylint>=0.19.0  # Optional: lint checks
+pytest-flake8>=1.1.1   # Optional: style checks
+
+# Performance testing
+pytest-benchmark>=4.0.0  # Optional: advanced benchmarking
+
+# Test reporting
+pytest-html>=3.2.0  # Optional: HTML test reports

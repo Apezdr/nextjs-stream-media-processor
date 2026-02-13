@@ -1,10 +1,10 @@
 import express from 'express';
-import blurhashRoutes from './blurhash.mjs';
-import metadataHashesRoutes from './metadataHashes.mjs';
-import systemStatusRoutes from './systemStatus.mjs';
-import tmdbRoutes from './tmdb.mjs';
-import adminRoutes from './admin.mjs';
-import discordEventsRoutes from '../integrations/discord/routes.mjs';
+import { setupBlurhashRoutes } from './blurhash.mjs';
+import { setupMetadataHashesRoutes } from './metadataHashes.mjs';
+import { setupSystemStatusRoutes } from './systemStatus.mjs';
+import { setupTmdbRoutes } from './tmdb.mjs';
+import { setupAdminRoutes } from './admin.mjs';
+import { setupDiscordRoutes } from '../integrations/discord/routes.mjs';
 
 /**
  * Initialize and configure all API routes
@@ -14,13 +14,17 @@ export function setupRoutes() {
   const router = express.Router();
   
   // Mount route modules
-  router.use('/api', blurhashRoutes);
-  router.use('/api', metadataHashesRoutes);
-  router.use('/api', systemStatusRoutes);
-  router.use('/api/tmdb', tmdbRoutes);
-  router.use('/api/admin', adminRoutes);
+  router.use('/api', setupBlurhashRoutes());
+  router.use('/api', setupMetadataHashesRoutes());
+  router.use('/api', setupSystemStatusRoutes());
+  router.use('/api/tmdb', setupTmdbRoutes());
+  router.use('/api/admin', setupAdminRoutes());
   // Integrations
-  router.use('/api', discordEventsRoutes);  // Discord webhook events
+  router.use('/api', setupDiscordRoutes());  // Discord webhook events
+  
+  // Debug logging to verify routes are mounted
+  console.log('[Routes] Mounted: /api/blurhash, /api/metadata-hashes, /api/system-status');
+  console.log('[Routes] Mounted: /api/tmdb/*, /api/admin/*, /api/discord');
   
   return router;
 }

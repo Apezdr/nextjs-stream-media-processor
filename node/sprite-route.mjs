@@ -11,7 +11,6 @@ import { getInfo } from './infoManager.mjs';
 import { createCategoryLogger } from './lib/logger.mjs';
 
 const logger = createCategoryLogger('sprite-route');
-const router = express.Router();
 
 // Chrome's maximum image height limit
 const CHROME_HEIGHT_LIMIT = 30780;
@@ -424,6 +423,8 @@ async function handleVttRequest(req, res, type, BASE_PATH) {
  * Setup sprite sheet routes with BASE_PATH dependency injection
  */
 export function createSpriteRoutes(BASE_PATH) {
+  const router = express.Router();
+
   // Sprite sheet routes
   router.get("/spritesheet/movie/:movieName", (req, res) => {
     handleSpriteSheetRequest(req, res, "movies", BASE_PATH);
@@ -444,5 +445,3 @@ export function createSpriteRoutes(BASE_PATH) {
 
   return router;
 }
-
-export default router;

@@ -7,10 +7,36 @@ import base64
 import asyncio
 import os
 
+# Try to import cairosvg for SVG support
+try:
+    import cairosvg
+    SVG_SUPPORT = True
+except ImportError:
+    SVG_SUPPORT = False
+
+# Async function to convert SVG to PNG
+async def convert_svg_to_png(svg_path, png_path, width=512, height=512):
+    """
+    Convert SVG file to PNG using cairosvg.
+    
+    Args:
+        svg_path: Path to input SVG file
+        png_path: Path to output PNG file
+        width: Output width (default: 512)
+        height: Output height (default: 512)
+    """
+    if not SVG_SUPPORT:
+        raise ImportError("cairosvg is required for SVG support")
+    
+    def _convert():
+        cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=width, output_height=height)
+    
+    await asyncio.to_thread(_convert)
+
 # Async function to generate a blurhash from an image file
 async def generate_blurhash(image_path, x_components=8, y_components=6, max_encode_size=200):
     """
-    Generate blurhash from an image file.
+    Generate blurhash from an image file (including SVG support).
     
     PERFORMANCE OPTIMIZATION: Resize image to max_encode_size before encoding.
     Blurhash doesn't need high resolution - encoding from 200px is 10-20x faster
@@ -22,9 +48,24 @@ async def generate_blurhash(image_path, x_components=8, y_components=6, max_enco
         y_components: Vertical blurhash components (default: 6)
         max_encode_size: Max dimension for encoding (default: 200px)
     """
+    temp_png_path = None
     try:
+        # Check if the file is an SVG
+        if image_path.lower().endswith('.svg'):
+            if not SVG_SUPPORT:
+                print(f"Error: SVG file detected but cairosvg is not available: {image_path}", file=sys.stderr)
+                return None
+            
+            # Convert SVG to temporary PNG file
+            temp_png_path = image_path + '.tmp.png'
+            await convert_svg_to_png(image_path, temp_png_path, width=512, height=512)
+            # Use the temporary PNG file for processing
+            actual_image_path = temp_png_path
+        else:
+            actual_image_path = image_path
+
         # Use asyncio.to_thread to open the image without blocking the event loop
-        img = await asyncio.to_thread(Image.open, image_path)
+        img = await asyncio.to_thread(Image.open, actual_image_path)
         
         # Store original dimensions (for aspect ratio calculation)
         original_width, original_height = img.size
@@ -64,6 +105,13 @@ async def generate_blurhash(image_path, x_components=8, y_components=6, max_enco
         import traceback
         traceback.print_exc(file=sys.stderr)
         return None
+    finally:
+        # Clean up temporary PNG file if it was created
+        if temp_png_path and os.path.exists(temp_png_path):
+            try:
+                os.remove(temp_png_path)
+            except Exception as cleanup_error:
+                print(f"Warning: Could not clean up temporary file {temp_png_path}: {cleanup_error}", file=sys.stderr)
 
 # Async function to convert a blurhash string to a base64-encoded image
 async def blurhash_to_base64(hash, width, height):

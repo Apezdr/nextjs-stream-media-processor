@@ -11,9 +11,11 @@ import cors from "cors";
 import axios from "axios";
 import { createSpriteRoutes } from "./sprite-route.mjs";
 import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
-import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash } from "./sqlite/metadataHashes.mjs";
+import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
+import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
+import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
@@ -27,9 +29,11 @@ import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
+import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
+import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
-const tmdbLogger   = createPythonLogger('DownloadTMDBImages');
+const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
 const app = express();
@@ -610,11 +614,12 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietM
 /**
  * GET /processes
  * Retrieves the current process queue information in JSON format.
+ * Requires either webhook authentication or admin user access.
  * Optional query parameters:
  * - processType: Filter by process_type (e.g., "spritesheet", "vtt")
  * - status: Filter by status (e.g., "in-progress", "queued", "completed", "error")
  */
-app.get('/processes', async (req, res) => {
+app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await getProcessTrackingDb();
 
@@ -642,8 +647,9 @@ app.get('/processes', async (req, res) => {
 /**
  * GET /processes/:fileKey
  * Retrieves the process information for a specific fileKey.
+ * Requires either webhook authentication or admin user access.
  */
-app.get('/processes/:fileKey', async (req, res) => {
+app.get('/processes/:fileKey', authenticateWebhookOrUser, async (req, res) => {
   try {
     const { fileKey } = req.params;
     const db = await getProcessTrackingDb();
@@ -787,430 +793,29 @@ scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hou
 });
 //
 // End Cache Management
+
+/**
+ * Wrapper function for backward compatibility
+ * Calls the new media-scanner component
+ */
 async function generateListTV(db, dirPath) {
-  const shows = await fs.readdir(dirPath, { withFileTypes: true });
-  const missingDataMedia = await getMissingDataMedia();
-  const now = new Date();
-
-  // Get the list of TV shows currently in the database
-  const existingShows = await getTVShows();
-  const existingShowNames = new Set(existingShows.map((show) => show.name));
-
-  try {
-    for (let index = 0; index < shows.length; index++) {
-      const show = shows[index];
-      if (isDebugMode) {
-        logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
-      }
-      if (!show.isDirectory()) continue; // Skip if not a directory
-
-      const showName = show.name;
-      existingShowNames.delete(showName); // Remove from the set of existing shows
-      const encodedShowName = encodeURIComponent(showName);
-      const showPath = normalize(join(dirPath, showName));
-      const allItems = await fs.readdir(showPath, { withFileTypes: true });
-      const seasonFolders = allItems.filter(
-        (item) => item.isDirectory() && item.name.startsWith("Season")
-      );
-      const sortedSeasonFolders = seasonFolders.sort((a, b) => {
-        const aNum = parseInt(a.name.replace("Season", ""));
-        const bNum = parseInt(b.name.replace("Season", ""));
-        return aNum - bNum;
-      });
-      const otherItems = allItems.filter((item) => !seasonFolders.includes(item));
-      const seasons = [...sortedSeasonFolders, ...otherItems];
-
-      // Initialize individual fields
-      let metadataUrl = "";
-      let metadata = "";
-      let poster = "";
-      let posterBlurhash = "";
-      let logo = "";
-      let logoBlurhash = "";
-      let backdrop = "";
-      let backdropBlurhash = "";
-
-      // Initialize runDownloadTmdbImagesFlag
-      let runDownloadTmdbImagesFlag = false;
-
-      // Handle show poster
-      const posterPath = join(showPath, "show_poster.jpg");
-      if (await fileExists(posterPath)) {
-        const posterStats = await fs.stat(posterPath);
-        const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
-        poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg?hash=${posterImageHash}`;
-        const blurhash = await getStoredBlurhash(posterPath, BASE_PATH);
-        if (blurhash) {
-          posterBlurhash = blurhash;
-        }
-      } else {
-        runDownloadTmdbImagesFlag = true;
-      }
-
-      // Handle show logo
-      const logoExtensions = ["svg", "jpg", "png", "gif"];
-      let logoFound = false;
-      for (const ext of logoExtensions) {
-        const logoPath = join(showPath, `show_logo.${ext}`);
-        if (await fileExists(logoPath)) {
-          const logoStats = await fs.stat(logoPath);
-          const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}?hash=${logoImageHash}`;
-          if (ext !== "svg") {
-            const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-            if (blurhash) {
-              logoBlurhash = blurhash;
-            }
-          }
-          logoFound = true;
-          break;
-        }
-      }
-      if (!logoFound) {
-        runDownloadTmdbImagesFlag = true;
-      }
-
-      // Handle show backdrop
-      const backdropExtensions = ["jpg", "png", "gif"];
-      let backdropFound = false;
-      for (const ext of backdropExtensions) {
-        const backdropPath = join(showPath, `show_backdrop.${ext}`);
-        if (await fileExists(backdropPath)) {
-          const backdropStats = await fs.stat(backdropPath);
-          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}?hash=${backdropImageHash}`;
-          const blurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
-          if (blurhash) {
-            backdropBlurhash = blurhash;
-          }
-          backdropFound = true;
-          break;
-        }
-      }
-      if (!backdropFound) {
-        runDownloadTmdbImagesFlag = true;
-      }
-
-      // Check for metadata.json
-      const metadataFilePath = join(showPath, "metadata.json");
-      if (!(await fileExists(metadataFilePath))) {
-        runDownloadTmdbImagesFlag = true;
-      } else {
-        metadataUrl = `${PREFIX_PATH}/tv/${encodedShowName}/metadata.json`
-        // metadata
-        metadata = JSON.stringify(JSON.parse(await fs.readFile(metadataFilePath, 'utf8')))
-      }
-
-      // Handle missing data attempts
-      const missingDataShow = missingDataMedia.find((media) => media.name === showName);
-      if (missingDataShow) {
-        const lastAttempt = new Date(missingDataShow.lastAttempt);
-        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-          runDownloadTmdbImagesFlag = true;
-        } else {
-          runDownloadTmdbImagesFlag = false;
-        }
-      }
-
-      if (runDownloadTmdbImagesFlag) {
-        await insertOrUpdateMissingDataMedia(showName);
-        await runDownloadTmdbImages(showName);
-        const retryFiles = await fs.readdir(showPath);
-        const retryFileSet = new Set(retryFiles);
-
-        // Retry poster
-        if (retryFileSet.has("show_poster.jpg")) {
-          const posterPath = join(showPath, "show_poster.jpg");
-          const posterStats = await fs.stat(posterPath);
-          const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          poster = `${PREFIX_PATH}/tv/${encodedShowName}/show_poster.jpg?hash=${posterImageHash}`;
-          const blurhash = await getStoredBlurhash(posterPath, BASE_PATH);
-          if (blurhash) {
-            posterBlurhash = blurhash;
-          }
-        }
-
-        // Retry logo
-        for (const ext of logoExtensions) {
-          const logoPath = join(showPath, `show_logo.${ext}`);
-          if (retryFileSet.has(`show_logo.${ext}`)) {
-            const logoStats = await fs.stat(logoPath);
-            const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
-            logo = `${PREFIX_PATH}/tv/${encodedShowName}/show_logo.${ext}?hash=${logoImageHash}`;
-            if (ext !== "svg") {
-              const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-              if (blurhash) {
-                logoBlurhash = blurhash;
-              }
-            }
-            break;
-          }
-        }
-
-        // Retry backdrop
-        for (const ext of backdropExtensions) {
-          const backdropPath = join(showPath, `show_backdrop.${ext}`);
-          if (retryFileSet.has(`show_backdrop.${ext}`)) {
-            const backdropStats = await fs.stat(backdropPath);
-            const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
-            backdrop = `${PREFIX_PATH}/tv/${encodedShowName}/show_backdrop.${ext}?hash=${backdropImageHash}`;
-            const blurhash = await getStoredBlurhash(backdropPath, BASE_PATH);
-            if (blurhash) {
-              backdropBlurhash = blurhash;
-            }
-            break;
-          }
-        }
-      }
-
-      // Initialize seasons object
-      const seasonsObj = {};
-
-      // Process each season
-      await Promise.all(
-        seasons.map(async (season) => {
-          if (!season.isDirectory()) return;
-
-          const seasonName = season.name;
-          const encodedSeasonName = encodeURIComponent(seasonName);
-          const seasonPath = join(showPath, seasonName);
-          const seasonNumberMatch = seasonName.match(/\d+/);
-          const seasonNumber = seasonNumberMatch ? seasonNumberMatch[0].padStart(2, "0") : "00";
-
-          const episodes = await fs.readdir(seasonPath);
-          const validEpisodes = episodes.filter(
-            (episode) => episode.endsWith(".mp4") && !episode.includes("-TdarrCacheFile-")
-          );
-          if (validEpisodes.length === 0) return;
-
-          // Restructure to use episodeKey = SxxExx
-          const seasonData = {
-            episodes: {},
-            lengths: {},
-            dimensions: {},
-            seasonNumber: parseInt(seasonNumber, 10)
-          };
-
-          // Handle season poster
-          const seasonPosterPath = join(seasonPath, "season_poster.jpg");
-          if (await fileExists(seasonPosterPath)) {
-            const seasonPosterStats = await fs.stat(seasonPosterPath);
-            const seasonPosterImageHash = createHash('md5').update(seasonPosterStats.mtime.toISOString()).digest('hex').substring(0, 10);
-            seasonData.season_poster = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg?hash=${seasonPosterImageHash}`;
-            const blurhash = await getStoredBlurhash(seasonPosterPath, BASE_PATH);
-            if (blurhash) {
-              seasonData.seasonPosterBlurhash = blurhash;
-            }
-          }
-
-          for (const episode of validEpisodes) {
-            const episodePath = join(seasonPath, episode);
-            const encodedEpisodePath = encodeURIComponent(episode);
-
-            let derivedEpisodeName = deriveEpisodeTitle(episode);
-            let fileLength;
-            let fileDimensions;
-            let hdrInfo;
-            let mediaQuality;
-            let additionalMetadata;
-            let uuid;
-
-            try {
-              const info = await getInfo(episodePath);
-              fileLength = info.length;
-              fileDimensions = info.dimensions;
-              hdrInfo = info.hdr;
-              mediaQuality = info.mediaQuality;
-              additionalMetadata = info.additionalMetadata;
-              uuid = info.uuid;
-            } catch (error) {
-              logger.error(`Failed to retrieve info for ${episodePath}:`, error);
-            }
-
-            // Extract episode number
-            const episodeNumberMatch = episode.match(/S\d+E(\d+)/i);
-            const episodeNumber = episodeNumberMatch ? episodeNumberMatch[1] : (episode.match(/\d+/) || ["0"])[0];
-            if (!episodeNumber || !seasonNumber) {
-              logger.warn(`Could not extract episode or season number from ${episode}, skipping.`);
-              continue;
-            }
-
-            const paddedEpisodeNumber = episodeNumber.padStart(2, "0");
-            const episodeKey = `S${seasonNumber}E${paddedEpisodeNumber}`;
-
-            // Store length/dimensions keyed by episodeKey
-            seasonData.lengths[episodeKey] = parseInt(fileLength, 10);
-            seasonData.dimensions[episodeKey] = fileDimensions;
-
-            const episodeData = {
-              _id: uuid,
-              filename: episode, // store original filename for reference
-              videoURL: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-              mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
-              hdr: hdrInfo || null,
-              mediaQuality: mediaQuality || null,
-              additionalMetadata: additionalMetadata || {},
-              episodeNumber: parseInt(episodeNumber, 10),
-              derivedEpisodeName: derivedEpisodeName,
-            };
-
-            // Handle thumbnail
-            const thumbnailPath = join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
-            if (await fileExists(thumbnailPath)) {
-              const thumbnailStats = await fs.stat(thumbnailPath);
-              const thumbnailImageHash = createHash('md5').update(thumbnailStats.mtime.toISOString()).digest('hex').substring(0, 10);
-              episodeData.thumbnail = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                `${episodeNumber} - Thumbnail.jpg`
-              )}?hash=${thumbnailImageHash}`;
-              const blurhash = await getStoredBlurhash(thumbnailPath, BASE_PATH);
-              if (blurhash) {
-                episodeData.thumbnailBlurhash = blurhash;
-              }
-            }
-
-            // Handle episode metadata
-            const episodeMetadataPath = join(seasonPath, `${episodeNumber}_metadata.json`);
-            if (await fileExists(episodeMetadataPath)) {
-              episodeData.metadata = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                `${episodeNumber}_metadata.json`
-              )}`;
-            }
-
-            // Handle chapters
-            const chaptersPath = join(
-              seasonPath,
-              "chapters",
-              `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
-            );
-            
-            // Generate chapter file before checking if it exists
-            await generateChapterFileIfNotExists(chaptersPath, episodePath, true); // Use quietMode for bulk operations
-            
-            if (await fileExists(chaptersPath)) {
-              episodeData.chapters = `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
-                `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
-              )}`;
-            }
-
-            // Generate a Unique ID for each episode
-            // if (episodeNumber && seasonNumber && showName) {
-            //   episodeData._id = generateCacheKey(`${showName.toLowerCase()}_S${seasonNumber}E${episodeNumber}`);
-            // }
-
-            // Find subtitles
-            const subtitleFiles = await fs.readdir(seasonPath);
-            const subtitles = {};
-            for (const subtitleFile of subtitleFiles) {
-              if (
-                subtitleFile.startsWith(episode.replace(".mp4", "")) &&
-                subtitleFile.endsWith(".srt")
-              ) {
-                const parts = subtitleFile.split(".");
-                const srtIndex = parts.lastIndexOf("srt");
-                const isHearingImpaired = parts[srtIndex - 1] === "hi";
-                const langCode = isHearingImpaired
-                  ? parts[srtIndex - 2]
-                  : parts[srtIndex - 1];
-                const langName = langMap[langCode] || langCode;
-                const subtitleKey = isHearingImpaired
-                  ? `${langName} Hearing Impaired`
-                  : langName;
-                subtitles[subtitleKey] = {
-                  url: `${PREFIX_PATH}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
-                    subtitleFile
-                  )}`,
-                  srcLang: langCode,
-                  lastModified: (await fs.stat(join(seasonPath, subtitleFile))).mtime.toISOString(),
-                };
-              }
-            }
-            if (Object.keys(subtitles).length > 0) {
-              episodeData.subtitles = subtitles;
-            }
-
-            // Store episode data under canonical episodeKey
-            seasonData.episodes[episodeKey] = episodeData;
-          }
-
-          // Process all thumbnails to ensure blurhash is generated (optional)
-          const thumbnailFiles = episodes.filter((file) =>
-            file.endsWith(" - Thumbnail.jpg")
-          );
-          for (const thumbnailFile of thumbnailFiles) {
-            const thumbnailPath = join(seasonPath, thumbnailFile);
-            // Even if we don't store them by filename now, we ensure blurhash is available.
-            await getStoredBlurhash(thumbnailPath, BASE_PATH);
-          }
-          
-          seasonsObj[seasonName] = seasonData;
-        })
-      );
-
-      // Sort seasons
-      const sortedSeasons = Object.fromEntries(
-        Object.entries(seasonsObj).sort((a, b) => {
-          // Extract numbers from season names and pad with zeros for proper string comparison
-          const seasonA = a[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
-          const seasonB = b[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
-          return seasonA.localeCompare(seasonB);
-        })
-      );
-
-      // Prepare individual fields for insertion
-      const seasonsFinal = sortedSeasons;
-
-      // Extract and store file paths for direct access
-      const posterFilePath = await fileExists(join(showPath, "show_poster.jpg")) ? 
-                             join(showPath, "show_poster.jpg") : null;
-      
-      let logoFilePath = null;
-      for (const ext of logoExtensions) {
-        const logoPath = join(showPath, `show_logo.${ext}`);
-        if (await fileExists(logoPath)) {
-          logoFilePath = logoPath;
-          break;
-        }
-      }
-      
-      let backdropFilePath = null;
-      for (const ext of backdropExtensions) {
-        const backdropPath = join(showPath, `show_backdrop.${ext}`);
-        if (await fileExists(backdropPath)) {
-          backdropFilePath = backdropPath;
-          break;
-        }
-      }
-
-      await insertOrUpdateTVShow(
-        showName,
-        metadata,
-        metadataUrl,
-        poster,
-        posterBlurhash,
-        logo,
-        logoBlurhash,
-        backdrop,
-        backdropBlurhash,
-        seasonsFinal,
-        posterFilePath,
-        backdropFilePath,
-        logoFilePath,
-        BASE_PATH // Store the base path for future reference
-      );
-    }
-
-    // Remove TV shows from the database that no longer exist in the file system
-    for (const showName of existingShowNames) {
-      await deleteTVShow(showName);
-    }
-
-  } catch (error) {
-    logger.error("Error during database update:" + error);
-  }
+  await scanTVShows(
+    db,
+    dirPath,
+    PREFIX_PATH,
+    BASE_PATH,
+    langMap,
+    isDebugMode,
+    runDownloadTmdbImages
+  );
 }
 
-app.get("/media/tv", async (req, res) => {
+/**
+ * Legacy implementation - moved to components/media-scanner/domain/tv-scanner.mjs
+ * @deprecated Use scanTVShows from media-scanner component instead
+ */
+
+app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty("tv_shows")) {
@@ -1240,491 +845,29 @@ app.get("/media/tv", async (req, res) => {
   }
 });
 
+/**
+ * Wrapper function for backward compatibility
+ * Calls the new media-scanner component
+ */
 async function generateListMovies(db, dirPath) {
-  const dirs = await fs.readdir(dirPath, { withFileTypes: true });
-  const missingDataMovies = await getMissingDataMedia();
-  const now = new Date();
-
-  // Get the list of movies currently in the database
-  const existingMovies = await getMovies();
-  const existingMovieNames = new Set(existingMovies.map((movie) => movie.name));
-
-  await Promise.all(
-    dirs.map(async (dir, index) => {
-      if (isDebugMode) {
-        logger.info(
-          `Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`
-        );
-      }
-      if (dir.isDirectory()) {
-        const dirName = dir.name;
-        const fullDirPath = join(dirPath, dirName);
-        const files = await fs.readdir(join(dirPath, dirName));
-        const hash = await calculateDirectoryHash(fullDirPath);
-
-        const existingMovie = await db.get(
-          "SELECT * FROM movies WHERE name = ?",
-          [dirName]
-        );
-        existingMovieNames.delete(dirName); // Remove from the set of existing movies
-        const dirHashChanged =
-          existingMovie && existingMovie.directory_hash !== hash;
-
-        // Check if we need to regenerate info files due to version updates
-        let needInfoRegeneration = false;
-        if (!dirHashChanged && existingMovie) {
-          // Even if directory hasn't changed, we still need to check if info files need to be regenerated
-          // Find all mp4 files and check if their info files need updating
-          const mp4Files = files.filter(file => file.endsWith('.mp4'));
-          
-          for (const mp4File of mp4Files) {
-            const filePath = join(dirPath, dirName, mp4File);
-            const infoFile = `${filePath}.info`;
-            
-            if (await fileExists(infoFile)) {
-              try {
-                const fileInfo = await fs.readFile(infoFile, 'utf-8');
-                const info = JSON.parse(fileInfo);
-                
-                // If info version is outdated, we need to process this movie
-                if (!info.version || info.version < CURRENT_VERSION) {
-                  logger.info(`Info file for ${mp4File} has outdated version (${info.version}), regeneration needed`);
-                  needInfoRegeneration = true;
-                  break;
-                }
-              } catch (error) {
-                logger.warn(`Error reading info file for ${mp4File}, regeneration needed:` + error);
-                needInfoRegeneration = true;
-                break;
-              }
-            } else {
-              // If info file doesn't exist, we need to process this movie
-              logger.info(`Info file for ${mp4File} doesn't exist, regeneration needed`);
-              needInfoRegeneration = true;
-              break;
-            }
-          }
-          
-          // If we don't need to regenerate info files and directory hasn't changed, skip processing
-          if (!needInfoRegeneration) {
-            if (isDebugMode) {
-              logger.info(
-                `No changes detected in ${dirName}, skipping processing.`
-              );
-            }
-            return; // Use return instead of continue
-          } else {
-            logger.info(`Processing ${dirName} to update info files`);
-          }
-        }
-
-        logger.info(`Directory Hash invalidated for, ${dirName}`);
-
-        const encodedDirName = encodeURIComponent(dirName);
-        const fileSet = new Set(files); // Create a set of filenames for quick lookup
-        const fileNames = files.filter(
-          (file) =>
-            file.endsWith(".mp4") ||
-            file.endsWith(".srt") ||
-            file.endsWith(".json") ||
-            file.endsWith(".info") ||
-            file.endsWith(".nfo") ||
-            file.endsWith(".jpg") ||
-            file.endsWith(".png")
-        );
-        const fileLengths = {};
-        const fileDimensions = {};
-        let hdrInfo;
-        let mediaQuality;
-        let additionalMetadata;
-        const urls = {};
-        const subtitles = {};
-        let _id = null;
-
-        let runDownloadTmdbImagesFlag = false;
-
-        const tmdbConfigPath = join(dirPath, dirName, "tmdb.config");
-        let tmdbConfigLastModified = null;
-
-        // Check if tmdb.config exists before getting its last modified time
-        if (await fileExists(tmdbConfigPath)) {
-          tmdbConfigLastModified = await getLastModifiedTime(tmdbConfigPath);
-        }
-
-        // If tmdb.config exists, try to extract tmdb_id from it
-        if (await fileExists(tmdbConfigPath)) {
-          tmdbConfigLastModified = await getLastModifiedTime(tmdbConfigPath);
-          try {
-            const tmdbConfigContent = await fs.readFile(tmdbConfigPath, "utf8");
-            const tmdbConfig = JSON.parse(tmdbConfigContent);
-
-            if (tmdbConfig.tmdb_id) {
-              // Use TMDb ID as primary identifier
-              _id = `tmdb_${tmdbConfig.tmdb_id}`;
-            }
-          } catch (error) {
-            logger.error(`Failed to parse tmdb.config for ${dirName}:`, error);
-          }
-        }
-
-        for (const file of fileNames) {
-          const filePath = join(dirPath, dirName, file);
-          const encodedFilePath = encodeURIComponent(file);
-
-          if (file.endsWith(".mp4")) {
-            let fileLength;
-            let fileDimensionsStr;
-
-            try {
-              const info = await getInfo(filePath);
-              fileLength = info.length;
-              fileDimensionsStr = info.dimensions;
-              hdrInfo = info.hdr;
-              mediaQuality = info.mediaQuality;
-              additionalMetadata = info.additionalMetadata;
-              _id = info.uuid;
-            } catch (error) {
-              logger.error(`Failed to retrieve info for ${filePath}:`, error);
-            }
-
-            fileLengths[file] = parseInt(fileLength, 10);
-            fileDimensions[file] = fileDimensionsStr;
-            urls[
-              "mp4"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodedFilePath}`;
-            urls["mediaLastModified"] = (
-              await fs.stat(filePath)
-            ).mtime.toISOString();
-            // Generate a Unique ID for each episode
-            // Bypassing the TMDB id
-            // if (await fileExists(filePath)) {
-            //   const headerInfo = getHeaderData(filePath);
-            //   _id = generateCacheKey(headerInfo);
-            // }
-          }
-
-          if (file.endsWith(".srt")) {
-            const parts = file.split(".");
-            const srtIndex = parts.lastIndexOf("srt");
-            const isHearingImpaired = parts[srtIndex - 1] === "hi";
-            const langCode = isHearingImpaired
-              ? parts[srtIndex - 2]
-              : parts[srtIndex - 1];
-            const langName = langMap[langCode] || langCode;
-            const subtitleKey = isHearingImpaired
-              ? `${langName} Hearing Impaired`
-              : langName;
-
-            subtitles[subtitleKey] = {
-              url: `${PREFIX_PATH}/movies/${encodedDirName}/${encodedFilePath}`,
-              srcLang: langCode,
-              lastModified: (await fs.stat(filePath)).mtime.toISOString(),
-            };
-          }
-        }
-
-        // Check for required files using the set
-        if (fileSet.has("backdrop.jpg")) {
-          const backdropPath = join(dirPath, dirName, "backdrop.jpg");
-          const backdropStats = await fs.stat(backdropPath);
-          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          urls[
-            "backdrop"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            "backdrop.jpg"
-          )}?hash=${backdropImageHash}`;
-          if (await fileExists(`${backdropPath}.blurhash`)) {
-            urls[
-              "backdropBlurhash"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              "backdrop.jpg"
-            )}.blurhash`;
-          } else {
-            await getStoredBlurhash(backdropPath, BASE_PATH);
-          }
-
-          // Check if tmdb.config has been updated more recently
-          const backdropLastModified = await getLastModifiedTime(backdropPath);
-          if (
-            tmdbConfigLastModified &&
-            backdropLastModified &&
-            tmdbConfigLastModified > backdropLastModified
-          ) {
-            runDownloadTmdbImagesFlag = true;
-          }
-        } else {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        if (fileSet.has("poster.jpg")) {
-          const posterPath = join(dirPath, dirName, "poster.jpg");
-          const posterStats = await fs.stat(posterPath);
-          const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          urls[
-            "poster"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            "poster.jpg"
-          )}?hash=${posterImageHash}`;
-          if (await fileExists(`${posterPath}.blurhash`)) {
-            urls[
-              "posterBlurhash"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              "poster.jpg"
-            )}.blurhash`;
-          } else {
-            await getStoredBlurhash(posterPath, BASE_PATH);
-          }
-
-          // Check if tmdb.config has been updated more recently
-          const posterLastModified = await getLastModifiedTime(posterPath);
-          if (
-            tmdbConfigLastModified &&
-            posterLastModified &&
-            tmdbConfigLastModified > posterLastModified
-          ) {
-            runDownloadTmdbImagesFlag = true;
-          }
-        } else {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        if (fileSet.has("movie_logo.png") || fileSet.has("logo.png")) {
-          const logoPath = join(dirPath, dirName, fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png");
-          const logoStats = await fs.stat(logoPath);
-          const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          urls[
-            "logo"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
-          )}?hash=${logoImageHash}`;
-          if (await fileExists(`${logoPath}.blurhash`)) {
-            urls[
-              "logoBlurhash"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              fileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
-            )}.blurhash`;
-          } else {
-            const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-            if (blurhash) {
-              urls["logoBlurhash"] = blurhash;
-            }
-          }
-        } else {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        if (fileSet.has("metadata.json")) {
-          urls[
-            "metadata"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            "metadata.json"
-          )}`;
-
-          // Check if tmdb.config has been updated more recently
-          const metadataPath = join(dirPath, dirName, "metadata.json");
-          const metadataLastModified = await getLastModifiedTime(metadataPath);
-          if (
-            tmdbConfigLastModified &&
-            metadataLastModified &&
-            tmdbConfigLastModified > metadataLastModified
-          ) {
-            runDownloadTmdbImagesFlag = true;
-          }
-        } else {
-          runDownloadTmdbImagesFlag = true;
-        }
-
-        // Check if the movie is in the missing data table and if it should be retried
-        const missingDataMovie = missingDataMovies.find(
-          (movie) => movie.name === dirName
-        );
-        if (missingDataMovie && !dirHashChanged) {
-          const lastAttempt = new Date(missingDataMovie.lastAttempt);
-          const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-          if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-            runDownloadTmdbImagesFlag = true; // Retry if it was more than RETRY_INTERVAL_HOURS
-          } else {
-            runDownloadTmdbImagesFlag = false; // Skip download attempt if it was recently tried
-          }
-        } else if (dirHashChanged) {
-          runDownloadTmdbImagesFlag = true; // Retry if the directory hash changed
-        }
-
-        if (runDownloadTmdbImagesFlag) {
-          await insertOrUpdateMissingDataMedia(dirName); // Update the last attempt timestamp
-          await runDownloadTmdbImages(null, dirName);
-          // Retry fetching the data after running the script
-          const retryFiles = await fs.readdir(join(dirPath, dirName));
-          const retryFileSet = new Set(retryFiles); // Create a set of filenames for quick lookup
-
-          if (retryFileSet.has("backdrop.jpg")) {
-          const backdropPath = join(dirPath, dirName, "backdrop.jpg");
-          const backdropStats = await fs.stat(backdropPath);
-          const backdropImageHash = createHash('md5').update(backdropStats.mtime.toISOString()).digest('hex').substring(0, 10);
-          urls[
-            "backdrop"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-            "backdrop.jpg"
-          )}?hash=${backdropImageHash}`;
-          if (await fileExists(`${backdropPath}.blurhash`)) {
-            urls[
-              "backdropBlurhash"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              "backdrop.jpg"
-            )}.blurhash`;
-          } else {
-            await getStoredBlurhash(backdropPath, BASE_PATH);
-          }
-          }
-
-          if (retryFileSet.has("poster.jpg")) {
-            const posterPath = join(dirPath, dirName, "poster.jpg");
-            const posterStats = await fs.stat(posterPath);
-            const posterImageHash = createHash('md5').update(posterStats.mtime.toISOString()).digest('hex').substring(0, 10);
-            urls[
-              "poster"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              "poster.jpg"
-            )}?hash=${posterImageHash}`;
-            if (await fileExists(`${posterPath}.blurhash`)) {
-              urls[
-                "posterBlurhash"
-              ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-                "poster.jpg"
-              )}.blurhash`;
-            } else {
-              await getStoredBlurhash(posterPath, BASE_PATH);
-            }
-          }
-
-          if (
-            retryFileSet.has("movie_logo.png") ||
-            retryFileSet.has("logo.png")
-          ) {
-            const logoPath = join(dirPath, dirName, retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png");
-            const logoStats = await fs.stat(logoPath);
-            const logoImageHash = createHash('md5').update(logoStats.mtime.toISOString()).digest('hex').substring(0, 10);
-            urls[
-              "logo"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
-            )}?hash=${logoImageHash}`;
-            if (await fileExists(`${logoPath}.blurhash`)) {
-              urls[
-                "logoBlurhash"
-              ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-                retryFileSet.has("movie_logo.png") ? "movie_logo.png" : "logo.png"
-              )}.blurhash`;
-            } else {
-              const blurhash = await getStoredBlurhash(logoPath, BASE_PATH);
-              if (blurhash) {
-                urls["logoBlurhash"] = blurhash;
-              }
-            }
-          }
-
-          if (retryFileSet.has("metadata.json")) {
-            urls[
-              "metadata"
-            ] = `${PREFIX_PATH}/movies/${encodedDirName}/${encodeURIComponent(
-              "metadata.json"
-            )}`;
-          }
-        }
-
-        let mp4Filename = fileNames.find(
-          (e) => e.endsWith(".mp4") && !e.endsWith(".mp4.info")
-        );
-        mp4Filename = mp4Filename?.replace(".mp4", "");
-
-        // Add chapter information
-        const chaptersPath = join(
-          dirPath,
-          dirName,
-          "chapters",
-          `${dirName}_chapters.vtt`
-        );
-        const chaptersPath2 = join(
-          dirPath,
-          dirName,
-          "chapters",
-          `${mp4Filename}_chapters.vtt`
-        );
-        
-        // Generate chapter files if the media exists
-        if (mp4Filename) {
-          const mediaPath = join(dirPath, dirName, `${mp4Filename}.mp4`);
-          if (await fileExists(mediaPath)) {
-            await generateChapterFileIfNotExists(chaptersPath, mediaPath, true);
-            // Only try the second path if the first one didn't work or doesn't exist
-            if (!await fileExists(chaptersPath)) {
-              await generateChapterFileIfNotExists(chaptersPath2, mediaPath, true);
-            }
-          }
-        }
-        
-        if (await fileExists(chaptersPath)) {
-          urls[
-            "chapters"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/chapters/${encodeURIComponent(
-            `${dirName}_chapters.vtt`
-          )}`;
-        } else if (await fileExists(chaptersPath2)) {
-          urls[
-            "chapters"
-          ] = `${PREFIX_PATH}/movies/${encodedDirName}/chapters/${encodeURIComponent(
-            `${mp4Filename}_chapters.vtt`
-          )}`;
-        }
-
-        // Remove empty sections
-        if (Object.keys(subtitles).length === 0) {
-          delete urls["subtitles"];
-        } else {
-          urls["subtitles"] = subtitles;
-        }
-
-        // Note: We don't need to check if urls is empty or reassign it
-        // The variable is already initialized as an empty object
-        // Attempting to reassign a const variable would cause a TypeError
-
-        const final_hash = await calculateDirectoryHash(fullDirPath);
-
-        // Extract file paths for direct access
-        const posterFilePath = fileSet.has("poster.jpg") ? join(dirPath, dirName, "poster.jpg") : null;
-        const backdropFilePath = fileSet.has("backdrop.jpg") ? join(dirPath, dirName, "backdrop.jpg") : null;
-        const logoFilePath = fileSet.has("movie_logo.png") 
-          ? join(dirPath, dirName, "movie_logo.png") 
-          : (fileSet.has("logo.png") ? join(dirPath, dirName, "logo.png") : null);
-
-        // Always update the database with the latest data including file paths
-        await insertOrUpdateMovie(
-          dirName,
-          fileNames, // Array of filenames
-          fileLengths, // Object mapping filenames to lengths
-          fileDimensions, // Object mapping filenames to dimensions
-          urls, // URLs and related data
-          urls["metadata"] || "", // metadata_url
-          final_hash, // directory_hash
-          hdrInfo,
-          mediaQuality,
-          additionalMetadata,
-          _id,
-          posterFilePath,
-          backdropFilePath,
-          logoFilePath,
-          BASE_PATH // Store the base path for future reference
-        );
-      }
-    })
+  await scanMovies(
+    db,
+    dirPath,
+    PREFIX_PATH,
+    BASE_PATH,
+    langMap,
+    CURRENT_VERSION,
+    isDebugMode,
+    runDownloadTmdbImages
   );
-  // Remove movies from the database that no longer exist in the file system
-  for (const movieName of existingMovieNames) {
-    await deleteMovie(movieName);
-  }
 }
 
-app.get("/media/movies", async (req, res) => {
+/**
+ * Legacy implementation - moved to components/media-scanner/domain/movie-scanner.mjs
+ * @deprecated Use scanMovies from media-scanner component instead
+ */
+
+app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty()) {
@@ -1754,7 +897,7 @@ app.get("/media/movies", async (req, res) => {
   }
 });
 
-app.post("/media/scan", async (req, res) => {
+app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
     await generateListMovies(db, `${BASE_PATH}/movies`);
@@ -1795,9 +938,16 @@ async function runDownloadTmdbImages(
     `${fullScan ? ' with full scan' : ''}` +
     `${debugMessage}`
   );
+
+  // Build args for Python script
   const args = [];
+  
   if (specificShow)  args.push('--show', specificShow);
   if (specificMovie) args.push('--movie', specificMovie);
+  
+  if (fullScan) {
+    args.push('--full-scan');
+  }
 
   await runPython({
     scriptPath: downloadTmdbImagesScript,
@@ -1813,18 +963,6 @@ async function runDownloadTmdbImages(
     }
   });
 }
-// async function runGenerateThumbnailJson() {
-//   logger.info(`Running generate_thumbnail_json.sh job${debugMessage}`);
-//   const command = isDebugMode
-//     ? `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript} >> ${LOG_FILE} 2>&1'`
-//     : `sudo bash -c 'env DEBUG=${process.env.DEBUG} bash ${generateThumbnailJsonScript}'`;
-
-//   try {
-//     await execAsync(command);
-//   } catch (error) {
-//     logger.error(`Error executing generate_thumbnail_json.sh: ${error}`);
-//   }
-// }
 
 // Function to parse and format a log line
 const formatLogEntry = (entry) => {
@@ -2116,7 +1254,7 @@ function scheduleTasks() {
     // Use task manager instead of isScanning flag
     enqueueTask(TaskType.DOWNLOAD, 'TMDB Image Download', async () => {
       logger.info('Running scheduled TMDB image download with task manager');
-      await runDownloadTmdbImages(null, null, true);
+      await runDownloadTmdbImages(null, null, false);  // Don't force refresh - respect age checks
       return 'TMDB image download completed successfully';
     }).catch(error => {
       logger.error(`Failed to enqueue TMDB download task: ${error.message}`);
@@ -2155,10 +1293,7 @@ function scheduleTasks() {
         const lastScanTime = new Date();
         lastScanTime.setMinutes(lastScanTime.getMinutes() - 16);
         const sinceTimestamp = lastScanTime.toISOString();
-        
-        // Import hash functions
-        const { updateAllMovieHashes, updateAllTVShowHashes } = await import('./sqlite/metadataHashes.mjs');
-        
+
         // Process movies first
         await updateAllMovieHashes(sinceTimestamp);
         logger.info("Movie metadata hashes completed, processing TV shows...");
@@ -2246,6 +1381,7 @@ async function initialize() {
     await initializeBlurhashHashesTable(db);
     logger.info('Blurhash hashes table initialized at startup');
     
+    
     // Perform initial full scan of blurhashes - sequentially to avoid transaction conflicts
     logger.info('Starting initial blurhash scan of all media files...');
     try {
@@ -2279,6 +1415,174 @@ async function initialize() {
 
 // Use the modular route system
 app.use(setupRoutes());
+
+//
+// Root endpoint - Welcome/Health check
+//
+app.get('/', (req, res) => {
+  const serverInfo = {
+    name: 'Media Server API',
+    version: MOVIE_LIST_VERSION.toFixed(4),
+    status: 'online',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'production',
+    debug: isDebugMode,
+    endpoints: {
+      media: {
+        description: 'Media library endpoints',
+        routes: ['/media/movies', '/media/tv', '/media/scan']
+      },
+      video: {
+        description: 'Video streaming',
+        routes: ['/video/movie/:movieName', '/video/tv/:showName/:season/:episode']
+      },
+      api: {
+        description: 'API operations',
+        routes: ['/api/tmdb/*', '/api/admin/*', '/api/system-status', '/api/logs']
+      },
+      frames: {
+        description: 'Frame/thumbnail generation',
+        routes: ['/frame/movie/:movieName/:timestamp', '/frame/tv/:showName/:season/:episode/:timestamp']
+      },
+      spritesheets: {
+        description: 'Sprite sheets and VTT files',
+        routes: ['/spritesheet/movie/:movieName', '/vtt/movie/:movieName']
+      },
+      chapters: {
+        description: 'Chapter information',
+        routes: ['/chapters/movie/:movieName', '/chapters/tv/:showName/:season/:episode']
+      },
+      clips: {
+        description: 'Video clip generation',
+        routes: ['/videoClip/movie/:movieName', '/videoClip/tv/:showName/:season/:episode']
+      },
+      processes: {
+        description: 'Process tracking',
+        routes: ['/processes', '/processes/:fileKey']
+      }
+    },
+    documentation: 'Access any endpoint category above for detailed API information'
+  };
+  
+  res.json(serverInfo);
+});
+
+//
+// 404 Handler - Must be after all valid routes but before error handlers
+//
+app.use((req, res, next) => {
+  const requestedPath = req.originalUrl || req.url;
+  const method = req.method;
+  
+  logger.warn(`404 Not Found: ${method} ${requestedPath}`);
+  
+  // Provide helpful API documentation for common base paths
+  const apiDocs = {
+    '/api': {
+      description: 'API endpoints',
+      endpoints: [
+        '/api/tmdb/* - TMDB metadata operations',
+        '/api/admin/* - Administrative operations (requires auth)',
+        '/api/blurhash-changes - Get blurhash changes',
+        '/api/metadata-hashes/:mediaType - Get metadata hashes',
+        '/api/system-status - System status information',
+        '/api/logs - Server logs (supports SSE streaming)'
+      ]
+    },
+    '/media': {
+      description: 'Media library endpoints',
+      endpoints: [
+        '/media/movies - List all movies',
+        '/media/tv - List all TV shows',
+        '/media/scan - Trigger library scan'
+      ]
+    },
+    '/video': {
+      description: 'Video streaming endpoints',
+      endpoints: [
+        '/video/movie/:movieName - Stream movie',
+        '/video/tv/:showName/:season/:episode - Stream TV episode'
+      ]
+    },
+    '/frame': {
+      description: 'Frame/thumbnail endpoints',
+      endpoints: [
+        '/frame/movie/:movieName/:timestamp - Get movie frame',
+        '/frame/tv/:showName/:season/:episode/:timestamp - Get TV frame'
+      ]
+    },
+    '/spritesheet': {
+      description: 'Sprite sheet endpoints',
+      endpoints: [
+        '/spritesheet/movie/:movieName - Get movie sprite sheet',
+        '/spritesheet/tv/:showName/:season/:episode - Get TV sprite sheet'
+      ]
+    },
+    '/vtt': {
+      description: 'VTT file endpoints',
+      endpoints: [
+        '/vtt/movie/:movieName - Get movie VTT file',
+        '/vtt/tv/:showName/:season/:episode - Get TV VTT file'
+      ]
+    },
+    '/chapters': {
+      description: 'Chapter endpoints',
+      endpoints: [
+        '/chapters/movie/:movieName - Get movie chapters',
+        '/chapters/tv/:showName/:season/:episode - Get TV chapters'
+      ]
+    },
+    '/videoClip': {
+      description: 'Video clip endpoints',
+      endpoints: [
+        '/videoClip/movie/:movieName - Generate movie clip',
+        '/videoClip/tv/:showName/:season/:episode - Generate TV clip'
+      ]
+    },
+    '/processes': {
+      description: 'Process tracking endpoints',
+      endpoints: [
+        '/processes - List all processes',
+        '/processes/:fileKey - Get specific process status'
+      ]
+    }
+  };
+  
+  // Determine which category the request falls into
+  let suggestions = null;
+  for (const [basePath, info] of Object.entries(apiDocs)) {
+    if (requestedPath.startsWith(basePath)) {
+      suggestions = info;
+      break;
+    }
+  }
+  
+  // Build response with helpful information
+  const response = {
+    error: 'Not Found',
+    message: `The requested endpoint '${method} ${requestedPath}' does not exist`,
+    statusCode: 404,
+    timestamp: new Date().toISOString()
+  };
+  
+  // Add suggestions if we found a matching base path
+  if (suggestions) {
+    response.suggestion = suggestions.description;
+    response.availableEndpoints = suggestions.endpoints;
+  } else if (requestedPath === '/') {
+    // Special handling for root path
+    response.message = 'Welcome to the Media Server API';
+    response.suggestion = 'This is an API server with no root endpoint';
+    response.availableCategories = Object.keys(apiDocs);
+    response.hint = 'Try accessing one of the available categories listed above';
+  } else {
+    // Generic suggestion for unknown paths
+    response.suggestion = 'Check the API documentation for available endpoints';
+    response.availableCategories = Object.keys(apiDocs);
+  }
+  
+  res.status(404).json(response);
+});
 
 //
 // Global Error Handlers for Express 5 Compatibility

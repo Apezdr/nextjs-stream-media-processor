@@ -122,6 +122,75 @@ The response includes:
 - `Cache-Control`: Caching guidelines
 - `X-RateLimit-*`: Rate limiting information
 
+### GET /api/health
+
+Retrieves the last reported system health status (public endpoint).
+
+**Authentication:**
+- No authentication required (public endpoint)
+
+**Use Cases:**
+- External health monitoring tools
+- Public status pages
+- Simple uptime checks
+- Quick health verification without credentials
+
+**Response:**
+```json
+{
+  "status": "normal|elevated|heavy|critical|unknown|error",
+  "message": "System is operating normally.",
+  "timestamp": "2025-04-22T22:52:10.123Z",
+  "incident": {
+    "id": "incident-1713996778",
+    "status": "heavy",
+    "startTime": "2025-04-22T22:45:29.000Z",
+    "latestUpdate": "2025-04-22T22:52:10.000Z",
+    "resolvedTime": null
+  }
+}
+```
+
+The response includes:
+- `status`: Overall system status classification
+- `message`: Human-readable description of the status
+- `timestamp`: When the status was last updated
+- `incident`: Basic incident information (if any active or recently resolved incident exists)
+
+**Special Status Values:**
+- `unknown`: Returned when system health data is not yet available (server just started)
+- `error`: Returned when there's an error retrieving health status
+
+**Headers:**
+- `Cache-Control`: Caching guidelines (2 minute TTL)
+- `Expires`: Cache expiration time
+
+**Notes:**
+- This endpoint returns cached data from the last system status check (updated every 60 seconds)
+- It does NOT include detailed metrics (CPU, memory, disk details) - use `/api/system-status` for full metrics
+- Ideal for lightweight health checks that don't require authentication
+- Respects the same cache invalidation as the authenticated endpoint
+
+**Example Usage:**
+```javascript
+async function checkServerHealth() {
+  try {
+    const response = await fetch('/api/health');
+    const health = await response.json();
+    
+    if (health.status === 'critical' || health.status === 'heavy') {
+      console.warn('Server is experiencing issues:', health.message);
+      // Show warning to users or trigger alerts
+    }
+    
+    return health;
+  } catch (error) {
+    console.error('Failed to check server health:', error);
+    return { status: 'error', message: 'Unable to connect to server' };
+  }
+}
+```
+
 ### POST /api/trigger-system-status
 
 Manually trigger a system status check and send notifications.

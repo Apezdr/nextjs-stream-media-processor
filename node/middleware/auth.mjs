@@ -4,6 +4,7 @@ import {
   authenticateWithSessionToken
 } from '../database.mjs';
 import { sessionCache } from './sessionCache.mjs';
+import { isValidWebhookId } from './webhookAuth.mjs';
 
 const logger = createCategoryLogger('auth-middleware');
 
@@ -205,6 +206,174 @@ export const requireFullAccess = (req, res, next) => {
   }
   
   next();
+};
+
+/**
+ * Combined authentication middleware - checks webhook FIRST, then falls back to admin user authentication
+ * This middleware handles both webhook and user authentication in the correct order.
+ *
+ * Flow:
+ * 1. Check webhook (fast, no database) - if valid, grant access immediately
+ * 2. Fall back to user authentication and verify admin privileges
+ *
+ * Use this for endpoints that require either webhook OR admin user access.
+ */
+export const authenticateWebhookOrUser = async (req, res, next) => {
+  const isDebugMode = process.env.DEBUG === 'TRUE';
+  
+  // STEP 1: Check webhook authentication FIRST (fast, no database request)
+  const webhookId = req.headers['x-webhook-id'];
+  if (webhookId && isValidWebhookId(webhookId)) {
+    if (isDebugMode) {
+      logger.debug('Access granted via webhook authentication');
+    }
+    req.isWebhook = true;
+    return next();
+  }
+  
+  // STEP 2: Webhook not provided or invalid - fall back to user authentication
+  // Log if an invalid webhook was attempted
+  if (webhookId) {
+    logger.warn(`Invalid webhook ID attempted, falling back to user authentication: ${webhookId.substring(0, 10)}...`);
+  }
+  
+  // Use a custom authentication flow that includes admin check
+  try {
+    const authHeader = req.headers.authorization;
+    const sessionToken = req.headers['x-session-token'];
+    const mobileToken = req.headers['x-mobile-token'];
+    const sessionTokenFromCookie = extractSessionTokenFromCookies(req.headers.cookie);
+    
+    if (!authHeader && !sessionToken && !mobileToken && !sessionTokenFromCookie) {
+      const origin = req.headers.origin || req.headers.referer || 'unknown';
+      logger.warn(`No authentication provided from origin: ${origin}`);
+      return res.status(401).json({
+        error: 'Authentication required',
+        message: 'Either a valid webhook ID or admin user session is required',
+        supportedMethods: [
+          'x-webhook-id: <webhook-id> (recommended for automated services)',
+          'Authorization: Bearer <token> (for admin users)',
+          'x-session-token: <token> (for admin users)',
+          'Cookie: session-token=<token> (for admin users - same-domain only)'
+        ]
+      });
+    }
+    
+    // Authenticate the user
+    let user = null;
+    let token = null;
+    let authMethod = null;
+    
+    if (mobileToken) {
+      token = mobileToken;
+      authMethod = 'x-mobile-token header';
+      user = await authenticateWithMobileToken(mobileToken);
+    } else if (authHeader) {
+      token = authHeader.replace('Bearer ', '');
+      authMethod = 'Authorization header';
+    } else if (sessionToken) {
+      token = sessionToken;
+      authMethod = 'x-session-token header';
+    } else if (sessionTokenFromCookie) {
+      token = sessionTokenFromCookie;
+      authMethod = 'session cookie';
+    }
+    
+    // For non-mobile tokens, check cache first
+    if (!user && token) {
+      const cachedUser = sessionCache.get(token);
+      if (cachedUser) {
+        user = cachedUser;
+        if (isDebugMode) {
+          logger.debug(`Cache hit for user: ${user.email}`);
+        }
+      } else {
+        user = await authenticateWithSessionToken(token);
+        if (user) {
+          const userToCache = {
+            id: user.id,
+            email: user.email,
+            admin: user.admin,
+            approved: user.approved,
+            limitedAccess: user.limitedAccess
+          };
+          sessionCache.set(token, userToCache);
+          if (isDebugMode) {
+            logger.debug(`User cached: ${user.email}`);
+          }
+        }
+      }
+    }
+    
+    if (!user) {
+      return res.status(401).json({
+        error: 'Authentication failed',
+        message: 'Invalid or expired session token'
+      });
+    }
+    
+    // Check if user is approved
+    if (!user.approved && !user.admin) {
+      return res.status(403).json({ error: 'User not approved for access' });
+    }
+    
+    // CRITICAL: User must be admin for this combined middleware
+    if (!user.admin) {
+      return res.status(403).json({
+        error: 'Admin privileges required',
+        message: 'This endpoint requires either a valid webhook ID or admin user access'
+      });
+    }
+    
+    // User is authenticated and is admin
+    req.user = user;
+    const origin = req.headers.origin || req.headers.referer || 'unknown';
+    logger.info(`Authenticated admin user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
+    
+    if (isDebugMode) {
+      logger.debug(`Access granted via admin user: ${user.email}`);
+    }
+    next();
+  } catch (error) {
+    logger.error('Authentication error:', error);
+    res.status(500).json({ error: 'Authentication service error' });
+  }
+};
+
+/**
+ * Combined authorization middleware - allows either webhook OR admin user
+ * Useful for endpoints that should be accessible from both automated services and admin panel
+ * NOTE: This should be used AFTER authenticateUser or authenticateWebhookOrUser has run
+ */
+export const requireWebhookOrAdmin = (req, res, next) => {
+  const isDebugMode = process.env.DEBUG === 'TRUE';
+  
+  // Debug logging to investigate req.user
+  if (isDebugMode) {
+    logger.debug(`requireWebhookOrAdmin check - req.user: ${JSON.stringify(req.user)}, webhook ID: ${req.headers['x-webhook-id']}`);
+  }
+  
+  // Check for webhook authentication first
+  const webhookId = req.headers['x-webhook-id'];
+  if (webhookId && isValidWebhookId(webhookId)) {
+    if (isDebugMode) {
+      logger.debug('Access granted via webhook authentication');
+    }
+    return next();
+  }
+  
+  // If no valid webhook, check for admin authentication
+  // Note: req.user.admin is a boolean, not req.user.role
+  if (req.user && req.user.admin === true) {
+    if (isDebugMode) {
+      logger.debug(`Access granted via admin authentication: ${req.user.email}`);
+    }
+    return next();
+  }
+  
+  // Neither authentication method succeeded
+  logger.warn(`Unauthorized request - no valid webhook ID or admin session. User: ${req.user ? req.user.email : 'none'}, Admin: ${req.user?.admin || false}`);
+  return res.status(401).json({ error: 'Unauthorized' });
 };
 
 /**

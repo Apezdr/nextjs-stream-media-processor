@@ -25,9 +25,10 @@ if (!TMDB_API_KEY) {
  * @param {number} cacheTtlHours - Cache TTL in hours (default: 1440 = 60 days)
  * @param {boolean} forceRefresh - Force refresh cache (default: false)
  * @param {boolean} includeBlurhash - Include blurhash data for images (default: false)
- * @returns {Promise<Object>} TMDB API response data
+ * @param {string|null} ifNoneMatch - ETag for conditional request (If-None-Match header)
+ * @returns {Promise<Object>} TMDB API response data with ETag support
  */
-export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cacheTtlHours = 1440, forceRefresh = false, includeBlurhash = false) => {
+export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cacheTtlHours = 1440, forceRefresh = false, includeBlurhash = false, ifNoneMatch = null) => {
   // Clean up expired cache entries periodically (10% chance)
   // Fire and forget to avoid blocking
   if (Math.random() < 0.1) {
@@ -60,21 +61,55 @@ export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cac
     }
   }
   
-  // Make API request with retry logic
+  // Make API request with retry logic and ETag support
   let retries = 0;
   let backoffFactor = 1;
   let responseData;
+  let responseETag = null;
 
   while (retries < maxRetries) {
     try {
+      const headers = {};
+      
+      // Add If-None-Match header for ETag validation if provided
+      if (ifNoneMatch) {
+        headers['If-None-Match'] = ifNoneMatch;
+        logger.debug(`Using ETag validation for ${endpoint}: ${ifNoneMatch}`);
+      }
+      
       const response = await axios.get(`${TMDB_BASE_URL}${endpoint}`, {
         params: {
           api_key: TMDB_API_KEY,
           ...params
         },
-        timeout: 10000
+        headers,
+        timeout: 10000,
+        validateStatus: (status) => {
+          // Accept both 200 (OK) and 304 (Not Modified) as valid responses
+          return status === 200 || status === 304;
+        }
       });
+      
+      // Handle 304 Not Modified response
+      if (response.status === 304) {
+        logger.debug(`TMDB returned 304 Not Modified for ${endpoint} - content unchanged`);
+        // Return cached data with special flag indicating it's unchanged
+        const cached = await getTmdbCache(endpoint, params, cacheKey);
+        if (cached) {
+          return {
+            ...cached.data,
+            _cached: true,
+            _cachedAt: cached.cachedAt,
+            _expiresAt: cached.expiresAt,
+            _notModified: true
+          };
+        }
+        // If no cached data available, fall through to treat as error
+        logger.warn(`Received 304 but no cached data found for ${endpoint}`);
+      }
+      
       responseData = response.data;
+      responseETag = response.headers.etag || response.headers.ETag;
       break;
     } catch (error) {
       if (error.response?.status === 429) {
@@ -107,14 +142,15 @@ export const makeTmdbRequest = async (endpoint, params = {}, maxRetries = 3, cac
     responseData = await enhanceTmdbResponseWithBlurhash(responseData, endpoint);
   }
   
-  // Cache the ENHANCED response (so we don't enhance it again on retrieval)
-  await setTmdbCache(endpoint, params, responseData, cacheTtlHours, cacheKey);
-  logger.debug(`TMDB response cached for ${endpoint}${includeBlurhash ? ' with blurhash' : ''}`);
+  // Cache the ENHANCED response with ETag (so we don't enhance it again on retrieval)
+  await setTmdbCache(endpoint, params, responseData, cacheTtlHours, cacheKey, responseETag);
+  logger.debug(`TMDB response cached for ${endpoint}${includeBlurhash ? ' with blurhash' : ''}${responseETag ? ' with ETag' : ''}`);
   
   return {
     ...responseData,
     _cached: false,
-    _cachedAt: new Date().toISOString()
+    _cachedAt: new Date().toISOString(),
+    _etag: responseETag
   };
 };
 
@@ -178,6 +214,129 @@ export const getMediaCast = async (type, id) => {
     character: member.character || '',
     profile_path: member.profile_path ? `https://image.tmdb.org/t/p/original${member.profile_path}` : null
   })) || [];
+};
+
+/**
+ * Get enhanced cast information with Season Regulars support for TV shows
+ * For movies, returns same data as getMediaCast. For TV shows, uses aggregate_credits 
+ * to include episode counts and role classifications
+ * @param {string} type - 'movie' or 'tv'
+ * @param {string|number} id - TMDB ID
+ * @returns {Promise<Array>} Enhanced cast array with role data for TV shows
+ */
+export const getEnhancedMediaCast = async (type, id) => {
+  if (!['movie', 'tv'].includes(type)) {
+    throw new Error('Type must be "movie" or "tv"');
+  }
+  
+  if (type === 'tv') {
+    // Use aggregate_credits for TV shows to get Season Regulars data
+    const data = await makeTmdbRequest(`/tv/${id}/aggregate_credits`);
+    return formatAggregateCast(data.cast);
+  } else {
+    // For movies, use regular credits endpoint
+    const data = await makeTmdbRequest(`/movie/${id}/credits`);
+    return formatBasicCast(data.cast);
+  }
+};
+
+/**
+ * Format aggregate credits cast data (TV shows)
+ * @param {Array} castData - Raw aggregate credits cast data from TMDB
+ * @returns {Array} Formatted cast array with enhanced TV data
+ */
+function formatAggregateCast(castData) {
+  return castData?.map(member => ({
+    id: member.id,
+    name: member.name,
+    character: member.roles?.[0]?.character || '',
+    profile_path: member.profile_path ? 
+      `https://image.tmdb.org/t/p/original${member.profile_path}` : null,
+    // Enhanced TV data
+    roles: member.roles || [],
+    total_episode_count: member.total_episode_count || 0,
+    type: classifyRole(member.total_episode_count), 
+    known_for_department: member.known_for_department
+  })) || [];
+}
+
+/**
+ * Format basic credits cast data (Movies)
+ * @param {Array} castData - Raw credits cast data from TMDB
+ * @returns {Array} Formatted cast array
+ */
+function formatBasicCast(castData) {
+  return castData?.map(member => ({
+    id: member.id,
+    name: member.name,
+    character: member.character || '',
+    profile_path: member.profile_path ? 
+      `https://image.tmdb.org/t/p/original${member.profile_path}` : null
+  })) || [];
+}
+
+/**
+ * Classify role type based on episode count for TV shows
+ * @param {number} episodeCount - Number of episodes appeared in
+ * @returns {string} Role classification
+ */
+function classifyRole(episodeCount) {
+  if (!episodeCount || episodeCount <= 0) {
+    return 'Guest Star';
+  }
+  
+  // Classification thresholds (can be adjusted based on analysis)
+  if (episodeCount >= 8) {
+    return 'Season Regular';
+  }
+  
+  if (episodeCount >= 3) {
+    return 'Recurring';
+  }
+  
+  return 'Guest Star';
+}
+
+/**
+ * Get structured cast information with separated recurring cast for TV shows
+ * Returns main cast array (all cast) plus recurring_cast array for TV shows
+ * @param {string} type - 'movie' or 'tv'
+ * @param {string|number} id - TMDB ID
+ * @param {boolean} includeGuestCast - Include guest_cast array (default: false)
+ * @returns {Promise<Object>} Object with cast (all), recurring_cast (TV only, 3-7 eps), and optionally guest_cast (TV only, <3 eps)
+ */
+export const getStructuredMediaCast = async (type, id, includeGuestCast = false) => {
+  if (!['movie', 'tv'].includes(type)) {
+    throw new Error('Type must be "movie" or "tv"');
+  }
+  
+  if (type === 'movie') {
+    // For movies, return all cast in the cast field (no separation)
+    const cast = await getMediaCast(type, id);
+    return { cast };
+  }
+  
+  // For TV shows, use aggregate_credits to get episode counts
+  const data = await makeTmdbRequest(`/tv/${id}/aggregate_credits`);
+  const allCast = formatAggregateCast(data.cast);
+  
+  // The cast array contains ALL cast members (unchanged for backward compatibility)
+  // But we also extract recurring and optionally guest cast into separate arrays
+  const cast = allCast; // All cast members
+  const recurring_cast = allCast.filter(member => member.type === 'Recurring');
+  
+  // Build result object
+  const result = {
+    cast, // All cast members (Season Regulars + Recurring + Guest Stars)
+    recurring_cast // Only recurring cast (3-7 episodes)
+  };
+  
+  // Optionally include guest cast array
+  if (includeGuestCast) {
+    result.guest_cast = allCast.filter(member => member.type === 'Guest Star');
+  }
+  
+  return result;
 };
 
 /**
@@ -328,9 +487,9 @@ export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId =
   }
   
   // Fetch all details in parallel
-  const [details, cast, videos, images, rating] = await Promise.all([
+  const [details, castData, videos, images, rating] = await Promise.all([
     getMediaDetails(type, id, includeBlurhash),
-    getMediaCast(type, id),
+    getStructuredMediaCast(type, id, false), // Get structured cast (main + recurring, no guest)
     getMediaVideos(type, id),
     getMediaImages(type, id, includeBlurhash),
     getMediaRating(type, id)
@@ -339,7 +498,7 @@ export const fetchComprehensiveMediaDetails = async (name, type = 'tv', tmdbId =
   // Combine all data similar to Python script
   return {
     ...details,
-    cast,
+    ...castData, // Spread cast, recurring_cast (and guest_cast if present)
     trailer_url: videos.trailer_url,
     logo_path: images.logo_path,
     rating: rating.rating,

@@ -5,7 +5,11 @@
   "main": "app.mjs",
   "scripts": {
     "start": "node app.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:watch": "npm test -- --watch",
+    "test:coverage": "npm test -- --coverage",
+    "test:unit": "npm test -- tests/unit",
+    "test:integration": "npm test -- tests/integration"
   },
   "engines": {
     "node": ">=20.19.0"
@@ -35,5 +39,30 @@
     "systeminformation": "^5.30.2",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "dotenv": "^17.2.3",
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.mjs"
+    ],
+    "transform": {},
+    "collectCoverageFrom": [
+      "utils/**/*.mjs",
+      "routes/**/*.mjs",
+      "lib/**/*.mjs",
+      "!**/*.test.mjs"
+    ],
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/tests/",
+      "/db/",
+      "/cache/"
+    ],
+    "testTimeout": 10000
   }
 }

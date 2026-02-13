@@ -10,3 +10,13 @@ node/cache
 
 # Ignore environment files
 .env.local
+
+docs
+logs
+clinet_docs
+.vscode
+.roo
+temp
+scripts/.pytest_cache
+scripts/.benchmarks
+scripts/tests/__pycache__
