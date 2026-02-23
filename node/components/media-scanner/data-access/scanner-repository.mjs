@@ -6,6 +6,7 @@ import {
   deleteMovie,
   insertOrUpdateTVShow,
   getTVShows,
+  getTVShowNamesAndHashes,
   deleteTVShow,
   getMissingDataMedia,
   insertOrUpdateMissingDataMedia,
@@ -33,6 +34,14 @@ export async function getExistingMovies() {
  */
 export async function getExistingTVShows() {
   return await getTVShows();
+}
+
+/**
+ * Lightweight: get only TV show names and directory hashes (no season/image processing)
+ * @returns {Promise<Array<{name: string, directory_hash: string|null}>>}
+ */
+export async function getExistingTVShowHashes() {
+  return await getTVShowNamesAndHashes();
 }
 
 /**
@@ -114,6 +123,7 @@ export async function saveMovie(
  * @param {string} backdropFilePath - Backdrop file path
  * @param {string} logoFilePath - Logo file path
  * @param {string} basePath - Base path for media files
+ * @param {string} directoryHash - Directory hash for change detection
  * @returns {Promise<void>}
  */
 export async function saveTVShow(
@@ -130,7 +140,8 @@ export async function saveTVShow(
   posterFilePath,
   backdropFilePath,
   logoFilePath,
-  basePath
+  basePath,
+  directoryHash = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -146,7 +157,8 @@ export async function saveTVShow(
     posterFilePath,
     backdropFilePath,
     logoFilePath,
-    basePath
+    basePath,
+    directoryHash
   );
 }
 

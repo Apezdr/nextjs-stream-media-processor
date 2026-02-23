@@ -43,11 +43,20 @@ sessionCache.set(token, userData);
 // Remove specific session
 sessionCache.delete(token);
 
+// Remove all sessions for a specific user (NEW)
+const removedCount = sessionCache.deleteByUserId('user123');
+
 // Clear all sessions
 sessionCache.clear();
 
 // Get statistics
 const stats = sessionCache.getStats();
+
+// Reset statistics (for monitoring)
+sessionCache.resetStats();
+
+// Graceful shutdown (NEW)
+sessionCache.shutdown();
 ```
 
 #### 2. Modified Authentication Middleware
@@ -78,18 +87,36 @@ Request → Extract Token → Check Cache
 
 ## Configuration
 
+All configuration is handled through environment variables in `.env` file:
+
 ### TTL (Time To Live)
-- **Default**: 2 minutes (120,000ms)
+- **Environment Variable**: `SESSION_CACHE_TTL_MS`
+- **Default**: 120,000ms (2 minutes)
 - **Rationale**: Balances performance with security
-- **Trade-off**: Permission changes take up to 2 minutes to propagate
+- **Trade-off**: Permission changes take up to TTL duration to propagate
+
+### Maximum Cache Size
+- **Environment Variable**: `SESSION_CACHE_MAX_SIZE`
+- **Default**: 10,000 sessions
+- **Purpose**: Prevents unbounded memory growth
+- **Behavior**: When limit reached, oldest entries are evicted (LRU)
 
 ### Cleanup Interval
-- **Default**: 30 seconds
+- **Environment Variable**: `SESSION_CACHE_CLEANUP_INTERVAL_MS`
+- **Default**: 30,000ms (30 seconds)
 - **Purpose**: Remove expired entries from memory
 
+### Stats Reporting Interval
+- **Environment Variable**: `SESSION_CACHE_STATS_INTERVAL_MS`
+- **Default**: 60,000ms (1 minute)
+- **Purpose**: Log performance metrics
+- **Feature**: Suppresses duplicate log lines when stats don't change
+
 ### Memory Usage
-- **Per User**: ~1KB
-- **1000 Users**: ~1MB (negligible)
+- **Per Session**: ~1KB
+- **1000 Sessions**: ~1MB
+- **10,000 Sessions**: ~10MB (with default max size)
+- **Additional Overhead**: User-to-token index for per-user invalidation
 
 ## API Endpoints
 
@@ -109,17 +136,20 @@ GET /api/admin/cache/session-stats
     "total": 45,
     "active": 40,
     "expired": 5,
+    "uniqueUsers": 38,
     "hitRate": "95.50%",
     "stats": {
       "hits": 1000,
       "misses": 47,
       "sets": 47,
       "deletes": 2,
-      "expired": 5
+      "expired": 5,
+      "evictions": 0
     },
     "config": {
-      "ttl": "2 minutes",
-      "cleanupInterval": "30 seconds"
+      "ttl": "120s",
+      "maxSize": 10000,
+      "cleanupInterval": "30s"
     }
   },
   "timestamp": "2025-01-20T12:00:00.000Z"
@@ -157,6 +187,25 @@ Resets hit/miss counters without clearing cached sessions.
 {
   "success": true,
   "message": "Session cache statistics reset",
+  "timestamp": "2025-01-20T12:00:00.000Z"
+}
+```
+
+### Clear Sessions for Specific User (NEW)
+
+```http
+DELETE /api/admin/cache/session-cache/user/{userId}
+```
+
+Removes all cached sessions for a specific user. Useful for immediate permission changes or security events affecting one user.
+
+**Response**:
+```json
+{
+  "success": true,
+  "message": "User sessions cleared from cache",
+  "userId": "user123",
+  "sessionsRemoved": 3,
   "timestamp": "2025-01-20T12:00:00.000Z"
 }
 ```
@@ -378,11 +427,11 @@ Expected results:
 
 Potential improvements for consideration:
 
-1. **Configurable TTL**: Environment variable for TTL adjustment
-2. **Per-User Invalidation**: Clear specific user's sessions
-3. **Redis Backend**: Optional Redis for distributed caching
-4. **Metrics Export**: Prometheus metrics for monitoring
-5. **Cache Warming**: Pre-populate cache for known active users
+1. **Redis Backend**: Optional Redis for distributed caching across multiple servers
+2. **Metrics Export**: Prometheus/OpenTelemetry metrics for monitoring dashboards
+3. **Cache Warming**: Pre-populate cache for known active users
+4. **Advanced Eviction Policies**: LFU (Least Frequently Used) vs current LRU
+5. **Cache Compression**: Compress cached user objects to reduce memory usage
 
 ## Related Documentation
 
@@ -392,6 +441,15 @@ Potential improvements for consideration:
 - [Performance Optimization](./TMDB_PERFORMANCE_OPTIMIZATION_PLAN.md)
 
 ## Changelog
+
+### Version 2.0 (2026-02-16)
+- **Environment Variable Configuration**: All settings configurable via .env
+- **Memory Management**: Configurable max cache size with LRU eviction
+- **Per-User Invalidation**: `deleteByUserId()` for targeted session clearing
+- **Log Noise Reduction**: Suppresses duplicate stats log lines when unchanged
+- **Graceful Shutdown**: `shutdown()` method for clean process exit
+- **Enhanced Statistics**: Added `uniqueUsers` and `evictions` tracking
+- **Production Optimizations**: Timer unref for better process lifecycle management
 
 ### Version 1.0 (2025-01-20)
 - Initial implementation

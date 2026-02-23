@@ -1,16 +1,20 @@
 import { promises as fs } from 'fs';
-import { join, normalize } from 'path';
+import { join, normalize, dirname } from 'path';
 import { createHash } from 'crypto';
+import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   fileExists,
   getStoredBlurhash,
-  deriveEpisodeTitle
+  deriveEpisodeTitle,
+  calculateDirectoryHash
 } from '../../../utils/utils.mjs';
 import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
+import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import {
   getExistingTVShows,
+  getExistingTVShowHashes,
   getMissingMediaData,
   saveTVShow,
   removeTVShow,
@@ -23,7 +27,8 @@ const logger = createCategoryLogger('tv-scanner');
 const RETRY_INTERVAL_HOURS = 24;
 
 /**
- * Helper function to generate chapter files if they don't exist
+ * Helper function to generate chapter files if they don't exist.
+ * Writes the generated VTT content to disk (matching app.mjs pattern).
  * @param {string} chaptersPath - Path to chapters file
  * @param {string} mediaPath - Path to media file
  * @param {boolean} quietMode - Whether to suppress logging
@@ -31,7 +36,16 @@ const RETRY_INTERVAL_HOURS = 24;
 async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode = false) {
   if (!(await fileExists(chaptersPath))) {
     try {
-      await generateChapters(mediaPath, quietMode);
+      const chapterData = await chapterInfo(mediaPath);
+      if (chapterData) {
+        // Create the chapters directory if it doesn't exist
+        await fs.mkdir(dirname(chaptersPath), { recursive: true });
+        const chapterContent = await generateChapters(mediaPath, chapterData);
+        await fs.writeFile(chaptersPath, chapterContent);
+        if (!quietMode) {
+          logger.info(`Generated chapter file: ${chaptersPath}`);
+        }
+      }
     } catch (error) {
       logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
     }
@@ -160,11 +174,12 @@ async function processShowMetadata(showPath, encodedShowName, prefixPath) {
  * @param {string} encodedSeasonName - URL-encoded season name
  * @param {string} prefixPath - URL prefix path
  * @param {Object} langMap - Language code mapping
+ * @param {string[]} seasonFiles - Pre-read directory listing for the season (avoids redundant readdir)
  * @returns {Promise<Object>} Subtitles object
  */
-async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, encodedSeasonName, prefixPath, langMap) {
+async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, encodedSeasonName, prefixPath, langMap, seasonFiles) {
   const subtitles = {};
-  const subtitleFiles = await fs.readdir(seasonPath);
+  const subtitleFiles = seasonFiles;
   
   for (const subtitleFile of subtitleFiles) {
     if (subtitleFile.startsWith(episode.replace('.mp4', '')) && subtitleFile.endsWith('.srt')) {
@@ -197,9 +212,10 @@ async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, enc
  * @param {string} prefixPath - URL prefix path
  * @param {string} basePath - Base path for media files
  * @param {Object} langMap - Language code mapping
+ * @param {string[]} seasonFiles - Pre-read directory listing for the season
  * @returns {Promise<Object|null>} Episode data object or null if processing fails
  */
-async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap) {
+async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles) {
   const episodePath = join(seasonPath, episode);
   const encodedEpisodePath = encodeURIComponent(episode);
 
@@ -293,7 +309,8 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     encodedShowName,
     encodedSeasonName,
     prefixPath,
-    langMap
+    langMap,
+    seasonFiles
   );
   
   if (Object.keys(subtitles).length > 0) {
@@ -354,7 +371,7 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
     }
   }
 
-  // Process each episode
+  // Process each episode (pass seasonFiles = episodes to avoid redundant readdir per episode)
   for (const episode of validEpisodes) {
     const episodeResult = await processEpisode(
       episode,
@@ -365,7 +382,8 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       seasonNumber,
       prefixPath,
       basePath,
-      langMap
+      langMap,
+      episodes
     );
     
     if (episodeResult) {
@@ -373,13 +391,6 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       seasonData.lengths[episodeResult.episodeKey] = episodeResult.length;
       seasonData.dimensions[episodeResult.episodeKey] = episodeResult.dimensions;
     }
-  }
-
-  // Process all thumbnails to ensure blurhash is generated
-  const thumbnailFiles = episodes.filter(file => file.endsWith(' - Thumbnail.jpg'));
-  for (const thumbnailFile of thumbnailFiles) {
-    const thumbnailPath = join(seasonPath, thumbnailFile);
-    await getStoredBlurhash(thumbnailPath, basePath);
   }
 
   return { seasonName, seasonData };
@@ -401,9 +412,13 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   const missingDataMedia = await getMissingMediaData();
   const now = new Date();
 
-  // Get the list of TV shows currently in the database
-  const existingShows = await getExistingTVShows();
-  const existingShowNames = new Set(existingShows.map(show => show.name));
+  // Lightweight hash lookup — avoids loading full show data with seasons/images
+  const existingShowHashes = await getExistingTVShowHashes();
+  const hashMap = new Map(existingShowHashes.map(s => [s.name, s.directory_hash]));
+  const existingShowNames = new Set(existingShowHashes.map(s => s.name));
+
+  // Bounded concurrency for season processing (moderate load — not unbounded)
+  const seasonLimit = pLimit(3);
 
   try {
     for (let index = 0; index < shows.length; index++) {
@@ -419,7 +434,21 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       existingShowNames.delete(showName);
       const encodedShowName = encodeURIComponent(showName);
       const showPath = normalize(join(dirPath, showName));
-      
+
+      // #1: Directory hash skip — if nothing changed, skip expensive processing
+      const currentHash = await calculateDirectoryHash(showPath);
+      const storedHash = hashMap.get(showName);
+      if (storedHash && storedHash === currentHash) {
+        if (isDebugMode) {
+          logger.info(`No changes detected in ${showName}, skipping processing.`);
+        }
+        continue;
+      }
+
+      if (storedHash) {
+        logger.info(`Directory hash changed for ${showName}, reprocessing.`);
+      }
+
       const allItems = await fs.readdir(showPath, { withFileTypes: true });
       const seasonFolders = allItems.filter(
         item => item.isDirectory() && item.name.startsWith('Season')
@@ -464,10 +493,10 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         Object.assign(assetsResult, retryAssetsResult);
       }
 
-      // Process seasons
+      // Process seasons with bounded concurrency
       const seasonsObj = {};
       await Promise.all(
-        seasons.map(async season => {
+        seasons.map(season => seasonLimit(async () => {
           const seasonResult = await processSeason(
             season,
             showPath,
@@ -481,7 +510,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           if (seasonResult) {
             seasonsObj[seasonResult.seasonName] = seasonResult.seasonData;
           }
-        })
+        }))
       );
 
       // Sort seasons
@@ -516,6 +545,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         }
       }
 
+      // Calculate final directory hash after all processing (files may have been created)
+      const finalHash = await calculateDirectoryHash(showPath);
+
       // Save to database
       await saveTVShow(
         showName,
@@ -531,7 +563,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         posterFilePath,
         backdropFilePath,
         logoFilePath,
-        basePath
+        basePath,
+        finalHash
       );
     }
 

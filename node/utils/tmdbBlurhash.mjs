@@ -12,39 +12,16 @@ import {
   clearExpiredTmdbBlurhashCacheWithDb
 } from '../sqlite/tmdbBlurhashCache.mjs';
 import { generateBlurhashFromBuffer } from './blurhashNative.mjs';
+import pLimit from 'p-limit';
 
 const logger = createCategoryLogger('tmdb-blurhash');
 
 // Feature flag: use native Node.js blurhash (faster) or Python subprocess (legacy)
 const USE_NATIVE_BLURHASH = process.env.USE_NATIVE_BLURHASH !== 'false'; // Default to true
 
-/**
- * Semaphore for limiting concurrent operations
- */
-class Semaphore {
-  constructor(max) {
-    this.max = max;
-    this.active = 0;
-    this.queue = [];
-  }
-
-  async run(fn) {
-    if (this.active >= this.max) {
-      await new Promise((r) => this.queue.push(r));
-    }
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      const next = this.queue.shift();
-      if (next) next();
-    }
-  }
-}
-
-// Limit concurrent download+python executions (tune with env var)
-const downloadExecSem = new Semaphore(Number(process.env.BLURHASH_CONCURRENCY || 4));
+// Limit concurrent download+blurhash operations using p-limit (better integration with worker pool)
+// This works at the application level, while the worker pool manages the actual blurhash computation
+const downloadLimit = pLimit(Number(process.env.BLURHASH_CONCURRENCY || 4));
 
 // Deduplicate in-flight blurhash generation
 const inflight = new Map(); // cacheKey -> Promise<string|null>
@@ -113,8 +90,8 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
         return cached;
       }
       
-      // Limit concurrent download operations
-      return await downloadExecSem.run(async () => {
+      // Limit concurrent download operations using p-limit
+      return await downloadLimit(async () => {
         try {
           // Download image into memory (faster than disk I/O)
           const response = await axios({

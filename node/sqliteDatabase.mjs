@@ -624,6 +624,17 @@ export async function getTVShows() {
   });
 }
 
+/**
+ * Lightweight query returning only TV show names and directory hashes.
+ * Used by the scanner to detect unchanged directories without loading full show data.
+ * @returns {Promise<Array<{name: string, directory_hash: string|null}>>}
+ */
+export async function getTVShowNamesAndHashes() {
+  return withDb("main", async (db) => {
+    return await withRetry(() => db.all('SELECT name, directory_hash FROM tv_shows'));
+  });
+}
+
 export async function getMovies() {
   return withDb("main", async (db) => {
     const movies = await withRetry(() => db.all('SELECT * FROM movies'));
@@ -891,7 +902,8 @@ export async function insertOrUpdateTVShow(
   posterFilePath = null,
   backdropFilePath = null,
   logoFilePath = null,
-  basePath = null
+  basePath = null,
+  directoryHash = null
 ) {
   return withWriteTx("main", async (db) => {
     // Get current cached values for comparison (if updating existing TV show)
@@ -912,8 +924,9 @@ export async function insertOrUpdateTVShow(
           name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash,
           backdrop, backdropBlurhash, seasons,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
-          poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
+          directory_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -933,11 +946,13 @@ export async function insertOrUpdateTVShow(
           backdrop_hash=excluded.backdrop_hash,
           backdrop_mtime=excluded.backdrop_mtime,
           logo_hash=excluded.logo_hash,
-          logo_mtime=excluded.logo_mtime`,
+          logo_mtime=excluded.logo_mtime,
+          directory_hash=excluded.directory_hash`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
-          posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime
+          posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
+          directoryHash
         ]
       )
     );

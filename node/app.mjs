@@ -31,6 +31,7 @@ import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
+import { destroyPool } from "./lib/blurhash-pool.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
 const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
@@ -1645,6 +1646,14 @@ async function gracefulShutdown(signal, code = 0) {
       logger.info('Closing Discord connections...');
     } catch (error) {
       logger.warn('Could not close Discord connections:', error.message);
+    }
+
+    // Destroy blurhash worker pool
+    try {
+      logger.info('Destroying blurhash worker pool...');
+      await destroyPool();
+    } catch (error) {
+      logger.warn('Error destroying blurhash worker pool:', error.message);
     }
 
     // Close database connections

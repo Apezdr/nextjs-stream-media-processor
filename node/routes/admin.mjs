@@ -218,28 +218,36 @@ router.delete('/cache/session-cache', authenticateUser, requireAdmin, (req, res)
 });
 
 /**
- * Route to reset session cache statistics counters
- * POST /admin/cache/session-stats/reset
+ * Route to clear session cache entries for a specific user
+ * DELETE /admin/cache/session-cache/user/:userId
  * Requires authentication and admin privileges
  *
- * Resets the hit/miss counters without clearing cached sessions.
- * Useful for monitoring cache performance over specific time periods.
+ * Removes all cached sessions for a specific user.
+ * Useful for immediate permission changes or security events affecting one user.
  */
-router.post('/cache/session-stats/reset', authenticateUser, requireAdmin, (req, res) => {
+router.delete('/cache/session-cache/user/:userId', authenticateUser, requireAdmin, (req, res) => {
     try {
-        sessionCache.resetStats();
+        const { userId } = req.params;
         
-        logger.info(`Admin ${req.user.email} reset session cache statistics`);
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        const sessionsRemoved = sessionCache.deleteByUserId(userId);
+        
+        logger.info(`Admin ${req.user.email} cleared ${sessionsRemoved} cached session(s) for user ${userId}`);
         
         return res.status(200).json({
             success: true,
-            message: 'Session cache statistics reset',
+            message: 'User sessions cleared from cache',
+            userId,
+            sessionsRemoved,
             timestamp: new Date().toISOString()
         });
     } catch (error) {
-        logger.error(`Error resetting session cache statistics: ${error.message}`);
+        logger.error(`Error clearing user sessions from cache: ${error.message}`);
         return res.status(500).json({
-            error: 'Failed to reset session cache statistics',
+            error: 'Failed to clear user sessions from cache',
             message: error.message
         });
     }

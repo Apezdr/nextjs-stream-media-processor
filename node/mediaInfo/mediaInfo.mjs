@@ -265,3 +265,135 @@ export async function extractHDRInfo(filePath) {
     return null;
   }
 }
+
+/**
+ * Derive HDR string from an already-computed mediaQuality object (no subprocess).
+ * @param {object|null} mediaQuality - Result from extractMediaQuality or getMediaInfoCombined
+ * @returns {string|null}
+ */
+export function deriveHDRFromQuality(mediaQuality) {
+  if (!mediaQuality || !mediaQuality.format) return null;
+  if (!mediaQuality.isHDR && mediaQuality.format.includes("10-bit SDR")) return mediaQuality.format;
+  if (!mediaQuality.isHDR) return null;
+  return mediaQuality.format;
+}
+
+/**
+ * Combined extraction: runs mediainfo once and returns headerData + mediaQuality + hdr.
+ * Replaces separate calls to getHeaderData(), extractMediaQuality(), and extractHDRInfo()
+ * reducing 3 mediainfo subprocess invocations to 1.
+ *
+ * @param {string} filePath - The path to the media file.
+ * @returns {Promise<{headerData: string, mediaQuality: object|null, hdr: string|null}>}
+ */
+export async function getMediaInfoCombined(filePath) {
+  try {
+    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
+    const data = JSON.parse(stdout);
+
+    // --- Header data extraction (from getHeaderData logic) ---
+    let headerData = '';
+    const generalTrack = data.media.track.find(t => t["@type"] === "General");
+    const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
+
+    if (generalTrack && videoTracks.length > 0) {
+      const video = videoTracks[0];
+      const generalFields = [
+        generalTrack.FileSize,
+        generalTrack.Duration,
+        generalTrack.OverallBitRate,
+        generalTrack.FrameCount
+      ];
+      const videoFields = [
+        video.Format, video.CodecID, video.Width, video.Height,
+        video.FrameRate, video.BitDepth, video.ColorSpace,
+        video.ChromaSubsampling, video.ScanType, video.StreamSize,
+        video.Format_Profile, video.Format_Level, video.FrameCount,
+        video.Encoded_Library_Settings
+      ];
+      headerData = [...generalFields, ...videoFields].filter(Boolean).join('|');
+    }
+
+    // --- Media quality extraction (from extractMediaQuality logic) ---
+    let mediaQuality = null;
+    if (videoTracks.length > 0) {
+      const detectedHDR = new Set();
+      let bitDepth = null;
+      let colorSpace = null;
+      let transferCharacteristics = null;
+      let encodingSettings = null;
+
+      for (const videoTrack of videoTracks) {
+        bitDepth = videoTrack["BitDepth"] ? parseInt(videoTrack["BitDepth"]) : null;
+        encodingSettings = videoTrack["Encoded_Library_Settings"] || "";
+        transferCharacteristics = videoTrack["transfer_characteristics"] || videoTrack["TransferCharacteristics"] || "";
+        colorSpace = videoTrack["ColorSpace"] || "";
+        const colourPrimaries = videoTrack["colour_primaries"] || videoTrack["ColorPrimaries"] || "";
+        const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
+        const contentLightLevel = videoTrack["MaxCLL"] || "";
+
+        if (videoTrack["HDR_Format"]) {
+          if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
+            detectedHDR.add("HDR10+"); continue;
+          } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
+            detectedHDR.add("HDR10");
+          } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
+            detectedHDR.add("Dolby Vision");
+          }
+        }
+        if (videoTrack["Format_Profile"]?.includes("Dolby Vision") ||
+            videoTrack["Format_Commercial"]?.includes("Dolby Vision") ||
+            videoTrack["CodecID"]?.startsWith("dva")) {
+          detectedHDR.add("Dolby Vision");
+        }
+        if ((includesIgnoreCase(transferCharacteristics, "PQ") ||
+             includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
+            includesIgnoreCase(colourPrimaries, "BT.2020")) {
+          if (masteringDisplayColorPrimaries && contentLightLevel) detectedHDR.add("HDR10");
+        }
+        if (includesIgnoreCase(transferCharacteristics, "HLG")) detectedHDR.add("HLG");
+        if ((includesIgnoreCase(colorSpace, "BT.2020") || includesIgnoreCase(colorSpace, "bt2020")) &&
+            (includesIgnoreCase(colourPrimaries, "BT.2020") || includesIgnoreCase(colourPrimaries, "bt2020"))) {
+          if (detectedHDR.size === 0) detectedHDR.add("Potential HDR (BT.2020)");
+        }
+        if (bitDepth === 10 &&
+            (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
+            (includesIgnoreCase(transferCharacteristics, "BT.709") || transferCharacteristics === "2") &&
+            detectedHDR.size === 0 && !encodingSettings.includes("no-hdr")) {
+          detectedHDR.add("10-bit SDR (BT.709)");
+        }
+        if ((bitDepth === 8 || bitDepth === null) &&
+            (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
+            detectedHDR.size === 0) {
+          detectedHDR.add("8-bit SDR (BT.709)");
+        }
+        if (encodingSettings.includes("no-hdr") && detectedHDR.size === 0) {
+          detectedHDR.add(bitDepth === 10 ? "10-bit SDR (BT.709)" : "8-bit SDR (BT.709)");
+        }
+      }
+
+      const formatString = detectedHDR.size > 0 ? Array.from(detectedHDR).join(', ') : null;
+      const isHDR = detectedHDR.size > 0 &&
+                   !Array.from(detectedHDR).some(f => f.includes("SDR") || f.includes("8-bit") || f.includes("10-bit SDR"));
+
+      mediaQuality = {
+        format: formatString,
+        bitDepth, colorSpace, transferCharacteristics, isHDR,
+        viewingExperience: {
+          enhancedColor: bitDepth === 10 || isHDR,
+          highDynamicRange: isHDR,
+          dolbyVision: detectedHDR.has("Dolby Vision"),
+          hdr10Plus: detectedHDR.has("HDR10+"),
+          standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HLG")
+        }
+      };
+    }
+
+    const hdr = deriveHDRFromQuality(mediaQuality);
+
+    return { headerData, mediaQuality, hdr };
+  } catch (error) {
+    logger.error(`Error in getMediaInfoCombined for ${filePath}: ${error.message}`);
+    return { headerData: '', mediaQuality: null, hdr: null };
+  }
+}

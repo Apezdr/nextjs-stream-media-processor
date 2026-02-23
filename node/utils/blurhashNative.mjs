@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import { encode, decode } from 'blurhash';
 import { createCategoryLogger } from '../lib/logger.mjs';
+import { runBlurhashTask, poolMetrics } from '../lib/blurhash-pool.mjs';
 
 const logger = createCategoryLogger('blurhash-native');
 
@@ -70,14 +71,29 @@ export async function generateBlurhashNative(imageBuffer, size = 'large', xCompo
       .raw()
       .toBuffer({ resolveWithObject: true });
     
-    // STEP 3: Generate blurhash string (matches Python line 55)
-    const blurhashString = encode(
-      new Uint8ClampedArray(pixelData),
-      info.width,
-      info.height,
-      xComponents,  // Optimized: 4 components (was 8) - sufficient for blur placeholders
-      yComponents   // Optimized: 3 components (was 6) - sufficient for blur placeholders
-    );
+    // STEP 3: Generate blurhash string using worker thread (non-blocking)
+    let blurhashString;
+    try {
+      blurhashString = await runBlurhashTask({
+        operation: 'encode',
+        pixels: pixelData.buffer,  // Pass ArrayBuffer (will be cloned by Piscina)
+        width: info.width,
+        height: info.height,
+        xComp: xComponents,
+        yComp: yComponents
+      });
+      logger.debug(`Blurhash encoded in worker thread: ${blurhashString.substring(0, 10)}...`);
+    } catch (workerError) {
+      // Fallback to main thread if worker fails
+      logger.warn(`Worker encode failed, falling back to main thread: ${workerError.message}`);
+      blurhashString = encode(
+        new Uint8ClampedArray(pixelData),
+        info.width,
+        info.height,
+        xComponents,
+        yComponents
+      );
+    }
     
     // STEP 4: Calculate preview dimensions maintaining original aspect ratio (matches Python lines 96-107)
     let previewWidth, finalPreviewHeight;
@@ -96,8 +112,22 @@ export async function generateBlurhashNative(imageBuffer, size = 'large', xCompo
     previewWidth = Math.max(previewWidth, 1);
     finalPreviewHeight = Math.max(finalPreviewHeight, 1);
     
-    // STEP 5: Decode blurhash to pixel data (matches Python line 74)
-    const decodedPixels = decode(blurhashString, previewWidth, finalPreviewHeight);
+    // STEP 5: Decode blurhash to pixel data using worker thread (non-blocking)
+    let decodedPixels;
+    try {
+      decodedPixels = await runBlurhashTask({
+        operation: 'decode',
+        hash: blurhashString,
+        width: previewWidth,
+        height: finalPreviewHeight
+      });
+      // decodedPixels arrives as Uint8Array from worker, Buffer.from() handles it fine
+      logger.debug(`Blurhash decoded in worker thread: ${previewWidth}x${finalPreviewHeight} pixels`);
+    } catch (workerError) {
+      // Fallback to main thread if worker fails
+      logger.warn(`Worker decode failed, falling back to main thread: ${workerError.message}`);
+      decodedPixels = decode(blurhashString, previewWidth, finalPreviewHeight);
+    }
     
     // STEP 6: Convert to PNG and base64 (matches Python lines 75-77)
     const pngBuffer = await sharp(Buffer.from(decodedPixels), {

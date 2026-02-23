@@ -214,7 +214,7 @@ export async function initializeIndexes() {
       },
       { name: "genres_id_lookup" }
     );
-
+    
     // Ensure indexes on Media.TV collection
     const tvCollection = mediaDb.collection("TV");
     await ensureIndex(

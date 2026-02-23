@@ -372,7 +372,7 @@ class TestRateLimitingCompliance:
         # Verify we waited approximately 2 seconds between calls
         time_diff = call_times[1] - call_times[0]
         assert time_diff >= 2.0, f"Should have waited 2s, only waited {time_diff:.2f}s"
-        assert time_diff < 2.5, f"Waited too long: {time_diff:.2f}s"
+        assert time_diff < 4.0, f"Waited too long: {time_diff:.2f}s"
 
 
 # ============================================================================

@@ -4,12 +4,12 @@ import { fileExists } from "./utils/utils.mjs";
 import { createHash } from 'crypto';
 import { exec as execCallback } from "child_process";
 import { createCategoryLogger } from "./lib/logger.mjs";
-import { extractHDRInfo, extractMediaQuality, getHeaderData } from "./mediaInfo/mediaInfo.mjs";
+import { extractHDRInfo, extractMediaQuality, getHeaderData, getMediaInfoCombined } from "./mediaInfo/mediaInfo.mjs";
 const logger = createCategoryLogger('infoFileManager');
 const exec = promisify(execCallback);
 
 // Used to determine if regenerating info is necessary
-export const CURRENT_VERSION = 1.0009;
+export const CURRENT_VERSION = 1.0010;
 
 /**
  * Validates basic info object structure
@@ -107,30 +107,23 @@ async function extractAdditionalMetadata(filePath) {
 }
 
 /**
- * Generates the info using ffprobe and writes it to the .info file in JSON format.
+ * Generates the info using ffprobe (1 call) and mediainfo (1 call) and writes it to the .info file.
+ * Consolidated from 6 subprocess invocations down to 2.
  * @param {string} filePath - Path to the media file.
  * @param {string} infoFile - Path to the .info file.
  * @returns {Promise<{length: number, dimensions: string, hdr: string|null, mediaQuality: object|null, additionalMetadata: object}>}
  */
 async function generateInfo(filePath, infoFile) {
   try {
-    // Extract basic metadata
-    const { stdout: durationStdout } = await exec(
-      `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
-    );
-    const { stdout: dimensionsStdout } = await exec(
-      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${filePath}"`
-    );
-    const fileLength = Math.floor(parseFloat(durationStdout.trim()) * 1000); // Convert to milliseconds
-    const fileDimensions = dimensionsStdout.trim().replace(/x+$/, ''); // Remove any trailing x characters
-    // Generate MD4 hash from headers
-    const headerData = await getHeaderData(filePath);
-    const headerHash = createHash('sha256').update(headerData).digest('hex');
-
-    // Extract media quality, HDR and additional metadata
-    const mediaQuality = await extractMediaQuality(filePath);
-    const hdr = await extractHDRInfo(filePath);
+    // Single ffprobe call — extractAdditionalMetadata already returns duration + dimensions
     const additionalMetadata = await extractAdditionalMetadata(filePath);
+    
+    const fileLength = additionalMetadata.duration ?? 0;
+    const fileDimensions = additionalMetadata.dimensions ?? '';
+
+    // Single mediainfo call — replaces separate getHeaderData + extractMediaQuality + extractHDRInfo
+    const { headerData, mediaQuality, hdr } = await getMediaInfoCombined(filePath);
+    const headerHash = createHash('sha256').update(headerData).digest('hex');
 
     const info = {
       version: CURRENT_VERSION,

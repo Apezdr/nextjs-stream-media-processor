@@ -47,6 +47,7 @@ export const authenticateUser = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     const sessionToken = req.headers['x-session-token'];
     const mobileToken = req.headers['x-mobile-token'];
+    const path = req.originalUrl || req.url;
     
     // Enhanced cookie extraction
     const sessionTokenFromCookie = extractSessionTokenFromCookies(req.headers.cookie);
@@ -58,7 +59,9 @@ export const authenticateUser = async (req, res, next) => {
     if (sessionTokenFromCookie) {
       logger.debug(`Found session token in cookie: ${sessionTokenFromCookie.substring(0, 10)}...`);
     }
-    
+
+    logger.debug(`Auth attempt: ${req.method} ${path} origin=${origin}`);
+
     logger.debug(`Authentication attempt from origin: ${origin}, User-Agent: ${userAgent.substring(0, 50)}...`);
     
     if (!authHeader && !sessionToken && !mobileToken && !sessionTokenFromCookie) {
@@ -168,7 +171,7 @@ export const authenticateUser = async (req, res, next) => {
     req.user = user;
     
     // Log successful authentication
-    logger.info(`Authenticated user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
+    logger.debug(`Authenticated user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
     next();
   } catch (error) {
     logger.error('Authentication error:', error);
@@ -328,7 +331,7 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     // User is authenticated and is admin
     req.user = user;
     const origin = req.headers.origin || req.headers.referer || 'unknown';
-    logger.info(`Authenticated admin user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
+    logger.debug(`Authenticated admin user: ${user.email} (ID: ${user.id}) via ${authMethod} from origin: ${origin}`);
     
     if (isDebugMode) {
       logger.debug(`Access granted via admin user: ${user.email}`);
