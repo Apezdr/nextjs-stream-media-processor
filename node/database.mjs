@@ -344,7 +344,7 @@ export async function updateLastSyncTime() {
 /**
  * Authenticate user using mobile token from authSessions collection
  * @param {string} mobileToken - The mobile session token
- * @returns {Object|null} User object or null if authentication fails
+ * @returns {Promise<Object|null>} User object or null if authentication fails
  */
 export async function authenticateWithMobileToken(mobileToken) {
   try {
@@ -385,7 +385,7 @@ export async function authenticateWithMobileToken(mobileToken) {
 /**
  * Authenticate user using regular Next.js session token
  * @param {string} token - The session token or session ID
- * @returns {Object|null} User object or null if authentication fails
+ * @returns {Promise<Object|null>} User object or null if authentication fails
  */
 export async function authenticateWithSessionToken(token) {
   try {
