@@ -4,7 +4,6 @@ import { join, dirname } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
 import { fileExists } from '../utils/utils.mjs';
-import { sessionCache } from '../middleware/sessionCache.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
@@ -151,103 +150,6 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         logger.error(`Error saving subtitle changes: ${error.message}`);
         return res.status(500).json({ 
             error: 'Failed to save subtitle changes',
-            message: error.message
-        });
-    }
-});
-
-/**
- * Route to get session cache statistics
- * GET /admin/cache/session-stats
- * Requires authentication and admin privileges
- *
- * Returns statistics about the in-memory session cache including:
- * - Total cached sessions
- * - Active vs expired sessions
- * - Cache hit rate
- * - Configuration details
- */
-router.get('/cache/session-stats', authenticateUser, requireAdmin, (req, res) => {
-    try {
-        const stats = sessionCache.getStats();
-        
-        logger.info(`Admin ${req.user.email} requested session cache statistics`);
-        
-        return res.status(200).json({
-            success: true,
-            cache: stats,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error(`Error fetching session cache statistics: ${error.message}`);
-        return res.status(500).json({
-            error: 'Failed to fetch session cache statistics',
-            message: error.message
-        });
-    }
-});
-
-/**
- * Route to clear all session cache entries
- * DELETE /admin/cache/session-cache
- * Requires authentication and admin privileges
- *
- * This will force all users to re-authenticate on their next request.
- * Useful for security events or when user permissions have been changed.
- */
-router.delete('/cache/session-cache', authenticateUser, requireAdmin, (req, res) => {
-    try {
-        const statsBefore = sessionCache.getStats();
-        sessionCache.clear();
-        
-        logger.warn(`Admin ${req.user.email} cleared all session cache entries (${statsBefore.total} entries removed)`);
-        
-        return res.status(200).json({
-            success: true,
-            message: 'All session cache entries cleared',
-            entriesRemoved: statsBefore.total,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error(`Error clearing session cache: ${error.message}`);
-        return res.status(500).json({
-            error: 'Failed to clear session cache',
-            message: error.message
-        });
-    }
-});
-
-/**
- * Route to clear session cache entries for a specific user
- * DELETE /admin/cache/session-cache/user/:userId
- * Requires authentication and admin privileges
- *
- * Removes all cached sessions for a specific user.
- * Useful for immediate permission changes or security events affecting one user.
- */
-router.delete('/cache/session-cache/user/:userId', authenticateUser, requireAdmin, (req, res) => {
-    try {
-        const { userId } = req.params;
-        
-        if (!userId) {
-            return res.status(400).json({ error: 'User ID is required' });
-        }
-
-        const sessionsRemoved = sessionCache.deleteByUserId(userId);
-        
-        logger.info(`Admin ${req.user.email} cleared ${sessionsRemoved} cached session(s) for user ${userId}`);
-        
-        return res.status(200).json({
-            success: true,
-            message: 'User sessions cleared from cache',
-            userId,
-            sessionsRemoved,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error(`Error clearing user sessions from cache: ${error.message}`);
-        return res.status(500).json({
-            error: 'Failed to clear user sessions from cache',
             message: error.message
         });
     }
