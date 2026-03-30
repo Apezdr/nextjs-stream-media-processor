@@ -1,347 +1,435 @@
+import { fromNodeHeaders } from 'better-auth/node'
+import { createCategoryLogger } from '../lib/logger.mjs'
+import { auth } from '../lib/auth.mjs'
+
+const logger = createCategoryLogger('session-cache')
+
 /**
- * In-memory session cache to reduce MongoDB queries
- * 
- * This module provides a simple, efficient caching layer for authenticated user sessions.
- * By caching session data in memory with a configurable TTL, we dramatically reduce MongoDB
- * connection usage during long-running operations (like TMDB requests with blurhash generation).
- * 
- * Performance Impact:
- * - Reduces MongoDB queries from 100+ requests to ~10 requests per user
- * - Auth latency: 50-100ms → <1ms (99% faster)
- * - Eliminates MongoDB connection pool exhaustion
- * 
- * Security Considerations:
- * - Default 2-minute TTL means permission changes have up to 2-minute delay
- * - Explicit cache invalidation on logout
- * - Entire cache can be cleared for security events
- * - Per-user invalidation for targeted permission changes
- * - Max cache size prevents unbounded memory growth
- * 
- * Configuration (environment variables):
- * - SESSION_CACHE_TTL_MS: TTL in milliseconds (default: 120000 = 2 minutes)
- * - SESSION_CACHE_MAX_SIZE: Maximum cached sessions (default: 10000)
- * - SESSION_CACHE_CLEANUP_INTERVAL_MS: Cleanup interval (default: 30000 = 30 seconds)
- * - SESSION_CACHE_STATS_INTERVAL_MS: Stats reporting interval (default: 60000 = 1 minute)
+ * Bounded LRU Cache with TTL
+ * Prevents unbounded memory growth with hard size limits and automatic eviction
  */
-
-import { createCategoryLogger } from '../lib/logger.mjs';
-
-const logger = createCategoryLogger('session-cache');
-
-// Configurable via environment variables with sensible defaults
-const SESSION_TTL_MS = parseInt(process.env.SESSION_CACHE_TTL_MS, 10) || 2 * 60 * 1000;
-const MAX_CACHE_SIZE = parseInt(process.env.SESSION_CACHE_MAX_SIZE, 10) || 10000;
-const CLEANUP_INTERVAL_MS = parseInt(process.env.SESSION_CACHE_CLEANUP_INTERVAL_MS, 10) || 30 * 1000;
-const STATS_INTERVAL_MS = parseInt(process.env.SESSION_CACHE_STATS_INTERVAL_MS, 10) || 60 * 1000;
-
-class SessionCache {
-  constructor(options = {}) {
-    this.ttl = options.ttl || SESSION_TTL_MS;
-    this.maxSize = options.maxSize || MAX_CACHE_SIZE;
-    this.cleanupIntervalMs = options.cleanupIntervalMs || CLEANUP_INTERVAL_MS;
-    this.statsIntervalMs = options.statsIntervalMs || STATS_INTERVAL_MS;
-
-    this.cache = new Map(); // token => {user, expiresAt}
-    this.userTokenIndex = new Map(); // userId => Set<token>  (for per-user invalidation)
-
-    this.stats = {
-      hits: 0,
-      misses: 0,
-      sets: 0,
-      deletes: 0,
-      expired: 0,
-      evictions: 0
-    };
-
-    // Track last reported values to suppress duplicate log lines
-    this._lastReportedLog = '';
-
-    this._cleanupTimer = null;
-    this._statsTimer = null;
-
-    this.startCleanup();
-    this.startStatsReporting();
-    
-    logger.info('Session cache initialized', {
-      ttl: `${this.ttl / 1000}s`,
-      maxSize: this.maxSize,
-      cleanupInterval: `${this.cleanupIntervalMs / 1000}s`,
-      statsInterval: `${this.statsIntervalMs / 1000}s`
-    });
+class BoundedLRUCache {
+  constructor(maxSize = 1000, ttl = 30000) {
+    this.maxSize = maxSize
+    this.ttl = ttl
+    this.cache = new Map()
+    this.accessOrder = new Map() // timestamp tracking for LRU
   }
-  
-  /**
-   * Get cached session data
-   * @param {string} token - Session token
-   * @returns {Object|null} Cached user data or null if not found/expired
-   */
-  get(token) {
-    if (!token) return null;
-    
-    const entry = this.cache.get(token);
-    if (!entry) {
-      this.stats.misses++;
-      return null;
-    }
-    
+
+  get(key) {
+    const item = this.cache.get(key)
+    if (!item) return null
+
     // Check if expired
-    if (Date.now() > entry.expiresAt) {
-      this._removeEntry(token, entry);
-      this.stats.expired++;
-      this.stats.misses++;
-      return null;
+    if (Date.now() - item.timestamp > this.ttl) {
+      this.cache.delete(key)
+      this.accessOrder.delete(key)
+      return null
     }
-    
-    this.stats.hits++;
-    return entry.user;
+
+    // Update access time for LRU
+    this.accessOrder.set(key, Date.now())
+    return item.value
   }
-  
-  /**
-   * Cache a session
-   * @param {string} token - Session token
-   * @param {Object} user - User data to cache (must include an `id` field)
-   */
-  set(token, user) {
-    if (!token || !user) return;
 
-    // Evict oldest entries if we're at capacity (and this is a new token)
-    if (!this.cache.has(token) && this.cache.size >= this.maxSize) {
-      this._evictOldest();
+  set(key, value) {
+    const now = Date.now()
+    
+    // Remove oldest if at capacity
+    if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
+      this.evictOldest()
     }
 
-    // Remove old index entry if overwriting
-    const existing = this.cache.get(token);
-    if (existing && existing.user?.id) {
-      const tokens = this.userTokenIndex.get(existing.user.id);
-      if (tokens) {
-        tokens.delete(token);
-        if (tokens.size === 0) this.userTokenIndex.delete(existing.user.id);
+    this.cache.set(key, { value, timestamp: now })
+    this.accessOrder.set(key, now)
+  }
+
+  evictOldest() {
+    // Find least recently accessed item
+    let oldest = null
+    let oldestTime = Infinity
+    
+    for (const [key, time] of this.accessOrder) {
+      if (time < oldestTime) {
+        oldestTime = time
+        oldest = key
       }
     }
-    
-    this.cache.set(token, {
-      user,
-      expiresAt: Date.now() + this.ttl
-    });
 
-    // Maintain userId → tokens reverse index
-    if (user.id) {
-      if (!this.userTokenIndex.has(user.id)) {
-        this.userTokenIndex.set(user.id, new Set());
-      }
-      this.userTokenIndex.get(user.id).add(token);
-    }
-    
-    this.stats.sets++;
-  }
-  
-  /**
-   * Remove a specific session from cache
-   * @param {string} token - Session token to remove
-   */
-  delete(token) {
-    if (!token) return;
-
-    const entry = this.cache.get(token);
-    if (entry) {
-      this._removeEntry(token, entry);
-      this.stats.deletes++;
-      logger.debug(`Session removed from cache: ${token.substring(0, 8)}...`);
+    if (oldest) {
+      this.cache.delete(oldest)
+      this.accessOrder.delete(oldest)
+      logger.debug(`Evicted LRU cache entry: ${oldest.substring(0, 10)}...`)
     }
   }
 
-  /**
-   * Remove all cached sessions for a specific user
-   * Useful for password resets, permission changes, or targeted logout
-   * @param {string} userId - User ID to invalidate
-   * @returns {number} Number of sessions removed
-   */
-  deleteByUserId(userId) {
-    if (!userId) return 0;
-
-    const tokens = this.userTokenIndex.get(userId);
-    if (!tokens || tokens.size === 0) return 0;
-
-    let removed = 0;
-    for (const token of tokens) {
-      if (this.cache.delete(token)) {
-        removed++;
-        this.stats.deletes++;
-      }
-    }
-    this.userTokenIndex.delete(userId);
-
-    if (removed > 0) {
-      logger.info(`Invalidated ${removed} cached session(s) for user ${userId}`);
-    }
-    return removed;
-  }
-  
-  /**
-   * Clear all sessions from cache
-   * Useful for logout all, security events, or emergency situations
-   */
   clear() {
-    const size = this.cache.size;
-    this.cache.clear();
-    this.userTokenIndex.clear();
-    logger.warn(`All sessions cleared from cache: ${size} entries removed`);
+    this.cache.clear()
+    this.accessOrder.clear()
   }
-  
-  /**
-   * Get cache statistics
-   * @returns {Object} Cache statistics including size, hit rate, etc.
-   */
-  getStats() {
-    let activeCount = 0;
-    let expiredCount = 0;
-    const now = Date.now();
-    
-    for (const [, entry] of this.cache) {
-      if (now > entry.expiresAt) {
-        expiredCount++;
-      } else {
-        activeCount++;
+
+  size() {
+    return this.cache.size
+  }
+
+  // Remove expired entries
+  cleanup() {
+    const now = Date.now()
+    const toDelete = []
+
+    for (const [key, item] of this.cache) {
+      if (now - item.timestamp > this.ttl) {
+        toDelete.push(key)
       }
     }
-    
-    const totalRequests = this.stats.hits + this.stats.misses;
-    const hitRate = totalRequests > 0 
-      ? (this.stats.hits / totalRequests * 100).toFixed(2) 
-      : 0;
-    
-    return {
-      total: this.cache.size,
-      active: activeCount,
-      expired: expiredCount,
-      uniqueUsers: this.userTokenIndex.size,
-      hitRate: `${hitRate}%`,
-      stats: { ...this.stats },
-      config: {
-        ttl: `${this.ttl / 1000}s`,
-        maxSize: this.maxSize,
-        cleanupInterval: `${this.cleanupIntervalMs / 1000}s`
-      }
-    };
+
+    for (const key of toDelete) {
+      this.cache.delete(key)
+      this.accessOrder.delete(key)
+    }
+
+    return toDelete.length
   }
-  
-  /**
-   * Reset statistics counters
-   */
-  resetStats() {
+}
+
+/**
+ * Memory-Aware Session Cache with adaptive behavior
+ * Monitors memory pressure and adjusts caching strategy accordingly
+ */
+class MemoryAwareSessionCache {
+  constructor() {
+    this.sessionCache = new BoundedLRUCache(1000, 30000) // 1000 sessions, 30s TTL
+    this.inflightCache = new BoundedLRUCache(100, 5000)   // 100 concurrent, 5s TTL
+    this.requestCache = new BoundedLRUCache(500, 1000)    // 500 requests, 1s TTL
+    
+    this.memoryPressure = false
     this.stats = {
       hits: 0,
       misses: 0,
-      sets: 0,
-      deletes: 0,
-      expired: 0,
-      evictions: 0
-    };
-    this._lastReportedLog = '';
-    logger.info('Cache statistics reset');
+      evictions: 0,
+      memoryCleanups: 0,
+      lastCleanup: null
+    }
+
+    this.memoryMonitor = null
+    this.cleanupScheduler = null
+
+    this.initializeMemoryMonitoring()
+    this.initializeCleanupScheduler()
   }
 
-  /**
-   * Graceful shutdown — clears timers so the process can exit cleanly.
-   * Safe to call multiple times.
-   */
+  initializeMemoryMonitoring() {
+    // Check memory every 30 seconds
+    this.memoryMonitor = setInterval(() => {
+      if (process.memoryUsage) {
+        const usage = process.memoryUsage()
+        const heapUsedMB = usage.heapUsed / 1024 / 1024
+        const heapTotalMB = usage.heapTotal / 1024 / 1024
+        
+        // Consider memory pressure if heap used > 80% of total or > 500MB
+        const wasUnderPressure = this.memoryPressure
+        this.memoryPressure = (heapUsedMB / heapTotalMB > 0.8) || (heapUsedMB > 500)
+        
+        if (this.memoryPressure && !wasUnderPressure) {
+          logger.warn(`Memory pressure detected: ${heapUsedMB.toFixed(1)}MB used (${((heapUsedMB / heapTotalMB) * 100).toFixed(1)}% of heap)`)
+          this.handleMemoryPressure()
+        } else if (!this.memoryPressure && wasUnderPressure) {
+          logger.info('Memory pressure relieved')
+        }
+      }
+    }, 30000)
+  }
+
+  handleMemoryPressure() {
+    // Aggressively clean caches under memory pressure
+    const sessionCleared = this.sessionCache.cleanup()
+    const inflightCleared = this.inflightCache.cleanup()
+    const requestCleared = this.requestCache.cleanup()
+    
+    this.stats.memoryCleanups++
+    this.stats.lastCleanup = new Date().toISOString()
+    
+    logger.info(`Emergency cache cleanup: ${sessionCleared + inflightCleared + requestCleared} entries removed`)
+    
+    // If still under pressure, clear everything
+    if (this.memoryPressure) {
+      this.sessionCache.clear()
+      this.inflightCache.clear()
+      this.requestCache.clear()
+      logger.warn('Full cache clear due to severe memory pressure')
+    }
+  }
+
+  initializeCleanupScheduler() {
+    // Regular cleanup every 5 minutes
+    this.cleanupScheduler = setInterval(() => {
+      if (!this.memoryPressure) { // Skip if under memory pressure (already cleaned)
+        const cleaned = this.sessionCache.cleanup() + 
+                        this.inflightCache.cleanup() + 
+                        this.requestCache.cleanup()
+        
+        if (cleaned > 0) {
+          logger.debug(`Regular cache cleanup: ${cleaned} expired entries removed`)
+          this.stats.lastCleanup = new Date().toISOString()
+        }
+      }
+    }, 5 * 60 * 1000)
+  }
+
+  // Graceful degradation
+  shouldUseCache() {
+    return !this.memoryPressure
+  }
+
   shutdown() {
-    if (this._cleanupTimer) {
-      clearInterval(this._cleanupTimer);
-      this._cleanupTimer = null;
-    }
-    if (this._statsTimer) {
-      clearInterval(this._statsTimer);
-      this._statsTimer = null;
-    }
-    logger.info('Session cache timers stopped');
+    if (this.memoryMonitor) clearInterval(this.memoryMonitor)
+    if (this.cleanupScheduler) clearInterval(this.cleanupScheduler)
+    this.sessionCache.clear()
+    this.inflightCache.clear()
+    this.requestCache.clear()
   }
-  
-  // ── Private helpers ──────────────────────────────────────────────
+}
 
-  /**
-   * Remove an entry from both the cache and the userId index.
-   * @private
-   */
-  _removeEntry(token, entry) {
-    this.cache.delete(token);
-    if (entry?.user?.id) {
-      const tokens = this.userTokenIndex.get(entry.user.id);
-      if (tokens) {
-        tokens.delete(token);
-        if (tokens.size === 0) this.userTokenIndex.delete(entry.user.id);
+/**
+ * Circuit Breaker for Auth Service Protection
+ * Prevents cascade failures and service overload
+ */
+class AuthCircuitBreaker {
+  constructor(failureThreshold = 5, timeout = 30000) {
+    this.failureCount = 0
+    this.failureThreshold = failureThreshold
+    this.timeout = timeout
+    this.state = 'CLOSED' // CLOSED (normal), OPEN (failing), HALF_OPEN (testing)
+    this.nextAttempt = null
+    this.lastFailure = null
+  }
+
+  async execute(fn) {
+    if (this.state === 'OPEN') {
+      if (Date.now() < this.nextAttempt) {
+        throw new Error(`Circuit breaker is OPEN. Auth service unavailable until ${new Date(this.nextAttempt).toISOString()}`)
+      }
+      this.state = 'HALF_OPEN'
+      logger.info('Circuit breaker entering HALF_OPEN state, testing auth service...')
+    }
+
+    try {
+      const result = await fn()
+      this.onSuccess()
+      return result
+    } catch (error) {
+      this.onFailure(error)
+      throw error
+    }
+  }
+
+  onSuccess() {
+    if (this.state === 'HALF_OPEN') {
+      logger.info('Circuit breaker closing after successful auth')
+    }
+    this.failureCount = 0
+    this.state = 'CLOSED'
+    this.nextAttempt = null
+    this.lastFailure = null
+  }
+
+  onFailure(error) {
+    this.failureCount++
+    this.lastFailure = new Date().toISOString()
+    
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'OPEN'
+      this.nextAttempt = Date.now() + this.timeout
+      logger.error(`Circuit breaker OPENED after ${this.failureCount} failures. Next attempt at ${new Date(this.nextAttempt).toISOString()}`)
+    } else {
+      logger.warn(`Auth failure ${this.failureCount}/${this.failureThreshold}: ${error.message}`)
+    }
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      nextAttempt: this.nextAttempt ? new Date(this.nextAttempt).toISOString() : null,
+      lastFailure: this.lastFailure
+    }
+  }
+}
+
+/**
+ * Production Session Manager
+ * Comprehensive session caching with memory safety and monitoring
+ */
+class ProductionSessionManager {
+  constructor() {
+    this.cache = new MemoryAwareSessionCache()
+    this.circuitBreaker = new AuthCircuitBreaker(5, 30000)
+    this.inflightRequests = new Map() // token -> { promise, timestamp }
+    
+    // Bounded inflight tracking with automatic cleanup
+    this.inflightCleanup = setInterval(() => this.cleanupInflight(), 10000) // Every 10 seconds
+  }
+
+  cleanupInflight() {
+    const now = Date.now()
+    const staleThreshold = 30000 // 30 seconds
+    let cleaned = 0
+    
+    for (const [token, { timestamp }] of this.inflightRequests) {
+      if (now - timestamp > staleThreshold) {
+        logger.warn(`Cleaning up stale inflight auth request for token: ${token.substring(0, 10)}...`)
+        this.inflightRequests.delete(token)
+        cleaned++
       }
     }
-  }
 
-  /**
-   * Evict the oldest entry when the cache exceeds maxSize.
-   * Map iteration order is insertion-order, so the first entry is the oldest.
-   * @private
-   */
-  _evictOldest() {
-    const oldestKey = this.cache.keys().next().value;
-    if (oldestKey !== undefined) {
-      const entry = this.cache.get(oldestKey);
-      this._removeEntry(oldestKey, entry);
-      this.stats.evictions++;
-      logger.debug('Evicted oldest cache entry due to max size limit');
+    if (cleaned > 0) {
+      logger.info(`Cleaned up ${cleaned} stale inflight auth requests`)
     }
   }
 
-  /**
-   * Periodic cleanup of expired entries
-   * @private
-   */
-  startCleanup() {
-    this._cleanupTimer = setInterval(() => {
-      const now = Date.now();
-      let removed = 0;
+  async getSession(sessionToken, req) {
+    // Validate token format to prevent cache pollution
+    if (!sessionToken || sessionToken.length < 10 || sessionToken.length > 200) {
+      throw new Error('Invalid token format')
+    }
+
+    // Quick request-level cache check (sub-second granularity)
+    const requestKey = `${sessionToken}:${Math.floor(Date.now() / 1000)}`
+    if (this.cache.shouldUseCache()) {
+      const cached = this.cache.requestCache.get(requestKey)
+      if (cached) {
+        this.cache.stats.hits++
+        return cached
+      }
+
+      // Check session-level cache (30 second TTL)
+      const sessionCached = this.cache.sessionCache.get(sessionToken)
+      if (sessionCached) {
+        this.cache.stats.hits++
+        this.cache.requestCache.set(requestKey, sessionCached)
+        return sessionCached
+      }
+    }
+
+    // Check inflight with bounded tracking
+    if (this.inflightRequests.has(sessionToken)) {
+      const { promise } = this.inflightRequests.get(sessionToken)
+      logger.debug('Deduplicating concurrent auth request')
+      return await promise
+    }
+
+    // Prevent inflight request accumulation
+    if (this.inflightRequests.size > 50) {
+      logger.warn(`Too many inflight auth requests (${this.inflightRequests.size}), clearing`)
+      this.inflightRequests.clear()
+    }
+
+    // Create bounded promise with circuit breaker protection
+    const authPromise = this.circuitBreaker.execute(async () => {
+      return await this.resolveSessionFromAuth(sessionToken, req)
+    })
+
+    // Track with timestamp for cleanup
+    this.inflightRequests.set(sessionToken, {
+      promise: authPromise,
+      timestamp: Date.now()
+    })
+
+    try {
+      const user = await authPromise
       
-      for (const [token, entry] of this.cache) {
-        if (now > entry.expiresAt) {
-          this._removeEntry(token, entry);
-          removed++;
-        }
+      // Cache successful auth
+      if (user && this.cache.shouldUseCache()) {
+        this.cache.sessionCache.set(sessionToken, user)
+        this.cache.requestCache.set(requestKey, user)
       }
-      
-      if (removed > 0) {
-        this.stats.expired += removed;
-        logger.debug(`Cleaned up ${removed} expired sessions`);
-      }
-    }, this.cleanupIntervalMs);
 
-    // Allow the process to exit even if the timer is still pending
-    if (this._cleanupTimer.unref) this._cleanupTimer.unref();
+      this.cache.stats.misses++
+      return user
+    } finally {
+      this.inflightRequests.delete(sessionToken)
+    }
   }
-  
-  /**
-   * Periodic reporting of cache statistics.
-   * Suppresses duplicate log lines when nothing has changed.
-   * @private
-   */
-  startStatsReporting() {
-    this._statsTimer = setInterval(() => {
-      const totalRequests = this.stats.hits + this.stats.misses;
-      
-      if (totalRequests > 0) {
-        const hitRate = (this.stats.hits / totalRequests * 100).toFixed(2);
-        const logLine = `${hitRate}% hit rate (${this.stats.hits} hits, ${this.stats.misses} misses, ${this.cache.size} cached)`;
 
-        // Only log if the message actually changed since last report
-        if (logLine !== this._lastReportedLog) {
-          logger.info(`Cache performance: ${logLine}`);
-          this._lastReportedLog = logLine;
-        }
+  async resolveSessionFromAuth(sessionToken, req) {
+    try {
+      const session = await auth.api.getSession({
+        headers: fromNodeHeaders(req.headers)
+      })
+
+      if (!session?.user) return null
+
+      const u = session.user
+      return {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        image: u.image,
+        approved: u.approved ?? false,
+        limitedAccess: u.limitedAccess ?? false,
+        admin: u.role === 'admin',
       }
-    }, this.statsIntervalMs);
+    } catch (error) {
+      logger.error(`Failed to resolve session from Better Auth: ${error.message}`)
+      throw error
+    }
+  }
 
-    if (this._statsTimer.unref) this._statsTimer.unref();
+  getStats() {
+    const totalRequests = this.cache.stats.hits + this.cache.stats.misses
+    const hitRate = totalRequests > 0 ? (this.cache.stats.hits / totalRequests * 100).toFixed(2) : 0
+
+    return {
+      cacheStats: {
+        hits: this.cache.stats.hits,
+        misses: this.cache.stats.misses,
+        hitRate: `${hitRate}%`,
+        evictions: this.cache.stats.evictions,
+        memoryCleanups: this.cache.stats.memoryCleanups,
+        lastCleanup: this.cache.stats.lastCleanup
+      },
+      cacheSizes: {
+        sessionCache: this.cache.sessionCache.size(),
+        requestCache: this.cache.requestCache.size(),
+        inflightRequests: this.inflightRequests.size
+      },
+      memoryStatus: {
+        memoryPressure: this.cache.memoryPressure,
+        heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
+        heapTotal: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`
+      },
+      circuitBreaker: this.circuitBreaker.getState()
+    }
+  }
+
+  // Manual cache control
+  clearCache() {
+    this.cache.sessionCache.clear()
+    this.cache.requestCache.clear()
+    this.cache.inflightCache.clear()
+    logger.info('Session cache manually cleared')
+  }
+
+  // Graceful shutdown
+  shutdown() {
+    if (this.inflightCleanup) clearInterval(this.inflightCleanup)
+    this.cache.shutdown()
+    this.inflightRequests.clear()
+    logger.info('Session manager shutdown complete')
   }
 }
 
 // Singleton instance
-export const sessionCache = new SessionCache();
+export const sessionManager = new ProductionSessionManager()
 
-// For testing purposes
-export { SessionCache };
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down session manager...')
+  sessionManager.shutdown()
+})
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down session manager...')
+  sessionManager.shutdown()
+})

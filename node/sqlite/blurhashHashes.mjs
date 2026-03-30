@@ -1,5 +1,6 @@
 import path from 'path';
 import { createHash } from 'crypto';
+import { promises as fs } from 'fs';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { getMovies, getTVShows, withRetry, withWriteTx } from '../sqliteDatabase.mjs';
 import { getStoredBlurhash } from '../utils/utils.mjs';
@@ -8,19 +9,24 @@ const PREFIX_PATH = process.env.PREFIX_PATH || '';
 
 const logger = createCategoryLogger('blurhashHashes');
 
-// Current version of the hash data structure
+// Current version of the hash data structure (database schema)
 export const HASH_DATA_VERSION = 1;
+
+// Current version of blurhash generation algorithm/optimization
+// Increment this when blurhash generation logic changes to trigger automatic regeneration
+export const BLURHASH_GENERATION_VERSION = 2; // v2: Optimized sizes (backdrop=small, poster=medium)
 
 /**
  * Initialize the blurhash_hashes table in the database
  * @param {Object} db - SQLite database connection
  */
 export async function initializeBlurhashHashesTable(db) {
-  // First check if the image_type column exists
+  // First check if the table exists and what columns it has
   const tableInfo = await db.all("PRAGMA table_info(blurhash_hashes)");
   const hasImageTypeColumn = tableInfo.some(column => column.name === 'image_type');
+  const hasGenerationVersionColumn = tableInfo.some(column => column.name === 'generation_version');
   
-  // If table doesn't exist yet, create it with the image_type column
+  // If table doesn't exist yet, create it with all columns
   if (tableInfo.length === 0) {
     await db.exec(`
       CREATE TABLE IF NOT EXISTS blurhash_hashes (
@@ -35,6 +41,7 @@ export async function initializeBlurhashHashesTable(db) {
         last_modified TIMESTAMP,
         hash_generated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         data_version INTEGER NOT NULL,
+        generation_version INTEGER DEFAULT 1,
         UNIQUE(media_type, media_id, season_number, episode_key, image_type)
       );
       
@@ -42,7 +49,16 @@ export async function initializeBlurhashHashesTable(db) {
       CREATE INDEX IF NOT EXISTS idx_blurhash_hashes_title_lookup ON blurhash_hashes(media_type, title, season_number, episode_key);
       CREATE INDEX IF NOT EXISTS idx_blurhash_hashes_modified ON blurhash_hashes(last_modified);
       CREATE INDEX IF NOT EXISTS idx_blurhash_hashes_image_type ON blurhash_hashes(image_type);
+      CREATE INDEX IF NOT EXISTS idx_blurhash_hashes_generation_version ON blurhash_hashes(generation_version);
     `);
+    logger.info('Blurhash hashes table created with generation_version column');
+  } else if (!hasGenerationVersionColumn) {
+    // Migration: Add generation_version column to existing table
+    await db.exec(`
+      ALTER TABLE blurhash_hashes ADD COLUMN generation_version INTEGER DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS idx_blurhash_hashes_generation_version ON blurhash_hashes(generation_version);
+    `);
+    logger.info('Added generation_version column to existing blurhash_hashes table');
   }
   
   logger.info('Blurhash hashes table initialized');
@@ -74,15 +90,15 @@ export function generateHash(data) {
 export async function storeHash(db, mediaType, mediaId, title, seasonNumber, episodeKey, imageType, hash, lastModified) {
   try {
     // Check if a record for this combination already exists
-    const existingRecord = await withRetry(() => 
+    const existingRecord = await withRetry(() =>
       db.get(
-        `SELECT id FROM blurhash_hashes 
-         WHERE media_type = ? AND media_id = ? AND title = ? 
+        `SELECT id FROM blurhash_hashes
+         WHERE media_type = ? AND media_id = ? AND title = ?
          AND (season_number IS NULL AND ? IS NULL OR season_number = ?)
          AND (episode_key IS NULL AND ? IS NULL OR episode_key = ?)
          AND image_type = ?`,
         [
-          mediaType, mediaId, title, 
+          mediaType, mediaId, title,
           seasonNumber, seasonNumber,
           episodeKey, episodeKey,
           imageType
@@ -92,28 +108,29 @@ export async function storeHash(db, mediaType, mediaId, title, seasonNumber, epi
 
     if (existingRecord) {
       // Update the existing record
-      await withRetry(() => 
+      await withRetry(() =>
         db.run(
-          `UPDATE blurhash_hashes SET 
-           hash = ?, 
-           last_modified = ?, 
+          `UPDATE blurhash_hashes SET
+           hash = ?,
+           last_modified = ?,
            hash_generated = CURRENT_TIMESTAMP,
-           data_version = ?
+           data_version = ?,
+           generation_version = ?
            WHERE id = ?`,
-          [hash, lastModified, HASH_DATA_VERSION, existingRecord.id]
+          [hash, lastModified, HASH_DATA_VERSION, BLURHASH_GENERATION_VERSION, existingRecord.id]
         )
       );
 
       logger.debug(`Updated blurhash hash for ${mediaType}/${title}${seasonNumber ? '/' + seasonNumber : ''}${episodeKey ? '/' + episodeKey : ''} (${imageType})`);
     } else {
       // Insert a new record
-      await withRetry(() => 
+      await withRetry(() =>
         db.run(
-          `INSERT INTO blurhash_hashes 
-            (media_type, media_id, title, season_number, episode_key, image_type, hash, last_modified, data_version) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO blurhash_hashes
+            (media_type, media_id, title, season_number, episode_key, image_type, hash, last_modified, data_version, generation_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            mediaType, mediaId, title, seasonNumber, episodeKey, imageType, hash, lastModified, HASH_DATA_VERSION
+            mediaType, mediaId, title, seasonNumber, episodeKey, imageType, hash, lastModified, HASH_DATA_VERSION, BLURHASH_GENERATION_VERSION
           ]
         )
       );
@@ -256,6 +273,45 @@ export async function getHashByTitle(db, mediaType, title, seasonNumber = null, 
 }
 
 /**
+ * Check if a blurhash needs regeneration based on generation version
+ * @param {Object} db - SQLite database connection
+ * @param {string} mediaType - 'movies' or 'tv'
+ * @param {string} mediaId - Movie or TV show unique ID
+ * @param {string} imageType - Type of image (poster, backdrop, logo, etc.)
+ * @returns {Promise<boolean>} - True if regeneration is needed
+ */
+export async function shouldRegenerateBlurhash(db, mediaType, mediaId, imageType) {
+  try {
+    const record = await withRetry(() =>
+      db.get(
+        `SELECT generation_version FROM blurhash_hashes
+         WHERE media_type = ? AND media_id = ? AND image_type = ?
+         LIMIT 1`,
+        [mediaType, mediaId, imageType]
+      )
+    );
+    
+    // If no record exists, generation is needed
+    if (!record) {
+      return true;
+    }
+    
+    // If record exists but has old generation version, regeneration is needed
+    if (!record.generation_version || record.generation_version < BLURHASH_GENERATION_VERSION) {
+      logger.info(`Blurhash regeneration needed for ${mediaType}/${mediaId}/${imageType} (v${record.generation_version || 1} → v${BLURHASH_GENERATION_VERSION})`);
+      return true;
+    }
+    
+    // Current version, no regeneration needed
+    return false;
+  } catch (error) {
+    logger.error(`Error checking blurhash version: ${error.message}`);
+    // On error, default to not regenerating to avoid issues
+    return false;
+  }
+}
+
+/**
  * Get all blurhash hashes modified since a specific timestamp
  * @param {Object} db - SQLite database connection
  * @param {string} sinceTimestamp - ISO timestamp to filter by (e.g., "2023-01-01T00:00:00.000Z")
@@ -320,6 +376,21 @@ export async function generateMovieBlurhashHashes(db, movie, basePath) {
     // Use the direct file paths from the database when available
     if (movie.posterFilePath) {
       logger.debug(`Using direct file path for poster for "${movie.name}": ${movie.posterFilePath}`);
+      
+      // Check if poster blurhash needs regeneration due to version upgrade
+      if (await shouldRegenerateBlurhash(db, 'movies', movie._id, 'poster')) {
+        const blurhashFile = `${movie.posterFilePath}.blurhash`;
+        try {
+          await fs.unlink(blurhashFile);
+          logger.debug(`Deleted outdated poster blurhash for regeneration: ${movie.name}`);
+        } catch (error) {
+          // File might not exist, that's okay
+          if (error.code !== 'ENOENT') {
+            logger.debug(`Could not delete poster blurhash: ${error.message}`);
+          }
+        }
+      }
+      
       const blurhash = await getStoredBlurhash(movie.posterFilePath, basePath);
       if (blurhash) {
         blurhashData.posterBlurhash = blurhash;
@@ -327,7 +398,7 @@ export async function generateMovieBlurhashHashes(db, movie, basePath) {
       } else {
         logger.debug(`No poster blurhash found for "${movie.name}" using direct path`);
       }
-    } 
+    }
     // Fallback to URL-based path construction if direct path not available
     else if (movie.urls?.poster) {
       const posterUrl = movie.urls.poster;
@@ -355,6 +426,21 @@ export async function generateMovieBlurhashHashes(db, movie, basePath) {
     // Use the direct file paths for backdrop from the database when available
     if (movie.backdropFilePath) {
       logger.debug(`Using direct file path for backdrop for "${movie.name}": ${movie.backdropFilePath}`);
+      
+      // Check if backdrop blurhash needs regeneration due to version upgrade
+      if (await shouldRegenerateBlurhash(db, 'movies', movie._id, 'backdrop')) {
+        const blurhashFile = `${movie.backdropFilePath}.blurhash`;
+        try {
+          await fs.unlink(blurhashFile);
+          logger.debug(`Deleted outdated backdrop blurhash for regeneration: ${movie.name}`);
+        } catch (error) {
+          // File might not exist, that's okay
+          if (error.code !== 'ENOENT') {
+            logger.debug(`Could not delete backdrop blurhash: ${error.message}`);
+          }
+        }
+      }
+      
       const blurhash = await getStoredBlurhash(movie.backdropFilePath, basePath);
       if (blurhash) {
         blurhashData.backdropBlurhash = blurhash;
@@ -390,6 +476,21 @@ export async function generateMovieBlurhashHashes(db, movie, basePath) {
     // Use the direct file paths for logo from the database when available
     if (movie.logoFilePath) {
       logger.debug(`Using direct file path for logo for "${movie.name}": ${movie.logoFilePath}`);
+      
+      // Check if logo blurhash needs regeneration due to version upgrade
+      if (await shouldRegenerateBlurhash(db, 'movies', movie._id, 'logo')) {
+        const blurhashFile = `${movie.logoFilePath}.blurhash`;
+        try {
+          await fs.unlink(blurhashFile);
+          logger.debug(`Deleted outdated logo blurhash for regeneration: ${movie.name}`);
+        } catch (error) {
+          // File might not exist, that's okay
+          if (error.code !== 'ENOENT') {
+            logger.debug(`Could not delete logo blurhash: ${error.message}`);
+          }
+        }
+      }
+      
       const blurhash = await getStoredBlurhash(movie.logoFilePath, basePath);
       if (blurhash) {
         blurhashData.logoBlurhash = blurhash;

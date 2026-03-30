@@ -1,56 +1,10 @@
-import { MongoClient, ObjectId } from "mongodb";
 import { createCategoryLogger } from "./lib/logger.mjs";
+import { mongoClient } from "./lib/mongo.mjs";
 
 const logger = createCategoryLogger("mongoDB");
-const uri = process.env.MONGODB_URI;
 
-// Singleton client instance
-let client = null;
-let clientPromise = null;
-
-/**
- * Get or create the MongoDB client connection.
- * Reuses the same connection across all calls.
- */
 export async function getClient() {
-  if (client) {
-    // Verify the client is actually connected
-    try {
-      if (client.topology && client.topology.isConnected()) {
-        return client;
-      } else {
-        logger.warn("MongoDB client exists but is not connected, reinitializing...");
-        client = null;
-        clientPromise = null;
-      }
-    } catch (error) {
-      logger.warn("Error checking MongoDB client state, reinitializing:", error.message);
-      client = null;
-      clientPromise = null;
-    }
-  }
-
-  if (!clientPromise) {
-    logger.info("Initializing new MongoDB connection...");
-    client = new MongoClient(uri, {
-      maxPoolSize: 10, // adjust based on your workload
-      minPoolSize: 2, // keep some connections warm
-      maxIdleTimeMS: 60000, // close idle connections after 60s
-    });
-    clientPromise = client.connect();
-  }
-
-  try {
-    await clientPromise;
-    logger.info("MongoDB connection established successfully");
-    return client;
-  } catch (error) {
-    logger.error(`MongoDB connection failed: ${error.message}`);
-    // Reset state on failure
-    client = null;
-    clientPromise = null;
-    throw error;
-  }
+  return mongoClient;
 }
 
 // Helper to get commonly used databases
@@ -74,28 +28,6 @@ export async function getAppConfigDb() {
   return client.db("app_config");
 }
 
-/**
- * Close the MongoDB connection and reset client state
- */
-export async function closeConnection() {
-  if (client) {
-    await client.close();
-    client = null;
-    clientPromise = null;
-    logger.info("MongoDB connection closed");
-  }
-}
-
-// Register shutdown handlers
-process.on("SIGINT", async () => {
-  await closeConnection();
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  await closeConnection();
-  process.exit(0);
-});
 
 /**
  * Ensures that an index exists on the specified collection.
@@ -341,217 +273,34 @@ export async function updateLastSyncTime() {
   }
 }
 
-/**
- * Authenticate user using mobile token from authSessions collection
- * @param {string} mobileToken - The mobile session token
- * @returns {Promise<Object|null>} User object or null if authentication fails
- */
-export async function authenticateWithMobileToken(mobileToken) {
-  try {
-    const db = await getUsersDb();
-
-    const authSession = await db.collection("authSessions").findOne({
-      "tokens.mobileSessionToken": mobileToken,
-      status: "complete",
-    });
-
-    if (authSession && authSession.tokens?.user?.id) {
-      // Get fresh user data from AuthenticatedUsers
-      const userObjectId = new ObjectId(authSession.tokens.user.id);
-      const userData = await db
-        .collection("AuthenticatedUsers")
-        .findOne({ _id: userObjectId });
-
-      if (userData) {
-        return {
-          id: userData._id.toString(),
-          email: userData.email,
-          name: userData.name,
-          image: userData.image,
-          approved: userData.approved || false,
-          limitedAccess: userData.limitedAccess || false,
-          admin: userData.admin || false,
-        };
-      }
-    }
-
-    return null;
-  } catch (error) {
-    logger.error("Error authenticating with mobile token:" + error);
-    return null;
-  }
-}
 
 /**
- * Authenticate user using regular Next.js session token
- * @param {string} token - The session token or session ID
- * @returns {Promise<Object|null>} User object or null if authentication fails
- */
-export async function authenticateWithSessionToken(token) {
-  try {
-    const db = await getUsersDb();
-
-    // Try to find session by sessionToken (Next.js session)
-    let session = await db.collection("session").findOne({
-      sessionToken: token,
-      expires: { $gt: new Date() },
-    });
-
-    // If not found, try by ObjectId (session ID)
-    if (!session) {
-      try {
-        const sessionId = new ObjectId(token);
-        session = await db.collection("session").findOne({
-          _id: sessionId,
-          expires: { $gt: new Date() },
-        });
-      } catch (error) {
-        // Invalid ObjectId format, return null
-        return null;
-      }
-    }
-
-    if (!session) {
-      return null;
-    }
-
-    // Get user details
-    const userData = await db
-      .collection("AuthenticatedUsers")
-      .findOne({ _id: session.userId });
-
-    if (!userData) {
-      return null;
-    }
-
-    return {
-      id: userData._id.toString(),
-      email: userData.email,
-      name: userData.name,
-      image: userData.image,
-      approved: userData.approved || false,
-      limitedAccess: userData.limitedAccess || false,
-      admin: userData.admin || false,
-    };
-  } catch (error) {
-    logger.error("Error authenticating with session token:" + error);
-    return null;
-  }
-}
-
-/**
- * Get user by session ID for real-time updates
- * @param {string} sessionId - The session ID
- * @returns {Object|null} User object or null if not found
- */
-export async function getUserBySessionId(sessionId) {
-  try {
-    const db = await getUsersDb();
-    
-    const sessionIdObjectId = new ObjectId(sessionId);
-    const session = await db
-      .collection("session")
-      .findOne({ _id: sessionIdObjectId });
-
-    if (!session) return null;
-
-    const user = await db
-      .collection("AuthenticatedUsers")
-      .findOne({ _id: session.userId });
-
-    if (!user) return null;
-
-    return {
-      id: user._id.toString(),
-      email: user.email,
-      name: user.name,
-      image: user.image,
-      approved: user.approved || false,
-      limitedAccess: user.limitedAccess || false,
-      admin: user.admin || false,
-    };
-  } catch (error) {
-    logger.error("Error getting user by session ID:" + error);
-    return null;
-  }
-}
-
-/**
- * Get user by mobile token
- * @param {string} mobileToken - The mobile session token
- * @returns {Object|null} User object or null if not found
- */
-export async function getUserByMobileToken(mobileToken) {
-  try {
-    const db = await getUsersDb();
-
-    // Find the auth session that contains this mobile token
-    const authSession = await db.collection("authSessions").findOne({
-      "tokens.mobileSessionToken": mobileToken,
-      status: "complete",
-    });
-
-    if (!authSession || !authSession.tokens?.user?.id) {
-      return null;
-    }
-
-    // Get the fresh user data from AuthenticatedUsers (single source of truth)
-    const userObjectId = new ObjectId(authSession.tokens.user.id);
-    const user = await db
-      .collection("AuthenticatedUsers")
-      .findOne({ _id: userObjectId });
-
-    if (!user) return null;
-
-    return {
-      id: user._id.toString(),
-      email: user.email,
-      name: user.name,
-      image: user.image,
-      approved: user.approved || false,
-      limitedAccess: user.limitedAccess || false,
-      admin: user.admin || false,
-    };
-  } catch (error) {
-    logger.error("Error getting user by mobile token:" + error);
-    return null;
-  }
-}
-
-/**
- * Get user by Discord ID and verify admin status
- * Uses SSO OAuth linking to find Discord accounts
- * @param {string} discordUserId - Discord User ID (providerAccountId from Discord OAuth)
+ * Get user by Discord ID and verify admin status.
+ * Used by the Discord bot to verify admin privileges via OAuth account linking.
+ * @param {string} discordUserId - Discord User ID (accountId from Discord OAuth)
  * @returns {Object|null} User object or null if not found/not admin
  */
 export async function getAdminByDiscordId(discordUserId) {
   try {
     const db = await getUsersDb();
 
-    // First, find the SSO account linked to this Discord ID
-    const ssoAccount = await db.collection("SSOAccounts").findOne({
-      provider: "discord",
-      providerAccountId: discordUserId,
+    // Find the Better Auth account linked to this Discord ID
+    const account = await db.collection("account").findOne({
+      providerId: "discord",
+      accountId: discordUserId,
     });
 
-    if (!ssoAccount || !ssoAccount.userId) {
-      // No Discord SSO account found for this user
+    if (!account?.userId) {
       return null;
     }
 
-    // Now get the user from AuthenticatedUsers using the linked userId
-    const user = await db.collection("AuthenticatedUsers").findOne({
-      _id: ssoAccount.userId,
-    });
+    const user = await db.collection("user").findOne({ _id: account.userId });
 
     if (!user) {
-      // User not found (shouldn't happen but handle gracefully)
       return null;
     }
 
-    // Check if user is an admin
-    if (!user.admin) {
-      // User exists but is not an admin
+    if (user.role !== "admin") {
       return null;
     }
 
@@ -560,7 +309,7 @@ export async function getAdminByDiscordId(discordUserId) {
       email: user.email,
       name: user.name,
       image: user.image,
-      admin: user.admin,
+      admin: true,
       approved: user.approved || false,
       limitedAccess: user.limitedAccess || false,
     };

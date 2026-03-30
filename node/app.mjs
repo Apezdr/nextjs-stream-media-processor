@@ -189,8 +189,6 @@ const configureCORS = () => {
     allowedHeaders: [
       'Content-Type',
       'Authorization',
-      'x-session-token',
-      'x-mobile-token',
       'x-webhook-id',
       'Cookie',
       'Origin',

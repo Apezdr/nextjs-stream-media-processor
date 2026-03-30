@@ -24,6 +24,11 @@ const dbFilePaths = {
 
 /**
  * Tiny async mutex. FIFO-ish fairness.
+ *
+ * Note: No deadlock detection or timeout. If a callback throws in a way that
+ * prevents `finally` from running (e.g., native addon crash), the mutex locks
+ * permanently. Consider adding a safety timeout for production if this becomes
+ * a concern.
  */
 class Mutex {
   constructor() {
@@ -328,6 +333,9 @@ async function getOrInitDb(dbType = "main") {
 
 /**
  * Retries for lock contention cases that are common in WAL or under high write load.
+ *
+ * IMPORTANT: Should NOT be used inside withWriteTx, as the mutex already prevents
+ * contention from same process. Use only at the outer withDb (read) layer.
  */
 const RETRYABLE = new Set(["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", "SQLITE_LOCKED"]);
 
@@ -379,6 +387,10 @@ export async function withWrite(dbType, fn) {
  * Transaction helper
  * - readOnly: BEGIN (deferred)
  * - writes:   BEGIN IMMEDIATE (acquire write intent early)
+ *
+ * Note: BEGIN IMMEDIATE is technically redundant since withWrite already serializes
+ * via mutex, but it provides defense-in-depth if the mutex is ever bypassed and
+ * has negligible performance cost.
  */
 export async function withTransaction(db, fn, { readOnly = false } = {}) {
   await db.exec(readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
@@ -454,6 +466,11 @@ function safeJson(jsonString, fallback) {
 /**
  * Calculate and cache image hash during sync/insert operations
  * Only recalculates if file mtime has changed since last cache
+ *
+ * Note: Hashes the mtime value, not file contents, for speed. This means a `touch`
+ * on the file will invalidate the cache even if content hasn't changed. This is
+ * acceptable for this use case where mtime changes generally indicate real updates.
+ *
  * @param {string} filePath - Path to the image file
  * @param {string} cachedHash - Previously cached hash (optional)
  * @param {number} cachedMtime - Previously cached mtime (optional)
@@ -503,8 +520,17 @@ function buildImageUrl(baseUrl, cachedHash) {
 }
 
 /**
- * Legacy function for season/episode images that aren't cached in database yet
- * TODO: Remove this when episode normalization is complete
+ * DEPRECATED: For legacy/manual operations only.
+ *
+ * Scanner embeds hashes in URLs during write operations (see tv-scanner.mjs).
+ * Read paths should use those cached hashes instead of calling this function.
+ * This causes unnecessary filesystem I/O.
+ *
+ * Only use for:
+ * - Manual admin operations outside scanner
+ * - Debugging/troubleshooting
+ * - Emergency hash refresh
+ *
  * @param {string} url - The original image URL
  * @param {string} filePath - Path to the actual image file
  * @returns {string} - Updated URL with a fresh hash parameter
@@ -537,10 +563,23 @@ async function refreshImageUrlHash(url, filePath) {
 }
 
 /**
- * Updates all image URLs in a TV show season with fresh hash parameters
+ * DEPRECATED: Replaced by scanner-embedded hashes.
+ *
+ * This function was causing a major performance bottleneck by doing filesystem I/O
+ * (fs.stat) for every season poster and every episode thumbnail. For a library with
+ * 50 shows × 5 seasons × 12 episodes, this was ~3,000+ syscalls per getTVShows() call.
+ *
+ * SOLUTION: Scanner now embeds hashes in URLs during write operations (see tv-scanner.mjs
+ * lines 264-274 for episode thumbnails, 357-366 for season posters). Read paths simply
+ * use those cached hashes from the database.
+ *
+ * This function is kept for potential legacy/manual operations but should NOT be called
+ * from read paths (getTVShows, getTVShowById, getTVShowByName).
+ *
  * @param {Object} season - Season object with episodes
  * @param {string} basePath - Base path for resolving file paths
  * @returns {Object} - Updated season with fresh image URL hashes
+ * @deprecated Use cached hashes from database instead
  */
 async function refreshSeasonImageHashes(season, basePath, showPath, seasonName) {
   // Skip if it's not a valid season or there's no base path
@@ -582,23 +621,19 @@ export async function getTVShows() {
   return withDb("main", async (db) => {
     const shows = await withRetry(() => db.all('SELECT * FROM tv_shows'));
     
-    // Process each show using CACHED hashes for show-level images (NO filesystem I/O)
-    const updatedShows = await Promise.all(shows.map(async (show) => {
-      // Parse seasons now so we can update them
+    // Process each show using CACHED hashes for ALL images (NO filesystem I/O)
+    const updatedShows = shows.map((show) => {
+      // Parse seasons from JSON
       const seasons = safeJson(show.seasons, {});
-      const basePath = show.base_path;
-      const showPath = join(basePath, 'tv', show.name);
       
-      // Update show-level image URLs with CACHED hashes (massive performance improvement)
+      // Update show-level image URLs with CACHED hashes
       const poster = buildImageUrl(show.poster, show.poster_hash);
       const logo = buildImageUrl(show.logo, show.logo_hash);
       const backdrop = buildImageUrl(show.backdrop, show.backdrop_hash);
       
-      // Update each season's image URLs (still uses filesystem I/O - will optimize in episode normalization phase)
-      const updatedSeasons = {};
-      for (const [seasonName, season] of Object.entries(seasons)) {
-        updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
-      }
+      // Use seasons directly - URLs already contain cached hashes from scanner
+      // Scanner embeds hashes during write (see tv-scanner.mjs lines 264-274, 357-366)
+      // No filesystem I/O needed - massive performance improvement!
       
       // Return updated show object
       return {
@@ -612,13 +647,13 @@ export async function getTVShows() {
         logoBlurhash: show.logoBlurhash,
         backdrop: backdrop,
         backdropBlurhash: show.backdropBlurhash,
-        seasons: updatedSeasons,
+        seasons: seasons,
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
         logoFilePath: show.logo_file_path,
         basePath: show.base_path
       };
-    }));
+    });
     
     return updatedShows;
   });
@@ -700,17 +735,17 @@ export async function getMovieById(id) {
       // Parse the URLs so we can update them
       const urls = safeJson(movie.urls, {});
       
-      // Update image URLs with fresh hashes
+      // Update image URLs with CACHED hashes (NO filesystem I/O)
       if (urls.poster) {
-        urls.poster = await refreshImageUrlHash(urls.poster, movie.poster_file_path);
+        urls.poster = buildImageUrl(urls.poster, movie.poster_hash);
       }
       
       if (urls.logo) {
-        urls.logo = await refreshImageUrlHash(urls.logo, movie.logo_file_path);
+        urls.logo = buildImageUrl(urls.logo, movie.logo_hash);
       }
       
       if (urls.backdrop) {
-        urls.backdrop = await refreshImageUrlHash(urls.backdrop, movie.backdrop_file_path);
+        urls.backdrop = buildImageUrl(urls.backdrop, movie.backdrop_hash);
       }
       
       return {
@@ -743,17 +778,17 @@ export async function getMovieByName(name) {
       // Parse the URLs so we can update them
       const urls = safeJson(movie.urls, {});
       
-      // Update image URLs with fresh hashes
+      // Update image URLs with CACHED hashes (NO filesystem I/O)
       if (urls.poster) {
-        urls.poster = await refreshImageUrlHash(urls.poster, movie.poster_file_path);
+        urls.poster = buildImageUrl(urls.poster, movie.poster_hash);
       }
       
       if (urls.logo) {
-        urls.logo = await refreshImageUrlHash(urls.logo, movie.logo_file_path);
+        urls.logo = buildImageUrl(urls.logo, movie.logo_hash);
       }
       
       if (urls.backdrop) {
-        urls.backdrop = await refreshImageUrlHash(urls.backdrop, movie.backdrop_file_path);
+        urls.backdrop = buildImageUrl(urls.backdrop, movie.backdrop_hash);
       }
       
       return {
@@ -783,21 +818,17 @@ export async function getTVShowById(id) {
   return withDb("main", async (db) => {
     const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE id = ?', [id]));
     if (show) {
-      // Parse seasons now so we can update them
+      // Parse seasons from JSON
       const seasons = safeJson(show.seasons, {});
-      const basePath = show.base_path;
-      const showPath = join(basePath, 'tv', show.name);
       
-      // Update show-level image URLs with fresh hashes
-      const poster = await refreshImageUrlHash(show.poster, show.poster_file_path);
-      const logo = await refreshImageUrlHash(show.logo, show.logo_file_path);
-      const backdrop = await refreshImageUrlHash(show.backdrop, show.backdrop_file_path);
+      // Update show-level image URLs with CACHED hashes (NO filesystem I/O)
+      const poster = buildImageUrl(show.poster, show.poster_hash);
+      const logo = buildImageUrl(show.logo, show.logo_hash);
+      const backdrop = buildImageUrl(show.backdrop, show.backdrop_hash);
       
-      // Update each season's image URLs
-      const updatedSeasons = {};
-      for (const [seasonName, season] of Object.entries(seasons)) {
-        updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
-      }
+      // Use seasons directly - URLs already contain cached hashes from scanner
+      // Scanner embeds hashes during write (see tv-scanner.mjs lines 264-274, 357-366)
+      // No filesystem I/O needed - massive performance improvement!
       
       return {
         id: show.id,
@@ -810,7 +841,7 @@ export async function getTVShowById(id) {
         logoBlurhash: show.logoBlurhash,
         backdrop: backdrop,
         backdropBlurhash: show.backdropBlurhash,
-        seasons: updatedSeasons,
+        seasons: seasons,
         directory_hash: show.directory_hash,
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
@@ -826,21 +857,17 @@ export async function getTVShowByName(name) {
   return withDb("main", async (db) => {
     const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE name = ?', [name]));
     if (show) {
-      // Parse seasons now so we can update them
+      // Parse seasons from JSON
       const seasons = safeJson(show.seasons, {});
-      const basePath = show.base_path;
-      const showPath = join(basePath, 'tv', show.name);
       
-      // Update show-level image URLs with fresh hashes
-      const poster = await refreshImageUrlHash(show.poster, show.poster_file_path);
-      const logo = await refreshImageUrlHash(show.logo, show.logo_file_path);
-      const backdrop = await refreshImageUrlHash(show.backdrop, show.backdrop_file_path);
+      // Update show-level image URLs with CACHED hashes (NO filesystem I/O)
+      const poster = buildImageUrl(show.poster, show.poster_hash);
+      const logo = buildImageUrl(show.logo, show.logo_hash);
+      const backdrop = buildImageUrl(show.backdrop, show.backdrop_hash);
       
-      // Update each season's image URLs
-      const updatedSeasons = {};
-      for (const [seasonName, season] of Object.entries(seasons)) {
-        updatedSeasons[seasonName] = await refreshSeasonImageHashes(season, basePath, showPath, seasonName);
-      }
+      // Use seasons directly - URLs already contain cached hashes from scanner
+      // Scanner embeds hashes during write (see tv-scanner.mjs lines 264-274, 357-366)
+      // No filesystem I/O needed - massive performance improvement!
       
       return {
         id: show.id,
@@ -853,7 +880,7 @@ export async function getTVShowByName(name) {
         logoBlurhash: show.logoBlurhash,
         backdrop: backdrop,
         backdropBlurhash: show.backdropBlurhash,
-        seasons: updatedSeasons,
+        seasons: seasons,
         directory_hash: show.directory_hash,
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
@@ -871,20 +898,23 @@ export async function isDatabaseEmpty(tableName = 'movies') {
   if (!ALLOWED_TABLES.has(tableName)) throw new Error("Invalid table");
   
   return withDb("main", async (db) => {
-    const row = await withRetry(() => db.get(`SELECT COUNT(*) as count FROM ${tableName}`));
-    return row.count === 0;
+    // Use EXISTS instead of COUNT(*) - stops after finding first row instead of scanning entire table
+    const row = await withRetry(() => db.get(`SELECT EXISTS(SELECT 1 FROM ${tableName} LIMIT 1) as exists_flag`));
+    return row.exists_flag === 0;
   });
 }
 
 export async function deleteMovie(name) {
   return withWriteTx("main", async (db) => {
-    await withRetry(() => db.run('DELETE FROM movies WHERE name = ?', [name]));
+    // No withRetry needed inside transaction - mutex prevents contention
+    await db.run('DELETE FROM movies WHERE name = ?', [name]);
   });
 }
 
 export async function deleteTVShow(name) {
   return withWriteTx("main", async (db) => {
-    await withRetry(() => db.run('DELETE FROM tv_shows WHERE name = ?', [name]));
+    // No withRetry needed inside transaction - mutex prevents contention
+    await db.run('DELETE FROM tv_shows WHERE name = ?', [name]);
   });
 }
 
