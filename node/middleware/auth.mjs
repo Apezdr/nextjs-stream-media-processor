@@ -1,51 +1,53 @@
-import { fromNodeHeaders } from 'better-auth/node'
 import { createCategoryLogger } from '../lib/logger.mjs'
-import { auth } from '../lib/auth.mjs'
 import { isValidWebhookId } from './webhookAuth.mjs'
+import { sessionManager } from './sessionCache.mjs'
 
 const logger = createCategoryLogger('auth-middleware')
 
 /**
- * Resolve a Better Auth session from the incoming request.
- * Returns a normalised req.user shape or null.
+ * Extract the session token string from either an Authorization: Bearer header
+ * or a nextjs-stream session cookie. Returns null if neither is present.
+ * Used as the cache key in sessionManager and as the presence check before
+ * making any DB calls.
  */
-const resolveSession = async (req) => {
-  const session = await auth.api.getSession({
-    headers: fromNodeHeaders(req.headers),
-  })
-
-  if (!session?.user) return null
-
-  const u = session.user
-  return {
-    id:           u.id,
-    email:        u.email,
-    name:         u.name,
-    image:        u.image,
-    approved:     u.approved  ?? false,
-    limitedAccess: u.limitedAccess ?? false,
-    admin:        u.role === 'admin',
+function extractSessionIdentifier(req) {
+  if (req.headers.authorization?.startsWith('Bearer ')) {
+    return req.headers.authorization.slice(7).trim()
   }
+  const cookieHeader = req.headers.cookie
+  if (cookieHeader) {
+    // Match both plain and __Secure- prefixed variants of the session cookie
+    const match = cookieHeader.match(/(?:__Secure-)?nextjs-stream\.session_token=([^;]+)/)
+    if (match?.[1]) return decodeURIComponent(match[1])
+  }
+  return null
 }
 
 /**
  * Express middleware for authenticating users.
  * Validates the Bearer token issued by the Next.js / React Native auth frontend.
  * Clients must send: Authorization: Bearer <session.token>
+ *
+ * Now enhanced with multi-tier session caching:
+ * - Request-level cache (1s TTL) for rapid consecutive requests
+ * - Session-level cache (30s TTL) for general use
+ * - Automatic request deduplication for concurrent requests
  */
 export const authenticateUser = async (req, res, next) => {
   try {
     const origin = req.headers.origin || req.headers.referer || 'unknown'
 
-    if (!req.headers.authorization) {
+    const sessionToken = extractSessionIdentifier(req)
+    if (!sessionToken) {
       logger.warn(`No authentication provided from origin: ${origin}`)
       return res.status(401).json({
         error: 'No authentication provided',
-        message: 'Include your session token in the Authorization header: "Authorization: Bearer <token>"',
+        message: 'Provide a session cookie or Authorization: Bearer <token> header',
       })
     }
 
-    const user = await resolveSession(req)
+    // Use session manager with multi-tier caching
+    const user = await sessionManager.getSession(sessionToken, req)
 
     if (!user) {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid or expired session token' })
@@ -60,6 +62,15 @@ export const authenticateUser = async (req, res, next) => {
     next()
   } catch (error) {
     logger.error('Authentication error:', error)
+    
+    // Handle circuit breaker errors specially
+    if (error.message?.includes('Circuit breaker')) {
+      return res.status(503).json({
+        error: 'Authentication service temporarily unavailable',
+        message: 'Please try again shortly'
+      })
+    }
+    
     res.status(500).json({ error: 'Authentication service error' })
   }
 }
@@ -116,11 +127,12 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     logger.warn(`Invalid webhook ID attempted, falling back to user authentication: ${webhookId.substring(0, 10)}...`)
   }
 
-  // STEP 2: Bearer token
+  // STEP 2: session token (Bearer header or session cookie)
   try {
     const origin = req.headers.origin || req.headers.referer || 'unknown'
 
-    if (!req.headers.authorization) {
+    const sessionToken = extractSessionIdentifier(req)
+    if (!sessionToken) {
       logger.warn(`No authentication provided from origin: ${origin}`)
       return res.status(401).json({
         error: 'Authentication required',
@@ -128,11 +140,13 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
         supportedMethods: [
           'x-webhook-id: <webhook-id> (recommended for automated services)',
           'Authorization: Bearer <token> (for admin users)',
+          'Session cookie (for browser-based access)',
         ],
       })
     }
-
-    const user = await resolveSession(req)
+    
+    // Use session manager with multi-tier caching
+    const user = await sessionManager.getSession(sessionToken, req)
 
     if (!user) {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid or expired session token' })
@@ -154,6 +168,15 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     next()
   } catch (error) {
     logger.error('Authentication error:', error)
+    
+    // Handle circuit breaker errors specially
+    if (error.message?.includes('Circuit breaker')) {
+      return res.status(503).json({
+        error: 'Authentication service temporarily unavailable',
+        message: 'Please try again shortly'
+      })
+    }
+    
     res.status(500).json({ error: 'Authentication service error' })
   }
 }

@@ -7,6 +7,7 @@ import { fileExists } from '../utils/utils.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
+import { sessionManager } from '../middleware/sessionCache.mjs';
 
 const logger = createCategoryLogger('admin-routes');
 
@@ -689,6 +690,42 @@ function convertWebVttToSrt(webvttContent) {
     
     return srtLines.join('\n');
 }
+
+  /**
+   * Get session cache statistics
+   * GET /admin/session-cache/stats
+   * Requires authentication and admin privileges
+   */
+  router.get('/session-cache/stats', authenticateUser, requireAdmin, (req, res) => {
+    try {
+      const stats = sessionManager.getStats();
+      logger.info(`Admin ${req.user.email} requested session cache stats`);
+      res.json(stats);
+    } catch (error) {
+      logger.error('Error getting session cache stats:', error);
+      res.status(500).json({ error: 'Failed to fetch session cache statistics' });
+    }
+  });
+
+  /**
+   * Clear session cache
+   * POST /admin/session-cache/clear
+   * Requires authentication and admin privileges
+   */
+  router.post('/session-cache/clear', authenticateUser, requireAdmin, (req, res) => {
+    try {
+      sessionManager.clearCache();
+      logger.info(`Admin ${req.user.email} cleared session cache`);
+      res.json({
+        success: true,
+        message: 'Session cache cleared successfully',
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      logger.error('Error clearing session cache:', error);
+      res.status(500).json({ error: 'Failed to clear session cache' });
+    }
+  });
 
   return router;
 }

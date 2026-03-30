@@ -12,8 +12,15 @@ export const auth = betterAuth({
     transaction: process.env.MONGODB_TRANSACTIONS === 'true',
   }),
   secret: process.env.BETTER_AUTH_SECRET,
+  baseURL: process.env.BETTER_AUTH_URL,
   advanced: {
     database: { generateId: false },
+    // Must match the Next.js app's cookiePrefix so the same cookie is recognised
+    cookiePrefix: 'nextjs-stream',
+    crossSubDomainCookies: {
+      enabled: !!process.env.AUTH_COOKIE_DOMAIN,
+      domain: process.env.AUTH_COOKIE_DOMAIN?.replace(/^\./, ''),
+    },
   },
   session: {
     deferSessionRefresh: true,

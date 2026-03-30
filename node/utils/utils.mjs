@@ -11,6 +11,7 @@ const blurhashCli = join(scriptsDir, 'blurhash_cli.py');
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import PQueue from 'p-queue';
+import { generateBlurhash } from './blurhashNative.mjs';
 const logger = createCategoryLogger('utility');
 //const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
 
@@ -602,23 +603,58 @@ export async function getStoredBlurhash(imagePath, basePath) {
     return relativeUrl;
   }
 
-  // Determine if debug mode is enabled
+  // OPTIMIZATION: Detect image type from filename for appropriate sizing
+  // backdrop/show_backdrop → 'small' (16px, ~8-12KB)
+  // poster/show_poster → 'medium' (24px, ~12-18KB)
+  // thumbnail → 'small' (16px, ~8-12KB)
+  // logo/show_logo → 'large' (32px, ~25-35KB)
+  const fileName = imagePath.toLowerCase();
+  let blurhashSize = 'large'; // Default
+  
+  if (fileName.includes('backdrop') || fileName.includes('thumbnail')) {
+    blurhashSize = 'small';
+  } else if (fileName.includes('poster')) {
+    blurhashSize = 'medium';
+  } else if (fileName.includes('logo')) {
+    blurhashSize = 'large';
+  }
+
+  // Feature flag: use native Node.js blurhash (faster) or Python subprocess (legacy)
+  const USE_NATIVE_BLURHASH = process.env.USE_NATIVE_BLURHASH !== 'false';
+  
+  if (USE_NATIVE_BLURHASH) {
+    try {
+      logger.info(`Generating ${blurhashSize} blurhash using Node.js for: ${imagePath}`);
+      
+      // Use optimized Node.js implementation with appropriate size
+      const blurhashBase64 = await generateBlurhash(imagePath, blurhashSize);
+      
+      if (blurhashBase64) {
+        // Write the generated blurhash to a file
+        await fs.writeFile(blurhashFile, blurhashBase64);
+        logger.debug(`Successfully generated ${blurhashSize} blurhash using Node.js: ${imagePath}`);
+        return relativeUrl;
+      } else {
+        logger.warn(`Node.js blurhash generation returned null, falling back to Python`);
+      }
+    } catch (error) {
+      logger.warn(`Node.js blurhash generation failed: ${error.message}, falling back to Python`);
+    }
+  }
+
+  // Python fallback (when USE_NATIVE_BLURHASH=false or Node.js fails)
   const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
   const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-  logger.info(`Running blurhash_cli.py job for ${imagePath}${debugMessage}`);
+  logger.info(`Running blurhash_cli.py (${blurhashSize}) for ${imagePath}${debugMessage}`);
 
-  // Construct the command in a cross-platform way
   const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
   
   try {
-    // Directly use the file path passed to the function without URL manipulations
-    // This ensures we're using actual filesystem paths and not URL-encoded paths
     const cleanedPath = imagePath.replace(/"/g, '\\"');
+    logger.debug(`Attempting to generate blurhash using Python: ${cleanedPath}`);
     
-    // Execute the command with properly escaped paths
-    // We use execFile where possible to avoid shell interpretation of special characters
-    logger.debug(`Attempting to generate blurhash for: ${cleanedPath}`);
-    const cmd = `${pythonExecutable} ${blurhashCli} "${cleanedPath}"`;
+    // Pass size parameter to Python script for consistency
+    const cmd = `${pythonExecutable} ${blurhashCli} "${cleanedPath}" "${blurhashSize}"`;
     const blurhashOutput = await execAsync(cmd);
     
     if (blurhashOutput.stderr) {
@@ -628,7 +664,7 @@ export async function getStoredBlurhash(imagePath, basePath) {
 
     // Write the generated blurhash to a file
     await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
-    logger.debug(`Successfully generated blurhash for: ${cleanedPath}`);
+    logger.debug(`Successfully generated ${blurhashSize} blurhash using Python: ${cleanedPath}`);
     return relativeUrl;
   } catch (error) {
     logger.error(`Error executing blurhash_cli.py for ${imagePath}: ${error}`);

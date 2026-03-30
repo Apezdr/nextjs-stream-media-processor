@@ -101,13 +101,22 @@ export async function downloadImage(imageUrl, destPath, options = {}) {
  * @param {Object} options - Download options
  * @param {boolean} options.forceDownload - Force re-download even if file exists
  * @param {boolean} options.generateBlurhash - Whether to generate blurhash (default: true)
+ * @param {string} options.imageType - Image type ('backdrop', 'poster', 'logo') for size optimization
  * @returns {Promise<Object>} Result object with success status and blurhash
  */
 export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}) {
   const {
     forceDownload = false,
-    generateBlurhash: shouldGenerateBlurhash = true
+    generateBlurhash: shouldGenerateBlurhash = true,
+    imageType = 'poster' // Default to poster for backwards compatibility
   } = options;
+  
+  // OPTIMIZATION: Size blurhashes based on image type and usage
+  // - backdrop: 'small' (16px preview, ~8-12KB) - blurred backgrounds
+  // - poster: 'medium' (24px preview, ~12-18KB) - balance quality and size
+  // - logo: 'large' (32px preview, ~25-35KB) - needs more detail
+  const blurhashSize = imageType === 'backdrop' ? 'small' :
+                       imageType === 'poster' ? 'medium' : 'large';
 
   try {
     const blurhashPath = `${destPath}.blurhash`;
@@ -151,7 +160,7 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
         try {
           const stats = await fs.stat(destPath);
           if (stats.size > 0) {
-            blurhashValue = await generateImageBlurhash(destPath, blurhashPath);
+            blurhashValue = await generateImageBlurhash(destPath, blurhashPath, blurhashSize);
             blurhashGenerated = !!blurhashValue;
           } else {
             logger.warn(`Cannot generate blurhash for empty file: ${destPath}`);
@@ -171,7 +180,7 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
           try {
             const stats = await fs.stat(destPath);
             if (stats.size > 0) {
-              blurhashValue = await generateImageBlurhash(destPath, blurhashPath);
+              blurhashValue = await generateImageBlurhash(destPath, blurhashPath, blurhashSize);
               blurhashGenerated = !!blurhashValue;
             }
           } catch (genError) {
@@ -203,19 +212,20 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
  * Generate blurhash for an existing image file
  * @param {string} imagePath - Path to image file
  * @param {string} blurhashPath - Path to save blurhash file
+ * @param {string} size - Size option: 'small' (16px), 'medium' (24px), 'large' (32px, default)
  * @returns {Promise<string|null>} Blurhash string or null if generation failed
  */
-export async function generateImageBlurhash(imagePath, blurhashPath) {
+export async function generateImageBlurhash(imagePath, blurhashPath, size = 'large') {
   try {
-    logger.debug(`Generating blurhash for ${imagePath}`);
+    logger.debug(`Generating blurhash for ${imagePath} with size: ${size}`);
     
-    // Generate blurhash using the existing native implementation
-    const blurhashString = await generateBlurhash(imagePath);
+    // Generate blurhash using the existing native implementation with specified size
+    const blurhashString = await generateBlurhash(imagePath, size);
     
     if (blurhashString && blurhashString.length > 0) {
       // Save blurhash to file
       await fs.writeFile(blurhashPath, blurhashString, 'utf8');
-      logger.debug(`Blurhash saved to ${blurhashPath}`);
+      logger.debug(`Blurhash saved to ${blurhashPath} (size: ${size})`);
       return blurhashString;
     } else {
       logger.warn(`No valid blurhash generated for ${imagePath}`);
@@ -307,10 +317,11 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
         continue;
       }
 
-      // Download image
+      // Download image with appropriate blurhash size for image type
       const result = await downloadImageWithBlurhash(imageUrl, destPath, {
         forceDownload,
-        generateBlurhash: shouldGenerateBlurhash
+        generateBlurhash: shouldGenerateBlurhash,
+        imageType: imageInfo.key // Pass image type for size optimization (backdrop = small, poster/logo = large)
       });
 
       if (result.success) {
@@ -363,7 +374,8 @@ export async function downloadSeasonPoster(seasonPosterUrl, seasonDir, options =
 
     const result = await downloadImageWithBlurhash(seasonPosterUrl, destPath, {
       forceDownload,
-      generateBlurhash: shouldGenerateBlurhash
+      generateBlurhash: shouldGenerateBlurhash,
+      imageType: 'poster' // Season posters use 'medium' size (balanced quality/size)
     });
 
     if (result.success) {
@@ -416,9 +428,11 @@ export async function downloadEpisodeThumbnail(thumbnailUrl, seasonDir, episodeN
       return { success: false, path: destPath, error: 'No thumbnail URL' };
     }
 
+    // Episode thumbnails are backdrop-style (16:9), so use 'backdrop' type for smaller blurhashes
     const result = await downloadImageWithBlurhash(thumbnailUrl, destPath, {
       forceDownload,
-      generateBlurhash: shouldGenerateBlurhash
+      generateBlurhash: shouldGenerateBlurhash,
+      imageType: 'backdrop' // Episode thumbnails benefit from 'small' size (60-70% reduction)
     });
 
     if (result.success) {

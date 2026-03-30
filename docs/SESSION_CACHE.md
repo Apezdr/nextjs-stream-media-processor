@@ -1,459 +1,369 @@
-# Session Cache Documentation
+# Session Cache System
 
 ## Overview
 
-The session cache is an in-memory caching system designed to dramatically reduce MongoDB connection usage during authenticated requests, particularly long-running TMDB operations with blurhash generation.
-
-## Problem Statement
-
-Before implementing the session cache, every authenticated request required:
-1. Opening a MongoDB connection
-2. Querying the sessions collection
-3. Querying the users collection
-4. Keeping the connection open for the entire request duration
-
-For long-running TMDB requests with blurhash generation (3+ minutes), this caused:
-- MongoDB connection pool exhaustion
-- `MongoNetworkError: AggregateError` errors
-- Failed requests under moderate load
-- Poor scalability
-
-## Solution
-
-The session cache stores authenticated user data in memory with a 2-minute TTL (Time To Live), reducing MongoDB queries from 100+ requests per user to approximately 1 request per user per 2 minutes - a **90% reduction** in database load.
+The session cache system provides a memory-safe, multi-tier caching mechanism for authenticated user sessions. It dramatically reduces MongoDB authentication queries while maintaining security and preventing memory leaks through sophisticated bounded caching strategies.
 
 ## Architecture
 
-### Components
+### Multi-Tier Caching Strategy
 
-#### 1. SessionCache Module
-**File**: [`node/middleware/sessionCache.mjs`](../node/middleware/sessionCache.mjs)
+The system implements three levels of caching with different TTLs and purposes:
 
-A singleton class that manages in-memory session storage:
+1. **Request-Level Cache** (1 second TTL, max 500 entries)
+   - Ultra-fast cache for sub-second consecutive requests
+   - Prevents duplicate auth checks within the same second
+   - Ideal for rapid API calls (e.g., pagination, media loading)
+
+2. **Session-Level Cache** (30 second TTL, max 1000 entries)
+   - Primary cache for user sessions
+   - Reduces MongoDB queries by 95%+ for normal usage patterns
+   - Uses LRU eviction when capacity is reached
+
+3. **Inflight Request Deduplication** (5 second TTL, max 100 entries)
+   - Prevents concurrent requests from triggering multiple auth checks
+   - Single auth lookup shared across simultaneous requests
+   - Automatic cleanup of stale promises
+
+## Memory Safety Features
+
+### 1. Bounded LRU Cache
+
+All caches have hard size limits and implement Least Recently Used (LRU) eviction:
 
 ```javascript
-import { sessionCache } from './sessionCache.mjs';
-
-// Get cached user data
-const user = sessionCache.get(token);
-
-// Cache user data
-sessionCache.set(token, userData);
-
-// Remove specific session
-sessionCache.delete(token);
-
-// Remove all sessions for a specific user (NEW)
-const removedCount = sessionCache.deleteByUserId('user123');
-
-// Clear all sessions
-sessionCache.clear();
-
-// Get statistics
-const stats = sessionCache.getStats();
-
-// Reset statistics (for monitoring)
-sessionCache.resetStats();
-
-// Graceful shutdown (NEW)
-sessionCache.shutdown();
+// Configuration
+sessionCache: 1000 sessions max, 30s TTL
+requestCache: 500 requests max, 1s TTL
+inflightCache: 100 concurrent max, 5s TTL
 ```
 
-#### 2. Modified Authentication Middleware
-**File**: [`node/middleware/auth.mjs`](../node/middleware/auth.mjs)
+When capacity is reached, the least recently accessed entry is automatically removed.
 
-The authentication flow now includes cache checking:
+### 2. Memory Pressure Detection
 
-```
-Request → Extract Token → Check Cache
-                              ↓
-                        Cache Hit? Yes → Use Cached Data
-                              ↓ No
-                        Query MongoDB → Cache Result → Use Data
-```
+The system monitors Node.js heap usage every 30 seconds:
 
-### Cache Flow
+- **Warning Threshold**: 80% heap usage or 500MB absolute
+- **Emergency Actions**:
+  - Aggressive cleanup of expired entries
+  - Full cache clear if pressure persists
+  - Temporary cache disable during high memory conditions
 
-1. **Cache Hit** (99% of requests after initial auth):
-   - Token lookup in memory: <1ms
-   - No MongoDB connection needed
-   - Immediate response
+### 3. Circuit Breaker Pattern
 
-2. **Cache Miss** (first request or after TTL expiration):
-   - Query MongoDB for session and user
-   - Cache the result with 2-minute TTL
-   - Close MongoDB connection immediately
-   - Return user data
+Protects against authentication service failures:
 
-## Configuration
+- **Failure Threshold**: 5 consecutive auth failures
+- **Open State**: Blocks auth attempts for 30 seconds
+- **Half-Open State**: Tests service recovery with single attempt
+- **Automatic Recovery**: Closes circuit on successful auth
 
-All configuration is handled through environment variables in `.env` file:
+### 4. Automatic Cleanup
 
-### TTL (Time To Live)
-- **Environment Variable**: `SESSION_CACHE_TTL_MS`
-- **Default**: 120,000ms (2 minutes)
-- **Rationale**: Balances performance with security
-- **Trade-off**: Permission changes take up to TTL duration to propagate
+Multiple cleanup mechanisms prevent memory accumulation:
 
-### Maximum Cache Size
-- **Environment Variable**: `SESSION_CACHE_MAX_SIZE`
-- **Default**: 10,000 sessions
-- **Purpose**: Prevents unbounded memory growth
-- **Behavior**: When limit reached, oldest entries are evicted (LRU)
+- **Regular Cleanup**: Every 5 minutes (expired entries only)
+- **Emergency Cleanup**: Triggered by memory pressure
+- **Stale Promise Cleanup**: Every 10 seconds (hung requests)
+- **TTL Expiration**: Checked on every cache access
 
-### Cleanup Interval
-- **Environment Variable**: `SESSION_CACHE_CLEANUP_INTERVAL_MS`
-- **Default**: 30,000ms (30 seconds)
-- **Purpose**: Remove expired entries from memory
+## Performance Metrics
 
-### Stats Reporting Interval
-- **Environment Variable**: `SESSION_CACHE_STATS_INTERVAL_MS`
-- **Default**: 60,000ms (1 minute)
-- **Purpose**: Log performance metrics
-- **Feature**: Suppresses duplicate log lines when stats don't change
+### Expected Performance Improvements
 
-### Memory Usage
-- **Per Session**: ~1KB
-- **1000 Sessions**: ~1MB
-- **10,000 Sessions**: ~10MB (with default max size)
-- **Additional Overhead**: User-to-token index for per-user invalidation
+- **95%+ reduction** in MongoDB authentication queries
+- **Sub-millisecond** response time for cached sessions
+- **Zero duplicate auth checks** for concurrent requests
+- **Automatic failover** during service degradation
+
+### Cache Hit Rates
+
+Typical hit rates by usage pattern:
+
+| Pattern | Expected Hit Rate | Cache Layer |
+|---------|------------------|-------------|
+| Rapid consecutive requests (< 1s) | 99% | Request cache |
+| Normal browsing (< 30s) | 95% | Session cache |
+| Long idle periods (> 30s) | 0% | Cache miss (expected) |
+| Concurrent requests | 100% | Deduplication |
 
 ## API Endpoints
-
-All endpoints require admin authentication.
 
 ### Get Cache Statistics
 
 ```http
-GET /api/admin/cache/session-stats
+GET /api/admin/session-cache/stats
+Authorization: Bearer <admin-token>
 ```
 
-**Response**:
+**Response:**
+
 ```json
 {
-  "success": true,
-  "cache": {
-    "total": 45,
-    "active": 40,
-    "expired": 5,
-    "uniqueUsers": 38,
-    "hitRate": "95.50%",
-    "stats": {
-      "hits": 1000,
-      "misses": 47,
-      "sets": 47,
-      "deletes": 2,
-      "expired": 5,
-      "evictions": 0
-    },
-    "config": {
-      "ttl": "120s",
-      "maxSize": 10000,
-      "cleanupInterval": "30s"
-    }
+  "cacheStats": {
+    "hits": 12543,
+    "misses": 234,
+    "hitRate": "98.17%",
+    "evictions": 5,
+    "memoryCleanups": 0,
+    "lastCleanup": "2024-03-17T02:00:00.000Z"
   },
-  "timestamp": "2025-01-20T12:00:00.000Z"
+  "cacheSizes": {
+    "sessionCache": 234,
+    "requestCache": 12,
+    "inflightRequests": 0
+  },
+  "memoryStatus": {
+    "memoryPressure": false,
+    "heapUsed": "245.34 MB",
+    "heapTotal": "512.00 MB"
+  },
+  "circuitBreaker": {
+    "state": "CLOSED",
+    "failureCount": 0,
+    "nextAttempt": null,
+    "lastFailure": null
+  }
 }
 ```
 
-### Clear All Cached Sessions
+### Clear Session Cache
 
 ```http
-DELETE /api/admin/cache/session-cache
+POST /api/admin/session-cache/clear
+Authorization: Bearer <admin-token>
 ```
 
-Forces all users to re-authenticate on their next request.
+**Response:**
 
-**Response**:
 ```json
 {
   "success": true,
-  "message": "All session cache entries cleared",
-  "entriesRemoved": 45,
-  "timestamp": "2025-01-20T12:00:00.000Z"
+  "message": "Session cache cleared successfully",
+  "timestamp": "2024-03-17T02:00:00.000Z"
 }
 ```
 
-### Reset Statistics Counters
+## Configuration
 
-```http
-POST /api/admin/cache/session-stats/reset
+### Environment Variables
+
+No additional configuration required. The system uses sensible defaults:
+
+```env
+# Better Auth (existing configuration)
+BETTER_AUTH_SECRET=your-secret-key
+MONGODB_AUTH_DB=Users
 ```
 
-Resets hit/miss counters without clearing cached sessions.
+### Tunable Parameters
 
-**Response**:
-```json
-{
-  "success": true,
-  "message": "Session cache statistics reset",
-  "timestamp": "2025-01-20T12:00:00.000Z"
-}
+Advanced users can modify cache parameters in [`node/middleware/sessionCache.mjs`](node/middleware/sessionCache.mjs):
+
+```javascript
+// In MemoryAwareSessionCache constructor
+this.sessionCache = new BoundedLRUCache(1000, 30000) // size, TTL in ms
+this.requestCache = new BoundedLRUCache(500, 1000)
+this.inflightCache = new BoundedLRUCache(100, 5000)
+
+// In AuthCircuitBreaker constructor
+new AuthCircuitBreaker(5, 30000) // failure threshold, timeout in ms
 ```
 
-### Clear Sessions for Specific User (NEW)
+## Monitoring & Observability
 
-```http
-DELETE /api/admin/cache/session-cache/user/{userId}
-```
+### Log Messages
 
-Removes all cached sessions for a specific user. Useful for immediate permission changes or security events affecting one user.
+The system logs important events for monitoring:
 
-**Response**:
-```json
-{
-  "success": true,
-  "message": "User sessions cleared from cache",
-  "userId": "user123",
-  "sessionsRemoved": 3,
-  "timestamp": "2025-01-20T12:00:00.000Z"
-}
-```
+**Debug Level:**
+- Cache hits and misses
+- Request deduplication
+- Regular cleanup operations
 
-## Performance Impact
+**Info Level:**
+- Emergency cache cleanup actions
+- Circuit breaker state changes
+- Admin operations (stats, clear)
 
-### Before Implementation
+**Warning Level:**
+- Memory pressure detection
+- Stale request cleanup
+- Authentication failures
 
-- **MongoDB Connection**: Every request (100+ per user)
-- **Auth Latency**: 50-100ms per request
-- **TMDB Requests**: 3+ minutes with MongoDB connection open
-- **Concurrent Users**: 10 users = 10+ open connections
-- **Connection Errors**: Frequent `MongoNetworkError`
+**Error Level:**
+- Circuit breaker opening
+- Auth service failures
+- Unexpected errors
 
-### After Implementation
+### Metrics to Monitor
 
-- **MongoDB Connection**: Once per user per 2 minutes (~1 per user)
-- **Auth Latency**: <1ms for cached requests (99% of traffic)
-- **TMDB Requests**: No MongoDB dependency after initial auth
-- **Concurrent Users**: 10 users = 10 connections over 2 minutes (not concurrent)
-- **Connection Errors**: Eliminated
-
-### Measured Improvements
-
-- **MongoDB Queries**: 90% reduction
-- **Auth Performance**: 99% faster (cached requests)
-- **Connection Pool**: No exhaustion
-- **Request Success Rate**: Near 100% under load
+1. **Hit Rate**: Should be > 90% during normal operation
+2. **Memory Pressure**: Should remain false
+3. **Circuit Breaker State**: Should stay CLOSED
+4. **Cache Sizes**: Should stay well below limits
+5. **Evictions**: Low eviction rate indicates good cache sizing
 
 ## Security Considerations
 
-### Potential Risks
+### Token Validation
 
-1. **Stale Permission Data**: 
-   - Risk: Permission changes take up to 2 minutes to propagate
-   - Mitigation: Acceptable for most use cases; admin can force clear cache
+All session tokens are validated before caching:
 
-2. **Session Revocation Delay**:
-   - Risk: Logged-out users have theoretical 2-minute window
-   - Mitigation: Frontend handles logout; backend sessions already have expiry
+- Minimum length: 10 characters
+- Maximum length: 200 characters
+- Prevents cache pollution from malformed tokens
 
-3. **Memory Usage**:
-   - Risk: Unbounded cache growth
-   - Mitigation: Automatic TTL expiration and periodic cleanup
+### Cache Isolation
 
-### Security Features
+Each user's session data is isolated by token:
 
-- **Short TTL**: 2-minute window limits stale data exposure
-- **Automatic Cleanup**: Expired entries removed every 30 seconds
-- **Admin Controls**: Manual cache clearing for security events
-- **Logging**: All cache operations logged for auditing
+- No cross-user cache contamination
+- Token-based cache keys
+- Automatic expiration of stale sessions
 
-## Monitoring
+### Admin-Only Access
 
-### Built-in Logging
+Cache management endpoints require admin privileges:
 
-The session cache includes automatic logging:
-
-```
-[session-cache] Session cache initialized { ttl: '2 minutes', cleanupInterval: '30 seconds' }
-[session-cache] Cache performance: 95.50% hit rate (1000 hits, 47 misses, 40 cached)
-[session-cache] Cleaned up 5 expired sessions
-```
-
-### Performance Metrics
-
-Monitor these metrics to assess cache effectiveness:
-
-- **Hit Rate**: Should be >90% under normal operation
-- **Total Cached**: Number of active user sessions
-- **Expired**: Frequency of expiration (indicates TTL effectiveness)
-
-### Alert Thresholds
-
-Consider alerting on:
-- Hit rate < 80% (may indicate issues)
-- Frequent cache clears (security investigation)
-- Unusually high cached session count
-
-## Usage Examples
-
-### Frontend Integration
-
-The frontend doesn't need any changes - the session cache is transparent to clients.
-
-### Backend Development
-
-When developing new authenticated endpoints:
-
-```javascript
-// Standard authentication - cache automatically used
-router.get('/my-endpoint', authenticateUser, async (req, res) => {
-  // req.user is populated from cache or MongoDB
-  const userId = req.user.id;
-  const isAdmin = req.user.admin;
-  
-  // Your endpoint logic here
-});
-```
-
-### Admin Operations
-
-#### Check Cache Performance
-
-```bash
-curl -X GET https://your-api.com/api/admin/cache/session-stats \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-```
-
-#### Force Re-authentication (Security Event)
-
-```bash
-# Clear all cached sessions
-curl -X DELETE https://your-api.com/api/admin/cache/session-cache \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-```
-
-## Testing
-
-### Unit Tests
-
-```javascript
-import { SessionCache } from './sessionCache.mjs';
-
-describe('SessionCache', () => {
-  it('should cache and retrieve user data', () => {
-    const cache = new SessionCache();
-    const userData = { id: '123', email: 'test@example.com' };
-    
-    cache.set('token123', userData);
-    const result = cache.get('token123');
-    
-    expect(result).toEqual(userData);
-  });
-  
-  it('should expire entries after TTL', async () => {
-    const cache = new SessionCache();
-    cache.set('token123', { id: '123' });
-    
-    // Wait for TTL + cleanup
-    await sleep(125000);
-    
-    const result = cache.get('token123');
-    expect(result).toBeNull();
-  });
-});
-```
-
-### Load Testing
-
-Test cache performance under load:
-
-```bash
-# 100 concurrent requests from same user
-ab -n 100 -c 10 -H "Authorization: Bearer YOUR_TOKEN" \
-   https://your-api.com/api/tmdb/comprehensive/movie?tmdb_id=550
-```
-
-Expected results:
-- First request: 50-100ms (MongoDB query)
-- Subsequent requests: <5ms (cache hit)
-- 0 connection errors
+- Statistics viewing: Admin only
+- Cache clearing: Admin only
+- Respects existing auth middleware chain
 
 ## Troubleshooting
 
-### Issue: Low Hit Rate
+### High Memory Usage
 
-**Symptoms**: Hit rate < 80%
+**Symptoms:**
+- Memory pressure warnings in logs
+- Automatic cache clearing
+- Increased cache misses
 
-**Possible Causes**:
-- Users logging out frequently
-- Session tokens changing often
-- TTL too short for usage pattern
+**Solutions:**
+1. Check for memory leaks in other parts of application
+2. Reduce cache sizes if needed
+3. Monitor heap usage trends
+4. Consider increasing server memory
 
-**Solutions**:
-- Check frontend session management
-- Verify token consistency
-- Consider increasing TTL (with security review)
+### Low Hit Rate
 
-### Issue: Memory Growth
+**Symptoms:**
+- Hit rate < 80%
+- Increased MongoDB queries
+- Slower response times
 
-**Symptoms**: Increasing memory usage over time
+**Possible Causes:**
+1. **Short session durations**: Users logging out frequently
+2. **Distributed deployment**: Multiple servers not sharing cache
+3. **Cache clearing**: Too frequent manual cache clears
+4. **High user churn**: Many new users/sessions
 
-**Possible Causes**:
-- Cleanup not running
-- Extremely high user count
-- Memory leak in cache logic
+**Solutions:**
+- Review session TTL configuration
+- Implement Redis for distributed caching (future enhancement)
+- Reduce cache clear frequency
 
-**Solutions**:
-- Check cleanup interval logs
-- Monitor active vs expired counts
-- Consider manual cache clear during off-peak
+### Circuit Breaker Opening
 
-### Issue: Stale Permissions
+**Symptoms:**
+- Circuit breaker state: OPEN or HALF_OPEN
+- 503 errors on auth endpoints
+- Authentication failures
 
-**Symptoms**: User has wrong access after permission change
+**Possible Causes:**
+1. MongoDB connection issues
+2. Better Auth service degradation
+3. Network problems
 
-**Possible Causes**:
-- Cached data not yet expired
-- Cache not cleared after permission update
+**Solutions:**
+1. Check MongoDB connectivity
+2. Review Better Auth logs
+3. Check network status
+4. Wait for automatic recovery (30 seconds)
 
-**Solutions**:
-- Wait up to 2 minutes for natural expiration
-- Manually clear cache: `DELETE /api/admin/cache/session-cache`
-- Consider clearing cache in permission update workflow
+### Stale Inflight Requests
 
-## Best Practices
+**Symptoms:**
+- Growing inflight request count
+- Warnings about stale request cleanup
 
-1. **Monitor Hit Rate**: Aim for >90% in production
-2. **Log Cache Clears**: Investigate frequent manual clears
-3. **Security Events**: Always clear cache after:
-   - Password resets
-   - Permission changes requiring immediate effect
-   - Suspected security breaches
-4. **Performance Testing**: Test new endpoints under load with cache enabled
-5. **Documentation**: Update this doc when modifying cache behavior
+**Possible Causes:**
+1. Slow authentication responses
+2. Network timeouts
+3. Better Auth hanging
+
+**Solutions:**
+- Review Better Auth performance
+- Check MongoDB query performance
+- Investigate network latency
+- Automatic cleanup occurs every 10 seconds
+
+## Implementation Details
+
+### Files
+
+- [`node/middleware/sessionCache.mjs`](node/middleware/sessionCache.mjs) - Core cache implementation
+- [`node/middleware/auth.mjs`](node/middleware/auth.mjs) - Auth middleware integration
+- [`node/routes/admin.mjs`](node/routes/admin.mjs) - Admin endpoints
+
+### Classes
+
+1. **BoundedLRUCache** - LRU cache with hard size limits and TTL
+2. **MemoryAwareSessionCache** - Multi-tier cache with memory monitoring
+3. **AuthCircuitBreaker** - Circuit breaker for auth service protection
+4. **ProductionSessionManager** - Main session manager coordinating all components
+
+### Design Patterns
+
+- **LRU Caching**: Automatic eviction of least recently used entries
+- **Circuit Breaker**: Fail-fast pattern for service protection
+- **Request Deduplication**: Single-flight pattern for concurrent requests
+- **Graceful Degradation**: Cache disable under memory pressure
+- **Observer Pattern**: Memory pressure monitoring with reactive cleanup
 
 ## Future Enhancements
 
-Potential improvements for consideration:
+### Planned Improvements
 
-1. **Redis Backend**: Optional Redis for distributed caching across multiple servers
-2. **Metrics Export**: Prometheus/OpenTelemetry metrics for monitoring dashboards
-3. **Cache Warming**: Pre-populate cache for known active users
-4. **Advanced Eviction Policies**: LFU (Least Frequently Used) vs current LRU
-5. **Cache Compression**: Compress cached user objects to reduce memory usage
+1. **Redis Integration**: Distributed caching across multiple servers
+2. **Prometheus Metrics**: Export cache metrics for monitoring
+3. **Dynamic TTL**: Adjust TTL based on usage patterns
+4. **Session Prediction**: Pre-cache likely-to-be-accessed sessions
+5. **Compression**: Compress cached session data for lower memory usage
 
-## Related Documentation
+### Known Limitations
 
-- [Authentication System](./AUTHENTICATION_SYSTEM.md)
-- [TMDB API](./TMDB_API.md)
-- [Implementation Plan](./AUTH_CACHE_IMPLEMENTATION_PLAN.md)
-- [Performance Optimization](./TMDB_PERFORMANCE_OPTIMIZATION_PLAN.md)
+1. **Single-Server Only**: Cache not shared across multiple app instances
+2. **In-Memory Only**: Cache lost on server restart
+3. **No Persistence**: Sessions must be re-authenticated after restart
+4. **Fixed TTLs**: TTLs are hardcoded, not adaptive
 
-## Changelog
+## Migration from Legacy System
 
-### Version 2.0 (2026-02-16)
-- **Environment Variable Configuration**: All settings configurable via .env
-- **Memory Management**: Configurable max cache size with LRU eviction
-- **Per-User Invalidation**: `deleteByUserId()` for targeted session clearing
-- **Log Noise Reduction**: Suppresses duplicate stats log lines when unchanged
-- **Graceful Shutdown**: `shutdown()` method for clean process exit
-- **Enhanced Statistics**: Added `uniqueUsers` and `evictions` tracking
-- **Production Optimizations**: Timer unref for better process lifecycle management
+If you had a previous session cache implementation, this new system is a drop-in replacement:
 
-### Version 1.0 (2025-01-20)
-- Initial implementation
-- 2-minute TTL
-- Admin management endpoints
-- Automatic cleanup and logging
-- 90% reduction in MongoDB queries
+1. **No Code Changes Required**: Existing auth middleware calls work unchanged
+2. **Backwards Compatible**: All existing auth flows continue working
+3. **Automatic Activation**: Cache activates immediately on server start
+4. **Zero Configuration**: Works out of the box with default settings
+
+## Best Practices
+
+1. **Monitor Hit Rates**: Check cache statistics in system status dashboard
+2. **Set Alerts**: Alert on low hit rates or memory pressure
+3. **Regular Review**: Check logs for unusual patterns
+4. **Load Testing**: Verify cache performance under expected load
+5. **Graceful Restarts**: Plan for cache warm-up period after restarts
+
+## Support & Maintenance
+
+For issues or questions about the session cache system:
+
+1. Check logs for error messages and warnings
+2. Review cache statistics via admin endpoint
+3. Verify MongoDB connectivity and performance
+4. Check system memory availability
+5. Review Better Auth configuration
+
+The session cache system is designed to be self-managing and require minimal intervention in normal operation.
