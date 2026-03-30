@@ -3,6 +3,7 @@ import { open } from 'sqlite';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
+import { withDbQuerySpan, withDbTransactionSpan, withDbConnectionSpan } from './lib/dbTracer.mjs';
 import { initializeMetadataHashesTable } from './sqlite/metadataHashes.mjs';
 import { initializeTmdbBlurhashCacheTable } from './sqlite/tmdbBlurhashCache.mjs';
 import { initializeDiscordIntrosTable } from './sqlite/discordIntros.mjs';
@@ -299,7 +300,11 @@ async function getOrInitDb(dbType = "main") {
   const filename = dbFilePaths[dbType];
   if (!filename) throw new Error(`Unknown dbType "${dbType}"`);
 
-  const p = (async () => {
+  const p = withDbConnectionSpan({
+    system: 'sqlite',
+    dbName: dbType,
+    path: filename
+  }, async () => {
     let db;
     try {
       await fs.mkdir(dbDirectory, { recursive: true });
@@ -323,7 +328,7 @@ async function getOrInitDb(dbType = "main") {
       }
       throw error;
     }
-  })().finally(() => {
+  }).finally(() => {
     initPromises.delete(dbType);
   });
 
@@ -368,7 +373,16 @@ export async function withRetry(operation, maxRetries = 15, initialDelayMs = 200
 export async function withDb(dbType, fn) {
   if (!dbFilePaths[dbType]) throw new Error(`Unknown dbType: ${dbType}`);
   const db = await getOrInitDb(dbType);
-  return fn(db);
+  
+  // For read operations, use a generic read span without SQL details
+  // as we don't know what queries will be run inside the callback
+  return withDbQuerySpan({
+    system: 'sqlite',
+    dbName: dbType,
+    operation: 'READ',
+  }, async () => {
+    return fn(db);
+  });
 }
 
 /**
@@ -377,9 +391,16 @@ export async function withDb(dbType, fn) {
 export async function withWrite(dbType, fn) {
   if (!dbFilePaths[dbType]) throw new Error(`Unknown dbType: ${dbType}`);
   const mutex = getWriteMutex(dbType);
-  return mutex.runExclusive(async () => {
-    const db = await getOrInitDb(dbType);
-    return fn(db);
+  
+  return withDbQuerySpan({
+    system: 'sqlite',
+    dbName: dbType,
+    operation: 'WRITE',
+  }, async () => {
+    return mutex.runExclusive(async () => {
+      const db = await getOrInitDb(dbType);
+      return fn(db);
+    });
   });
 }
 
@@ -393,15 +414,42 @@ export async function withWrite(dbType, fn) {
  * has negligible performance cost.
  */
 export async function withTransaction(db, fn, { readOnly = false } = {}) {
-  await db.exec(readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
-  try {
-    const result = await fn(db);
-    await db.exec("COMMIT");
-    return result;
-  } catch (e) {
-    await db.exec("ROLLBACK");
-    throw e;
-  }
+  return withDbTransactionSpan({
+    system: 'sqlite',
+    type: readOnly ? 'read-only' : 'read-write',
+  }, async () => {
+    await withDbQuerySpan({
+      system: 'sqlite',
+      operation: 'BEGIN',
+      sql: readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE'
+    }, async () => {
+      return db.exec(readOnly ? "BEGIN" : "BEGIN IMMEDIATE");
+    });
+    
+    try {
+      const result = await fn(db);
+      
+      await withDbQuerySpan({
+        system: 'sqlite',
+        operation: 'COMMIT',
+        sql: 'COMMIT'
+      }, async () => {
+        return db.exec("COMMIT");
+      });
+      
+      return result;
+    } catch (e) {
+      await withDbQuerySpan({
+        system: 'sqlite',
+        operation: 'ROLLBACK',
+        sql: 'ROLLBACK'
+      }, async () => {
+        return db.exec("ROLLBACK");
+      });
+      
+      throw e;
+    }
+  });
 }
 
 /**

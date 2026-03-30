@@ -1,3 +1,6 @@
+// MUST BE FIRST - Initialize OpenTelemetry before any other imports
+import './lib/telemetry.mjs';
+
 import express from "express";
 import { scheduleJob } from "node-schedule";
 import { exec } from "child_process";
