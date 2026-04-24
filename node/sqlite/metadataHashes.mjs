@@ -20,16 +20,25 @@ export async function initializeMetadataHashesTable(db) {
       season_number TEXT,
       episode_key TEXT,
       hash TEXT NOT NULL,
+      content_hash TEXT,
       last_modified TIMESTAMP,
       hash_generated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       data_version INTEGER NOT NULL,
       UNIQUE(media_type, title, season_number, episode_key)
     );
-    
+
     CREATE INDEX IF NOT EXISTS idx_metadata_hashes_lookup ON metadata_hashes(media_type, title, season_number, episode_key);
     CREATE INDEX IF NOT EXISTS idx_metadata_hashes_modified ON metadata_hashes(last_modified);
   `);
-  
+
+  // Idempotent migration for installs created before content_hash existed.
+  // SQLite throws "duplicate column name" if the column is already present — swallow that.
+  try {
+    await db.exec(`ALTER TABLE metadata_hashes ADD COLUMN content_hash TEXT`);
+  } catch (err) {
+    if (!/duplicate column name/i.test(err?.message || '')) throw err;
+  }
+
   logger.info('Metadata hashes table initialized');
 }
 
@@ -53,23 +62,27 @@ export function generateHash(data) {
  * @param {string|null} episodeKey - Episode key (SxxExx) or null for movies/seasons/show-level
  * @param {string} hash - The calculated hash value
  * @param {string} lastModified - ISO timestamp of when the source content was last modified
+ * @param {string|null} [contentHash=null] - Aggregate hash of child content (used only for
+ *   show-level rows: SHA1 of sorted per-episode hashes). Invalidates when any video file changes,
+ *   letting the Next.js client detect video-file swaps without TMDB metadata edits.
  */
-export async function storeHash(db, mediaType, title, seasonNumber, episodeKey, hash, lastModified) {
+export async function storeHash(db, mediaType, title, seasonNumber, episodeKey, hash, lastModified, contentHash = null) {
   try {
-    await withRetry(() => 
+    await withRetry(() =>
       db.run(
-        `INSERT INTO metadata_hashes 
-          (media_type, title, season_number, episode_key, hash, last_modified, data_version) 
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(media_type, title, season_number, episode_key) 
-         DO UPDATE SET 
-           hash = ?, 
-           last_modified = ?, 
+        `INSERT INTO metadata_hashes
+          (media_type, title, season_number, episode_key, hash, content_hash, last_modified, data_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(media_type, title, season_number, episode_key)
+         DO UPDATE SET
+           hash = ?,
+           content_hash = ?,
+           last_modified = ?,
            hash_generated = CURRENT_TIMESTAMP,
            data_version = ?`,
         [
-          mediaType, title, seasonNumber, episodeKey, hash, lastModified, HASH_DATA_VERSION,
-          hash, lastModified, HASH_DATA_VERSION
+          mediaType, title, seasonNumber, episodeKey, hash, contentHash, lastModified, HASH_DATA_VERSION,
+          hash, contentHash, lastModified, HASH_DATA_VERSION
         ]
       )
     );
@@ -146,20 +159,22 @@ export async function getMediaTypeHashes(db, mediaType) {
     }
     
     // Get all title-level hashes for this media type
-    const titleHashes = await withRetry(() => 
+    const titleHashes = await withRetry(() =>
       db.all(
-        `SELECT title, hash, last_modified, hash_generated 
-         FROM metadata_hashes 
+        `SELECT title, hash, content_hash, last_modified, hash_generated
+         FROM metadata_hashes
          WHERE media_type = ? AND season_number IS NULL AND episode_key IS NULL`,
         [mediaType]
       )
     );
-    
-    // Format the result as a map of titles to hashes
+
+    // Format the result as a map of titles to hashes. contentHash is included
+    // when present (TV shows, post-migration); null for movies and pre-migration rows.
     const hashesMap = {};
     for (const record of titleHashes) {
       hashesMap[record.title] = {
         hash: record.hash,
+        contentHash: record.content_hash,
         lastModified: record.last_modified,
         generated: record.hash_generated
       };
@@ -345,7 +360,7 @@ export async function generateMovieHashes(db, movie) {
  */
 export async function generateTVShowHashes(db, show) {
   try {
-    // Generate show-level hash
+    // Generate show-level hash (metadata + asset paths only — TMDB edits)
     const showHashableData = {
       name: show.name,
       metadata_path: show.metadata_path,
@@ -354,45 +369,40 @@ export async function generateTVShowHashes(db, show) {
       backdrop: show.backdrop,
       seasonKeys: Object.keys(show.seasons)
     };
-    
+
     const showHash = generateHash(showHashableData);
-    
-    // Store show-level hash
-    await storeHash(
-      db, 
-      'tv', 
-      show.name, 
-      null, 
-      null, 
-      showHash, 
-      new Date().toISOString()
-    );
-    
+
+    // Accumulate episode hashes across all seasons so we can compute a show-level
+    // contentHash at the end. This gives the Next.js client a signal that
+    // invalidates when any video file changes (same mtime/URL inputs that drive
+    // the per-episode hash below), complementing the TMDB-metadata-only showHash.
+    const episodeHashes = [];
+
     // Generate and store season-level hashes
     for (const [seasonName, seasonData] of Object.entries(show.seasons)) {
       // Extract season number from name (e.g., "Season 1" -> "1")
       const seasonNumber = seasonName.replace(/Season\s+/i, '');
-      
+
       // Generate season-level hash
       const seasonHashableData = {
         seasonNumber: seasonData.seasonNumber,
         season_poster: seasonData.season_poster,
         episodeKeys: Object.keys(seasonData.episodes)
       };
-      
+
       const seasonHash = generateHash(seasonHashableData);
-      
+
       // Store season-level hash
       await storeHash(
-        db, 
-        'tv', 
-        show.name, 
-        seasonNumber, 
-        null, 
-        seasonHash, 
+        db,
+        'tv',
+        show.name,
+        seasonNumber,
+        null,
+        seasonHash,
         new Date().toISOString()
       );
-      
+
       // Generate and store episode-level hashes
       for (const [episodeKey, episodeData] of Object.entries(seasonData.episodes)) {
         // Generate episode-level hash
@@ -408,22 +418,40 @@ export async function generateTVShowHashes(db, show) {
           chapters: episodeData.chapters,
           subtitles: episodeData.subtitles
         };
-        
+
         const episodeHash = generateHash(episodeHashableData);
-        
+        episodeHashes.push(episodeHash);
+
         // Store episode-level hash
         await storeHash(
-          db, 
-          'tv', 
-          show.name, 
-          seasonNumber, 
-          episodeKey, 
-          episodeHash, 
+          db,
+          'tv',
+          show.name,
+          seasonNumber,
+          episodeKey,
+          episodeHash,
           episodeData.mediaLastModified || new Date().toISOString()
         );
       }
     }
-    
+
+    // Deterministic aggregate — sort before hashing so season/episode iteration
+    // order doesn't affect the result.
+    const contentHash = generateHash(episodeHashes.slice().sort());
+
+    // Store show-level hash with its aggregated contentHash. Must run AFTER the
+    // episode loops so contentHash is available.
+    await storeHash(
+      db,
+      'tv',
+      show.name,
+      null,
+      null,
+      showHash,
+      new Date().toISOString(),
+      contentHash
+    );
+
     logger.debug(`Generated hashes for TV show: ${show.name}`);
   } catch (error) {
     logger.error(`Error generating TV show hashes for ${show.name}: ${error.message}`);
