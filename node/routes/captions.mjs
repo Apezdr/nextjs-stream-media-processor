@@ -17,8 +17,7 @@ import {
   getHealthSnapshot,
   FeatureDisabledError,
   LanguageNotAllowedError,
-  TargetExistsError,
-  HumanSubtitleExistsError
+  TargetExistsError
 } from '../components/caption-generator/index.mjs';
 
 const logger = createCategoryLogger('captions-routes');
@@ -230,9 +229,6 @@ function mapEnqueueError(res, err) {
     return res.status(400).json({ error: err.message, code: err.code });
   }
   if (err instanceof TargetExistsError) {
-    return res.status(409).json({ error: err.message, code: err.code, path: err.path });
-  }
-  if (err instanceof HumanSubtitleExistsError) {
     return res.status(409).json({ error: err.message, code: err.code, path: err.path });
   }
   // resolveTarget throws plain Errors for missing files — surface as 404

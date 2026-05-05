@@ -55,13 +55,6 @@ export class TargetExistsError extends Error {
     this.path = path;
   }
 }
-export class HumanSubtitleExistsError extends Error {
-  constructor(path) {
-    super(`A human-authored subtitle already exists for this language: ${path}`);
-    this.code = 'HUMAN_SUBTITLE_EXISTS';
-    this.path = path;
-  }
-}
 
 async function fileExists(p) {
   try { await fs.access(p); return true; } catch { return false; }
@@ -165,24 +158,6 @@ function queuePositionFor(jobId) {
 }
 
 /**
- * Check whether a same-lang human-authored SRT already exists next to the mp4.
- * Looks for `{base}.{lang}.srt` and `{base}.{lang}.hi.srt`. Returns the path
- * if found, else null.
- */
-async function findHumanSubtitle(target, langCode) {
-  const dir = dirname(target.srtPath);
-  const base = target.baseFilename;
-  const candidates = [
-    join(dir, `${base}.${langCode}.srt`),
-    join(dir, `${base}.${langCode}.hi.srt`)
-  ];
-  for (const c of candidates) {
-    if (await fileExists(c)) return c;
-  }
-  return null;
-}
-
-/**
  * Enqueue (or join an in-flight) caption generation job.
  *
  * @param {Object} req - { mediaType, mediaTitle, language, season?, episode?, force? }
@@ -201,14 +176,10 @@ export async function enqueueCaptionJob(req) {
 
   const target = await resolveRequest(req);
 
-  if (!req.force) {
-    if (await fileExists(target.srtPath)) {
-      throw new TargetExistsError(target.srtPath);
-    }
-    const humanPath = await findHumanSubtitle(target, langCode);
-    if (humanPath) {
-      throw new HumanSubtitleExistsError(humanPath);
-    }
+  // Only block on an existing .auto.srt — human-authored subs in the same
+  // language are allowed to coexist as alternative tracks.
+  if (!req.force && await fileExists(target.srtPath)) {
+    throw new TargetExistsError(target.srtPath);
   }
 
   // Dedupe: if there's already an in-flight job for this (video, lang), join it.

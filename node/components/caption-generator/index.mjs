@@ -7,8 +7,7 @@ export {
   getHealthSnapshot,
   FeatureDisabledError,
   LanguageNotAllowedError,
-  TargetExistsError,
-  HumanSubtitleExistsError
+  TargetExistsError
 } from './entry-points/caption-controller.mjs';
 
 export { getAutoCaptionsConfig, isLanguageEnabled } from './data-access/caption-config.mjs';

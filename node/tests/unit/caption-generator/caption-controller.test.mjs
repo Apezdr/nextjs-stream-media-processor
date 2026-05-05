@@ -93,7 +93,6 @@ const {
   getJob,
   _resetStateForTests,
   FeatureDisabledError,
-  HumanSubtitleExistsError,
   TargetExistsError
 } = await import('../../../components/caption-generator/entry-points/caption-controller.mjs');
 
@@ -123,13 +122,17 @@ describe('enqueueCaptionJob', () => {
     ).rejects.toBeInstanceOf(FeatureDisabledError);
   });
 
-  it('rejects when a same-lang human SRT already exists', async () => {
+  it('still enqueues when a same-lang human SRT exists (alternative track)', async () => {
     const humanPath = join(moviesDir, 'Test Movie.en.srt');
     await fs.writeFile(humanPath, 'human cues');
 
-    await expect(
-      enqueueCaptionJob({ mediaType: 'movie', mediaTitle: 'Test Movie', language: 'en' })
-    ).rejects.toBeInstanceOf(HumanSubtitleExistsError);
+    const job = await enqueueCaptionJob({
+      mediaType: 'movie',
+      mediaTitle: 'Test Movie',
+      language: 'en'
+    });
+    expect(job.status).toBe('queued');
+    expect(job.expectedPath).toContain('Test Movie.en.auto.srt');
 
     await fs.unlink(humanPath);
   });

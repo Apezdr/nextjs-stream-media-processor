@@ -25,13 +25,21 @@ function buildTrackUrl({ mediaType, mediaTitle, season, episode }, langCode) {
 }
 
 /**
- * For each enabled language in app_config.autoCaptions that isn't already
- * represented in `subtitles`, mutate-in a "pending" stub entry pointing at the
- * track endpoint so the frontend can surface the option before generation runs.
+ * For each enabled language in app_config.autoCaptions, mutate-in a "pending"
+ * stub entry pointing at the track endpoint so the frontend can surface the
+ * option before generation runs.
  *
- * Skips when the feature is disabled or the same language already has any
- * subtitle (human or auto) — both cases would otherwise produce a stub that
- * 409s when the user clicks it.
+ * Auto-generated tracks are offered as an *alternative* alongside any
+ * human-authored subtitle for the same language — the user can switch to the
+ * auto track if the human one is missing, wrong, or out of sync. Distinct
+ * scanner keys ("English" vs "English - Auto Generated") keep them separate
+ * in the player's track list.
+ *
+ * Skips only when:
+ *  - feature disabled, or
+ *  - an `.auto.srt` for that language already exists on disk (the scanner
+ *    will have emitted a real entry under the same display key, which we'd
+ *    shadow with a stub).
  *
  * @param {Object} subtitles - Subtitles map keyed by display name; mutated in place.
  * @param {Object} ctx       - { mediaType, mediaTitle, season?, episode?, langMap }
@@ -40,15 +48,7 @@ export async function addCaptionStubs(subtitles, ctx) {
   const config = await getAutoCaptionsConfigCached().catch(() => null);
   if (!config || !config.enabled || !Array.isArray(config.languages)) return;
 
-  const existingLangs = new Set(
-    Object.values(subtitles)
-      .map(s => s && s.srcLang)
-      .filter(Boolean)
-  );
-
   for (const langCode of config.languages) {
-    if (existingLangs.has(langCode)) continue;
-
     const langName = (ctx.langMap && ctx.langMap[langCode]) || langCode;
     const stubKey = `${langName} - Auto Generated`;
     if (subtitles[stubKey]) continue;
