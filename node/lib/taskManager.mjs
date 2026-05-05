@@ -7,11 +7,12 @@ export const TaskType = {
   API_REQUEST: 1,        // Highest priority - user-facing requests
   SYSTEM_MONITORING: 1.5, // System health monitoring - high priority
   MEDIA_SCAN: 2,         // General media scanning operations
-  MOVIE_SCAN: 2.1,       // Movie scanning specifically 
+  MOVIE_SCAN: 2.1,       // Movie scanning specifically
   TV_SCAN: 2.2,          // TV show scanning specifically
   METADATA_HASH: 3,      // Metadata hash operations
   BLURHASH: 4,           // Blurhash operations
   DOWNLOAD: 5,           // TMDB downloads
+  CAPTION_GENERATE: 5.5, // Whisper-based caption generation (CPU-heavy, low priority)
   CACHE_CLEANUP: 6       // Lowest priority - cleanup operations
 };
 
@@ -34,6 +35,7 @@ const concurrencyLimits = {
   [TaskType.METADATA_HASH]: 1,      // Only one metadata hash operation
   [TaskType.BLURHASH]: 1,           // Only one blurhash operation
   [TaskType.DOWNLOAD]: 2,           // Allow 2 download operations
+  [TaskType.CAPTION_GENERATE]: 1,   // One caption job at a time (CPU-heavy)
   [TaskType.CACHE_CLEANUP]: 1       // Only one cleanup at a time
 };
 

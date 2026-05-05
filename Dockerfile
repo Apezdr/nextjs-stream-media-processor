@@ -24,6 +24,18 @@ RUN apk add --no-cache \
     cairo-dev \
     py3-cairo
 
+# Build whisper.cpp (whisper-cli binary) for on-demand caption generation.
+# Model files are downloaded lazily at runtime, not baked into the image.
+RUN apk add --no-cache cmake git && \
+    git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp && \
+    cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DWHISPER_BUILD_TESTS=OFF \
+        -DWHISPER_BUILD_EXAMPLES=ON && \
+    cmake --build /tmp/whisper.cpp/build --target whisper-cli -j && \
+    install -m755 /tmp/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli && \
+    rm -rf /tmp/whisper.cpp
+
 # Set working directory for the build
 WORKDIR /usr/src/app
 
@@ -101,6 +113,7 @@ WORKDIR /usr/src/app
 COPY --from=builder /usr/src/app/node /usr/src/app/node
 COPY --from=builder /usr/src/app/scripts /usr/src/app/scripts
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 # Copy test requirements to force the testing stage to run during build
 COPY --from=testing /usr/src/app/scripts/test-requirements.txt /tmp/test-proof
 
@@ -134,8 +147,10 @@ RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py && \
     dos2unix /usr/src/app/scripts/*.sh
 
 # The default user of node:25.2.1-alpine is 'node' with UID/GID 1000
-# Create the logs directory and set its ownership to the 'node' user
-RUN mkdir -p /usr/src/app/logs && chown 1000:1000 /usr/src/app/logs
+# Create the logs and whisper-models directories and set ownership to the 'node' user.
+# whisper-models holds whisper.cpp ggml model files, downloaded lazily at runtime.
+RUN mkdir -p /usr/src/app/logs /usr/src/app/whisper-models && \
+    chown 1000:1000 /usr/src/app/logs /usr/src/app/whisper-models
 # ---------------------------------------------------------------------------
 
 # Command to run your Node.js app

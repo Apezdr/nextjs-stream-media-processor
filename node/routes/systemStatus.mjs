@@ -690,6 +690,7 @@ router.get('/tasks', authenticateWebhookOrUser, async (req, res) => {
       [TaskType.METADATA_HASH]: 'Metadata Hash',
       [TaskType.BLURHASH]: 'Blurhash',
       [TaskType.DOWNLOAD]: 'TMDB Download',
+      [TaskType.CAPTION_GENERATE]: 'Caption Generation',
       [TaskType.CACHE_CLEANUP]: 'Cache Cleanup'
     };
     

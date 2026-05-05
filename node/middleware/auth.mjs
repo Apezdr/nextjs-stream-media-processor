@@ -10,7 +10,7 @@ const logger = createCategoryLogger('auth-middleware')
  * Used as the cache key in sessionManager and as the presence check before
  * making any DB calls.
  */
-function extractSessionIdentifier(req) {
+export function extractSessionIdentifier(req) {
   if (req.headers.authorization?.startsWith('Bearer ')) {
     return req.headers.authorization.slice(7).trim()
   }

@@ -15,6 +15,7 @@ import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
+import { sweepOrphanTempFiles as sweepOrphanCaptionTempFiles } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
@@ -1409,6 +1410,8 @@ async function initialize() {
       });
     runGenerateList().catch(logger.error);
     runGeneratePosterCollage().catch(logger.error);
+    // Sweep stale caption-generator temp files left behind by interrupted jobs
+    sweepOrphanCaptionTempFiles().catch(err => logger.error(`Caption temp sweep failed: ${err.message}`));
   });
 }
 
