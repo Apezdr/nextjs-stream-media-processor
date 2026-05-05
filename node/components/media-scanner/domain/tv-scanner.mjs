@@ -13,7 +13,6 @@ import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
-import { addCaptionStubs } from './caption-stubs.mjs';
 import {
   getExistingTVShows,
   getExistingTVShowHashes,
@@ -311,15 +310,6 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     langMap,
     seasonFiles
   );
-
-  // Emit pending stubs for any auto-caption languages not already covered
-  await addCaptionStubs(subtitles, {
-    mediaType: 'tv',
-    mediaTitle: showName,
-    season: seasonNumber,
-    episode: paddedEpisodeNumber,
-    langMap
-  });
 
   if (Object.keys(subtitles).length > 0) {
     episodeData.subtitles = subtitles;

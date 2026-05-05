@@ -106,6 +106,11 @@ ENV LIBVA_DRIVERS_PATH=/usr/lib/dri
 ENV LIBVA_DRIVER_NAME=iHD
 ENV GST_VAAPI_ALL_DRIVERS=1
 
+# Pin whisper-cli paths for the container so the Node process doesn't fall back
+# to its host-OS-relative defaults (which target local development setups).
+ENV WHISPER_BIN=/usr/local/bin/whisper-cli
+ENV WHISPER_MODELS_DIR=/usr/src/app/whisper-models
+
 # Set working directory for the runtime
 WORKDIR /usr/src/app
 

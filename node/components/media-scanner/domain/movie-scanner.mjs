@@ -11,7 +11,6 @@ import {
 import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
-import { addCaptionStubs } from './caption-stubs.mjs';
 import {
   getExistingMovies,
   getMissingMediaData,
@@ -202,13 +201,6 @@ async function processSubtitles(fileNames, dirPath, dirName, prefixPath, langMap
       };
     }
   }
-
-  // Emit pending stubs for any auto-caption languages not already covered
-  await addCaptionStubs(subtitles, {
-    mediaType: 'movie',
-    mediaTitle: dirName,
-    langMap
-  });
 
   return subtitles;
 }

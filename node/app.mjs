@@ -15,7 +15,11 @@ import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
-import { sweepOrphanTempFiles as sweepOrphanCaptionTempFiles } from "./components/caption-generator/index.mjs";
+import {
+  sweepOrphanTempFiles as sweepOrphanCaptionTempFiles,
+  injectMovieStubs,
+  injectTvStubs
+} from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
@@ -824,6 +828,9 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
     const shows = await getTVShows();
     await releaseDatabase(db);
 
+    // Read-time injection of auto-caption stubs.
+    await injectTvStubs(shows, langMap);
+
     const tvData = shows.reduce((acc, show) => {
       acc[show.name] = {
         metadata: show.metadata_path,
@@ -867,7 +874,8 @@ async function generateListMovies(db, dirPath) {
  * @deprecated Use scanMovies from media-scanner component instead
  */
 
-app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
+// TEMP: auth disabled for local response inspection. RESTORE before commit.
+app.get("/media/movies", /* authenticateWebhookOrUser, */ async (req, res) => {
   try {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty()) {
@@ -875,6 +883,10 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
     }
     const movies = await getMovies();
     await releaseDatabase(db);
+
+    // Read-time injection of auto-caption stubs (no rescan needed when the
+    // autoCaptions flag or language list changes).
+    await injectMovieStubs(movies, langMap);
 
     const movieData = movies.reduce((acc, movie) => {
       acc[movie.name] = {

@@ -1,13 +1,19 @@
 import { spawn } from 'child_process';
-import { promises as fs, createWriteStream } from 'fs';
-import { dirname, join } from 'path';
+import { promises as fs, createWriteStream, existsSync } from 'fs';
+import { delimiter, dirname, isAbsolute, join } from 'path';
 import { pipeline } from 'stream/promises';
 import { createCategoryLogger } from './logger.mjs';
 
 const logger = createCategoryLogger('whisper');
 
-const WHISPER_BIN = process.env.WHISPER_BIN || '/usr/local/bin/whisper-cli';
-const WHISPER_MODELS_DIR = process.env.WHISPER_MODELS_DIR || '/usr/src/app/whisper-models';
+// Defaults are PATH-resolved (no absolute path) so the same code works in
+// Docker (where /usr/local/bin is on PATH), on Linux/macOS with a system
+// install, and on Windows if the user has whisper-cli on PATH. Production
+// containers can pin both via env (the Dockerfile does).
+const WHISPER_BIN = process.env.WHISPER_BIN ||
+  (process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli');
+const WHISPER_MODELS_DIR = process.env.WHISPER_MODELS_DIR ||
+  join(process.cwd(), 'whisper-models');
 
 /**
  * Resolve the on-disk path for a given whisper.cpp model name.
@@ -31,18 +37,46 @@ async function fileExists(p) {
 }
 
 /**
+ * Resolve a binary spec (absolute path OR bare name) to its on-disk location,
+ * walking PATH (and PATHEXT on Windows) for bare names. Returns null if not
+ * found. Used by `inspect()` for the health check; spawn() does its own PATH
+ * resolution at call time.
+ */
+function resolveBinaryPath(bin) {
+  if (isAbsolute(bin)) {
+    return existsSync(bin) ? bin : null;
+  }
+  const dirs = (process.env.PATH || '').split(delimiter);
+  const exts = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.BAT;.CMD').split(';').map(e => e.toLowerCase())
+    : [''];
+  const lowerBin = bin.toLowerCase();
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = ext && !lowerBin.endsWith(ext)
+        ? join(dir, bin + ext)
+        : join(dir, bin);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+/**
  * Returns { binaryPresent, modelPresent, modelSizeBytes } for health reporting.
+ * For bare-name WHISPER_BIN values, walks PATH so a system-installed binary is
+ * detected without requiring an absolute path in env.
  */
 export async function inspect(modelName) {
   const modelPath = getModelPath(modelName);
-  const [binaryPresent, modelStat] = await Promise.all([
-    fileExists(WHISPER_BIN),
-    fs.stat(modelPath).catch(() => null)
-  ]);
+  const resolvedBinary = resolveBinaryPath(WHISPER_BIN);
+  const modelStat = await fs.stat(modelPath).catch(() => null);
 
   return {
     binary: WHISPER_BIN,
-    binaryPresent,
+    binaryResolved: resolvedBinary,
+    binaryPresent: !!resolvedBinary,
     model: modelName,
     modelPath,
     modelPresent: !!modelStat,
@@ -167,7 +201,17 @@ export async function transcribe({
     child.stdout.on('data', handleChunk);
     child.stderr.on('data', handleChunk);
 
-    child.on('error', err => reject(new Error(`whisper-cli failed to start: ${err.message}`)));
+    child.on('error', err => {
+      if (err.code === 'ENOENT') {
+        return reject(new Error(
+          `whisper-cli not found at "${WHISPER_BIN}". Install whisper.cpp ` +
+          `(https://github.com/ggml-org/whisper.cpp) and either put whisper-cli on PATH ` +
+          `or set the WHISPER_BIN env var to the absolute path. (When running in Docker, ` +
+          `the included build handles this automatically.)`
+        ));
+      }
+      reject(new Error(`whisper-cli failed to start: ${err.message}`));
+    });
     child.on('close', (code, signal) => {
       if (signal) return reject(new Error(`whisper-cli killed by signal ${signal}`));
       if (code !== 0) return reject(new Error(`whisper-cli exited with code ${code}: ${stderr.slice(-500)}`));
