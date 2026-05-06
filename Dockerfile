@@ -30,6 +30,7 @@ RUN apk add --no-cache cmake git && \
     git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp && \
     cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
         -DWHISPER_BUILD_TESTS=OFF \
         -DWHISPER_BUILD_EXAMPLES=ON && \
     cmake --build /tmp/whisper.cpp/build --target whisper-cli -j && \
