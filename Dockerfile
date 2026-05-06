@@ -96,11 +96,11 @@ RUN --mount=type=secret,id=tmdb_api_key \
     if [ -f /run/secrets/tmdb_api_key ]; then \
         echo "✓ TMDB_API_KEY secret detected - Running ALL tests (including critical integration tests)..."; \
         export TMDB_API_KEY=$(cat /run/secrets/tmdb_api_key); \
-        node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose; \
+        node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose --forceExit; \
     else \
         echo "⚠️  WARNING: No TMDB_API_KEY secret - skipping integration tests"; \
         echo "ℹ️  Build with: docker build --secret id=tmdb_api_key,env=TMDB_API_KEY ..."; \
-        node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose --testPathIgnorePatterns=cross-platform-metadata; \
+        node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose --forceExit --testPathIgnorePatterns=cross-platform-metadata; \
     fi && \
     echo "✓ Node.js tests passed!"
 
