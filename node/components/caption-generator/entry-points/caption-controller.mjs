@@ -16,12 +16,15 @@ import {
   getProcessTrackingDb
 } from '../../../sqlite/processTracking.mjs';
 import { releaseDatabase } from '../../../sqliteDatabase.mjs';
+import { mainCacheDir } from '../../../utils/utils.mjs';
 
 const logger = createCategoryLogger('caption-controller');
 
 const BASE_PATH = process.env.BASE_PATH || '/var/www/html';
 const PUBLIC_PREFIX = process.env.PREFIX_PATH || '';
-const CAPTIONS_TMP_DIR = process.env.CAPTIONS_TMP_DIR || join(process.cwd(), 'cache', 'captions');
+// Align with the existing cache convention (node/cache/...) — module-relative,
+// not cwd-relative, so we land in a directory the container actually owns.
+const CAPTIONS_TMP_DIR = process.env.CAPTIONS_TMP_DIR || join(mainCacheDir, 'captions');
 const ORPHAN_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 // Aggregate health state — surfaced by /api/captions/health.
