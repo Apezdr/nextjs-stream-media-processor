@@ -52,12 +52,34 @@ async function resolveTvEpisode({ basePath, publicPrefix = '', mediaTitle, langC
   }
 
   const decodedTitle = decodeURIComponent(mediaTitle);
-  const seasonName = `Season ${season}`;
-  const seasonDir = join(basePath, 'tv', decodedTitle, seasonName);
+  const showDir = join(basePath, 'tv', decodedTitle);
+
+  // Find the season folder by numeric match against `\d+` rather than
+  // assuming a specific zero-padding convention. Folders can legitimately
+  // be "Season 1", "Season 01", "Season 1 - Pilots", etc. — match by integer
+  // value of the first digit run, the same way the scanner does.
+  const seasonInt = parseInt(season, 10);
+  if (!Number.isFinite(seasonInt)) {
+    throw new Error(`Invalid season "${season}" — must be numeric`);
+  }
+  let seasonFolders;
+  try {
+    seasonFolders = await fs.readdir(showDir);
+  } catch (err) {
+    throw new Error(`Show folder not found: ${showDir} (${err.code})`);
+  }
+  const seasonName = seasonFolders.find(f => {
+    const m = f.match(/\d+/);
+    return m && parseInt(m[0], 10) === seasonInt;
+  });
+  if (!seasonName) {
+    throw new Error(`Season ${seasonInt} not found in ${showDir}`);
+  }
+  const seasonDir = join(showDir, seasonName);
 
   const files = await fs.readdir(seasonDir);
 
-  const paddedSeason = String(season).padStart(2, '0');
+  const paddedSeason = String(seasonInt).padStart(2, '0');
   const paddedEpisode = String(episode).padStart(2, '0');
   const episodePattern = new RegExp(`S${paddedSeason}E${paddedEpisode}`, 'i');
 

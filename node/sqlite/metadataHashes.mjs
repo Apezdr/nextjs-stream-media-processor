@@ -1,11 +1,46 @@
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { withRetry, withDb, withWriteTx, getMovies, getTVShows, getTVShowByName } from '../sqliteDatabase.mjs';
+import { getAutoCaptionsConfigCached } from '../components/caption-generator/data-access/caption-config.mjs';
 
 const logger = createCategoryLogger('metadataHashes');
 
 // Current version of the hash data structure
 export const HASH_DATA_VERSION = 1;
+
+/**
+ * Per-item hashes are computed at scan time and stored in SQLite. Auto-caption
+ * stubs, however, are injected at READ time from `app_config.autoCaptions` —
+ * so a stored hash never reflects the stub state. Without this mix-in, toggling
+ * `autoCaptions.enabled` or adding a language would not invalidate any per-item
+ * hash, and Next.js's hash-skip optimisation would silently swallow the change.
+ *
+ * The fix: derive a deterministic fingerprint from the current autoCaptions
+ * config state and combine it with each stored hash before returning. Toggling
+ * the flag or changing the language list now naturally invalidates all hashes
+ * for one sync cycle (after which they stabilise again until the next change).
+ */
+async function getAutoCaptionsContextHash() {
+  try {
+    const config = await getAutoCaptionsConfigCached();
+    const sortedLangs = Array.isArray(config?.languages)
+      ? [...config.languages].map(String).sort()
+      : [];
+    const fingerprint = JSON.stringify({
+      enabled: Boolean(config?.enabled),
+      languages: sortedLangs,
+    });
+    return createHash('sha1').update(fingerprint).digest('hex');
+  } catch (err) {
+    logger.warn(`autoCaptions context hash unavailable: ${err.message} — using stable fallback`);
+    return 'autoCaptions-unavailable';
+  }
+}
+
+function mixAutoCaptionsHash(baseHash, contextHash) {
+  if (!baseHash) return baseHash;
+  return createHash('sha1').update(`${baseHash}:${contextHash}`).digest('hex');
+}
 
 /**
  * Initialize the metadata_hashes table in the database
@@ -168,13 +203,17 @@ export async function getMediaTypeHashes(db, mediaType) {
       )
     );
 
+    const autoCaptionsContext = await getAutoCaptionsContextHash();
+
     // Format the result as a map of titles to hashes. contentHash is included
     // when present (TV shows, post-migration); null for movies and pre-migration rows.
+    // Both fields are mixed with the autoCaptions context so the Next.js
+    // hash-skip can detect config changes (see getAutoCaptionsContextHash docs).
     const hashesMap = {};
     for (const record of titleHashes) {
       hashesMap[record.title] = {
-        hash: record.hash,
-        contentHash: record.content_hash,
+        hash: mixAutoCaptionsHash(record.hash, autoCaptionsContext),
+        contentHash: mixAutoCaptionsHash(record.content_hash, autoCaptionsContext),
         lastModified: record.last_modified,
         generated: record.hash_generated
       };
@@ -221,27 +260,29 @@ export async function getShowHashes(db, title) {
     const updatedShowHash = await getHash(db, 'tv', title);
     
     // Get all season-level hashes for this show
-    const seasonHashes = await withRetry(() => 
+    const seasonHashes = await withRetry(() =>
       db.all(
-        `SELECT season_number, hash, last_modified, hash_generated 
-         FROM metadata_hashes 
+        `SELECT season_number, hash, last_modified, hash_generated
+         FROM metadata_hashes
          WHERE media_type = 'tv' AND title = ? AND season_number IS NOT NULL AND episode_key IS NULL`,
         [title]
       )
     );
-    
+
+    const autoCaptionsContext = await getAutoCaptionsContextHash();
+
     // Format the result as a map of season numbers to hashes
     const seasonsMap = {};
     for (const record of seasonHashes) {
       seasonsMap[record.season_number] = {
-        hash: record.hash,
+        hash: mixAutoCaptionsHash(record.hash, autoCaptionsContext),
         lastModified: record.last_modified,
         generated: record.hash_generated
       };
     }
-    
+
     return {
-      hash: updatedShowHash ? updatedShowHash.hash : null,
+      hash: updatedShowHash ? mixAutoCaptionsHash(updatedShowHash.hash, autoCaptionsContext) : null,
       seasons: seasonsMap,
       generated: new Date().toISOString()
     };
@@ -285,27 +326,32 @@ export async function getSeasonHashes(db, title, seasonNumber) {
     const updatedSeasonHash = await getHash(db, 'tv', title, seasonNumber);
     
     // Get all episode-level hashes for this season
-    const episodeHashes = await withRetry(() => 
+    const episodeHashes = await withRetry(() =>
       db.all(
-        `SELECT episode_key, hash, last_modified, hash_generated 
-         FROM metadata_hashes 
+        `SELECT episode_key, hash, last_modified, hash_generated
+         FROM metadata_hashes
          WHERE media_type = 'tv' AND title = ? AND season_number = ? AND episode_key IS NOT NULL`,
         [title, seasonNumber]
       )
     );
-    
-    // Format the result as a map of episode keys to hashes
+
+    const autoCaptionsContext = await getAutoCaptionsContextHash();
+
+    // Format the result as a map of episode keys to hashes. Episode hashes are
+    // the gate that EpisodeSyncService.ts:106 uses to skip per-episode work, so
+    // mixing the autoCaptions fingerprint here is what actually unblocks the
+    // auto-stub from reaching MongoDB on a config toggle.
     const episodesMap = {};
     for (const record of episodeHashes) {
       episodesMap[record.episode_key] = {
-        hash: record.hash,
+        hash: mixAutoCaptionsHash(record.hash, autoCaptionsContext),
         lastModified: record.last_modified,
         generated: record.hash_generated
       };
     }
-    
+
     return {
-      hash: updatedSeasonHash ? updatedSeasonHash.hash : null,
+      hash: updatedSeasonHash ? mixAutoCaptionsHash(updatedSeasonHash.hash, autoCaptionsContext) : null,
       episodes: episodesMap,
       generated: new Date().toISOString()
     };

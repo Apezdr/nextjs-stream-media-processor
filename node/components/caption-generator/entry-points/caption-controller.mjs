@@ -378,6 +378,10 @@ export async function getHealthSnapshot() {
   const engine = config
     ? await whisper.inspect(config.model)
     : { binary: whisper.getBinaryPath(), binaryPresent: false, model: null, modelPath: null, modelPresent: false, modelSizeBytes: 0 };
+  // Reported by the Dockerfile at build time. "none" for CPU builds; "vulkan"
+  // / "cuda" for GPU builds. Always present as a string so the frontend can
+  // display it without conditional logic.
+  engine.gpuBackend = process.env.WHISPER_GPU_BACKEND || 'none';
 
   const taskStatus = getTaskStatus();
   const queued = taskStatus.queueSizes[TaskType.CAPTION_GENERATE] || 0;

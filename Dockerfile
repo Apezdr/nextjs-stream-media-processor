@@ -1,6 +1,12 @@
 # Stage 1: Build Stage
 FROM node:25.2.1-alpine AS builder
 
+# Whisper.cpp GPU backend selection. "none" (default) builds a CPU-only binary;
+# "vulkan" enables the Vulkan compute backend for ~3-5x speedup on Intel ARC,
+# AMD, and NVIDIA GPUs. CUDA support lives in Dockerfile.cuda (separate base
+# image required).
+ARG WHISPER_GPU=none
+
 # Install necessary build tools and runtime packages needed for building
 RUN apk add --no-cache \
     python3 \
@@ -26,13 +32,23 @@ RUN apk add --no-cache \
 
 # Build whisper.cpp (whisper-cli binary) for on-demand caption generation.
 # Model files are downloaded lazily at runtime, not baked into the image.
-RUN apk add --no-cache cmake git && \
+RUN set -e && \
+    apk add --no-cache cmake git && \
+    if [ "$WHISPER_GPU" = "vulkan" ]; then \
+        echo "[whisper.cpp] building with Vulkan backend"; \
+        apk add --no-cache vulkan-headers vulkan-loader-dev shaderc spirv-headers spirv-tools-dev; \
+        GPU_FLAGS="-DGGML_VULKAN=ON"; \
+    else \
+        echo "[whisper.cpp] building CPU-only (WHISPER_GPU=$WHISPER_GPU)"; \
+        GPU_FLAGS=""; \
+    fi && \
     git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper.cpp && \
     cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DWHISPER_BUILD_TESTS=OFF \
-        -DWHISPER_BUILD_EXAMPLES=ON && \
+        -DWHISPER_BUILD_EXAMPLES=ON \
+        $GPU_FLAGS && \
     cmake --build /tmp/whisper.cpp/build --target whisper-cli -j && \
     install -m755 /tmp/whisper.cpp/build/bin/whisper-cli /usr/local/bin/whisper-cli && \
     rm -rf /tmp/whisper.cpp
@@ -102,6 +118,11 @@ RUN echo "" && \
 # Stage 2: Production Stage
 FROM node:25.2.1-alpine
 
+# Re-declare so the production stage can install matching runtime libraries
+# and surface the choice via env. Must be passed at build time:
+#   docker build --build-arg WHISPER_GPU=vulkan ...
+ARG WHISPER_GPU=none
+
 # Set environment variables for VA-API
 ENV LIBVA_DRIVERS_PATH=/usr/lib/dri
 ENV LIBVA_DRIVER_NAME=iHD
@@ -111,6 +132,8 @@ ENV GST_VAAPI_ALL_DRIVERS=1
 # to its host-OS-relative defaults (which target local development setups).
 ENV WHISPER_BIN=/usr/local/bin/whisper-cli
 ENV WHISPER_MODELS_DIR=/usr/src/app/whisper-models
+# Surface the GPU backend choice to the running app (read by /api/captions/health).
+ENV WHISPER_GPU_BACKEND=$WHISPER_GPU
 
 # Set working directory for the runtime
 WORKDIR /usr/src/app
@@ -147,6 +170,17 @@ RUN apk add --no-cache \
     mesa-dri-gallium && \
     # Install libva-utils from the edge community repository explicitly
     apk add --no-cache libva-utils --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community
+
+# Vulkan runtime: loader + Mesa drivers. NVIDIA users get their driver injected
+# by the NVIDIA Container Toolkit at runtime, so no Mesa NVIDIA driver is
+# needed here. Skipped entirely for CPU builds.
+#   mesa-vulkan-intel  - ANV (Intel ARC + iGPU)
+#   mesa-vulkan-ati    - RADV (AMD Radeon) -- alpine package name preserves
+#                        the original upstream "ati" name
+RUN if [ "$WHISPER_GPU" = "vulkan" ]; then \
+        echo "[runtime] installing Vulkan loader + Mesa GPU drivers"; \
+        apk add --no-cache vulkan-loader mesa-vulkan-intel mesa-vulkan-ati; \
+    fi
 
 # Grant execution rights and convert scripts to Unix format
 RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py && \
