@@ -874,8 +874,7 @@ async function generateListMovies(db, dirPath) {
  * @deprecated Use scanMovies from media-scanner component instead
  */
 
-// TEMP: auth disabled for local response inspection. RESTORE before commit.
-app.get("/media/movies", /* authenticateWebhookOrUser, */ async (req, res) => {
+app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty()) {
