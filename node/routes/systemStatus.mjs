@@ -483,8 +483,14 @@ async function refreshSystemStatus() {
     (await si.currentLoad()).avgLoad :
     [0, 0, 0];
 
-  // Calculate memory usage percentage
-  const memUsagePercent = (mem.used / mem.total) * 100;
+  // Calculate memory usage percentage using MemAvailable equivalent.
+  // si.mem().used is `total - free` (includes reclaimable page cache),
+  // which on a Linux file server with a warm disk cache routinely reports
+  // 90%+ "used" while plenty of memory is actually available for processes.
+  // (mem.total - mem.available) matches kernel MemAvailable, the number
+  // `free -h` shows under the "available" column.
+  const memActuallyUsed = mem.total - (mem.available ?? mem.free);
+  const memUsagePercent = (memActuallyUsed / mem.total) * 100;
 
   // Calculate overall disk usage percentage (average across all drives)
   const diskUsagePercent = fsSize.length > 0 ?
