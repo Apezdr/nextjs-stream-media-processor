@@ -1,4 +1,5 @@
 import { createCategoryLogger } from './logger.mjs';
+import { withTaskEnqueueSpan, withTaskExecuteSpan, registerTaskTypes, registerTaskQueueMetrics } from './taskTracer.mjs';
 
 const logger = createCategoryLogger('taskManager');
 
@@ -80,6 +81,9 @@ function canTaskStart(taskType) {
   return true;
 }
 
+// Register task types with the tracer for better spans and metrics
+registerTaskTypes(TaskType);
+
 /**
  * Process queued tasks when a running task completes
  */
@@ -105,7 +109,13 @@ function processQueues() {
         
         // Execute the task
         const startTime = Date.now();
-        Promise.resolve(task.fn())
+        withTaskExecuteSpan({
+          type: type,
+          name: task.name,
+          id: taskId
+        }, async () => {
+          return await task.fn();
+        })
           .then(result => {
             const endTime = Date.now();
             const duration = endTime - startTime;
@@ -153,8 +163,14 @@ export function enqueueTask(type, name, fn, immediate = false) {
   }
   
   // Create a promise that will resolve when the task completes
-  return new Promise((resolve, reject) => {
-    const task = { name, fn, resolve, reject };
+  return withTaskEnqueueSpan({
+    type: type,
+    name: name,
+    immediate: immediate,
+    queueDepth: (taskQueues.get(type) || []).length
+  }, async () => {
+    return new Promise((resolve, reject) => {
+      const task = { name, fn, resolve, reject };
     
     // Check if we can run the task immediately
     if (immediate && canTaskStart(type)) {
@@ -170,7 +186,13 @@ export function enqueueTask(type, name, fn, immediate = false) {
       
       // Execute the task
       const startTime = Date.now();
-      Promise.resolve(fn())
+      withTaskExecuteSpan({
+        type: type,
+        name: name,
+        id: taskId
+      }, async () => {
+        return await fn();
+      })
         .then(result => {
           const endTime = Date.now();
           const duration = endTime - startTime;
@@ -205,6 +227,7 @@ export function enqueueTask(type, name, fn, immediate = false) {
       }
     }
   });
+});
 }
 
 /**

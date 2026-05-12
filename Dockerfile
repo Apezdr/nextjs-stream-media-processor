@@ -95,11 +95,15 @@ RUN --mount=type=secret,id=tmdb_api_key \
     echo "============================================" && \
     if [ -f /run/secrets/tmdb_api_key ]; then \
         echo "✓ TMDB_API_KEY secret detected - Running ALL tests (including critical integration tests)..."; \
+        # Disable OpenTelemetry during tests
+        export OTEL_ENABLED=false; \
         export TMDB_API_KEY=$(cat /run/secrets/tmdb_api_key); \
         node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose --forceExit; \
     else \
         echo "⚠️  WARNING: No TMDB_API_KEY secret - skipping integration tests"; \
         echo "ℹ️  Build with: docker build --secret id=tmdb_api_key,env=TMDB_API_KEY ..."; \
+        # Disable OpenTelemetry during tests
+        export OTEL_ENABLED=false; \
         node --experimental-vm-modules node_modules/jest/bin/jest.js --verbose --forceExit --testPathIgnorePatterns=cross-platform-metadata; \
     fi && \
     echo "✓ Node.js tests passed!"
@@ -127,6 +131,17 @@ ARG WHISPER_GPU=none
 ENV LIBVA_DRIVERS_PATH=/usr/lib/dri
 ENV LIBVA_DRIVER_NAME=iHD
 ENV GST_VAAPI_ALL_DRIVERS=1
+
+# Set default OpenTelemetry environment variables (can be overridden at runtime)
+# These variables control the OpenTelemetry SDK behavior
+ENV OTEL_ENABLED=false
+ENV OTEL_SERVICE_NAME=nextjs-stream-media-processor
+ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+ENV OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production,service.namespace=media-processor,service.version=1.0.0
+ENV OTEL_PROPAGATORS=tracecontext,baggage
+ENV OTEL_TRACES_SAMPLER=always_on
+ENV OTEL_LOG_LEVEL=info
 
 # Pin whisper-cli paths for the container so the Node process doesn't fall back
 # to its host-OS-relative defaults (which target local development setups).
