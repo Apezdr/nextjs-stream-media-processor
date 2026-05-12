@@ -1,5 +1,7 @@
 import { createLogger, format, transports } from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
+import { trace, context } from '@opentelemetry/api';
+import { isOpenTelemetryEnabled } from './telemetry.mjs';
 import path from 'path';
 import fs from 'fs';
 
@@ -11,10 +13,26 @@ if (!fs.existsSync(logDirectory)) {
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Custom format to add trace context to logs
+const traceContextFormat = format((info) => {
+  // Only add trace context if OpenTelemetry is enabled
+  if (isOpenTelemetryEnabled) {
+    const span = trace.getSpan(context.active());
+    if (span) {
+      const spanContext = span.spanContext();
+      info.trace_id = spanContext.traceId;
+      info.span_id = spanContext.spanId;
+      info.trace_flags = spanContext.traceFlags;
+    }
+  }
+  return info;
+});
+
 // Base Winston logger configuration
 const baseLogger = createLogger({
   level: isProduction ? 'info' : 'debug',
   format: format.combine(
+    traceContextFormat(),
     format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     format.errors({ stack: true }),
     format.splat(),

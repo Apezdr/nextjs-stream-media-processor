@@ -5,6 +5,7 @@ import { createWriteStream } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createCategoryLogger } from '../lib/logger.mjs';
+import { withImageProcessingSpan, withBlurhashSpan, withApiCacheSpan } from '../lib/apiTracer.mjs';
 import { execAsync } from './utils.mjs';
 import {
   getCachedTmdbBlurhashWithDb,
@@ -84,7 +85,14 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
   return dedupe(cacheKey, async () => {
     try {
       // Check cache first using encapsulated database function
-      const cached = await getCachedTmdbBlurhashWithDb(cacheKey);
+      const cached = await withApiCacheSpan({
+        service: 'tmdb-blurhash',
+        operation: 'GET',
+        cacheKey: cacheKey
+      }, async () => {
+        return await getCachedTmdbBlurhashWithDb(cacheKey);
+      });
+      
       if (cached) {
         logger.debug(`Blurhash cache hit for ${imageUrl} (${size})`);
         return cached;
@@ -94,17 +102,24 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
       return await downloadLimit(async () => {
         try {
           // Download image into memory (faster than disk I/O)
-          const response = await axios({
-            method: 'get',
+          const response = await withApiRequestSpan({
+            service: 'tmdb-image',
+            method: 'GET',
             url: canonicalUrl,
-            responseType: 'arraybuffer',  // Get raw bytes, no temp files needed
-            timeout: 5000,
-            maxContentLength: 5 * 1024 * 1024, // 5MB limit
-            maxBodyLength: 5 * 1024 * 1024,
-            validateStatus: (s) => s >= 200 && s < 300,
-            headers: {
-              'User-Agent': 'nextjs-stream-media-processor/1.0'
-            }
+            endpoint: 'image'
+          }, async () => {
+            return await axios({
+              method: 'get',
+              url: canonicalUrl,
+              responseType: 'arraybuffer',  // Get raw bytes, no temp files needed
+              timeout: 5000,
+              maxContentLength: 5 * 1024 * 1024, // 5MB limit
+              maxBodyLength: 5 * 1024 * 1024,
+              validateStatus: (s) => s >= 200 && s < 300,
+              headers: {
+                'User-Agent': 'nextjs-stream-media-processor/1.0'
+              }
+            });
           });
           
           const imageBuffer = Buffer.from(response.data);
@@ -115,7 +130,14 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
           // Use native implementation if enabled, otherwise fall back to Python
           if (USE_NATIVE_BLURHASH) {
             try {
-              blurhashBase64 = await generateBlurhashFromBuffer(imageBuffer, size);
+              blurhashBase64 = await withBlurhashSpan({
+                type: 'native',
+                url: canonicalUrl,
+                componentsX: size === 'large' ? 6 : size === 'medium' ? 4 : 3,
+                componentsY: size === 'large' ? 5 : 3
+              }, async () => {
+                return await generateBlurhashFromBuffer(imageBuffer, size);
+              });
               logger.debug(`Generated blurhash using native implementation for ${imageUrl} (${size})`);
             } catch (nativeError) {
               logger.warn(`Native blurhash failed, falling back to Python: ${nativeError.message}`);
@@ -171,7 +193,14 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
           }
           
           // Cache the result
-          await cacheTmdbBlurhashWithDb(cacheKey, blurhashBase64, 2160, { file_size: fileSize });
+          await withApiCacheSpan({
+            service: 'tmdb-blurhash',
+            operation: 'SET',
+            cacheKey: cacheKey,
+            ttl: 2160
+          }, async () => {
+            await cacheTmdbBlurhashWithDb(cacheKey, blurhashBase64, 2160, { file_size: fileSize });
+          });
           logger.debug(`Cached blurhash for ${imageUrl} (${size})`);
           
           return blurhashBase64;

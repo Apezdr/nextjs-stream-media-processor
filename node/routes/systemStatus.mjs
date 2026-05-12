@@ -62,13 +62,41 @@ const THRESHOLDS = {
   }
 };
 
-// Minimum free disk space before triggering critical warning (default: 5GB)
-const MIN_FREE_DISK_SPACE = parseInt(process.env.SYSTEM_STATUS_MIN_FREE_DISK_GB, 10) * 1024 * 1024 * 1024 || 5 * 1024 * 1024 * 1024;
+// Drives with more free space than this (GB) are healthy regardless of fill %.
+// Default 500 GB suits large media servers; lower for smaller setups.
+const MIN_FREE_DRIVE_GB = parseInt(process.env.SYSTEM_STATUS_MIN_FREE_DISK_GB, 10) || 500;
+
+// Filesystem types that are Docker/OS infrastructure, not real storage
+const EXCLUDE_FS_TYPES = new Set(
+  (process.env.SYSTEM_STATUS_DISK_EXCLUDE_TYPES ||
+    'overlay,squashfs,tmpfs,devtmpfs,devfs,proc,sysfs,cgroup,cgroup2,nsfs,aufs')
+    .split(',').map(t => t.trim())
+);
+
+// Docker bind-mounts individual config files from the host — same underlying
+// device as the overlay root but appear as separate ext4 entries in df output
+const CONTAINER_CONFIG_MOUNTS = new Set(['/etc/hostname', '/etc/hosts', '/etc/resolv.conf']);
+
+/**
+ * Returns only real storage drives, excluding Docker/OS virtual filesystems
+ * and deduplicating storage pools mounted at multiple paths (e.g. mergerfs).
+ */
+function getRelevantDrives(fsSize) {
+  const seen = new Set();
+  return fsSize.filter(drive => {
+    if (EXCLUDE_FS_TYPES.has(drive.type)) return false;
+    if (CONTAINER_CONFIG_MOUNTS.has(drive.mount)) return false;
+    if (!drive.size || drive.size === 0) return false;
+    if (seen.has(drive.fs)) return false; // deduplicate same pool at multiple mounts
+    seen.add(drive.fs);
+    return true;
+  });
+}
 
 if (isDebugMode) {
   logger.debug(`System status monitoring: CPU=${MONITOR_CPU}, Memory=${MONITOR_MEMORY}, Disk=${MONITOR_DISK}`);
   logger.debug(`System status thresholds: ${JSON.stringify(THRESHOLDS)}`);
-  logger.debug(`Minimum free disk space: ${formatBytes(MIN_FREE_DISK_SPACE)}`);
+  logger.debug(`Minimum free drive space: ${MIN_FREE_DRIVE_GB} GB`);
 }
 
 // Track active system incidents
@@ -486,49 +514,65 @@ async function refreshSystemStatus() {
   // Calculate memory usage percentage
   const memUsagePercent = (mem.used / mem.total) * 100;
 
-  // Calculate overall disk usage percentage (average across all drives)
-  const diskUsagePercent = fsSize.length > 0 ?
-    fsSize.reduce((sum, drive) => sum + (drive.used / drive.size) * 100, 0) / fsSize.length :
-    0;
+  // Filter to real storage drives only (excludes overlay, Docker bind-mounts, deduplicates mergerfs pools)
+  const relevantDrives = getRelevantDrives(fsSize);
+
+  // Average % across real drives — informational only, not used for threshold checks
+  const diskUsagePercent = relevantDrives.length > 0
+    ? relevantDrives.reduce((sum, d) => sum + (d.used / d.size) * 100, 0) / relevantDrives.length
+    : 0;
 
   // Calculate CPU utilization (average across all cores)
   const cpuUsagePercent = currentLoad.currentLoad;
 
-  // Determine system status based on thresholds
+  // A drive is only "concerning" when BOTH its fill % is high AND it has little free space.
+  // This prevents large media volumes (e.g. 87% full, 5 TB free) from falsely alerting.
+  const levelOrder = { normal: 0, elevated: 1, heavy: 2, critical: 3 };
+  const getDriveLevel = (drive) => {
+    if (!MONITOR_DISK) return 'normal';
+    const freeGB = drive.available / (1024 * 1024 * 1024);
+    if (freeGB >= MIN_FREE_DRIVE_GB) return 'normal';
+    if (drive.use >= THRESHOLDS.critical.disk) return 'critical';
+    if (drive.use >= THRESHOLDS.heavy.disk) return 'heavy';
+    if (drive.use >= THRESHOLDS.elevated.disk) return 'elevated';
+    return 'normal';
+  };
+
+  const worstDrive = relevantDrives.length > 0
+    ? relevantDrives.reduce((w, d) =>
+        levelOrder[getDriveLevel(d)] > levelOrder[getDriveLevel(w)] ? d : w,
+        relevantDrives[0])
+    : null;
+  const worstDriveLevel = worstDrive ? getDriveLevel(worstDrive) : 'normal';
+
+  // Determine overall status
   let status = 'normal';
   let message = 'System is operating normally.';
 
-  // Determine status based on the highest resource usage (only for enabled monitors)
-  const criticalConditions = [
-    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.critical.cpu,
-    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.critical.memory,
-    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.critical.disk
-  ].filter(Boolean);
-  
-  const heavyConditions = [
-    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.heavy.cpu,
-    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.heavy.memory,
-    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.heavy.disk
-  ].filter(Boolean);
-  
-  const elevatedConditions = [
-    MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.elevated.cpu,
-    MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.elevated.memory,
-    MONITOR_DISK && diskUsagePercent >= THRESHOLDS.elevated.disk
-  ].filter(Boolean);
-  
-  if (criticalConditions.length > 0) {
+  if (
+    (MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.critical.cpu) ||
+    (MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.critical.memory) ||
+    worstDriveLevel === 'critical'
+  ) {
     status = 'critical';
     message = 'System resources are critically constrained. User experience will be degraded.';
-  } else if (heavyConditions.length > 0) {
+  } else if (
+    (MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.heavy.cpu) ||
+    (MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.heavy.memory) ||
+    worstDriveLevel === 'heavy'
+  ) {
     status = 'heavy';
     message = 'System is under heavy load. User experience may be affected.';
-  } else if (elevatedConditions.length > 0) {
+  } else if (
+    (MONITOR_CPU && cpuUsagePercent >= THRESHOLDS.elevated.cpu) ||
+    (MONITOR_MEMORY && memUsagePercent >= THRESHOLDS.elevated.memory) ||
+    worstDriveLevel === 'elevated'
+  ) {
     status = 'elevated';
     message = 'System is under moderate load but operating normally.';
   }
 
-  // Add detail to the message for debugging
+  // Build detailed message
   let detailedMessage = message;
   if (status !== 'normal') {
     const highestUtilization = [
@@ -536,31 +580,18 @@ async function refreshSystemStatus() {
       { name: 'Memory', value: memUsagePercent },
       { name: 'Disk', value: diskUsagePercent }
     ].sort((a, b) => b.value - a.value)[0];
-    
     detailedMessage += ` The ${highestUtilization.name} utilization is at ${highestUtilization.value.toFixed(1)}%.`;
   }
 
-  // Calculate total and free disk space
-  const totalDiskSpace = fsSize.reduce((sum, drive) => sum + drive.size, 0);
-  const freeDiskSpace = fsSize.reduce((sum, drive) => sum + drive.available, 0);
-  
-  // Check for critically low absolute free space (if disk monitoring is enabled)
-  const criticallyLowSpace = MONITOR_DISK && freeDiskSpace < MIN_FREE_DISK_SPACE;
-  if (criticallyLowSpace && status !== 'critical') {
-    status = 'critical';
-    detailedMessage = `Critical disk space issue. Only ${formatBytes(freeDiskSpace)} available across all drives.`;
+  // Add drive details only when a drive is actually concerning (low free space + high %)
+  if (worstDrive && worstDriveLevel !== 'normal') {
+    const freeGB = (worstDrive.available / (1024 * 1024 * 1024)).toFixed(1);
+    detailedMessage += ` Drive ${worstDrive.mount} is at ${worstDrive.use.toFixed(1)}% capacity with ${freeGB} GB free.`;
   }
-  
-  // Find the most constrained drive
-  const worstDrive = fsSize.length > 0 ?
-    [...fsSize].sort((a, b) => b.use - a.use)[0] : null;
-  
-  // Add drive-specific details to message if space is an issue
-  if (status !== 'normal' && diskUsagePercent >= THRESHOLDS.elevated.disk && worstDrive) {
-    if (!detailedMessage.includes('disk')) {
-      detailedMessage += ` Drive ${worstDrive.mount} is at ${worstDrive.use.toFixed(1)}% capacity with ${formatBytes(worstDrive.available)} free.`;
-    }
-  }
+
+  // Aggregate totals from relevant drives (for informational display)
+  const totalDiskSpace = relevantDrives.reduce((sum, d) => sum + d.size, 0);
+  const freeDiskSpace = relevantDrives.reduce((sum, d) => sum + d.available, 0);
   
   // Prepare system status object
   const systemStatus = {
@@ -590,7 +621,7 @@ async function refreshSystemStatus() {
           write_wait_percent: disksIO.wWaitPercent ? disksIO.wWaitPercent.toFixed(1) : '0.0',
           total_wait_percent: disksIO.tWaitPercent ? disksIO.tWaitPercent.toFixed(1) : '0.0'
         } : null,
-        drives: fsSize.map(drive => ({
+        drives: relevantDrives.map(drive => ({
           fs: drive.fs,
           type: drive.type,
           mount: drive.mount,

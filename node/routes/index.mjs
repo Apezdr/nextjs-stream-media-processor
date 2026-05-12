@@ -1,4 +1,5 @@
 import express from 'express';
+import { telemetryMiddleware, telemetryErrorMiddleware } from '../middleware/telemetryMiddleware.mjs';
 import { setupBlurhashRoutes } from './blurhash.mjs';
 import { setupMetadataHashesRoutes } from './metadataHashes.mjs';
 import { setupSystemStatusRoutes } from './systemStatus.mjs';
@@ -13,6 +14,9 @@ import { setupDiscordRoutes } from '../integrations/discord/routes.mjs';
 export function setupRoutes() {
   const router = express.Router();
   
+  // Add OpenTelemetry middleware for all routes
+  router.use(telemetryMiddleware());
+  
   // Mount route modules
   router.use('/api', setupBlurhashRoutes());
   router.use('/api', setupMetadataHashesRoutes());
@@ -25,6 +29,12 @@ export function setupRoutes() {
   // Debug logging to verify routes are mounted
   console.log('[Routes] Mounted: /api/blurhash, /api/metadata-hashes, /api/system-status');
   console.log('[Routes] Mounted: /api/tmdb/*, /api/admin/*, /api/discord');
+  if (process.env.OTEL_ENABLED?.toLowerCase() === 'true') {
+    console.log('[Telemetry] Added OpenTelemetry tracing middleware');
+  }
+
+  // Error middleware must be added last
+  router.use(telemetryErrorMiddleware());
   
   return router;
 }
