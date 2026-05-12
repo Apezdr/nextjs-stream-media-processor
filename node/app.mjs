@@ -37,6 +37,7 @@ import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
+import { langMap } from "./utils/languageMap.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
 const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
@@ -214,87 +215,6 @@ app.use(configureCORS());
 app.use(express.json({ limit: '30mb' }));
 
 ensureCacheDirs();
-
-const langMap = {
-  en: "English",
-  eng: "English",
-  es: "Spanish",
-  spa: "Spanish",
-  tl: "Tagalog",
-  tgl: "Tagalog",
-  zh: "Chinese",
-  zho: "Chinese",
-  cs: "Czech",
-  cze: "Czech",
-  da: "Danish",
-  dan: "Danish",
-  nl: "Dutch",
-  dut: "Dutch",
-  fi: "Finnish",
-  fin: "Finnish",
-  fr: "French",
-  fre: "French",
-  de: "German",
-  ger: "German",
-  el: "Greek",
-  gre: "Greek",
-  hu: "Hungarian",
-  hun: "Hungarian",
-  it: "Italian",
-  ita: "Italian",
-  ja: "Japanese",
-  jpn: "Japanese",
-  ko: "Korean",
-  kor: "Korean",
-  no: "Norwegian",
-  nor: "Norwegian",
-  pl: "Polish",
-  pol: "Polish",
-  pt: "Portuguese",
-  por: "Portuguese",
-  ro: "Romanian",
-  ron: "Romanian",
-  rum: "Romanian",
-  sk: "Slovak",
-  slo: "Slovak",
-  sv: "Swedish",
-  swe: "Swedish",
-  tr: "Turkish",
-  tur: "Turkish",
-  ara: "Arabic",
-  bul: "Bulgarian",
-  chi: "Chinese",
-  est: "Estonian",
-  fin: "Finnish",
-  fre: "French",
-  ger: "German",
-  gre: "Greek",
-  heb: "Hebrew",
-  hin: "Hindi",
-  hun: "Hungarian",
-  ind: "Indonesian",
-  ita: "Italian",
-  jpn: "Japanese",
-  kor: "Korean",
-  lav: "Latvian",
-  lit: "Lithuanian",
-  may: "Malay",
-  nor: "Norwegian",
-  pol: "Polish",
-  por: "Portuguese",
-  rus: "Russian",
-  slo: "Slovak",
-  slv: "Slovenian",
-  spa: "Spanish",
-  swe: "Swedish",
-  tam: "Tamil",
-  tel: "Telugu",
-  tha: "Thai",
-  tur: "Turkish",
-  ukr: "Ukrainian",
-  vie: "Vietnamese",
-};
-
 
 app.get("/frame/movie/:movieName/:timestamp{.:ext}", (req, res) =>
   handleFrameRequest(req, res, "movies")

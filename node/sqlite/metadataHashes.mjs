@@ -626,3 +626,21 @@ export async function updateAllTVShowHashes(sinceTimestamp = null) {
     logger.error(`Error updating TV show hashes: ${error.message}`);
   }
 }
+
+/**
+ * Delete all metadata hash rows for a media item.
+ * Call this when the scanner detects a directory change so the next scheduled
+ * hash update regenerates fresh hashes for that item.
+ * @param {Object} db - SQLite database connection
+ * @param {string} mediaType - 'movies' or 'tv'
+ * @param {string} title - Movie or TV show title
+ */
+export async function deleteHashesForMedia(db, mediaType, title) {
+  await withRetry(() =>
+    db.run(
+      `DELETE FROM metadata_hashes WHERE media_type = ? AND title = ?`,
+      [mediaType, title]
+    )
+  );
+  logger.debug(`Invalidated metadata hashes for ${mediaType}/${title}`);
+}

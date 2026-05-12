@@ -8,6 +8,7 @@ import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
 import { sessionManager } from '../middleware/sessionCache.mjs';
+import { getLanguageCode } from '../utils/languageMap.mjs';
 
 const logger = createCategoryLogger('admin-routes');
 
@@ -536,116 +537,6 @@ router.get('/metadata/test', authenticateUser, requireAdmin, async (req, res) =>
         });
     }
 });
-
-/**
- * Gets a language code from a language name
- * @param {string} languageName - Full language name (e.g. "English", "Spanish")
- * @returns {string|null} - ISO 639-1 (2-character) language code or null if not found
- */
-function getLanguageCode(languageName) {
-    // Strip variant suffixes ("Hearing Impaired", " - Auto Generated") so the
-    // base name (e.g. "English") looks up cleanly in langMap. Order doesn't
-    // matter — both regexes are anchored to end-of-string and stripped iteratively.
-    const cleanName = languageName
-        .replace(/\s*-\s*auto\s+generated\s*$/i, '')
-        .replace(/\s+hearing\s+impaired\s*$/i, '')
-        .trim();
-    
-    // Use same language mapping as in app.mjs but create a reverse mapping to 2-character codes
-    const langMap = {
-        en: "English",
-        eng: "English",
-        es: "Spanish",
-        spa: "Spanish",
-        tl: "Tagalog",
-        tgl: "Tagalog",
-        zh: "Chinese",
-        zho: "Chinese",
-        cs: "Czech",
-        cze: "Czech",
-        da: "Danish",
-        dan: "Danish",
-        nl: "Dutch",
-        dut: "Dutch",
-        fi: "Finnish",
-        fin: "Finnish",
-        fr: "French",
-        fre: "French",
-        de: "German",
-        ger: "German",
-        el: "Greek",
-        gre: "Greek",
-        hu: "Hungarian",
-        hun: "Hungarian",
-        it: "Italian",
-        ita: "Italian",
-        ja: "Japanese",
-        jpn: "Japanese",
-        ko: "Korean",
-        kor: "Korean",
-        no: "Norwegian",
-        nor: "Norwegian",
-        pl: "Polish",
-        pol: "Polish",
-        pt: "Portuguese",
-        por: "Portuguese",
-        ro: "Romanian",
-        ron: "Romanian",
-        rum: "Romanian",
-        sk: "Slovak",
-        slo: "Slovak",
-        sv: "Swedish",
-        swe: "Swedish",
-        tr: "Turkish",
-        tur: "Turkish",
-        ar: "Arabic",
-        ara: "Arabic",
-        bg: "Bulgarian",
-        bul: "Bulgarian",
-        chi: "Chinese",
-        et: "Estonian",
-        est: "Estonian",
-        he: "Hebrew",
-        heb: "Hebrew",
-        hi: "Hindi",
-        hin: "Hindi",
-        id: "Indonesian",
-        ind: "Indonesian",
-        lv: "Latvian",
-        lav: "Latvian",
-        lt: "Lithuanian",
-        lit: "Lithuanian",
-        ms: "Malay",
-        may: "Malay",
-        ru: "Russian",
-        rus: "Russian",
-        sl: "Slovenian",
-        slv: "Slovenian",
-        ta: "Tamil",
-        tam: "Tamil",
-        te: "Telugu",
-        tel: "Telugu",
-        th: "Thai",
-        tha: "Thai",
-        uk: "Ukrainian",
-        ukr: "Ukrainian",
-        vi: "Vietnamese",
-        vie: "Vietnamese",
-    };
-    
-    // Create a reverse mapping from language names to 2-character codes
-    const reverseMap = {};
-    
-    // Populate the reverse map - prioritize 2-character codes
-    for (const [code, name] of Object.entries(langMap)) {
-        // Only use 2-character codes for the reverse mapping
-        if (code.length === 2) {
-            reverseMap[name.toLowerCase()] = code;
-        }
-    }
-    
-    return reverseMap[cleanName.toLowerCase()] || null;
-}
 
 /**
  * Converts WebVTT format to SRT format

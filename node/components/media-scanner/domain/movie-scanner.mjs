@@ -19,6 +19,7 @@ import {
   markMediaAsMissingData,
   getDatabaseInstance
 } from '../data-access/scanner-repository.mjs';
+import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
 
@@ -461,6 +462,20 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         logoFilePath,
         basePath
       );
+
+      // Immediately regenerate the metadata hash using the fresh data just saved.
+      // The scheduled hash job filters by mp4 mtime and would miss changes where
+      // only tmdb.config or images changed, so we generate here to avoid the gap.
+      if (dirHashChanged) {
+        await generateMovieHashes(db, {
+          _id,
+          name: dirName,
+          urls,
+          hdr: videoData.hdrInfo,
+          mediaQuality: videoData.mediaQuality,
+          metadataUrl: urls.metadata || '',
+        });
+      }
     })
   );
 

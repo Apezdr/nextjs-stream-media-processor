@@ -21,6 +21,8 @@ import {
   removeTVShow,
   markMediaAsMissingData
 } from '../data-access/scanner-repository.mjs';
+import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
+import { getTVShowByName } from '../../../sqliteDatabase.mjs';
 
 const logger = createCategoryLogger('tv-scanner');
 
@@ -564,6 +566,16 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         basePath,
         finalHash
       );
+
+      // Immediately regenerate the metadata hash using the fresh data just saved.
+      // The scheduled hash job filters by episode mtime and would miss changes where
+      // only tmdb.config or images changed, so we generate here to avoid the gap.
+      if (storedHash) {
+        const freshShow = await getTVShowByName(showName);
+        if (freshShow) {
+          await generateTVShowHashes(db, freshShow);
+        }
+      }
     }
 
     // Remove TV shows from the database that no longer exist in the file system
