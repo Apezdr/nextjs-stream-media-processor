@@ -1,0 +1,11 @@
+[
+  { "file": "backdrop (7).jpg",        "expectedFocal": "center", "notes": "Man in robe centered in window frame; luminance asymmetry misleads luma alone" },
+  { "file": "backdrop (8).jpg",        "expectedFocal": "center", "notes": "Person in porthole, clearly centered" },
+  { "file": "backdrop (9).jpg",        "expectedFocal": "center", "notes": "Woman at desk, roughly centered; dark right edge misleads luma alone" },
+  { "file": "backdrop (10).jpg",       "expectedFocal": "center",       "notes": "Man on horse; luma says left but face centroid is only slightly left-of-centre — call it center" },
+  { "file": "backdrop (11).jpg",       "expectedFocal": "center-right", "notes": "Ensemble cast with train; luma=center, face centroid right-of-centre" },
+  { "file": "backdrop (12).jpg",       "expectedFocal": "right",  "notes": "Pinhead on right, dark void on left" },
+  { "file": "show_backdrop.jpg",       "expectedFocal": "center-right", "notes": "South Park ensemble; luma=left (bright wall), face centroid clearly right-of-centre — yields center-right" },
+  { "file": "show_backdrop (1).jpg",   "expectedFocal": "center", "notes": "The Expanse ensemble cast, broadly centered" },
+  { "file": "show_backdrop (2).jpg",   "expectedFocal": "center", "notes": "Fired on Mars character at desk, roughly centered; luma correctly returns center" }
+]

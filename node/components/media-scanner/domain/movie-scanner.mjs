@@ -20,6 +20,8 @@ import {
   getDatabaseInstance
 } from '../data-access/scanner-repository.mjs';
 import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
+import { loadTmdbConfig } from '../../../utils/tmdbConfig.mjs';
+import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
 
@@ -377,8 +379,10 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         tmdbConfigLastModified = await getLastModifiedTime(tmdbConfigPath);
       }
 
-      // Extract TMDB ID
-      let _id = await extractTMDBId(tmdbConfigPath);
+      // Extract TMDB ID and manual focal override from config
+      const tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      let _id = tmdbConfig.tmdb_id ? `tmdb_${tmdbConfig.tmdb_id}` : null;
+      const manualFocal = tmdbConfig.backdrop_focal ?? null;
 
       // Check if TMDB images need to be downloaded
       runDownloadTmdbImagesFlag = await checkTMDBImagesNeeded(
@@ -444,6 +448,9 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         ? join(dirPath, dirName, 'movie_logo.png')
         : (fileSet.has('logo.png') ? join(dirPath, dirName, 'logo.png') : null);
 
+      // Auto-detect backdrop focal point
+      const backdropFocalSuggested = backdropFilePath ? await detectBackdropFocal(backdropFilePath) : null;
+
       // Save to database
       await saveMovie(
         dirName,
@@ -460,7 +467,9 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         posterFilePath,
         backdropFilePath,
         logoFilePath,
-        basePath
+        basePath,
+        manualFocal,
+        backdropFocalSuggested
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

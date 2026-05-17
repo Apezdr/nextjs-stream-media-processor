@@ -764,6 +764,8 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
         backdrop: show.backdrop,
         backdropBlurhash: show.backdropBlurhash,
         seasons: show.seasons,
+        backdropFocal: show.backdropFocal ?? null,
+        backdropFocalSuggested: show.backdropFocalSuggested ?? null,
       };
       return acc;
     }, {});
@@ -820,6 +822,8 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
         hdr: movie.hdr,
         mediaQuality: movie.mediaQuality,
         additional_metadata: movie.additional_metadata,
+        backdropFocal: movie.backdropFocal ?? null,
+        backdropFocalSuggested: movie.backdropFocalSuggested ?? null,
       };
       return acc;
     }, {});

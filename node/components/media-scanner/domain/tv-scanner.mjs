@@ -23,6 +23,8 @@ import {
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
+import { loadTmdbConfig, getTmdbConfigFilePath } from '../../../utils/tmdbConfig.mjs';
+import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
 
 const logger = createCategoryLogger('tv-scanner');
 
@@ -548,6 +550,12 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // Calculate final directory hash after all processing (files may have been created)
       const finalHash = await calculateDirectoryHash(showPath);
 
+      // Load tmdb.config for manual focal override; auto-detect from backdrop
+      const tmdbConfigPath = getTmdbConfigFilePath(showPath);
+      const tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      const manualFocal = tmdbConfig.backdrop_focal ?? null;
+      const backdropFocalSuggested = backdropFilePath ? await detectBackdropFocal(backdropFilePath) : null;
+
       // Save to database
       await saveTVShow(
         showName,
@@ -564,7 +572,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         backdropFilePath,
         logoFilePath,
         basePath,
-        finalHash
+        finalHash,
+        manualFocal,
+        backdropFocalSuggested
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

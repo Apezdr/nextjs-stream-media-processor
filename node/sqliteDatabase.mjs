@@ -127,7 +127,9 @@ async function initializeSchema(dbType, db) {
         backdrop_hash TEXT,
         backdrop_mtime INTEGER,
         logo_hash TEXT,
-        logo_mtime INTEGER
+        logo_mtime INTEGER,
+        backdrop_focal TEXT,
+        backdrop_focal_suggested TEXT
       );
     `);
 
@@ -154,7 +156,9 @@ async function initializeSchema(dbType, db) {
         backdrop_hash TEXT,
         backdrop_mtime INTEGER,
         logo_hash TEXT,
-        logo_mtime INTEGER
+        logo_mtime INTEGER,
+        backdrop_focal TEXT,
+        backdrop_focal_suggested TEXT
       );
     `);
 
@@ -168,6 +172,7 @@ async function initializeSchema(dbType, db) {
 
     // MIGRATE EXISTING DATABASES: Add hash columns if they don't exist
     await migrateToHashColumns(db);
+    await migrateToFocalColumns(db);
 
     // Add unique indexes for UPSERT operations
     await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_movies_name ON movies(name);`);
@@ -220,6 +225,26 @@ async function initializeSchema(dbType, db) {
 
   if (dbType === "discordIntros") {
     await initializeDiscordIntrosTable(db);
+  }
+}
+
+/**
+ * Migration function to add backdrop focal columns to existing databases
+ * Safe to run multiple times - ignores duplicate column name errors
+ */
+async function migrateToFocalColumns(db) {
+  const columns = [
+    ['movies',   'backdrop_focal TEXT'],
+    ['movies',   'backdrop_focal_suggested TEXT'],
+    ['tv_shows', 'backdrop_focal TEXT'],
+    ['tv_shows', 'backdrop_focal_suggested TEXT'],
+  ];
+  for (const [table, col] of columns) {
+    try {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
+    } catch (err) {
+      if (!err.message.includes('duplicate column name')) throw err;
+    }
   }
 }
 
@@ -699,7 +724,9 @@ export async function getTVShows() {
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
         logoFilePath: show.logo_file_path,
-        basePath: show.base_path
+        basePath: show.base_path,
+        backdropFocal: show.backdrop_focal ?? null,
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
       };
     });
     
@@ -757,7 +784,9 @@ export async function getMovies() {
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
-        basePath: movie.base_path
+        basePath: movie.base_path,
+        backdropFocal: movie.backdrop_focal ?? null,
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
       };
     });
     
@@ -812,7 +841,9 @@ export async function getMovieById(id) {
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
-        basePath: movie.base_path
+        basePath: movie.base_path,
+        backdropFocal: movie.backdrop_focal ?? null,
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
       };
     }
     return null;
@@ -855,7 +886,9 @@ export async function getMovieByName(name) {
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
-        basePath: movie.base_path
+        basePath: movie.base_path,
+        backdropFocal: movie.backdrop_focal ?? null,
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
       };
     }
     return null;
@@ -894,7 +927,9 @@ export async function getTVShowById(id) {
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
         logoFilePath: show.logo_file_path,
-        basePath: show.base_path
+        basePath: show.base_path,
+        backdropFocal: show.backdrop_focal ?? null,
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
       };
     }
     return null;
@@ -933,7 +968,9 @@ export async function getTVShowByName(name) {
         posterFilePath: show.poster_file_path,
         backdropFilePath: show.backdrop_file_path,
         logoFilePath: show.logo_file_path,
-        basePath: show.base_path
+        basePath: show.base_path,
+        backdropFocal: show.backdrop_focal ?? null,
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
       };
     }
     return null;
@@ -981,7 +1018,9 @@ export async function insertOrUpdateTVShow(
   backdropFilePath = null,
   logoFilePath = null,
   basePath = null,
-  directoryHash = null
+  directoryHash = null,
+  backdropFocal = null,
+  backdropFocalSuggested = null
 ) {
   return withWriteTx("main", async (db) => {
     // Get current cached values for comparison (if updating existing TV show)
@@ -1003,8 +1042,8 @@ export async function insertOrUpdateTVShow(
           backdrop, backdropBlurhash, seasons,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
-          directory_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          directory_hash, backdrop_focal, backdrop_focal_suggested
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -1025,12 +1064,14 @@ export async function insertOrUpdateTVShow(
           backdrop_mtime=excluded.backdrop_mtime,
           logo_hash=excluded.logo_hash,
           logo_mtime=excluded.logo_mtime,
-          directory_hash=excluded.directory_hash`,
+          directory_hash=excluded.directory_hash,
+          backdrop_focal=excluded.backdrop_focal,
+          backdrop_focal_suggested=excluded.backdrop_focal_suggested`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
           posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
-          directoryHash
+          directoryHash, backdropFocal, backdropFocalSuggested
         ]
       )
     );
@@ -1052,7 +1093,9 @@ export async function insertOrUpdateMovie(
   posterFilePath = null,
   backdropFilePath = null,
   logoFilePath = null,
-  basePath = null
+  basePath = null,
+  backdropFocal = null,
+  backdropFocalSuggested = null
 ) {
   return withWriteTx("main", async (db) => {
     // Get current cached values for comparison (if updating existing movie)
@@ -1094,8 +1137,9 @@ export async function insertOrUpdateMovie(
           name, file_names, lengths, dimensions, urls, metadata_url, directory_hash, 
           hdr, media_quality, additional_metadata, _id,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
-          poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
+          backdrop_focal, backdrop_focal_suggested
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           file_names=excluded.file_names,
           lengths=excluded.lengths,
@@ -1116,8 +1160,11 @@ export async function insertOrUpdateMovie(
           backdrop_hash=excluded.backdrop_hash,
           backdrop_mtime=excluded.backdrop_mtime,
           logo_hash=excluded.logo_hash,
-          logo_mtime=excluded.logo_mtime
-        WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash`,
+          logo_mtime=excluded.logo_mtime,
+          backdrop_focal=excluded.backdrop_focal,
+          backdrop_focal_suggested=excluded.backdrop_focal_suggested
+        WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
+        OR movies.backdrop_focal_suggested IS NULL`,
         [
           name,
           movie.file_names,
@@ -1139,7 +1186,9 @@ export async function insertOrUpdateMovie(
           backdropHash.hash,
           backdropHash.mtime,
           logoHash.hash,
-          logoHash.mtime
+          logoHash.mtime,
+          backdropFocal,
+          backdropFocalSuggested
         ]
       )
     );

@@ -118,6 +118,12 @@ export function validateTmdbConfig(config) {
     logger.warn(`Invalid update_metadata value: ${validated.update_metadata}, defaulting to true`);
     validated.update_metadata = true;
   }
+
+  const validFocalValues = ['left', 'right', 'center', null];
+  if (!validFocalValues.includes(validated.backdrop_focal)) {
+    logger.warn(`Invalid backdrop_focal value: ${validated.backdrop_focal}, defaulting to null`);
+    validated.backdrop_focal = null;
+  }
   
   return validated;
 }
@@ -128,7 +134,8 @@ export function validateTmdbConfig(config) {
  */
 function createDefaultConfig() {
   return {
-    update_metadata: true
+    update_metadata: true,
+    backdrop_focal: null
   };
 }
 

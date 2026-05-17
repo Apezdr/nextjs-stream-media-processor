@@ -19,6 +19,17 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@opentelemetry/auto-instrumentations-node": "^0.72.0",
+    "@opentelemetry/exporter-metrics-otlp-grpc": "^0.214.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": "^0.214.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.214.0",
+    "@opentelemetry/instrumentation": "^0.214.0",
+    "@opentelemetry/resources": "^2.6.1",
+    "@opentelemetry/sdk-node": "^0.214.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@vladmandic/face-api": "^1.7.15",
     "axios": "^1.13.2",
     "better-auth": "^1.5.5",
     "blurhash": "^2.0.5",
@@ -40,15 +51,7 @@
     "sqlite3": "^5.1.7",
     "systeminformation": "^5.30.2",
     "winston": "^3.19.0",
-    "winston-daily-rotate-file": "^5.0.0",
-    "@opentelemetry/sdk-node": "^0.214.0",
-    "@opentelemetry/auto-instrumentations-node": "^0.72.0",
-    "@opentelemetry/exporter-trace-otlp-grpc": "^0.214.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.214.0",
-    "@opentelemetry/exporter-metrics-otlp-grpc": "^0.214.0",
-    "@opentelemetry/instrumentation": "^0.214.0",
-    "@opentelemetry/resources": "^2.6.1",
-    "@opentelemetry/semantic-conventions": "^1.40.0"
+    "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
     "@jest/globals": "^29.7.0",
@@ -73,6 +76,7 @@
       "/db/",
       "/cache/"
     ],
-    "testTimeout": 10000
+    "testTimeout": 30000
   }
 }
+
