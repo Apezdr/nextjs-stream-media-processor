@@ -75,6 +75,10 @@ tmpclaude-*
 # Cache for Node
 node/cache
 
+# Whisper.cpp model files (downloaded lazily on first use; >100 MB each)
+whisper-models/
+node/whisper-models/
+
 # AI model files
 /cline_docs
 /.roo

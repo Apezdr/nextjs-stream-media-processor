@@ -1,0 +1,42 @@
+# =============================================================================
+# Dockerfile.cuda — STUB / NOT YET IMPLEMENTED
+# =============================================================================
+#
+# Builds the processor with whisper.cpp's CUDA backend for NVIDIA GPUs.
+# Expected speedup: ~10-30x over CPU on a typical desktop NVIDIA card.
+#
+# This is intentionally a stub. The CUDA path requires switching the base
+# image from `node:25.2.1-alpine` to an NVIDIA-CUDA-bearing image (e.g.
+# `nvidia/cuda:12-runtime-ubuntu22.04`), which means:
+#   - apt-get instead of apk (different package names + repo setup)
+#   - Node.js installed manually via NodeSource (not preinstalled in CUDA images)
+#   - No reuse of the existing alpine builder/testing/production stages
+#
+# Build (when implemented):
+#   docker build -f Dockerfile.cuda -t <repo>:<tag>-cuda .
+#
+# Run (host needs NVIDIA Container Toolkit installed):
+#   docker run --gpus all -e ... <repo>:<tag>-cuda
+#   # or in compose:
+#   #   deploy:
+#   #     resources:
+#   #       reservations:
+#   #         devices:
+#   #           - driver: nvidia
+#   #             count: all
+#   #             capabilities: [gpu]
+#
+# When implemented, the cmake build in the builder stage should pass:
+#   -DGGML_CUDA=ON
+# and the production stage env should set:
+#   ENV WHISPER_GPU_BACKEND=cuda
+# so /api/captions/health reports the active backend.
+#
+# Until then, build.ps1 -Variant cuda will exit early with a friendly error.
+# =============================================================================
+
+# Placeholder FROM so this file is at least syntactically valid Dockerfile.
+# Replace the entire file when implementing CUDA support.
+FROM scratch
+LABEL stub="true"
+LABEL purpose="CUDA build target — see header comment for implementation plan"

@@ -86,7 +86,9 @@ export async function saveMovie(
   posterFilePath,
   backdropFilePath,
   logoFilePath,
-  basePath
+  basePath,
+  backdropFocal = null,
+  backdropFocalSuggested = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -103,7 +105,9 @@ export async function saveMovie(
     posterFilePath,
     backdropFilePath,
     logoFilePath,
-    basePath
+    basePath,
+    backdropFocal,
+    backdropFocalSuggested
   );
 }
 
@@ -141,7 +145,9 @@ export async function saveTVShow(
   backdropFilePath,
   logoFilePath,
   basePath,
-  directoryHash = null
+  directoryHash = null,
+  backdropFocal = null,
+  backdropFocalSuggested = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -158,7 +164,9 @@ export async function saveTVShow(
     backdropFilePath,
     logoFilePath,
     basePath,
-    directoryHash
+    directoryHash,
+    backdropFocal,
+    backdropFocalSuggested
   );
 }
 

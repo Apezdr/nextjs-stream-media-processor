@@ -18,6 +18,11 @@ import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
+import {
+  sweepOrphanTempFiles as sweepOrphanCaptionTempFiles,
+  injectMovieStubs,
+  injectTvStubs
+} from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
@@ -35,6 +40,7 @@ import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
+import { langMap } from "./utils/languageMap.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
 const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
@@ -212,87 +218,6 @@ app.use(configureCORS());
 app.use(express.json({ limit: '30mb' }));
 
 ensureCacheDirs();
-
-const langMap = {
-  en: "English",
-  eng: "English",
-  es: "Spanish",
-  spa: "Spanish",
-  tl: "Tagalog",
-  tgl: "Tagalog",
-  zh: "Chinese",
-  zho: "Chinese",
-  cs: "Czech",
-  cze: "Czech",
-  da: "Danish",
-  dan: "Danish",
-  nl: "Dutch",
-  dut: "Dutch",
-  fi: "Finnish",
-  fin: "Finnish",
-  fr: "French",
-  fre: "French",
-  de: "German",
-  ger: "German",
-  el: "Greek",
-  gre: "Greek",
-  hu: "Hungarian",
-  hun: "Hungarian",
-  it: "Italian",
-  ita: "Italian",
-  ja: "Japanese",
-  jpn: "Japanese",
-  ko: "Korean",
-  kor: "Korean",
-  no: "Norwegian",
-  nor: "Norwegian",
-  pl: "Polish",
-  pol: "Polish",
-  pt: "Portuguese",
-  por: "Portuguese",
-  ro: "Romanian",
-  ron: "Romanian",
-  rum: "Romanian",
-  sk: "Slovak",
-  slo: "Slovak",
-  sv: "Swedish",
-  swe: "Swedish",
-  tr: "Turkish",
-  tur: "Turkish",
-  ara: "Arabic",
-  bul: "Bulgarian",
-  chi: "Chinese",
-  est: "Estonian",
-  fin: "Finnish",
-  fre: "French",
-  ger: "German",
-  gre: "Greek",
-  heb: "Hebrew",
-  hin: "Hindi",
-  hun: "Hungarian",
-  ind: "Indonesian",
-  ita: "Italian",
-  jpn: "Japanese",
-  kor: "Korean",
-  lav: "Latvian",
-  lit: "Lithuanian",
-  may: "Malay",
-  nor: "Norwegian",
-  pol: "Polish",
-  por: "Portuguese",
-  rus: "Russian",
-  slo: "Slovak",
-  slv: "Slovenian",
-  spa: "Spanish",
-  swe: "Swedish",
-  tam: "Tamil",
-  tel: "Telugu",
-  tha: "Thai",
-  tur: "Turkish",
-  ukr: "Ukrainian",
-  vie: "Vietnamese",
-};
-
 
 app.get("/frame/movie/:movieName/:timestamp{.:ext}", (req, res) =>
   handleFrameRequest(req, res, "movies")
@@ -826,6 +751,9 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
     const shows = await getTVShows();
     await releaseDatabase(db);
 
+    // Read-time injection of auto-caption stubs.
+    await injectTvStubs(shows, langMap);
+
     const tvData = shows.reduce((acc, show) => {
       acc[show.name] = {
         metadata: show.metadata_path,
@@ -836,6 +764,8 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
         backdrop: show.backdrop,
         backdropBlurhash: show.backdropBlurhash,
         seasons: show.seasons,
+        backdropFocal: show.backdropFocal ?? null,
+        backdropFocalSuggested: show.backdropFocalSuggested ?? null,
       };
       return acc;
     }, {});
@@ -878,6 +808,10 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
     const movies = await getMovies();
     await releaseDatabase(db);
 
+    // Read-time injection of auto-caption stubs (no rescan needed when the
+    // autoCaptions flag or language list changes).
+    await injectMovieStubs(movies, langMap);
+
     const movieData = movies.reduce((acc, movie) => {
       acc[movie.name] = {
         _id: movie._id,
@@ -888,6 +822,8 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
         hdr: movie.hdr,
         mediaQuality: movie.mediaQuality,
         additional_metadata: movie.additional_metadata,
+        backdropFocal: movie.backdropFocal ?? null,
+        backdropFocalSuggested: movie.backdropFocalSuggested ?? null,
       };
       return acc;
     }, {});
@@ -1412,6 +1348,8 @@ async function initialize() {
       });
     runGenerateList().catch(logger.error);
     runGeneratePosterCollage().catch(logger.error);
+    // Sweep stale caption-generator temp files left behind by interrupted jobs
+    sweepOrphanCaptionTempFiles().catch(err => logger.error(`Caption temp sweep failed: ${err.message}`));
   });
 }
 

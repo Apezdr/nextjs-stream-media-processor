@@ -365,8 +365,9 @@ router.post('/trigger-system-status', authenticateWebhookOrUser, async (req, res
       getDiskIOMetrics() // Add disk I/O metrics to the trigger endpoint
     ]);
     
-    // Basic calculations
-    const memUsagePercent = (mem.used / mem.total) * 100;
+    // Basic calculations — same MemAvailable-based math as refreshSystemStatus.
+    const memActuallyUsed = mem.total - (mem.available ?? mem.free);
+    const memUsagePercent = (memActuallyUsed / mem.total) * 100;
     const diskUsagePercent = fsSize.length > 0 ?
       fsSize.reduce((sum, drive) => sum + (drive.used / drive.size) * 100, 0) / fsSize.length : 0;
     const cpuUsagePercent = currentLoad.currentLoad;
@@ -384,11 +385,11 @@ router.post('/trigger-system-status', authenticateWebhookOrUser, async (req, res
           usage: cpuUsagePercent.toFixed(1),
           cores: cpu.cores 
         },
-        memory: { 
+        memory: {
           usage: memUsagePercent.toFixed(1),
           total: formatBytes(mem.total),
-          free: formatBytes(mem.free),
-          used: formatBytes(mem.used)
+          free: formatBytes(mem.available ?? mem.free),
+          used: formatBytes(memActuallyUsed)
         },
         disk: {
           usage: diskUsagePercent.toFixed(1),
@@ -511,8 +512,14 @@ async function refreshSystemStatus() {
     (await si.currentLoad()).avgLoad :
     [0, 0, 0];
 
-  // Calculate memory usage percentage
-  const memUsagePercent = (mem.used / mem.total) * 100;
+  // Calculate memory usage percentage using MemAvailable equivalent.
+  // si.mem().used is `total - free` (includes reclaimable page cache),
+  // which on a Linux file server with a warm disk cache routinely reports
+  // 90%+ "used" while plenty of memory is actually available for processes.
+  // (mem.total - mem.available) matches kernel MemAvailable, the number
+  // `free -h` shows under the "available" column.
+  const memActuallyUsed = mem.total - (mem.available ?? mem.free);
+  const memUsagePercent = (memActuallyUsed / mem.total) * 100;
 
   // Filter to real storage drives only (excludes overlay, Docker bind-mounts, deduplicates mergerfs pools)
   const relevantDrives = getRelevantDrives(fsSize);
@@ -606,8 +613,11 @@ async function refreshSystemStatus() {
       memory: {
         usage: memUsagePercent.toFixed(1),
         total: formatBytes(mem.total),
-        free: formatBytes(mem.free),
-        used: formatBytes(mem.used)
+        // free now reports MemAvailable (memory usable without swapping),
+        // matching the corrected `usage` percentage. Old behavior reported
+        // MemFree which excluded reclaimable cache.
+        free: formatBytes(mem.available ?? mem.free),
+        used: formatBytes(memActuallyUsed)
       },
       disk: {
         usage: diskUsagePercent.toFixed(1),
@@ -721,6 +731,7 @@ router.get('/tasks', authenticateWebhookOrUser, async (req, res) => {
       [TaskType.METADATA_HASH]: 'Metadata Hash',
       [TaskType.BLURHASH]: 'Blurhash',
       [TaskType.DOWNLOAD]: 'TMDB Download',
+      [TaskType.CAPTION_GENERATE]: 'Caption Generation',
       [TaskType.CACHE_CLEANUP]: 'Cache Cleanup'
     };
     

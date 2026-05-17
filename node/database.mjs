@@ -222,6 +222,49 @@ export async function initializeIndexes() {
       }
     );
 
+    // Ensure a unique index on app_config.settings.name so each setting
+    // (autoSync, autoCaptions, ...) can only have one document.
+    const appConfigDb = client.db("app_config");
+    const settingsCollection = appConfigDb.collection("settings");
+    // Detect an existing non-unique index on the same key — the generic
+    // ensureIndex helper would short-circuit on key match alone, leaving the
+    // constraint unenforced. Drop it so we can recreate as unique.
+    const settingsIndexes = await settingsCollection.indexes();
+    const existingNameIdx = settingsIndexes.find(
+      (i) => JSON.stringify(i.key) === JSON.stringify({ name: 1 })
+    );
+    if (existingNameIdx && !existingNameIdx.unique) {
+      logger.warn(
+        `Found non-unique index "${existingNameIdx.name}" on app_config.settings.name; dropping to recreate as unique`
+      );
+      await settingsCollection.dropIndex(existingNameIdx.name);
+    }
+    try {
+      await ensureIndex(
+        settingsCollection,
+        { name: 1 },
+        { name: "settings_name_unique", unique: true }
+      );
+    } catch (err) {
+      // Duplicate keys block index creation. Surface the offenders so an
+      // operator can resolve manually — don't crash the whole app over this.
+      if (err && (err.code === 11000 || /E11000|duplicate key/i.test(err.message || ""))) {
+        const dupes = await settingsCollection
+          .aggregate([
+            { $group: { _id: "$name", count: { $sum: 1 } } },
+            { $match: { count: { $gt: 1 } } },
+          ])
+          .toArray();
+        logger.error(
+          `Cannot create unique index on app_config.settings.name — duplicates exist: ${JSON.stringify(
+            dupes.map((d) => ({ name: d._id, count: d.count }))
+          )}. Keep one document per name and restart to enforce uniqueness.`
+        );
+      } else {
+        throw err;
+      }
+    }
+
     logger.info("Indexes have been initialized successfully.");
   } catch (error) {
     logger.error("An error occurred while initializing indexes:" + error);
