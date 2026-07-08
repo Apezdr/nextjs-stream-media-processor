@@ -13,6 +13,15 @@ const logger = createCategoryLogger("tmdb-utils");
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 
+// Preferred metadata language for episode title/overview. TMDB's episode `name`
+// is the base/primary name and (for English-original shows) is NOT overridden by
+// the per-language translation the TMDB website displays — so an episode can read
+// e.g. "Che Guevara" from the episode endpoint while the site (and the
+// `translations` sub-resource) show the en-US title "New York in June". When set,
+// getEpisodeDetails fetches translations and prefers that language's name/overview.
+// Set TMDB_PREFERRED_LANGUAGE='' to disable and use TMDB's base fields verbatim.
+const PREFERRED_METADATA_LANGUAGE = (process.env.TMDB_PREFERRED_LANGUAGE ?? "en-US").trim();
+
 if (!TMDB_API_KEY) {
   logger.error("TMDB_API_KEY environment variable is not set");
 }
@@ -555,10 +564,40 @@ export const getMediaRating = async (type, id) => {
  * @param {string|number} episode - Episode number
  * @returns {Promise<Object>} Episode details with last_updated timestamp
  */
-export const getEpisodeDetails = async (showId, season, episode) => {
+export const getEpisodeDetails = async (showId, season, episode, opts = {}) => {
+  const { forceRefresh = false } = opts;
+
   const data = await makeTmdbRequest(
     `/tv/${showId}/season/${season}/episode/${episode}`,
+    // Pull translations alongside so we can prefer the configured language's
+    // title/overview (what the TMDB website shows) over the base `name`.
+    PREFERRED_METADATA_LANGUAGE ? { append_to_response: "translations" } : {},
+    3,            // maxRetries
+    1440,         // cacheTtlHours
+    // forceRefresh bypasses the 60-day response cache — critical for the
+    // backfill, whose whole purpose is to detect TMDB fill-ins the cache hides.
+    forceRefresh,
   );
+
+  if (!data) return data;
+
+  // Prefer the configured language's translation for name/overview, falling back
+  // to the base fields when a translated value is absent/empty. Matches the title
+  // shown on themoviedb.org for English-original shows where the base `name` and
+  // the en-US translation diverge.
+  if (PREFERRED_METADATA_LANGUAGE && data.translations?.translations) {
+    const want = PREFERRED_METADATA_LANGUAGE.toLowerCase();
+    const lang = want.split("-")[0];
+    const t =
+      data.translations.translations.find(
+        (x) => `${x.iso_639_1}-${x.iso_3166_1}`.toLowerCase() === want,
+      ) ||
+      data.translations.translations.find((x) => (x.iso_639_1 || "").toLowerCase() === lang);
+    if (t?.data?.name) data.name = t.data.name;
+    if (t?.data?.overview) data.overview = t.data.overview;
+  }
+  // Never persist the bulky translations sub-resource into the episode file.
+  delete data.translations;
 
   // Add last updated timestamp like Python script
   data.last_updated = new Date().toISOString();

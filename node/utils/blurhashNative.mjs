@@ -2,6 +2,7 @@ import sharp from 'sharp';
 import { encode, decode } from 'blurhash';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { runBlurhashTask, poolMetrics } from '../lib/blurhash-pool.mjs';
+import { withApiRequestSpan } from '../lib/apiTracer.mjs';
 
 const logger = createCategoryLogger('blurhash-native');
 
@@ -171,25 +172,34 @@ export async function generateBlurhashFromBuffer(imageBuffer, size = 'large') {
 export async function generateBlurhashFromUrl(imageUrl, size = 'large') {
   try {
     const axios = (await import('axios')).default;
-    
+
     // Download image into memory (no temp files needed)
-    const response = await axios({
-      method: 'get',
-      url: imageUrl,
-      responseType: 'arraybuffer',
-      timeout: 5000,
-      maxContentLength: 5 * 1024 * 1024,
-      validateStatus: (s) => s >= 200 && s < 300,
-      headers: {
-        'User-Agent': 'nextjs-stream-media-processor/1.0'
-      }
-    });
-    
+    const response = await withApiRequestSpan(
+      {
+        service: 'tmdb-images',
+        method: 'GET',
+        url: imageUrl,
+        endpoint: 'blurhash-source'
+      },
+      async () =>
+        axios({
+          method: 'get',
+          url: imageUrl,
+          responseType: 'arraybuffer',
+          timeout: 5000,
+          maxContentLength: 5 * 1024 * 1024,
+          validateStatus: (s) => s >= 200 && s < 300,
+          headers: {
+            'User-Agent': 'nextjs-stream-media-processor/1.0'
+          }
+        })
+    );
+
     const imageBuffer = Buffer.from(response.data);
-    
+
     // Generate blurhash using native implementation
     return await generateBlurhashNative(imageBuffer, size);
-    
+
   } catch (error) {
     logger.error(`Failed to generate blurhash from URL ${imageUrl}: ${error.message}`);
     return null;

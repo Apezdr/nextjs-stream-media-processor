@@ -71,12 +71,18 @@ router.get('/metadata-hashes/:mediaType/:title', async (req, res) => {
         await releaseDatabase(db);
         return res.status(404).json({ error: "Movie not found" });
       }
-      
-      // Generate hash if needed
-      await generateMovieHashes(db, movie);
-      
-      // Get the hash
-      const hash = await getHash(db, 'movies', decodedTitle);
+
+      // Read the stored hash. Only generate as a fallback when none exists yet
+      // (a movie that hasn't been scanned). We must NOT regenerate on every GET:
+      // getMovieByName carries no metadata.json content, so generateMovieHashes
+      // here would write a CONTENT-LESS hash, clobbering the content-aware hash
+      // the scanner maintains and potentially re-sticking a stale movie on the
+      // client. The scanner (movie-scanner.mjs) is the source of truth.
+      let hash = await getHash(db, 'movies', decodedTitle);
+      if (!hash) {
+        await generateMovieHashes(db, movie);
+        hash = await getHash(db, 'movies', decodedTitle);
+      }
       result = {
         title: decodedTitle,
         hash: hash ? hash.hash : null,

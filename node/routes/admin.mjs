@@ -1,6 +1,6 @@
 import express from 'express';
 import { promises as fs } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve, sep } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
 import { fileExists } from '../utils/utils.mjs';
@@ -14,6 +14,29 @@ const logger = createCategoryLogger('admin-routes');
 
 // BASE_PATH is the path to the media files directory
 const BASE_PATH = process.env.BASE_PATH ? process.env.BASE_PATH : "/var/www/html";
+
+class PathTraversalError extends Error {}
+
+/**
+ * Join untrusted segments onto a trusted base dir, verifying the final
+ * resolved absolute path cannot escape base. Handles '..', traversal
+ * embedded inside a larger segment, and platform separator differences
+ * in one check, unlike a naive substring-scan for '..'.
+ *
+ * `base` should be the most specific directory the caller actually intends
+ * to stay within (e.g. `join(BASE_PATH, 'movies')`, not just `BASE_PATH`) —
+ * checking only against BASE_PATH would let a crafted title escape into a
+ * sibling top-level directory (e.g. into `tv/` from a movie route) while
+ * technically staying "inside" BASE_PATH.
+ */
+function safeJoin(base, ...segments) {
+    const resolvedBase = resolve(base);
+    const resolvedPath = resolve(resolvedBase, ...segments);
+    if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + sep)) {
+        throw new PathTraversalError(`Rejected path outside base directory: ${segments.join('/')}`);
+    }
+    return resolvedPath;
+}
 
 /**
  * Initialize and configure admin routes
@@ -78,7 +101,7 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         if (mediaType === 'movie') {
             // For movies
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
-            const movieDir = join(BASE_PATH, 'movies', decodedMediaTitle);
+            const movieDir = safeJoin(join(BASE_PATH, 'movies'), decodedMediaTitle);
 
             // Find the main movie file to determine the subtitle filename
             const files = await fs.readdir(movieDir);
@@ -97,7 +120,7 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         } else {
             // For TV shows
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
-            const seasonDir = join(BASE_PATH, 'tv', decodedMediaTitle, `Season ${season}`);
+            const seasonDir = safeJoin(join(BASE_PATH, 'tv'), decodedMediaTitle, `Season ${season}`);
 
             // Find the episode file
             const files = await fs.readdir(seasonDir);
@@ -150,8 +173,12 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
             ...(mediaType === 'tv' && { season, episode })
         });
     } catch (error) {
+        if (error instanceof PathTraversalError) {
+            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            return res.status(400).json({ error: 'Invalid mediaTitle/season: path traversal not allowed' });
+        }
         logger.error(`Error saving subtitle changes: ${error.message}`);
-        return res.status(500).json({ 
+        return res.status(500).json({
             error: 'Failed to save subtitle changes',
             message: error.message
         });
@@ -391,7 +418,7 @@ router.get('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
             return res.status(400).json({ error: 'mediaName is required' });
         }
 
-        const mediaDir = join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies', mediaName);
+        const mediaDir = safeJoin(join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies'), mediaName);
         const configPath = getTmdbConfigFilePath(mediaDir);
         
         logger.info(`Admin ${req.user.email} requested TMDB config for ${mediaType}: ${mediaName}`);
@@ -407,6 +434,10 @@ router.get('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
         });
 
     } catch (error) {
+        if (error instanceof PathTraversalError) {
+            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            return res.status(400).json({ error: 'Invalid mediaName: path traversal not allowed' });
+        }
         logger.error(`Error reading TMDB config: ${error.message}`);
         return res.status(500).json({
             error: 'Failed to read TMDB configuration',
@@ -443,7 +474,7 @@ router.put('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
             return res.status(400).json({ error: 'config object is required' });
         }
 
-        const mediaDir = join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies', mediaName);
+        const mediaDir = safeJoin(join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies'), mediaName);
         const configPath = getTmdbConfigFilePath(mediaDir);
         
         logger.info(`Admin ${req.user.email} updating TMDB config for ${mediaType}: ${mediaName}`);
@@ -460,6 +491,10 @@ router.put('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
         });
 
     } catch (error) {
+        if (error instanceof PathTraversalError) {
+            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            return res.status(400).json({ error: 'Invalid mediaName: path traversal not allowed' });
+        }
         logger.error(`Error updating TMDB config: ${error.message}`);
         return res.status(500).json({
             error: 'Failed to update TMDB configuration',

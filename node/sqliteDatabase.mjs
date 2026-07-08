@@ -170,6 +170,23 @@ async function initializeSchema(dbType, db) {
       );
     `);
 
+    // Per-episode cooldown for the air-date-aware backfill of missing/thin
+    // episode metadata. Distinct from missing_data_media (show-level): keyed by
+    // (show, season, episode) so one freshly-aired episode is retried on its own
+    // cadence without re-hammering the rest of the show. See
+    // plans/AIR_DATE_AWARE_EPISODE_BACKFILL.md.
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS episode_metadata_missing (
+        show_name TEXT,
+        season_number INTEGER,
+        episode_number INTEGER,
+        air_date TEXT,
+        last_attempt TEXT,
+        attempts INTEGER DEFAULT 0,
+        PRIMARY KEY (show_name, season_number, episode_number)
+      );
+    `);
+
     // MIGRATE EXISTING DATABASES: Add hash columns if they don't exist
     await migrateToHashColumns(db);
     await migrateToFocalColumns(db);
@@ -537,43 +554,6 @@ function safeJson(jsonString, fallback) {
 }
 
 /**
- * Calculate and cache image hash during sync/insert operations
- * Only recalculates if file mtime has changed since last cache
- *
- * Note: Hashes the mtime value, not file contents, for speed. This means a `touch`
- * on the file will invalidate the cache even if content hasn't changed. This is
- * acceptable for this use case where mtime changes generally indicate real updates.
- *
- * @param {string} filePath - Path to the image file
- * @param {string} cachedHash - Previously cached hash (optional)
- * @param {number} cachedMtime - Previously cached mtime (optional)
- * @returns {Object} - { hash: string | null, mtime: number | null }
- */
-async function calculateImageHash(filePath, cachedHash = null, cachedMtime = null) {
-  if (!filePath) return { hash: null, mtime: null };
-  
-  try {
-    const stats = await fs.stat(filePath);
-    const currentMtime = Math.floor(stats.mtimeMs);
-    
-    // If we have a cached hash and mtime hasn't changed, use cached version
-    if (cachedHash && cachedMtime && cachedMtime === currentMtime) {
-      return { hash: cachedHash, mtime: currentMtime };
-    }
-    
-    // Calculate new hash based on mtime
-    const hash = createHash('md5')
-      .update(String(currentMtime))
-      .digest('hex')
-      .substring(0, 10);
-    
-    return { hash, mtime: currentMtime };
-  } catch {
-    return { hash: null, mtime: null };
-  }
-}
-
-/**
  * Build URL with cached hash - NO filesystem access required
  * @param {string} baseUrl - The base image URL
  * @param {string} cachedHash - Previously calculated hash from database
@@ -590,104 +570,6 @@ function buildImageUrl(baseUrl, cachedHash) {
   else {
     return `${baseUrl}?hash=${cachedHash}`;
   }
-}
-
-/**
- * DEPRECATED: For legacy/manual operations only.
- *
- * Scanner embeds hashes in URLs during write operations (see tv-scanner.mjs).
- * Read paths should use those cached hashes instead of calling this function.
- * This causes unnecessary filesystem I/O.
- *
- * Only use for:
- * - Manual admin operations outside scanner
- * - Debugging/troubleshooting
- * - Emergency hash refresh
- *
- * @param {string} url - The original image URL
- * @param {string} filePath - Path to the actual image file
- * @returns {string} - Updated URL with a fresh hash parameter
- */
-async function refreshImageUrlHash(url, filePath) {
-  // If there's no file path or URL, return the original URL
-  if (!filePath || !url) return url;
-  
-  try {
-    // Get the file's current stats (consolidated - one syscall instead of two)
-    const stats = await fs.stat(filePath);
-    // Create a hash from the modification time
-    const imageHash = createHash('md5')
-      .update(stats.mtime.toISOString())
-      .digest('hex')
-      .substring(0, 10);
-    
-    // If the URL already has a hash parameter, replace it
-    if (url.includes('?hash=')) {
-      return url.replace(/\?hash=[a-f0-9]+/, `?hash=${imageHash}`);
-    }
-    // Otherwise, add the hash parameter
-    else {
-      return `${url}?hash=${imageHash}`;
-    }
-  } catch {
-    // Return the original URL if file doesn't exist or other error
-    return url;
-  }
-}
-
-/**
- * DEPRECATED: Replaced by scanner-embedded hashes.
- *
- * This function was causing a major performance bottleneck by doing filesystem I/O
- * (fs.stat) for every season poster and every episode thumbnail. For a library with
- * 50 shows × 5 seasons × 12 episodes, this was ~3,000+ syscalls per getTVShows() call.
- *
- * SOLUTION: Scanner now embeds hashes in URLs during write operations (see tv-scanner.mjs
- * lines 264-274 for episode thumbnails, 357-366 for season posters). Read paths simply
- * use those cached hashes from the database.
- *
- * This function is kept for potential legacy/manual operations but should NOT be called
- * from read paths (getTVShows, getTVShowById, getTVShowByName).
- *
- * @param {Object} season - Season object with episodes
- * @param {string} basePath - Base path for resolving file paths
- * @returns {Object} - Updated season with fresh image URL hashes
- * @deprecated Use cached hashes from database instead
- */
-async function refreshSeasonImageHashes(season, basePath, showPath, seasonName) {
-  // Skip if it's not a valid season or there's no base path
-  if (!season || !basePath) return season;
-  
-  const updatedSeason = { ...season };
-  
-  // Update season poster if available
-  if (season.season_poster) {
-    const seasonPosterPath = join(showPath, seasonName, "season_poster.jpg");
-    updatedSeason.season_poster = await refreshImageUrlHash(season.season_poster, seasonPosterPath);
-  }
-  
-  // Update episode thumbnails if available
-  if (season.episodes) {
-    const updatedEpisodes = { ...season.episodes };
-    
-    for (const [episodeKey, episode] of Object.entries(season.episodes)) {
-      const updatedEpisode = { ...episode };
-      
-      // Update thumbnail URL if available
-      if (episode.thumbnail) {
-        // Extract episode number from key (e.g., "S01E02" -> "02")
-        const episodeNumber = episodeKey.match(/E(\d+)/i)?.[1] || "";
-        const thumbnailPath = join(showPath, seasonName, `${episodeNumber} - Thumbnail.jpg`);
-        updatedEpisode.thumbnail = await refreshImageUrlHash(episode.thumbnail, thumbnailPath);
-      }
-      
-      updatedEpisodes[episodeKey] = updatedEpisode;
-    }
-    
-    updatedSeason.episodes = updatedEpisodes;
-  }
-  
-  return updatedSeason;
 }
 
 export async function getTVShows() {
@@ -713,7 +595,13 @@ export async function getTVShows() {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        metadata_path: show.metadata_path,
+        // Cache-bust metadata.json by URL the same way images are (and the same
+        // way getMovies* cache-busts urls.metadata). The frontend keys its
+        // metadata fetch cache by URL, so without a version token a content
+        // change is served stale from its Redis/304 cache. directory_hash moves
+        // whenever anything in the show dir changes (incl. a metadata.json
+        // rewrite), so it's a zero-cost version token.
+        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -766,7 +654,17 @@ export async function getMovies() {
       if (urls.backdrop) {
         urls.backdrop = buildImageUrl(urls.backdrop, movie.backdrop_hash);
       }
-      
+
+      // Cache-bust metadata.json the same way images are cache-busted. The
+      // frontend keys its metadata fetch cache by URL, so without a version
+      // token a metadata.json content change (e.g. tmdb_id edit) is served
+      // stale from its Redis/304 cache even though the file on disk changed.
+      // directory_hash changes whenever anything in the movie dir changes
+      // (including a metadata.json rewrite), so it's a zero-cost version token.
+      if (urls.metadata) {
+        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+      }
+
       // Return updated movie object
       return {
         id: movie.id,
@@ -824,7 +722,15 @@ export async function getMovieById(id) {
       if (urls.backdrop) {
         urls.backdrop = buildImageUrl(urls.backdrop, movie.backdrop_hash);
       }
-      
+
+      // Cache-bust metadata.json the same way images are (see getMovies).
+      // Without a version token the frontend serves stale cached metadata after
+      // a content change; directory_hash moves on any dir change incl. a
+      // metadata.json rewrite, so it's a zero-cost version token.
+      if (urls.metadata) {
+        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+      }
+
       return {
         id: movie.id,
         name: movie.name,
@@ -869,7 +775,15 @@ export async function getMovieByName(name) {
       if (urls.backdrop) {
         urls.backdrop = buildImageUrl(urls.backdrop, movie.backdrop_hash);
       }
-      
+
+      // Cache-bust metadata.json the same way images are (see getMovies).
+      // Without a version token the frontend serves stale cached metadata after
+      // a content change; directory_hash moves on any dir change incl. a
+      // metadata.json rewrite, so it's a zero-cost version token.
+      if (urls.metadata) {
+        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+      }
+
       return {
         id: movie.id,
         name: movie.name,
@@ -915,7 +829,8 @@ export async function getTVShowById(id) {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        metadata_path: show.metadata_path,
+        // Cache-bust metadata.json URL with directory_hash (see getTVShows).
+        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -956,7 +871,8 @@ export async function getTVShowByName(name) {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        metadata_path: show.metadata_path,
+        // Cache-bust metadata.json URL with directory_hash (see getTVShows).
+        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -1020,18 +936,17 @@ export async function insertOrUpdateTVShow(
   basePath = null,
   directoryHash = null,
   backdropFocal = null,
-  backdropFocalSuggested = null
+  backdropFocalSuggested = null,
+  imageHashes = null
 ) {
   return withWriteTx("main", async (db) => {
-    // Get current cached values for comparison (if updating existing TV show)
-    const existing = await withRetry(() => 
-      db.get('SELECT poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime FROM tv_shows WHERE name = ?', [showName])
-    );
-
-    // Calculate image hashes during write
-    const posterHash = await calculateImageHash(posterFilePath, existing?.poster_hash, existing?.poster_mtime);
-    const backdropHash = await calculateImageHash(backdropFilePath, existing?.backdrop_hash, existing?.backdrop_mtime);
-    const logoHash = await calculateImageHash(logoFilePath, existing?.logo_hash, existing?.logo_mtime);
+    // Image cache-bust hashes are precomputed by the scanner from the SAME stat
+    // that resolved each image file + built its URL (see resolveImage /
+    // imageHashesFromResolved). Storing them directly keeps the URL filename,
+    // *_file_path, and *_hash in lockstep and avoids a second stat per image.
+    const posterHash   = imageHashes?.poster   ?? { hash: null, mtime: null };
+    const backdropHash = imageHashes?.backdrop ?? { hash: null, mtime: null };
+    const logoHash     = imageHashes?.logo     ?? { hash: null, mtime: null };
 
     const seasonsStr = JSON.stringify(seasonsObj);
     
@@ -1095,18 +1010,17 @@ export async function insertOrUpdateMovie(
   logoFilePath = null,
   basePath = null,
   backdropFocal = null,
-  backdropFocalSuggested = null
+  backdropFocalSuggested = null,
+  imageHashes = null
 ) {
   return withWriteTx("main", async (db) => {
-    // Get current cached values for comparison (if updating existing movie)
-    const existing = await withRetry(() => 
-      db.get('SELECT poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime FROM movies WHERE name = ?', [name])
-    );
-
-    // Calculate image hashes during write
-    const posterHash = await calculateImageHash(posterFilePath, existing?.poster_hash, existing?.poster_mtime);
-    const backdropHash = await calculateImageHash(backdropFilePath, existing?.backdrop_hash, existing?.backdrop_mtime);
-    const logoHash = await calculateImageHash(logoFilePath, existing?.logo_hash, existing?.logo_mtime);
+    // Image cache-bust hashes are precomputed by the scanner from the SAME stat
+    // that resolved each image file + built its URL (see resolveImage /
+    // imageHashesFromResolved). Storing them directly keeps the URL filename,
+    // *_file_path, and *_hash in lockstep and avoids a second stat per image.
+    const posterHash   = imageHashes?.poster   ?? { hash: null, mtime: null };
+    const backdropHash = imageHashes?.backdrop ?? { hash: null, mtime: null };
+    const logoHash     = imageHashes?.logo     ?? { hash: null, mtime: null };
 
     const movie = {
       name,
@@ -1198,14 +1112,88 @@ export async function insertOrUpdateMovie(
 export async function insertOrUpdateMissingDataMedia(name) {
   return withWriteTx("main", async (db) => {
     const now = new Date().toISOString();
-    
+
     await withRetry(() =>
       db.run(
-        `INSERT INTO missing_data_media (name, last_attempt) 
+        `INSERT INTO missing_data_media (name, last_attempt)
          VALUES (?, ?)
          ON CONFLICT(name) DO UPDATE SET
          last_attempt = excluded.last_attempt`,
         [name, now]
+      )
+    );
+  });
+}
+
+/**
+ * Remove a media item from the missing_data_media cooldown table.
+ * Called by the scanner once a previously-flagged item has successfully
+ * recovered (metadata.json AND all required image files are now present).
+ * Idempotent: no-op if the entry doesn't exist.
+ * @param {string} name - Media name (movie or show directory name)
+ */
+export async function deleteMissingDataMedia(name) {
+  return withWriteTx("main", async (db) => {
+    await withRetry(() =>
+      db.run(`DELETE FROM missing_data_media WHERE name = ?`, [name])
+    );
+  });
+}
+
+/**
+ * Read the per-episode backfill cooldown rows for one show.
+ * @param {string} showName
+ * @returns {Promise<Array<{seasonNumber:number, episodeNumber:number, airDate:string|null, lastAttempt:string|null, attempts:number}>>}
+ */
+export async function getEpisodeMetadataMissingRows(showName) {
+  return withDb("main", async (db) => {
+    const rows = await withRetry(() =>
+      db.all('SELECT * FROM episode_metadata_missing WHERE show_name = ?', [showName])
+    );
+    return rows.map((r) => ({
+      seasonNumber: r.season_number,
+      episodeNumber: r.episode_number,
+      airDate: r.air_date,
+      lastAttempt: r.last_attempt,
+      attempts: r.attempts,
+    }));
+  });
+}
+
+/**
+ * Record a backfill attempt for one episode (upsert): stamps last_attempt = now,
+ * increments attempts, and preserves a known air_date (only overwrites with a
+ * non-null value). Drives the 3-day per-episode cooldown.
+ */
+export async function recordEpisodeMetadataAttempt(showName, seasonNumber, episodeNumber, airDate) {
+  return withWriteTx("main", async (db) => {
+    const now = new Date().toISOString();
+    await withRetry(() =>
+      db.run(
+        `INSERT INTO episode_metadata_missing
+           (show_name, season_number, episode_number, air_date, last_attempt, attempts)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(show_name, season_number, episode_number) DO UPDATE SET
+           air_date = COALESCE(excluded.air_date, episode_metadata_missing.air_date),
+           last_attempt = excluded.last_attempt,
+           attempts = episode_metadata_missing.attempts + 1`,
+        [showName, seasonNumber, episodeNumber, airDate ?? null, now]
+      )
+    );
+  });
+}
+
+/**
+ * Remove an episode's backfill cooldown row once it's resolved (no longer thin).
+ * Idempotent.
+ */
+export async function clearEpisodeMetadataMissing(showName, seasonNumber, episodeNumber) {
+  return withWriteTx("main", async (db) => {
+    await withRetry(() =>
+      db.run(
+        `DELETE FROM episode_metadata_missing
+         WHERE show_name = ? AND season_number = ? AND episode_number = ?`,
+        [showName, seasonNumber, episodeNumber]
       )
     );
   });

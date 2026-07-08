@@ -14,15 +14,12 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { config as dotenvConfig } from 'dotenv';
 // NOTE: tmdb.mjs is NOT statically imported here. A static import would cause
 // tmdb.mjs to load before dotenvConfig runs, so TMDB_API_KEY would be undefined
 // when the module initializes. Instead we use dynamic imports inside the tests,
 // which run after the module-level dotenvConfig call has set the env var.
 
-const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -244,32 +241,13 @@ function formatDifferences(differences, ignoredDifferences = []) {
   return output;
 }
 
-/**
- * Run Python metadata generation script
- */
-async function runPythonMetadataGeneration(basePath, mediaType, mediaName) {
-  const scriptsDir = join(__dirname, '../../../scripts');
-  const scriptPath = join(scriptsDir, 'generate-metadata.mjs');
-  
-  // Check if Python script exists, if not use Node.js alternative
-  const pythonScriptPath = join(scriptsDir, 'download_tmdb_images.py');
-  
-  try {
-    await fs.access(pythonScriptPath);
-    // Python script exists, use it
-    const { stdout, stderr } = await execAsync(
-      `python "${pythonScriptPath}" --base-path "${basePath}" --type ${mediaType} --name "${mediaName}"`,
-      { 
-        env: { ...process.env, TMDB_API_KEY: process.env.TMDB_API_KEY },
-        timeout: 60000 // 60 second timeout
-      }
-    );
-    
-    return { stdout, stderr, success: true };
-  } catch (error) {
-    throw new Error(`Python script execution failed: ${error.message}`);
-  }
-}
+// NOTE: The previous Python-spawning helper here was dead code (no test
+// referenced it). After the migration off `scripts/download_tmdb_images.py`,
+// the comparison below validates Node's MetadataGenerator output against a
+// "Python-style" reference that itself reuses Node's `fetchComprehensiveMediaDetails`
+// — the test is effectively Node-vs-Node with naming preserved for historical
+// continuity. If you want a true cross-runtime comparison again, recapture a
+// reference snapshot from the deleted Python script and compare against that.
 
 describe('Cross-Platform Metadata Generation', () => {
   let testDir;

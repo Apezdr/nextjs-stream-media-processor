@@ -10,6 +10,10 @@ import {
   deleteTVShow,
   getMissingDataMedia,
   insertOrUpdateMissingDataMedia,
+  deleteMissingDataMedia,
+  getEpisodeMetadataMissingRows,
+  recordEpisodeMetadataAttempt,
+  clearEpisodeMetadataMissing,
   releaseDatabase
 } from '../../../sqliteDatabase.mjs';
 
@@ -19,6 +23,17 @@ const logger = createCategoryLogger('scanner-repository');
  * Data Access Layer for Media Scanner
  * Handles all database operations for scanning media files
  */
+
+/**
+ * Cooldown (in hours) between retries for media that has been flagged as
+ * having missing TMDB data. Owned here because the cooldown semantics belong
+ * to the `missing_data_media` table that this repository fronts.
+ *
+ * Only the *metadata-missing* failure mode is gated by this interval —
+ * transient image-download failures bypass it and retry every scan tick
+ * (see the scanner gate logic in movie-scanner.mjs and tv-scanner.mjs).
+ */
+export const RETRY_INTERVAL_HOURS = 24;
 
 /**
  * Get all existing movies from the database
@@ -69,6 +84,11 @@ export async function getMissingMediaData() {
  * @param {string} backdropFilePath - Backdrop file path
  * @param {string} logoFilePath - Logo file path
  * @param {string} basePath - Base path for media files
+ * @param {Object} [backdropFocal] - Manual backdrop focal override
+ * @param {Object} [backdropFocalSuggested] - Auto-detected backdrop focal
+ * @param {Object} [imageHashes] - Precomputed `{poster,backdrop,logo}` →
+ *   `{hash,mtime}` cache-bust hashes from the scanner's single resolve, so the
+ *   DB stores the exact hash for the file the URL points at (no second stat).
  * @returns {Promise<void>}
  */
 export async function saveMovie(
@@ -88,7 +108,8 @@ export async function saveMovie(
   logoFilePath,
   basePath,
   backdropFocal = null,
-  backdropFocalSuggested = null
+  backdropFocalSuggested = null,
+  imageHashes = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -107,7 +128,8 @@ export async function saveMovie(
     logoFilePath,
     basePath,
     backdropFocal,
-    backdropFocalSuggested
+    backdropFocalSuggested,
+    imageHashes
   );
 }
 
@@ -128,6 +150,11 @@ export async function saveMovie(
  * @param {string} logoFilePath - Logo file path
  * @param {string} basePath - Base path for media files
  * @param {string} directoryHash - Directory hash for change detection
+ * @param {Object} [backdropFocal] - Manual backdrop focal override
+ * @param {Object} [backdropFocalSuggested] - Auto-detected backdrop focal
+ * @param {Object} [imageHashes] - Precomputed `{poster,backdrop,logo}` →
+ *   `{hash,mtime}` cache-bust hashes from the scanner's single resolve, so the
+ *   DB stores the exact hash for the file the URL points at (no second stat).
  * @returns {Promise<void>}
  */
 export async function saveTVShow(
@@ -147,7 +174,8 @@ export async function saveTVShow(
   basePath,
   directoryHash = null,
   backdropFocal = null,
-  backdropFocalSuggested = null
+  backdropFocalSuggested = null,
+  imageHashes = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -166,7 +194,8 @@ export async function saveTVShow(
     basePath,
     directoryHash,
     backdropFocal,
-    backdropFocalSuggested
+    backdropFocalSuggested,
+    imageHashes
   );
 }
 
@@ -189,12 +218,52 @@ export async function removeTVShow(name) {
 }
 
 /**
- * Mark media as having missing data (for retry logic)
+ * Mark media as having missing data (for retry logic).
+ *
+ * Records a `last_attempt` timestamp so the scanner can apply the
+ * `RETRY_INTERVAL_HOURS` cooldown before re-attempting a TMDB metadata
+ * lookup. Should ONLY be called for the metadata-missing failure mode —
+ * pure image-download failures should not flip this gate (they retry
+ * every scan tick).
+ *
  * @param {string} name - Media name
- * @returns {Promise<void>}
  */
 export async function markMediaAsMissingData(name) {
   await insertOrUpdateMissingDataMedia(name);
+}
+
+/**
+ * Clear a previously-flagged item from the missing-data cooldown table.
+ * Called by the scanner after a successful recovery where BOTH metadata
+ * and all required image files are now present on disk. Idempotent.
+ *
+ * @param {string} name - Media name
+ */
+export async function clearMissingMediaData(name) {
+  await deleteMissingDataMedia(name);
+}
+
+/**
+ * Per-episode backfill cooldown rows for one show (air-date-aware retry).
+ * @param {string} showName
+ */
+export async function getEpisodeRetryRows(showName) {
+  return await getEpisodeMetadataMissingRows(showName);
+}
+
+/**
+ * Stamp a backfill attempt for one episode (upsert; bumps attempts, preserves
+ * a known air_date). Drives the 3-day per-episode cooldown.
+ */
+export async function recordEpisodeAttempt(showName, seasonNumber, episodeNumber, airDate) {
+  await recordEpisodeMetadataAttempt(showName, seasonNumber, episodeNumber, airDate);
+}
+
+/**
+ * Clear an episode's backfill cooldown row once it's resolved. Idempotent.
+ */
+export async function clearEpisodeRetry(showName, seasonNumber, episodeNumber) {
+  await clearEpisodeMetadataMissing(showName, seasonNumber, episodeNumber);
 }
 
 /**

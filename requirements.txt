@@ -1,10 +1,5 @@
-#requests
-#requests-cache
+# Python deps for the remaining `scripts/generate_poster_collage.py` utility.
+# All TMDB / image-download / blurhash Python code has been migrated to the
+# Node implementation under `node/`.
 Pillow
-blurhash-python
-aiohttp
-aiohttp_client_cache
-aiofiles
 python-dotenv
-cairosvg
-# Add any other dependencies your Python scripts require

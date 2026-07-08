@@ -1,12 +1,8 @@
 import axios from 'axios';
 import { promises as fs } from 'fs';
-import { pipeline } from 'stream/promises';
-import { createWriteStream } from 'fs';
 import path from 'path';
-import os from 'os';
 import { createCategoryLogger } from '../lib/logger.mjs';
-import { withImageProcessingSpan, withBlurhashSpan, withApiCacheSpan } from '../lib/apiTracer.mjs';
-import { execAsync } from './utils.mjs';
+import { withImageProcessingSpan, withBlurhashSpan, withApiCacheSpan, withApiRequestSpan } from '../lib/apiTracer.mjs';
 import {
   getCachedTmdbBlurhashWithDb,
   cacheTmdbBlurhashWithDb,
@@ -16,9 +12,6 @@ import { generateBlurhashFromBuffer } from './blurhashNative.mjs';
 import pLimit from 'p-limit';
 
 const logger = createCategoryLogger('tmdb-blurhash');
-
-// Feature flag: use native Node.js blurhash (faster) or Python subprocess (legacy)
-const USE_NATIVE_BLURHASH = process.env.USE_NATIVE_BLURHASH !== 'false'; // Default to true
 
 // Limit concurrent download+blurhash operations using p-limit (better integration with worker pool)
 // This works at the application level, while the worker pool manages the actual blurhash computation
@@ -103,10 +96,10 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
         try {
           // Download image into memory (faster than disk I/O)
           const response = await withApiRequestSpan({
-            service: 'tmdb-image',
+            service: 'tmdb-images',
             method: 'GET',
             url: canonicalUrl,
-            endpoint: 'image'
+            endpoint: 'blurhash-image'
           }, async () => {
             return await axios({
               method: 'get',
@@ -127,66 +120,25 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
           
           let blurhashBase64;
           
-          // Use native implementation if enabled, otherwise fall back to Python
-          if (USE_NATIVE_BLURHASH) {
-            try {
-              blurhashBase64 = await withBlurhashSpan({
-                type: 'native',
-                url: canonicalUrl,
-                componentsX: size === 'large' ? 6 : size === 'medium' ? 4 : 3,
-                componentsY: size === 'large' ? 5 : 3
-              }, async () => {
-                return await generateBlurhashFromBuffer(imageBuffer, size);
-              });
-              logger.debug(`Generated blurhash using native implementation for ${imageUrl} (${size})`);
-            } catch (nativeError) {
-              logger.warn(`Native blurhash failed, falling back to Python: ${nativeError.message}`);
-              // Fall through to Python implementation below
-              blurhashBase64 = null;
-            }
+          // Generate via the native Node.js implementation. The previous
+          // Python `blurhash_cli.py` fallback was removed when the TMDB
+          // workflow migrated entirely to Node — blurhashNative.mjs already
+          // has worker-pool → main-thread fallbacks internally.
+          try {
+            blurhashBase64 = await withBlurhashSpan({
+              type: 'native',
+              url: canonicalUrl,
+              componentsX: size === 'large' ? 6 : size === 'medium' ? 4 : 3,
+              componentsY: size === 'large' ? 5 : 3
+            }, async () => {
+              return await generateBlurhashFromBuffer(imageBuffer, size);
+            });
+            logger.debug(`Generated blurhash using native implementation for ${imageUrl} (${size})`);
+          } catch (nativeError) {
+            logger.error(`Native blurhash failed for ${imageUrl} (${size}): ${nativeError.message}`);
+            blurhashBase64 = null;
           }
-          
-          // Python fallback if native is disabled or failed
-          if (!blurhashBase64) {
-            // Use system temp directory for Python subprocess
-            let tempDir = path.join(os.tmpdir(), 'tmdb_images');
-            try {
-              await fs.mkdir(tempDir, { recursive: true });
-            } catch (error) {
-              tempDir = path.join(os.tmpdir(), `tmdb_images_${Date.now()}`);
-              await fs.mkdir(tempDir, { recursive: true });
-            }
-            
-            const imageExt = path.extname(imageUrl) || '.jpg';
-            const uniqueFilename = `tmdb_${Date.now()}_${Math.random().toString(36).substring(2, 15)}${imageExt}`;
-            const imagePath = path.join(tempDir, uniqueFilename);
-            
-            try {
-              // Write buffer to disk for Python script
-              await fs.writeFile(imagePath, imageBuffer);
-              
-              // Generate blurhash using Python script
-              const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
-              const blurhashCli = path.join(process.cwd(), 'scripts', 'utils', 'blurhash_cli.py');
-              
-              const result = await execAsync(`"${pythonExecutable}" "${blurhashCli}" "${imagePath}" "${size}"`);
-              blurhashBase64 = result.stdout.trim();
-              
-              if (result.stderr && result.stderr.trim()) {
-                logger.warn(`Python script warnings for ${imageUrl} (${size}): ${result.stderr}`);
-              }
-              
-              logger.debug(`Generated blurhash using Python for ${imageUrl} (${size})`);
-            } finally {
-              // Clean up temp file
-              try {
-                await fs.unlink(imagePath);
-              } catch (cleanupError) {
-                // Ignore cleanup errors
-              }
-            }
-          }
-          
+
           if (!blurhashBase64) {
             logger.error(`Failed to generate blurhash for ${imageUrl} (${size})`);
             return null;
