@@ -74,18 +74,71 @@ export async function initializeMetadataHashesTable(db) {
     if (!/duplicate column name/i.test(err?.message || '')) throw err;
   }
 
+  // One-time cleanup of historical duplicate rows. Before storeHash switched to
+  // delete-then-insert, null-keyed rows (movies + show-level) never deduped and
+  // accumulated one row per regeneration. GROUP BY treats NULLs as a single
+  // group (unlike UNIQUE), so MAX(id) keeps the most recently written row per
+  // logical key and discards the rest. Idempotent: a no-op once collapsed.
+  const dupCleanup = await db.run(`
+    DELETE FROM metadata_hashes
+    WHERE id NOT IN (
+      SELECT MAX(id) FROM metadata_hashes
+      GROUP BY media_type, title, season_number, episode_key
+    )
+  `);
+  if (dupCleanup?.changes) {
+    logger.info(`Metadata hashes: collapsed ${dupCleanup.changes} duplicate row(s)`);
+  }
+
   logger.info('Metadata hashes table initialized');
 }
 
 /**
- * Generate a deterministic hash for an object
+ * Deterministic JSON serialization: sorts object keys at EVERY nesting level and
+ * includes ALL keys. Mirrors `JSON.stringify` semantics otherwise — honors
+ * `toJSON` (e.g. Date), drops `undefined`/function/symbol-valued object keys, and
+ * emits `null` for those in arrays.
+ *
+ * This replaces the previous `JSON.stringify(data, Object.keys(data).sort())`,
+ * whose second argument is an array *replacer* (a key allowlist), NOT a key sort.
+ * JSON.stringify applies that allowlist at every level, so nested keys absent from
+ * the top-level list were silently stripped — notably `urls.poster`/`urls.backdrop`/
+ * `urls.logo` in movie hashes. The result: a movie image swap (incl. svg→png) never
+ * moved its metadata hash, so the frontend sync gate skipped it forever and the new
+ * image never propagated. Sorting recursively here keeps determinism without
+ * dropping any field.
+ *
+ * @param {*} value - The value to serialize
+ * @returns {string|undefined} - Stable JSON string, or undefined for values JSON omits
+ */
+function stableStringify(value) {
+  // Honor toJSON (Date, etc.) exactly like JSON.stringify does.
+  if (value !== null && typeof value === 'object' && typeof value.toJSON === 'function') {
+    value = value.toJSON();
+  }
+  const t = typeof value;
+  if (t === 'undefined' || t === 'function' || t === 'symbol') return undefined;
+  if (value === null || t !== 'object') return JSON.stringify(value); // string/number/boolean/null
+  if (Array.isArray(value)) {
+    return '[' + value.map((el) => stableStringify(el) ?? 'null').join(',') + ']';
+  }
+  const parts = [];
+  for (const key of Object.keys(value).sort()) {
+    const serialized = stableStringify(value[key]);
+    if (serialized === undefined) continue; // drop undefined/function/symbol-valued keys, like JSON.stringify
+    parts.push(JSON.stringify(key) + ':' + serialized);
+  }
+  return '{' + parts.join(',') + '}';
+}
+
+/**
+ * Generate a deterministic hash for an object. Every field (including nested keys
+ * like `urls.logo`) contributes, so image/asset changes move the hash.
  * @param {Object} data - The data to hash
  * @returns {string} - The hash value
  */
 export function generateHash(data) {
-  // Ensure deterministic JSON stringification by sorting keys
-  const sortedJson = JSON.stringify(data, Object.keys(data).sort());
-  return createHash('sha1').update(sortedJson).digest('hex');
+  return createHash('sha1').update(stableStringify(data)).digest('hex');
 }
 
 /**
@@ -103,22 +156,36 @@ export function generateHash(data) {
  */
 export async function storeHash(db, mediaType, title, seasonNumber, episodeKey, hash, lastModified, contentHash = null) {
   try {
+    // Delete-then-insert instead of INSERT ... ON CONFLICT.
+    //
+    // The table declares UNIQUE(media_type, title, season_number, episode_key),
+    // but SQLite treats NULLs as DISTINCT in UNIQUE constraints. Movie and
+    // show-level rows carry NULL season_number AND episode_key, so they never
+    // conflict — every call INSERTed a brand-new duplicate row, and the table
+    // accumulated dozens of rows per movie (the bulk endpoint then served a
+    // nondeterministic one). DELETE with `IS ?` is null-safe and collapses any
+    // pre-existing duplicates for this key before inserting the fresh row, so
+    // exactly one row per logical key survives.
+    //
+    // Atomicity: inside withWriteTx (e.g. updateAllMovieHashes) the two
+    // statements commit together. In the bare-call paths (scanner, route) they
+    // run as separate autocommits; node-sqlite3 serializes statements on the
+    // singleton connection and a given title isn't hashed concurrently, so a
+    // race is improbable — and self-healing regardless, since the next call's
+    // DELETE removes any stray duplicate.
+    await withRetry(() =>
+      db.run(
+        `DELETE FROM metadata_hashes
+         WHERE media_type = ? AND title = ? AND season_number IS ? AND episode_key IS ?`,
+        [mediaType, title, seasonNumber, episodeKey]
+      )
+    );
     await withRetry(() =>
       db.run(
         `INSERT INTO metadata_hashes
           (media_type, title, season_number, episode_key, hash, content_hash, last_modified, data_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(media_type, title, season_number, episode_key)
-         DO UPDATE SET
-           hash = ?,
-           content_hash = ?,
-           last_modified = ?,
-           hash_generated = CURRENT_TIMESTAMP,
-           data_version = ?`,
-        [
-          mediaType, title, seasonNumber, episodeKey, hash, contentHash, lastModified, HASH_DATA_VERSION,
-          hash, contentHash, lastModified, HASH_DATA_VERSION
-        ]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [mediaType, title, seasonNumber, episodeKey, hash, contentHash, lastModified, HASH_DATA_VERSION]
       )
     );
     logger.debug(`Stored hash for ${mediaType}/${title}${seasonNumber ? '/' + seasonNumber : ''}${episodeKey ? '/' + episodeKey : ''}`);
@@ -139,10 +206,11 @@ export async function storeHash(db, mediaType, title, seasonNumber, episodeKey, 
  */
 export async function getHash(db, mediaType, title, seasonNumber = null, episodeKey = null) {
   try {
-    return await withRetry(() => 
+    return await withRetry(() =>
       db.get(
-        `SELECT * FROM metadata_hashes 
-         WHERE media_type = ? AND title = ? AND season_number IS ? AND episode_key IS ?`,
+        `SELECT * FROM metadata_hashes
+         WHERE media_type = ? AND title = ? AND season_number IS ? AND episode_key IS ?
+         ORDER BY hash_generated DESC LIMIT 1`,
         [mediaType, title, seasonNumber, episodeKey]
       )
     );
@@ -193,12 +261,17 @@ export async function getMediaTypeHashes(db, mediaType) {
       }
     }
     
-    // Get all title-level hashes for this media type
+    // Get all title-level hashes for this media type. ORDER BY hash_generated
+    // ASC so that if any duplicate rows still exist (e.g. a race before the
+    // next storeHash collapses them), the most-recently-generated row wins the
+    // `hashesMap[title] = ...` overwrite below — deterministic, never an
+    // arbitrary stale row.
     const titleHashes = await withRetry(() =>
       db.all(
         `SELECT title, hash, content_hash, last_modified, hash_generated
          FROM metadata_hashes
-         WHERE media_type = ? AND season_number IS NULL AND episode_key IS NULL`,
+         WHERE media_type = ? AND season_number IS NULL AND episode_key IS NULL
+         ORDER BY hash_generated ASC`,
         [mediaType]
       )
     );
@@ -368,7 +441,11 @@ export async function getSeasonHashes(db, title, seasonNumber) {
  */
 export async function generateMovieHashes(db, movie) {
   try {
-    // Extract relevant fields for hashing
+    // Extract relevant fields for hashing. `metadata` carries the parsed
+    // metadata.json content (or a {mtime,size} fallback marker); without it
+    // the hash only advances on mp4 mtime changes, so TMDB-id edits never
+    // propagate to client caches — mirrors the TV episode hash, which folds
+    // in `episodeData.metadata` for the same reason.
     const hashableData = {
       _id: movie._id,
       name: movie.name,
@@ -376,6 +453,7 @@ export async function generateMovieHashes(db, movie) {
       hdr: movie.hdr,
       mediaQuality: movie.mediaQuality,
       metadataUrl: movie.metadataUrl,
+      metadata: movie.metadata,
       lastModified: movie.urls?.mediaLastModified || new Date().toISOString()
     };
     
@@ -406,10 +484,16 @@ export async function generateMovieHashes(db, movie) {
  */
 export async function generateTVShowHashes(db, show) {
   try {
-    // Generate show-level hash (metadata + asset paths only — TMDB edits)
+    // Generate show-level hash (metadata content + asset paths — TMDB edits).
+    // Folds the parsed metadata.json *content* in (mirrors generateMovieHashes)
+    // so a content change (e.g. tmdb_id edit with unchanged images) moves the
+    // hash. metadata_path is intentionally omitted: it's a constant locator that
+    // adds nothing once content is folded in, and including it would absorb the
+    // serve-time directory_hash cache-bust (getTVShows*), polluting this hash
+    // with every directory change and blurring the showHash/contentHash split.
     const showHashableData = {
       name: show.name,
-      metadata_path: show.metadata_path,
+      metadata: show.metadata,
       poster: show.poster,
       logo: show.logo,
       backdrop: show.backdrop,

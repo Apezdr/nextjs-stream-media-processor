@@ -38,9 +38,55 @@ const imageProcessingDuration = createHistogram(meter, 'image.processing.duratio
   unit: 'ms'
 });
 
+// Counter for image download outcomes. Each time the image downloader
+// reaches a terminal decision for a given (mediaName, imageType) pair, it
+// records exactly one event here so the ratio of fresh downloads to disk
+// cache hits and failures is queryable per media type.
+const imageOutcomeCounter = createCounter(meter, 'image.download.outcome', {
+  description: 'TMDB image download outcomes by image type (downloaded / cache-hit / cache-hit-fresh / no-url / failed)',
+  unit: '1'
+});
+
+/**
+ * Record a single image download decision.
+ *
+ * @param {Object} options
+ * @param {string} options.imageType - 'poster' | 'backdrop' | 'logo' | 'season-poster' | 'episode-thumbnail'
+ * @param {string} options.outcome - 'downloaded' | 'cache-hit' | 'cache-hit-fresh' | 'no-url' | 'failed'
+ * @param {string} [options.mediaType] - 'tv' | 'movie' (optional, low cardinality)
+ */
+export function recordImageOutcome({ imageType, outcome, mediaType }) {
+  if (!imageType || !outcome) return;
+  const attrs = {
+    'image.type': imageType,
+    'image.outcome': outcome,
+  };
+  if (mediaType) attrs['media.type'] = mediaType;
+  imageOutcomeCounter.add(1, attrs);
+}
+
+/**
+ * Best-effort byte size for an axios response body. Returns 0 instead of
+ * throwing for streams, Buffers, or objects with circular references.
+ */
+function computeResponseSize(data) {
+  if (data == null) return 0;
+  if (typeof data === 'string') return data.length;
+  if (Buffer.isBuffer(data)) return data.length;
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  // Streams (Readable) and other piping objects have a .pipe method.
+  if (typeof data.pipe === 'function') return 0;
+  try {
+    return JSON.stringify(data).length;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Create a span for API requests
- * 
+ *
  * @param {Object} options API request options
  * @param {Function} fn Function to execute within the span
  * @returns {Promise<any>} Result of the function execution
@@ -68,10 +114,17 @@ export async function withApiRequestSpan(options, fn) {
     // Record response metrics
     const duration = Date.now() - startTime;
     const statusCode = result?.status || 200;
-    
-    // Add response attributes
+
+    // Add response attributes. `api.response_size` must guard against
+    // non-JSON-serializable bodies — when axios is called with
+    // `responseType: 'stream'` (image downloads) or `'arraybuffer'`
+    // (blurhash source fetch), `result.data` is a Readable stream or Buffer
+    // with circular references (TLSSocket → HTTPParser → socket), and
+    // calling JSON.stringify on it throws "Converting circular structure to
+    // JSON". That throw used to escape this wrapper and fail every image
+    // download via the retry loop.
     attributes['http.status_code'] = statusCode;
-    attributes['api.response_size'] = result?.data ? JSON.stringify(result.data).length : 0;
+    attributes['api.response_size'] = computeResponseSize(result?.data);
     
     // Record success metrics
     apiRequestDuration.record(duration, {

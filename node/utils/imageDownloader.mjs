@@ -3,15 +3,80 @@ import { createWriteStream } from 'node:fs';
 import { finished } from 'node:stream/promises';
 import path from 'path';
 import axios from 'axios';
+import pLimit from 'p-limit';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { extractFileExtension, touchFile, pathExists, getFileAgeDays } from './fileUtils.mjs';
 import { generateBlurhash } from './blurhashNative.mjs';
+import { withApiRequestSpan, recordImageOutcome } from '../lib/apiTracer.mjs';
+import { getConvention } from '../components/media-scanner/domain/image-conventions.mjs';
 
 const logger = createCategoryLogger('image-downloader');
 
 // Configurable refresh intervals from environment variables
 const season_poster_refresh_days = parseInt(process.env.SEASON_POSTER_REFRESH_DAYS) || 1;
 const episode_thumbnail_refresh_days = parseInt(process.env.EPISODE_THUMBNAIL_REFRESH_DAYS) || 3;
+
+const IMAGE_DOWNLOAD_MAX_RETRIES = parseInt(process.env.TMDB_IMAGE_MAX_RETRIES) || 5;
+const IMAGE_DOWNLOAD_CONCURRENCY = parseInt(process.env.TMDB_IMAGE_CONCURRENCY) || 5;
+
+async function fetchImageStream(imageUrl, timeout, imageType) {
+  let lastError;
+  let backoffSeconds = 1;
+
+  for (let attempt = 0; attempt < IMAGE_DOWNLOAD_MAX_RETRIES; attempt++) {
+    try {
+      return await withApiRequestSpan(
+        {
+          service: 'tmdb-images',
+          method: 'GET',
+          url: imageUrl,
+          endpoint: imageType || 'image'
+        },
+        async () =>
+          axios({
+            method: 'get',
+            url: imageUrl,
+            responseType: 'stream',
+            timeout,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; MetadataGenerator/1.0)'
+            }
+          })
+      );
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      const code = error.code;
+      const retryable =
+        status === 429 ||
+        status === 503 ||
+        code === 'ECONNABORTED' ||
+        code === 'ENOTFOUND' ||
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT';
+
+      const isLastAttempt = attempt === IMAGE_DOWNLOAD_MAX_RETRIES - 1;
+      if (!retryable || isLastAttempt) {
+        throw error;
+      }
+
+      let waitSeconds = backoffSeconds;
+      if (status === 429) {
+        const retryAfter = parseInt(error.response.headers?.['retry-after']);
+        if (!Number.isNaN(retryAfter)) waitSeconds = retryAfter;
+      }
+
+      logger.warn(
+        `Image download attempt ${attempt + 1}/${IMAGE_DOWNLOAD_MAX_RETRIES} failed for ${imageUrl} ` +
+        `(${status || code || error.message}); retrying in ${waitSeconds}s`
+      );
+      await new Promise((r) => setTimeout(r, waitSeconds * 1000));
+      backoffSeconds *= 2;
+    }
+  }
+
+  throw lastError;
+}
 
 /**
  * Download an image from URL and save to local path
@@ -20,18 +85,38 @@ const episode_thumbnail_refresh_days = parseInt(process.env.EPISODE_THUMBNAIL_RE
  * @param {Object} options - Download options
  * @param {boolean} options.forceDownload - Force re-download even if file exists
  * @param {number} options.timeout - Request timeout in milliseconds (default: 30000)
+ * @param {string} options.imageType - Image kind ('poster' | 'backdrop' | 'logo' | 'season-poster' | 'episode-thumbnail') for telemetry endpoint tagging
+ * @param {string} options.mediaName - Show or movie name for structured logging
+ * @param {string} options.mediaType - 'tv' | 'movie' for structured logging + metrics
+ * @param {boolean} options.skipExistsCheck - If true, the caller already decided to download; skip the file-exists short-circuit and do not record a cache-hit outcome here
  * @returns {Promise<boolean>} Whether download was successful
  */
 export async function downloadImage(imageUrl, destPath, options = {}) {
   const {
     forceDownload = false,
-    timeout = 30000
+    timeout = 30000,
+    imageType,
+    mediaName,
+    mediaType,
+    skipExistsCheck = false
   } = options;
 
+  const logMeta = {
+    'image.type': imageType,
+    'image.url': imageUrl,
+    'image.dest': destPath,
+    'media.name': mediaName,
+    'media.type': mediaType
+  };
+
   try {
-    // Check if image already exists and skip if not forcing download
-    if (!forceDownload && await pathExists(destPath)) {
-      logger.debug(`Image already exists at ${destPath}. Skipping download.`);
+    // Check if image already exists and skip if not forcing download.
+    // Callers that already performed their own freshness check (e.g.
+    // downloadMediaImages, downloadSeasonPoster) pass skipExistsCheck=true
+    // so this branch doesn't double-count their cache-hit decision.
+    if (!skipExistsCheck && !forceDownload && await pathExists(destPath)) {
+      logger.debug(`Image already exists at ${destPath}. Skipping download.`, logMeta);
+      recordImageOutcome({ imageType, outcome: 'cache-hit', mediaType });
       return true;
     }
 
@@ -39,56 +124,53 @@ export async function downloadImage(imageUrl, destPath, options = {}) {
     const destDir = path.dirname(destPath);
     await fs.mkdir(destDir, { recursive: true });
 
-    // Download the image
-    logger.debug(`Downloading image from ${imageUrl} to ${destPath}`);
-    
-    const response = await axios({
-      method: 'get',
-      url: imageUrl,
-      responseType: 'stream',
-      timeout,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; MetadataGenerator/1.0)'
-      }
-    });
+    // Download the image (instrumented + retried on 429/network errors)
+    logger.debug(`Downloading image from ${imageUrl} to ${destPath}`, logMeta);
+
+    const response = await fetchImageStream(imageUrl, timeout, imageType);
 
     // Check response status
     if (response.status !== 200) {
-      logger.warn(`Failed to download image. HTTP Status: ${response.status}`);
+      logger.warn(`Failed to download image. HTTP Status: ${response.status}`, logMeta);
+      recordImageOutcome({ imageType, outcome: 'failed', mediaType });
       return false;
     }
 
     // Create write stream and pipe response
     const writeStream = createWriteStream(destPath);
-    
+
     try {
       // Pipe the response data to the write stream
       response.data.pipe(writeStream);
-      
+
       // Wait for the stream to finish using async/await approach
       await finished(writeStream);
-      
+
       // Verify file was written and has content
       const stats = await fs.stat(destPath);
       if (stats.size > 0) {
-        logger.info(`Image successfully downloaded and saved to ${destPath}`);
+        logger.info(`Image successfully downloaded and saved to ${destPath}`, logMeta);
+        recordImageOutcome({ imageType, outcome: 'downloaded', mediaType });
         return true;
       } else {
-        logger.error(`Downloaded file is empty: ${destPath}`);
+        logger.error(`Downloaded file is empty: ${destPath}`, logMeta);
+        recordImageOutcome({ imageType, outcome: 'failed', mediaType });
         // Clean up empty file
         await fs.unlink(destPath).catch(() => {});
         return false;
       }
-      
+
     } catch (error) {
-      logger.error(`Error during stream operation: ${error.message}`);
+      logger.error(`Error during stream operation: ${error.message}`, logMeta);
+      recordImageOutcome({ imageType, outcome: 'failed', mediaType });
       // Clean up partial file
       await fs.unlink(destPath).catch(() => {});
       return false;
     }
 
   } catch (error) {
-    logger.error(`HTTP error occurred while downloading image from ${imageUrl}: ${error.message}`);
+    logger.error(`HTTP error occurred while downloading image from ${imageUrl}: ${error.message}`, logMeta);
+    recordImageOutcome({ imageType, outcome: 'failed', mediaType });
     return false;
   }
 }
@@ -108,15 +190,20 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
   const {
     forceDownload = false,
     generateBlurhash: shouldGenerateBlurhash = true,
-    imageType = 'poster' // Default to poster for backwards compatibility
+    imageType = 'poster', // Default to poster for backwards compatibility
+    mediaName,
+    mediaType,
+    skipExistsCheck = false
   } = options;
   
   // OPTIMIZATION: Size blurhashes based on image type and usage
-  // - backdrop: 'small' (16px preview, ~8-12KB) - blurred backgrounds
-  // - poster: 'medium' (24px preview, ~12-18KB) - balance quality and size
-  // - logo: 'large' (32px preview, ~25-35KB) - needs more detail
-  const blurhashSize = imageType === 'backdrop' ? 'small' :
-                       imageType === 'poster' ? 'medium' : 'large';
+  // - backdrop / episode-thumbnail: 'small' (16px preview, ~8-12KB) - blurred backgrounds, 16:9
+  // - poster / season-poster:        'medium' (24px preview, ~12-18KB) - balanced
+  // - logo:                          'large' (32px preview, ~25-35KB) - needs more detail
+  const blurhashSize =
+    (imageType === 'backdrop' || imageType === 'episode-thumbnail') ? 'small' :
+    (imageType === 'poster' || imageType === 'season-poster') ? 'medium' :
+    'large';
 
   try {
     const blurhashPath = `${destPath}.blurhash`;
@@ -137,7 +224,13 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
     }
 
     // Download the image
-    const downloadSuccess = await downloadImage(imageUrl, destPath, { forceDownload });
+    const downloadSuccess = await downloadImage(imageUrl, destPath, {
+      forceDownload,
+      imageType,
+      mediaName,
+      mediaType,
+      skipExistsCheck
+    });
     
     if (!downloadSuccess) {
       return {
@@ -252,6 +345,7 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
     forceDownload = false,
     generateBlurhash: shouldGenerateBlurhash = true
   } = options;
+  const mediaName = options.mediaName || path.basename(mediaDir);
 
   const results = {
     backdrop: { success: false, path: null },
@@ -259,89 +353,104 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
     logo: { success: false, path: null }
   };
 
-  // Image type mappings
+  // Image type mappings. Prefixes come from the shared image-conventions
+  // module so the scanner's discovery rules and the downloader's write
+  // rules stay in sync.
   const imageTypes = {
     backdrop_path: {
       key: 'backdrop',
-      prefix: mediaType === 'tv' ? 'show_backdrop' : 'backdrop',
+      prefix: getConvention(mediaType, 'backdrop').prefix,
       overrideKey: 'override_backdrop'
     },
     poster_path: {
-      key: 'poster', 
-      prefix: mediaType === 'tv' ? 'show_poster' : 'poster',
+      key: 'poster',
+      prefix: getConvention(mediaType, 'poster').prefix,
       overrideKey: 'override_poster'
     },
     logo_path: {
       key: 'logo',
-      prefix: mediaType === 'tv' ? 'show_logo' : 'logo', 
+      prefix: getConvention(mediaType, 'logo').prefix,
       overrideKey: 'override_logo'
     }
   };
 
-  for (const [dataKey, imageInfo] of Object.entries(imageTypes)) {
-    try {
-      let imageUrl = null;
+  const limit = pLimit(IMAGE_DOWNLOAD_CONCURRENCY);
 
-      // Check for override first (matches Python script priority)
-      const overridePath = config[imageInfo.overrideKey];
-      if (overridePath) {
-        imageUrl = `https://image.tmdb.org/t/p/original${overridePath}`;
-        logger.debug(`Using override ${imageInfo.key} image: ${overridePath}`);
-      } else if (mediaData[dataKey]) {
-        // Use TMDB image
-        if (mediaData[dataKey].startsWith('http')) {
-          imageUrl = mediaData[dataKey];
-        } else {
-          imageUrl = `https://image.tmdb.org/t/p/original${mediaData[dataKey]}`;
-        }
-      }
-
-      if (!imageUrl) {
-        logger.debug(`No ${imageInfo.key} image URL found for media`);
-        continue;
-      }
-
-      // Determine file extension and create destination path
-      const extension = extractFileExtension(imageUrl) || '.jpg';
-      const fileName = `${imageInfo.prefix}${extension}`;
-      const destPath = path.join(mediaDir, fileName);
-
-      // Check if image needs updating (URL comparison like Python script)
-      let needsUpdate = forceDownload;
-      
-      if (!forceDownload && await pathExists(destPath)) {
-        // Could add URL comparison logic here similar to Python script
-        // For now, skip download if file exists and not forcing
-        logger.debug(`${imageInfo.key} image already exists: ${fileName}`);
-        results[imageInfo.key] = { success: true, path: destPath, skipped: true };
-        continue;
-      }
-
-      // Download image with appropriate blurhash size for image type
-      const result = await downloadImageWithBlurhash(imageUrl, destPath, {
-        forceDownload,
-        generateBlurhash: shouldGenerateBlurhash,
-        imageType: imageInfo.key // Pass image type for size optimization (backdrop = small, poster/logo = large)
-      });
-
-      if (result.success) {
-        results[imageInfo.key] = { 
-          success: true, 
-          path: destPath, 
-          blurhash: result.blurhash,
-          downloaded: true 
+  await Promise.all(
+    Object.entries(imageTypes).map(([dataKey, imageInfo]) =>
+      limit(async () => {
+        const logMeta = {
+          'image.type': imageInfo.key,
+          'media.name': mediaName,
+          'media.type': mediaType
         };
-        logger.info(`Successfully downloaded ${imageInfo.key} image: ${fileName}`);
-      } else {
-        results[imageInfo.key] = { success: false, path: destPath, error: result.error };
-        logger.warn(`Failed to download ${imageInfo.key} image: ${result.error}`);
-      }
+        try {
+          let imageUrl = null;
 
-    } catch (error) {
-      logger.error(`Error processing ${imageInfo.key} image: ${error.message}`);
-      results[imageInfo.key] = { success: false, error: error.message };
-    }
-  }
+          // Check for override first (matches Python script priority)
+          const overridePath = config[imageInfo.overrideKey];
+          if (overridePath) {
+            imageUrl = `https://image.tmdb.org/t/p/original${overridePath}`;
+            logger.debug(`Using override ${imageInfo.key} image: ${overridePath}`, logMeta);
+          } else if (mediaData[dataKey]) {
+            // Use TMDB image
+            if (mediaData[dataKey].startsWith('http')) {
+              imageUrl = mediaData[dataKey];
+            } else {
+              imageUrl = `https://image.tmdb.org/t/p/original${mediaData[dataKey]}`;
+            }
+          }
+
+          if (!imageUrl) {
+            logger.debug(`No ${imageInfo.key} image URL found for media`, logMeta);
+            recordImageOutcome({ imageType: imageInfo.key, outcome: 'no-url', mediaType });
+            return;
+          }
+
+          // Determine file extension and create destination path
+          const extension = extractFileExtension(imageUrl) || '.jpg';
+          const fileName = `${imageInfo.prefix}${extension}`;
+          const destPath = path.join(mediaDir, fileName);
+
+          if (!forceDownload && await pathExists(destPath)) {
+            // Skip download if file exists and not forcing
+            logger.debug(`${imageInfo.key} image already exists: ${fileName}`, logMeta);
+            recordImageOutcome({ imageType: imageInfo.key, outcome: 'cache-hit', mediaType });
+            results[imageInfo.key] = { success: true, path: destPath, skipped: true, outcome: 'cache-hit' };
+            return;
+          }
+
+          // Download image with appropriate blurhash size for image type
+          const result = await downloadImageWithBlurhash(imageUrl, destPath, {
+            forceDownload,
+            generateBlurhash: shouldGenerateBlurhash,
+            imageType: imageInfo.key, // Pass image type for size optimization (backdrop = small, poster/logo = large)
+            mediaName,
+            mediaType,
+            skipExistsCheck: true // we already did the existence check above
+          });
+
+          if (result.success) {
+            results[imageInfo.key] = {
+              success: true,
+              path: destPath,
+              blurhash: result.blurhash,
+              downloaded: true,
+              outcome: 'downloaded'
+            };
+            logger.info(`Successfully downloaded ${imageInfo.key} image: ${fileName}`, logMeta);
+          } else {
+            results[imageInfo.key] = { success: false, path: destPath, error: result.error, outcome: 'failed' };
+            logger.warn(`Failed to download ${imageInfo.key} image: ${result.error}`, logMeta);
+          }
+        } catch (error) {
+          logger.error(`Error processing ${imageInfo.key} image: ${error.message}`, logMeta);
+          recordImageOutcome({ imageType: imageInfo.key, outcome: 'failed', mediaType });
+          results[imageInfo.key] = { success: false, error: error.message, outcome: 'failed' };
+        }
+      })
+    )
+  );
 
   return results;
 }
@@ -356,43 +465,61 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
 export async function downloadSeasonPoster(seasonPosterUrl, seasonDir, options = {}) {
   const {
     forceDownload = false,
-    generateBlurhash: shouldGenerateBlurhash = true
+    generateBlurhash: shouldGenerateBlurhash = true,
+    mediaName,
+    mediaType = 'tv'
   } = options;
 
   const fileName = 'season_poster.jpg';
   const destPath = path.join(seasonDir, fileName);
+  const logMeta = {
+    'image.type': 'season-poster',
+    'image.dest': destPath,
+    'media.name': mediaName,
+    'media.type': mediaType
+  };
 
   try {
     // Check if refresh is needed (matches Python script logic)
     if (!forceDownload && await pathExists(destPath)) {
       const daysSinceModified = await getFileAgeDays(destPath);
       if (daysSinceModified !== null && daysSinceModified < season_poster_refresh_days) {
-        logger.debug(`Season poster is recent, skipping download: ${destPath}`);
-        return { success: true, path: destPath, skipped: true };
+        logger.debug(`Season poster is recent, skipping download: ${destPath}`, logMeta);
+        recordImageOutcome({ imageType: 'season-poster', outcome: 'cache-hit-fresh', mediaType });
+        return { success: true, path: destPath, skipped: true, outcome: 'cache-hit-fresh' };
       }
     }
 
     const result = await downloadImageWithBlurhash(seasonPosterUrl, destPath, {
       forceDownload,
       generateBlurhash: shouldGenerateBlurhash,
-      imageType: 'poster' // Season posters use 'medium' size (balanced quality/size)
+      imageType: 'season-poster',
+      mediaName,
+      mediaType,
+      skipExistsCheck: true
     });
 
     if (result.success) {
       // Touch the file to update timestamp (matches Python script)
       await touchFile(destPath);
+    } else {
+      // downloadImage already recorded a `failed` outcome at the HTTP layer if
+      // it was a network failure; this branch covers the wrapper-only path.
+      logger.warn(`Season poster download failed: ${result.error}`, logMeta);
     }
 
     return {
       success: result.success,
       path: destPath,
       blurhash: result.blurhash,
-      error: result.error
+      error: result.error,
+      outcome: result.success ? 'downloaded' : 'failed'
     };
 
   } catch (error) {
-    logger.error(`Error downloading season poster: ${error.message}`);
-    return { success: false, path: destPath, error: error.message };
+    logger.error(`Error downloading season poster: ${error.message}`, logMeta);
+    recordImageOutcome({ imageType: 'season-poster', outcome: 'failed', mediaType });
+    return { success: false, path: destPath, error: error.message, outcome: 'failed' };
   }
 }
 
@@ -406,49 +533,67 @@ export async function downloadSeasonPoster(seasonPosterUrl, seasonDir, options =
  */
 export async function downloadEpisodeThumbnail(thumbnailUrl, seasonDir, episodeNumber, options = {}) {
   const {
-    forceDownload = false, 
-    generateBlurhash: shouldGenerateBlurhash = true
+    forceDownload = false,
+    generateBlurhash: shouldGenerateBlurhash = true,
+    mediaName,
+    mediaType = 'tv'
   } = options;
 
   const fileName = `${episodeNumber.toString().padStart(2, '0')} - Thumbnail.jpg`;
   const destPath = path.join(seasonDir, fileName);
+  const logMeta = {
+    'image.type': 'episode-thumbnail',
+    'image.dest': destPath,
+    'media.name': mediaName,
+    'media.type': mediaType,
+    'episode.number': episodeNumber
+  };
 
   try {
     // Check if refresh is needed (configurable refresh interval)
     if (!forceDownload && await pathExists(destPath)) {
       const daysSinceModified = await getFileAgeDays(destPath);
       if (daysSinceModified !== null && daysSinceModified < episode_thumbnail_refresh_days) {
-        logger.debug(`Episode thumbnail is recent, skipping download: ${destPath}`);
-        return { success: true, path: destPath, skipped: true };
+        logger.debug(`Episode thumbnail is recent, skipping download: ${destPath}`, logMeta);
+        recordImageOutcome({ imageType: 'episode-thumbnail', outcome: 'cache-hit-fresh', mediaType });
+        return { success: true, path: destPath, skipped: true, outcome: 'cache-hit-fresh' };
       }
     }
 
     if (!thumbnailUrl) {
-      logger.debug(`No thumbnail URL provided for episode ${episodeNumber}`);
-      return { success: false, path: destPath, error: 'No thumbnail URL' };
+      logger.debug(`No thumbnail URL provided for episode ${episodeNumber}`, logMeta);
+      recordImageOutcome({ imageType: 'episode-thumbnail', outcome: 'no-url', mediaType });
+      return { success: false, path: destPath, error: 'No thumbnail URL', outcome: 'no-url' };
     }
 
     // Episode thumbnails are backdrop-style (16:9), so use 'backdrop' type for smaller blurhashes
     const result = await downloadImageWithBlurhash(thumbnailUrl, destPath, {
       forceDownload,
       generateBlurhash: shouldGenerateBlurhash,
-      imageType: 'backdrop' // Episode thumbnails benefit from 'small' size (60-70% reduction)
+      imageType: 'episode-thumbnail',
+      mediaName,
+      mediaType,
+      skipExistsCheck: true
     });
 
     if (result.success) {
       // Touch the file to update timestamp
       await touchFile(destPath);
+    } else {
+      logger.warn(`Episode thumbnail download failed: ${result.error}`, logMeta);
     }
 
     return {
       success: result.success,
       path: destPath,
       blurhash: result.blurhash,
-      error: result.error
+      error: result.error,
+      outcome: result.success ? 'downloaded' : 'failed'
     };
 
   } catch (error) {
-    logger.error(`Error downloading episode thumbnail: ${error.message}`);
-    return { success: false, path: destPath, error: error.message };
+    logger.error(`Error downloading episode thumbnail: ${error.message}`, logMeta);
+    recordImageOutcome({ imageType: 'episode-thumbnail', outcome: 'failed', mediaType });
+    return { success: false, path: destPath, error: error.message, outcome: 'failed' };
   }
 }

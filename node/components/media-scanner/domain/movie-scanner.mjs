@@ -1,6 +1,5 @@
 import { promises as fs } from 'fs';
 import { join } from 'path';
-import { createHash } from 'crypto';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   calculateDirectoryHash,
@@ -17,16 +16,21 @@ import {
   saveMovie,
   removeMovie,
   markMediaAsMissingData,
-  getDatabaseInstance
+  clearMissingMediaData,
+  getDatabaseInstance,
+  RETRY_INTERVAL_HOURS
 } from '../data-access/scanner-repository.mjs';
 import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
 import { loadTmdbConfig } from '../../../utils/tmdbConfig.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
+import {
+  iterateConventions,
+  findExistingImageInSet,
+  resolveImage,
+  imageHashesFromResolved,
+} from './image-conventions.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
-
-// Constants
-const RETRY_INTERVAL_HOURS = 24;
 
 /**
  * Helper function to generate chapter files if they don't exist
@@ -82,41 +86,73 @@ async function needsInfoRegeneration(files, dirPath, dirName, currentVersion) {
 }
 
 /**
- * Check if TMDB images need to be downloaded
+ * Classify which TMDB-derived files (if any) are missing or stale for a movie
+ * directory. Splits the result into two independent booleans so the caller
+ * can apply different retry policies:
+ *
+ *   - `missingMetadata` — `metadata.json` is missing or older than `tmdb.config`.
+ *     Indicates a TMDB *lookup* problem (e.g. no match for the title); the
+ *     scanner applies the 24h `RETRY_INTERVAL_HOURS` cooldown to this case.
+ *
+ *   - `missingImages` — at least one of poster / backdrop / logo is missing
+ *     or stale. Indicates a *download* problem (e.g. transient image-CDN
+ *     flake); the scanner bypasses the cooldown for this case so retries
+ *     happen every scan tick. Reasoning is in
+ *     https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults
+ *
+ *   - `staleByConfig` — true specifically when tmdb.config is newer than an
+ *     EXISTING metadata.json (an id/config edit), as opposed to metadata.json
+ *     being plain absent. Mirrors `processShowMetadata`'s flag of the same
+ *     name in tv-scanner.mjs; the caller uses it to force a forceRefresh
+ *     image repull (wipe-then-redownload) for the new id instead of leaving
+ *     the previous id's art on disk under the download's existence checks.
+ *
  * @param {Set<string>} fileSet - Set of files in directory
  * @param {string} dirPath - Directory path
  * @param {string} dirName - Directory name
  * @param {Date} tmdbConfigLastModified - Last modified time of tmdb.config
- * @returns {Promise<boolean>} True if download is needed
+ * @returns {Promise<{missingMetadata: boolean, missingImages: boolean, staleByConfig: boolean}>}
  */
 async function checkTMDBImagesNeeded(fileSet, dirPath, dirName, tmdbConfigLastModified) {
-  const imagesToCheck = [
-    { name: 'backdrop.jpg', path: join(dirPath, dirName, 'backdrop.jpg') },
-    { name: 'poster.jpg', path: join(dirPath, dirName, 'poster.jpg') },
-    { name: 'movie_logo.png', path: join(dirPath, dirName, 'movie_logo.png'), alt: 'logo.png' },
-    { name: 'metadata.json', path: join(dirPath, dirName, 'metadata.json') }
-  ];
+  let missingMetadata = false;
+  let missingImages = false;
+  let staleByConfig = false;
 
-  for (const image of imagesToCheck) {
-    const exists = fileSet.has(image.name) || (image.alt && fileSet.has(image.alt));
-    
-    if (!exists) {
-      return true;
-    }
-
-    // Check if tmdb.config has been updated more recently than the image
-    if (exists && tmdbConfigLastModified) {
-      const imagePath = fileSet.has(image.name) ? image.path : 
-                        (image.alt ? join(dirPath, dirName, image.alt) : image.path);
-      const imageLastModified = await getLastModifiedTime(imagePath);
-      
+  // Check each image kind via the shared convention. Multi-extension
+  // discovery is symmetric with the TV scanner — a TMDB-served .svg movie
+  // logo (or a user's manually-placed .gif backdrop) is now visible.
+  for (const [, convention] of iterateConventions('movie')) {
+    const found = findExistingImageInSet(fileSet, convention);
+    let stale = false;
+    if (found && tmdbConfigLastModified) {
+      const resolvedPath = join(dirPath, dirName, found.fileName);
+      const imageLastModified = await getLastModifiedTime(resolvedPath);
       if (imageLastModified && tmdbConfigLastModified > imageLastModified) {
-        return true;
+        stale = true;
       }
+    }
+    if (!found || stale) {
+      missingImages = true;
     }
   }
 
-  return false;
+  // metadata.json is its own concern (fixed filename, gated by 24h cooldown
+  // for the lookup-failure case rather than the transient-download case).
+  const metadataExists = fileSet.has('metadata.json');
+  let metadataStale = false;
+  if (metadataExists && tmdbConfigLastModified) {
+    const metadataPath = join(dirPath, dirName, 'metadata.json');
+    const metadataLastModified = await getLastModifiedTime(metadataPath);
+    if (metadataLastModified && tmdbConfigLastModified > metadataLastModified) {
+      metadataStale = true;
+      staleByConfig = true;
+    }
+  }
+  if (!metadataExists || metadataStale) {
+    missingMetadata = true;
+  }
+
+  return { missingMetadata, missingImages, staleByConfig };
 }
 
 /**
@@ -126,45 +162,40 @@ async function checkTMDBImagesNeeded(fileSet, dirPath, dirName, tmdbConfigLastMo
  * @param {string} dirName - Directory name
  * @param {string} prefixPath - URL prefix path
  * @param {string} basePath - Base path for media files
- * @returns {Promise<Object>} URLs object
+ * @returns {Promise<{urls: Object, resolved: {poster: ?Object, backdrop: ?Object, logo: ?Object}}>}
+ *   `urls` is the URL map; `resolved` carries each kind's single resolveImage()
+ *   result (file path + mtime + cache-bust hash) so the caller can feed the DB
+ *   the exact file/hash that produced the URL — no second stat, no drift.
  */
 async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
   const urls = {};
   const encodedDirName = encodeURIComponent(dirName);
+  const movieDir = join(dirPath, dirName);
+  const resolved = { poster: null, backdrop: null, logo: null };
 
-  // Helper to add image URL with hash and blurhash
-  const addImageURL = async (fileName, urlKey, blurhashKey) => {
-    const imagePath = join(dirPath, dirName, fileName);
-    const imageStats = await fs.stat(imagePath);
-    const imageHash = createHash('md5')
-      .update(imageStats.mtime.toISOString())
-      .digest('hex')
-      .substring(0, 10);
-    
-    urls[urlKey] = `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent(fileName)}?hash=${imageHash}`;
-    
-    if (await fileExists(`${imagePath}.blurhash`)) {
-      urls[blurhashKey] = `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent(fileName)}.blurhash`;
-    } else {
-      await getStoredBlurhash(imagePath, basePath);
-    }
+  // Discover each image kind via the shared convention (multi-extension) with a
+  // single readdir-set lookup + single stat per kind. The same resolution drives
+  // the URL filename, the baked `?hash=` token, and (via `resolved`) the DB row.
+  const blurhashKeyMap = {
+    poster:   'posterBlurhash',
+    backdrop: 'backdropBlurhash',
+    logo:     'logoBlurhash',
   };
+  for (const [imageKey, convention] of iterateConventions('movie')) {
+    const r = await resolveImage({ dirPath: movieDir, fileSet, convention });
+    if (!r) continue;
+    resolved[imageKey] = r;
+    const encodedFileName = encodeURIComponent(r.fileName);
+    urls[imageKey] = `${prefixPath}/movies/${encodedDirName}/${encodedFileName}?hash=${r.hash}`;
 
-  // Backdrop
-  if (fileSet.has('backdrop.jpg')) {
-    await addImageURL('backdrop.jpg', 'backdrop', 'backdropBlurhash');
-  }
-
-  // Poster
-  if (fileSet.has('poster.jpg')) {
-    await addImageURL('poster.jpg', 'poster', 'posterBlurhash');
-  }
-
-  // Logo
-  if (fileSet.has('movie_logo.png')) {
-    await addImageURL('movie_logo.png', 'logo', 'logoBlurhash');
-  } else if (fileSet.has('logo.png')) {
-    await addImageURL('logo.png', 'logo', 'logoBlurhash');
+    // SVG sources have no usable raster blurhash representation (`sharp` may
+    // error or emit a junk hash), so skip blurhash for them. Mirrors TV.
+    if (r.ext === 'svg') continue;
+    if (await fileExists(`${r.path}.blurhash`)) {
+      urls[blurhashKeyMap[imageKey]] = `${prefixPath}/movies/${encodedDirName}/${encodedFileName}.blurhash`;
+    } else {
+      await getStoredBlurhash(r.path, basePath);
+    }
   }
 
   // Metadata
@@ -172,7 +203,7 @@ async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
     urls['metadata'] = `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent('metadata.json')}`;
   }
 
-  return urls;
+  return { urls, resolved };
 }
 
 /**
@@ -384,8 +415,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       let _id = tmdbConfig.tmdb_id ? `tmdb_${tmdbConfig.tmdb_id}` : null;
       const manualFocal = tmdbConfig.backdrop_focal ?? null;
 
-      // Check if TMDB images need to be downloaded
-      runDownloadTmdbImagesFlag = await checkTMDBImagesNeeded(
+      // Classify which TMDB-derived files (if any) are missing/stale.
+      const { missingMetadata, missingImages, staleByConfig } = await checkTMDBImagesNeeded(
         fileSet,
         dirPath,
         dirName,
@@ -396,8 +427,13 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       const videoData = await processVideoFiles(fileNames, dirPath, dirName, prefixPath);
       if (videoData._id) _id = videoData._id;
 
-      // Build URLs
-      const urls = await buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath);
+      // Build URLs. The resolution map (file path + mtime + hash per kind) comes
+      // from the same pass that builds the URLs, so the DB row below stores the
+      // exact file + hash the URL points at. Reassigned to the post-download
+      // resolution inside the download block when a re-pull happens.
+      const built = await buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath);
+      const urls = built.urls;
+      let resolvedImages = built.resolved;
       Object.assign(urls, videoData.urls);
 
       // Process subtitles
@@ -406,30 +442,92 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         urls.subtitles = subtitles;
       }
 
-      // Check if movie is in missing data table and should be retried
+      // Compute the retry gate. The 24h cooldown (RETRY_INTERVAL_HOURS)
+      // applies ONLY to the metadata-missing path — that case represents a
+      // TMDB *lookup* failure that's not worth retrying every 3 minutes.
+      // Image-download failures bypass the cooldown because they are
+      // typically transient (image CDN flake, network glitch); see
+      // https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults
+      // dirHashChanged forces a retry of either kind regardless.
       const missingDataMovie = missingDataMovies.find(movie => movie.name === dirName);
-      if (missingDataMovie && !dirHashChanged) {
-        const lastAttempt = new Date(missingDataMovie.lastAttempt);
-        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-          runDownloadTmdbImagesFlag = true;
-        } else {
-          runDownloadTmdbImagesFlag = false;
-        }
-      } else if (dirHashChanged) {
-        runDownloadTmdbImagesFlag = true;
-      }
+      const metadataGateAllowsRetry =
+        !missingDataMovie ||
+        ((now - new Date(missingDataMovie.lastAttempt)) / (1000 * 60 * 60)) >= RETRY_INTERVAL_HOURS;
 
-      // Download TMDB images if needed
+      runDownloadTmdbImagesFlag =
+        dirHashChanged ||
+        missingImages ||
+        (missingMetadata && metadataGateAllowsRetry);
+
+      // Download TMDB images if needed. The bypass log is emitted AFTER
+      // the download attempt, conditional on actual work having happened
+      // — items where TMDB has nothing to offer for the missing slot
+      // become silent no-ops, which keeps the log channel clean for
+      // genuine retry activity.
       if (runDownloadTmdbImagesFlag) {
-        await markMediaAsMissingData(dirName);
-        await downloadTMDBImages(null, dirName);
-        
+        // Only record a cooldown marker when the metadata path itself is
+        // failing. Images-only retries don't flip this gate — otherwise
+        // the 24h cooldown would suppress legitimate fast retries.
+        if (missingMetadata) {
+          await markMediaAsMissingData(dirName);
+        }
+        // Previously-managed file paths from the DB row. MetadataGenerator's
+        // reconcile step uses these to detect orphans (the path we'd write
+        // now differs from the path we wrote last time, e.g. override URL
+        // extension changed). Null on first scan; safe.
+        const previousPaths = existingMovie ? {
+          poster:   existingMovie.poster_file_path || null,
+          backdrop: existingMovie.backdrop_file_path || null,
+          logo:     existingMovie.logo_file_path || null,
+        } : null;
+        // A tmdb.config edit (id change) forces a forceRefresh repull so the
+        // generator wipes the previous id's images first, then re-downloads —
+        // otherwise the downloader's existence check would leave the old id's
+        // art on disk. Symmetric with the TV path's `fullScan: metadataResult.staleByConfig`.
+        const downloadResult = await downloadTMDBImages({
+          movieName: dirName,
+          previousPaths,
+          fullScan: staleByConfig,
+        });
+
+        // Post-condition observability: only log when the images-only
+        // bypass produced real download or failure events. cache-hit /
+        // no-url outcomes are uninteresting at the scanner level.
+        const summary = downloadResult?.imageSummary;
+        const didWork =
+          summary &&
+          ((summary.downloaded ?? 0) > 0 || (summary.failed ?? 0) > 0);
+        if (didWork && missingImages && !missingMetadata && !dirHashChanged) {
+          logger.info('scanner: images-only retry performed work', {
+            'media.name': dirName,
+            'media.type': 'movie',
+            imageSummary: summary
+          });
+        }
+
         // Retry fetching the data after running the script
         const retryFiles = await fs.readdir(join(dirPath, dirName));
         const retryFileSet = new Set(retryFiles);
-        const retryURLs = await buildMovieURLs(retryFileSet, dirPath, dirName, prefixPath, basePath);
-        Object.assign(urls, retryURLs);
+        // Rebuild URLs + resolution map against the POST-download contents: a
+        // download may have changed an image's extension (e.g. an override logo
+        // svg→png), so both the URL and the DB file_path/hash must track the
+        // file that now exists on disk.
+        const retryBuilt = await buildMovieURLs(retryFileSet, dirPath, dirName, prefixPath, basePath);
+        Object.assign(urls, retryBuilt.urls);
+        resolvedImages = retryBuilt.resolved;
+
+        // Conservative clear: only when BOTH metadata and images are now
+        // present after the retry pass. Partial recovery leaves the marker
+        // in place so the next tick has a chance to finish the job.
+        const after = await checkTMDBImagesNeeded(
+          retryFileSet,
+          dirPath,
+          dirName,
+          tmdbConfigLastModified
+        );
+        if (!after.missingMetadata && !after.missingImages) {
+          await clearMissingMediaData(dirName);
+        }
       }
 
       // Process chapters
@@ -441,12 +539,14 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // Calculate final hash
       const final_hash = await calculateDirectoryHash(fullDirPath);
 
-      // Extract file paths for direct access
-      const posterFilePath = fileSet.has('poster.jpg') ? join(dirPath, dirName, 'poster.jpg') : null;
-      const backdropFilePath = fileSet.has('backdrop.jpg') ? join(dirPath, dirName, 'backdrop.jpg') : null;
-      const logoFilePath = fileSet.has('movie_logo.png')
-        ? join(dirPath, dirName, 'movie_logo.png')
-        : (fileSet.has('logo.png') ? join(dirPath, dirName, 'logo.png') : null);
+      // File paths + cache-bust hashes come from the SAME resolve that built the
+      // URLs (resolveImage: one set lookup + one stat per kind). The URL
+      // filename, *_file_path, and *_hash therefore cannot disagree — the drift
+      // that once froze a movie logo on a stale hash is structurally impossible.
+      const posterFilePath = resolvedImages.poster?.path ?? null;
+      const backdropFilePath = resolvedImages.backdrop?.path ?? null;
+      const logoFilePath = resolvedImages.logo?.path ?? null;
+      const imageHashes = imageHashesFromResolved(resolvedImages);
 
       // Auto-detect backdrop focal point
       const backdropFocalSuggested = backdropFilePath ? await detectBackdropFocal(backdropFilePath) : null;
@@ -469,13 +569,36 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         logoFilePath,
         basePath,
         manualFocal,
-        backdropFocalSuggested
+        backdropFocalSuggested,
+        imageHashes
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
       // The scheduled hash job filters by mp4 mtime and would miss changes where
       // only tmdb.config or images changed, so we generate here to avoid the gap.
+      //
+      // metadata.json content is folded into the hash so it invalidates on
+      // tmdb.config-driven regenerations — symmetric with the TV episode hash
+      // (metadataHashes.mjs `metadata: episodeData.metadata`). Without it the
+      // hash inputs only change when the mp4 mtime advances, so client caches
+      // would keep serving stale metadata after a TMDB-id edit.
+      //
+      // Fallback chain: parsed JSON > {mtime,size} marker > null. The marker
+      // keeps the hash advancing if the file exists but can't be parsed
+      // (rare, but better than the hash silently freezing).
       if (dirHashChanged) {
+        const metadataPath = join(dirPath, dirName, 'metadata.json');
+        let metadataFingerprint = null;
+        try {
+          metadataFingerprint = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+        } catch (readErr) {
+          try {
+            const st = await fs.stat(metadataPath);
+            metadataFingerprint = { _stat: { mtimeMs: st.mtimeMs, size: st.size } };
+          } catch {
+            // file doesn't exist at all — leave as null
+          }
+        }
         await generateMovieHashes(db, {
           _id,
           name: dirName,
@@ -483,6 +606,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
           hdr: videoData.hdrInfo,
           mediaQuality: videoData.mediaQuality,
           metadataUrl: urls.metadata || '',
+          metadata: metadataFingerprint,
         });
       }
     })

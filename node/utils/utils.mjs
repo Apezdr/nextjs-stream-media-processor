@@ -6,8 +6,6 @@ import { promises as fs, stat } from 'fs'; // Use the promise-based version of f
 import { resolve as _resolve, join, relative, sep, dirname, basename, extname } from 'path';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
-const scriptsDir = dirname(__filename) + '/../../scripts/utils';
-const blurhashCli = join(scriptsDir, 'blurhash_cli.py');
 import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import PQueue from 'p-queue';
@@ -619,55 +617,25 @@ export async function getStoredBlurhash(imagePath, basePath) {
     blurhashSize = 'large';
   }
 
-  // Feature flag: use native Node.js blurhash (faster) or Python subprocess (legacy)
-  const USE_NATIVE_BLURHASH = process.env.USE_NATIVE_BLURHASH !== 'false';
-  
-  if (USE_NATIVE_BLURHASH) {
-    try {
-      logger.info(`Generating ${blurhashSize} blurhash using Node.js for: ${imagePath}`);
-      
-      // Use optimized Node.js implementation with appropriate size
-      const blurhashBase64 = await generateBlurhash(imagePath, blurhashSize);
-      
-      if (blurhashBase64) {
-        // Write the generated blurhash to a file
-        await fs.writeFile(blurhashFile, blurhashBase64);
-        logger.debug(`Successfully generated ${blurhashSize} blurhash using Node.js: ${imagePath}`);
-        return relativeUrl;
-      } else {
-        logger.warn(`Node.js blurhash generation returned null, falling back to Python`);
-      }
-    } catch (error) {
-      logger.warn(`Node.js blurhash generation failed: ${error.message}, falling back to Python`);
-    }
-  }
-
-  // Python fallback (when USE_NATIVE_BLURHASH=false or Node.js fails)
-  const isDebugMode = process.env.DEBUG && process.env.DEBUG.toLowerCase() === 'true';
-  const debugMessage = isDebugMode ? ' [Debugging Enabled]' : '';
-  logger.info(`Running blurhash_cli.py (${blurhashSize}) for ${imagePath}${debugMessage}`);
-
-  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (process.platform === "win32" ? "python" : "python3");
-  
+  // Generate the blurhash via the native Node.js implementation. The previous
+  // Python `blurhash_cli.py` fallback was removed when the TMDB workflow
+  // migrated entirely to Node; blurhashNative.mjs has its own worker-pool to
+  // main-thread fallback chain, so a single null return here means generation
+  // truly failed.
   try {
-    const cleanedPath = imagePath.replace(/"/g, '\\"');
-    logger.debug(`Attempting to generate blurhash using Python: ${cleanedPath}`);
-    
-    // Pass size parameter to Python script for consistency
-    const cmd = `${pythonExecutable} ${blurhashCli} "${cleanedPath}" "${blurhashSize}"`;
-    const blurhashOutput = await execAsync(cmd);
-    
-    if (blurhashOutput.stderr) {
-      logger.error(`Error generating blurhash: ${blurhashOutput.stderr}`);
+    logger.info(`Generating ${blurhashSize} blurhash for: ${imagePath}`);
+    const blurhashBase64 = await generateBlurhash(imagePath, blurhashSize);
+
+    if (!blurhashBase64) {
+      logger.warn(`Blurhash generation returned null for ${imagePath}`);
       return null;
     }
 
-    // Write the generated blurhash to a file
-    await fs.writeFile(blurhashFile, blurhashOutput.stdout.trim());
-    logger.debug(`Successfully generated ${blurhashSize} blurhash using Python: ${cleanedPath}`);
+    await fs.writeFile(blurhashFile, blurhashBase64);
+    logger.debug(`Successfully generated ${blurhashSize} blurhash: ${imagePath}`);
     return relativeUrl;
   } catch (error) {
-    logger.error(`Error executing blurhash_cli.py for ${imagePath}: ${error}`);
+    logger.error(`Blurhash generation failed for ${imagePath}: ${error.message}`);
     return null;
   }
 }

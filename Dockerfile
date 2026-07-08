@@ -1,5 +1,5 @@
 # Stage 1: Build Stage
-FROM node:25.2.1-alpine AS builder
+FROM node:25-alpine AS builder
 
 # Whisper.cpp GPU backend selection. "none" (default) builds a CPU-only binary;
 # "vulkan" enables the Vulkan compute backend for ~3-5x speedup on Intel ARC,
@@ -73,18 +73,11 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 FROM builder AS testing
 # Use BuildKit secret mount for TMDB_API_KEY (does NOT leak into image history)
 # Secret is only available during RUN commands that explicitly mount it
-
-# Install Python test dependencies
-COPY scripts/test-requirements.txt /tmp/
-RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/test-requirements.txt
-
-# Run Python test suite (skip slow real API tests during build)
-WORKDIR /usr/src/app/scripts
-RUN echo "============================================" && \
-    echo "Running Python Test Suite" && \
-    echo "============================================" && \
-    /opt/venv/bin/pytest -m "not slow" --cov=utils --cov-report=term-missing tests/ -v --tb=short && \
-    echo "✓ Python tests passed!"
+#
+# NOTE: The Python pytest suite that used to run here was removed when the
+# TMDB image-download workflow was migrated from `scripts/download_tmdb_images.py`
+# to the in-process Node MetadataGenerator. All TMDB business-logic tests now
+# live in `node/tests/` and are exercised by the Jest run below.
 
 # Run Node.js test suite with secret mount (API key never stored in image layers)
 WORKDIR /usr/src/app/node
@@ -108,7 +101,9 @@ RUN --mount=type=secret,id=tmdb_api_key \
     fi && \
     echo "✓ Node.js tests passed!"
 
-# Mark testing complete
+# Mark testing complete. The production stage COPY's this marker file
+# from the testing stage so that if any RUN above fails, the production
+# build fails too (you can't COPY from a stage that didn't build).
 RUN echo "" && \
     echo "============================================" && \
     echo "✓ All Tests Passed - Build Validated!" && \
@@ -117,7 +112,8 @@ RUN echo "" && \
     echo "🔒 Security Check: Verifying no secrets in this stage..." && \
     if printenv | grep -i "TMDB_API_KEY"; then \
         echo "⚠️  TMDB_API_KEY found in testing stage (OK - not in final image)"; \
-    fi
+    fi && \
+    echo "node-tests-passed" > /tmp/tests-passed.marker
 
 # Stage 2: Production Stage
 FROM node:25.2.1-alpine
@@ -158,8 +154,10 @@ COPY --from=builder /usr/src/app/node /usr/src/app/node
 COPY --from=builder /usr/src/app/scripts /usr/src/app/scripts
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
-# Copy test requirements to force the testing stage to run during build
-COPY --from=testing /usr/src/app/scripts/test-requirements.txt /tmp/test-proof
+# Copy a marker file produced only by the testing stage to force it to run
+# during build (if any test fails, the stage doesn't produce this file and
+# this COPY fails the whole build).
+COPY --from=testing /tmp/tests-passed.marker /tmp/tests-passed.marker
 
 # Ensure the virtual environment's bin is in the PATH
 ENV PATH="/opt/venv/bin:$PATH"
@@ -197,9 +195,10 @@ RUN if [ "$WHISPER_GPU" = "vulkan" ]; then \
         apk add --no-cache vulkan-loader mesa-vulkan-intel mesa-vulkan-ati; \
     fi
 
-# Grant execution rights and convert scripts to Unix format
-RUN chmod +x /usr/src/app/scripts/*.sh /usr/src/app/scripts/*.py && \
-    dos2unix /usr/src/app/scripts/*.sh
+# Grant execution rights to remaining Python scripts. Shell scripts under
+# scripts/ were removed when the TMDB workflow moved to Node; nothing is left
+# that needs dos2unix.
+RUN chmod +x /usr/src/app/scripts/*.py
 
 # The default user of node:25.2.1-alpine is 'node' with UID/GID 1000
 # Create the logs and whisper-models directories and set ownership to the 'node' user.

@@ -1,13 +1,13 @@
 import { promises as fs } from 'fs';
 import { join, normalize, dirname } from 'path';
-import { createHash } from 'crypto';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   fileExists,
   getStoredBlurhash,
   deriveEpisodeTitle,
-  calculateDirectoryHash
+  calculateDirectoryHash,
+  getLastModifiedTime
 } from '../../../utils/utils.mjs';
 import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
@@ -19,17 +19,40 @@ import {
   getMissingMediaData,
   saveTVShow,
   removeTVShow,
-  markMediaAsMissingData
+  markMediaAsMissingData,
+  clearMissingMediaData,
+  RETRY_INTERVAL_HOURS,
+  getEpisodeRetryRows,
+  recordEpisodeAttempt,
+  clearEpisodeRetry
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
-import { loadTmdbConfig, getTmdbConfigFilePath } from '../../../utils/tmdbConfig.mjs';
+import { refreshMissingEpisodes } from '../../../lib/metadataGenerator.mjs';
+import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed } from '../../../utils/tmdbConfig.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
+import {
+  iterateConventions,
+  resolveImage,
+  imageHashFromMtimeMs,
+  imageHashesFromResolved,
+} from './image-conventions.mjs';
 
 const logger = createCategoryLogger('tv-scanner');
 
-// Constants
-const RETRY_INTERVAL_HOURS = 24;
+// How deep `calculateDirectoryHash` recurses into each show directory.
+// 2 catches "season folder added/removed" and "a file dropped at the show
+// root or season root" — the cheapest depth that still detects the changes
+// a sysadmin would expect to trigger a re-scan. Movie scanner uses the
+// utility's default (5); TV defaults shallower because shows have far more
+// nested content (per-episode subtitle files etc.) that doesn't warrant a
+// scanner re-pass on its own. Override with `TV_DIR_HASH_MAX_DEPTH=N` if you
+// want movie-style symmetry.
+const TV_DIR_HASH_MAX_DEPTH = (() => {
+  const raw = parseInt(process.env.TV_DIR_HASH_MAX_DEPTH ?? '2', 10);
+  if (Number.isNaN(raw)) return 2;
+  return Math.max(0, Math.min(5, raw));
+})();
 
 /**
  * Helper function to generate chapter files if they don't exist.
@@ -65,86 +88,90 @@ async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode
  * @param {string} basePath - Base path for media files
  * @returns {Promise<Object>} Object containing asset URLs and flags
  */
-async function processShowAssets(showPath, encodedShowName, prefixPath, basePath) {
-  let poster = '';
-  let posterBlurhash = '';
-  let logo = '';
-  let logoBlurhash = '';
-  let backdrop = '';
-  let backdropBlurhash = '';
-  let runDownloadTmdbImagesFlag = false;
-
-  // Helper to add image with hash and blurhash
-  const addImage = async (fileName, urlKey, blurhashKey) => {
-    const imagePath = join(showPath, fileName);
-    if (await fileExists(imagePath)) {
-      const imageStats = await fs.stat(imagePath);
-      const imageHash = createHash('md5')
-        .update(imageStats.mtime.toISOString())
-        .digest('hex')
-        .substring(0, 10);
-      
-      const url = `${prefixPath}/tv/${encodedShowName}/${fileName}?hash=${imageHash}`;
-      const blurhash = await getStoredBlurhash(imagePath, basePath);
-      
-      return { url, blurhash, found: true };
-    }
-    return { url: '', blurhash: '', found: false };
+/**
+ * Discover poster / backdrop / logo for a show, build their URLs + blurhash
+ * refs, and flag any that are missing OR stale (older than `tmdb.config`).
+ *
+ * @param {Object} opts
+ * @param {string} opts.showPath
+ * @param {string} opts.showName - For structured logging only
+ * @param {string} opts.encodedShowName
+ * @param {string} opts.prefixPath
+ * @param {string} opts.basePath
+ * @param {Date|null} [opts.tmdbConfigLastModified=null] - mtime of the show's
+ *   tmdb.config. An image with mtime < this counts as missing (the user has
+ *   edited config since we last wrote the image). Pass null when the show
+ *   has no tmdb.config.
+ */
+async function processShowAssets({
+  showPath,
+  showName,
+  encodedShowName,
+  prefixPath,
+  basePath,
+  fileSet = null,
+  tmdbConfigLastModified = null,
+}) {
+  // Per-kind outputs. The frontend reads each from its dedicated DB column
+  // (poster / posterBlurhash / logo / logoBlurhash / backdrop /
+  // backdropBlurhash), so they must stay as discrete fields rather than
+  // collapsing into a map.
+  const outputs = {
+    poster:   { url: '', blurhash: '' },
+    backdrop: { url: '', blurhash: '' },
+    logo:     { url: '', blurhash: '' },
   };
 
-  // Handle show poster
-  const posterResult = await addImage('show_poster.jpg');
-  if (posterResult.found) {
-    poster = posterResult.url;
-    if (posterResult.blurhash) posterBlurhash = posterResult.blurhash;
-  } else {
-    runDownloadTmdbImagesFlag = true;
-  }
+  // Per-kind resolveImage() results (file path + mtime + cache-bust hash). Fed
+  // to the DB so *_file_path / *_hash come from the same stat that built the URL.
+  const resolved = { poster: null, backdrop: null, logo: null };
 
-  // Handle show logo
-  const logoExtensions = ['svg', 'jpg', 'png', 'gif'];
-  let logoFound = false;
-  for (const ext of logoExtensions) {
-    const logoResult = await addImage(`show_logo.${ext}`);
-    if (logoResult.found) {
-      logo = logoResult.url;
-      if (ext !== 'svg' && logoResult.blurhash) {
-        logoBlurhash = logoResult.blurhash;
-      }
-      logoFound = true;
-      break;
-    }
-  }
-  if (!logoFound) {
-    runDownloadTmdbImagesFlag = true;
-  }
+  // Tracks whether any of poster / logo / backdrop are missing on disk.
+  // Returned to the scanner as `missingImages` so it can apply a different
+  // retry policy than the metadata-missing case (image downloads are
+  // typically transient and should retry every scan tick).
+  let missingImages = false;
 
-  // Handle show backdrop
-  const backdropExtensions = ['jpg', 'png', 'gif'];
-  let backdropFound = false;
-  for (const ext of backdropExtensions) {
-    const backdropResult = await addImage(`show_backdrop.${ext}`);
-    if (backdropResult.found) {
-      backdrop = backdropResult.url;
-      if (backdropResult.blurhash) backdropBlurhash = backdropResult.blurhash;
-      backdropFound = true;
-      break;
+  for (const [imageKey, convention] of iterateConventions('tv')) {
+    const r = await resolveImage({ dirPath: showPath, fileSet, convention });
+    if (!r) {
+      missingImages = true;
+      continue;
     }
-  }
-  if (!backdropFound) {
-    runDownloadTmdbImagesFlag = true;
+
+    // Staleness: tmdb.config is newer than the image, meaning the user
+    // edited config (or it was otherwise touched) since this image was
+    // written. Treat as missing so the scanner gate triggers a refresh.
+    // Mirrors the movie scanner's `checkTMDBImagesNeeded` behavior. Reuses
+    // the resolver's single stat (`r.mtime`) — no extra syscall.
+    if (tmdbConfigLastModified && tmdbConfigLastModified > r.mtime) {
+      logger.info('scanner: tmdb.config newer than asset, marking missing', {
+        'media.name': showName,
+        'media.type': 'tv',
+        'image.type': imageKey,
+        'image.path': r.path,
+      });
+      missingImages = true;
+      continue;
+    }
+
+    resolved[imageKey] = r;
+    outputs[imageKey].url = `${prefixPath}/tv/${encodedShowName}/${r.fileName}?hash=${r.hash}`;
+    // SVGs can't be encoded as raster blurhashes; everything else can.
+    if (r.ext !== 'svg') {
+      outputs[imageKey].blurhash = await getStoredBlurhash(r.path, basePath);
+    }
   }
 
   return {
-    poster,
-    posterBlurhash,
-    logo,
-    logoBlurhash,
-    backdrop,
-    backdropBlurhash,
-    runDownloadTmdbImagesFlag,
-    logoExtensions,
-    backdropExtensions
+    poster:           outputs.poster.url,
+    posterBlurhash:   outputs.poster.blurhash,
+    logo:             outputs.logo.url,
+    logoBlurhash:     outputs.logo.blurhash,
+    backdrop:         outputs.backdrop.url,
+    backdropBlurhash: outputs.backdrop.blurhash,
+    missingImages,
+    resolved,
   };
 }
 
@@ -155,20 +182,73 @@ async function processShowAssets(showPath, encodedShowName, prefixPath, basePath
  * @param {string} prefixPath - URL prefix path
  * @returns {Promise<Object>} Object containing metadata URL and content
  */
-async function processShowMetadata(showPath, encodedShowName, prefixPath) {
+/**
+ * Discover and load metadata.json for a show; flag it as missing if absent
+ * OR stale (older than `tmdb.config`).
+ *
+ * @param {Object} opts
+ * @param {string} opts.showPath
+ * @param {string} opts.showName - For structured logging only
+ * @param {string} opts.encodedShowName
+ * @param {string} opts.prefixPath
+ * @param {Date|null} [opts.tmdbConfigLastModified=null] - See processShowAssets.
+ */
+async function processShowMetadata({
+  showPath,
+  showName,
+  encodedShowName,
+  prefixPath,
+  tmdbConfigLastModified = null,
+}) {
   let metadataUrl = '';
   let metadata = '';
-  let runDownloadTmdbImagesFlag = false;
+  // Returned to the scanner as `missingMetadata` so it can apply the 24h
+  // cooldown to metadata-lookup failures while letting image failures
+  // retry every tick.
+  let missingMetadata = false;
+  // True specifically when tmdb.config is newer than metadata.json (an id/config
+  // edit), as opposed to a plain absent file. The scanner uses this to force a
+  // full per-show refresh so seasons/episodes repull for the changed id — a
+  // normal scan's existence/age gates would otherwise leave them on the old id.
+  let staleByConfig = false;
 
   const metadataFilePath = join(showPath, 'metadata.json');
-  if (await fileExists(metadataFilePath)) {
-    metadataUrl = `${prefixPath}/tv/${encodedShowName}/metadata.json`;
-    metadata = JSON.stringify(JSON.parse(await fs.readFile(metadataFilePath, 'utf8')));
-  } else {
-    runDownloadTmdbImagesFlag = true;
+  const exists = await fileExists(metadataFilePath);
+
+  if (!exists) {
+    missingMetadata = true;
+  } else if (tmdbConfigLastModified) {
+    const mtime = await getLastModifiedTime(metadataFilePath);
+    if (mtime && tmdbConfigLastModified > mtime) {
+      logger.info('scanner: tmdb.config newer than metadata.json, marking missing', {
+        'media.name': showName,
+        'media.type': 'tv',
+        'metadata.path': metadataFilePath,
+      });
+      missingMetadata = true;
+      staleByConfig = true;
+    }
   }
 
-  return { metadataUrl, metadata, runDownloadTmdbImagesFlag };
+  // Read the existing metadata.json whenever the file is PRESENT — even when it's
+  // flagged stale-by-config or the show is update-disabled. Only a genuinely
+  // absent file leaves these empty. Otherwise the scanner persists a blank
+  // metadata column (and a content-less show hash) for valid-but-frozen/stale
+  // shows the generator won't (re)write — e.g. `update_metadata: false`.
+  if (exists) {
+    try {
+      metadata = JSON.stringify(JSON.parse(await fs.readFile(metadataFilePath, 'utf8')));
+      metadataUrl = `${prefixPath}/tv/${encodedShowName}/metadata.json`;
+    } catch (err) {
+      logger.warn('scanner: metadata.json present but unparseable, leaving metadata empty', {
+        'media.name': showName,
+        'media.type': 'tv',
+        error: err.message,
+      });
+    }
+  }
+
+  return { metadataUrl, metadata, missingMetadata, staleByConfig };
 }
 
 /**
@@ -266,11 +346,8 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
   const thumbnailPath = join(seasonPath, `${episodeNumber} - Thumbnail.jpg`);
   if (await fileExists(thumbnailPath)) {
     const thumbnailStats = await fs.stat(thumbnailPath);
-    const thumbnailImageHash = createHash('md5')
-      .update(thumbnailStats.mtime.toISOString())
-      .digest('hex')
-      .substring(0, 10);
-    
+    const thumbnailImageHash = imageHashFromMtimeMs(thumbnailStats.mtimeMs);
+
     episodeData.thumbnail = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
       `${episodeNumber} - Thumbnail.jpg`
     )}?hash=${thumbnailImageHash}`;
@@ -281,12 +358,18 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     }
   }
 
-  // Handle episode metadata
+  // Handle episode metadata. Append an mtime content-version token (same scheme
+  // as the thumbnail above) so the URL changes when the episode metadata file
+  // changes. This cache-busts the frontend's URL-keyed metadata fetch AND moves
+  // the episode hash, which folds in episodeData.metadata (this URL string).
   const episodeMetadataPath = join(seasonPath, `${episodeNumber}_metadata.json`);
   if (await fileExists(episodeMetadataPath)) {
+    const episodeMetadataStats = await fs.stat(episodeMetadataPath);
+    const episodeMetadataHash = imageHashFromMtimeMs(episodeMetadataStats.mtimeMs);
+
     episodeData.metadata = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(
       `${episodeNumber}_metadata.json`
-    )}`;
+    )}?hash=${episodeMetadataHash}`;
   }
 
   // Handle chapters
@@ -360,11 +443,8 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
   const seasonPosterPath = join(seasonPath, 'season_poster.jpg');
   if (await fileExists(seasonPosterPath)) {
     const seasonPosterStats = await fs.stat(seasonPosterPath);
-    const seasonPosterImageHash = createHash('md5')
-      .update(seasonPosterStats.mtime.toISOString())
-      .digest('hex')
-      .substring(0, 10);
-    
+    const seasonPosterImageHash = imageHashFromMtimeMs(seasonPosterStats.mtimeMs);
+
     seasonData.season_poster = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/season_poster.jpg?hash=${seasonPosterImageHash}`;
     
     const blurhash = await getStoredBlurhash(seasonPosterPath, basePath);
@@ -437,17 +517,17 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       const encodedShowName = encodeURIComponent(showName);
       const showPath = normalize(join(dirPath, showName));
 
-      // #1: Directory hash skip — if nothing changed, skip expensive processing
-      const currentHash = await calculateDirectoryHash(showPath);
+      // Detect whether the directory contents changed since last scan. This
+      // was previously an unconditional `continue` that skipped EVERYTHING
+      // when the hash matched — but that suppressed image-only retries when
+      // the dir was unchanged. Now `dirHashChanged` is a gate signal (joined
+      // with `missingImages` / `missingMetadata`), and the cheap fast-skip
+      // moved to AFTER the gate is computed.
+      const currentHash = await calculateDirectoryHash(showPath, TV_DIR_HASH_MAX_DEPTH);
       const storedHash = hashMap.get(showName);
-      if (storedHash && storedHash === currentHash) {
-        if (isDebugMode) {
-          logger.info(`No changes detected in ${showName}, skipping processing.`);
-        }
-        continue;
-      }
+      const dirHashChanged = !storedHash || storedHash !== currentHash;
 
-      if (storedHash) {
+      if (storedHash && dirHashChanged) {
         logger.info(`Directory hash changed for ${showName}, reprocessing.`);
       }
 
@@ -463,36 +543,197 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       const otherItems = allItems.filter(item => !seasonFolders.includes(item));
       const seasons = [...sortedSeasonFolders, ...otherItems];
 
-      // Process show assets
-      const assetsResult = await processShowAssets(showPath, encodedShowName, prefixPath, basePath);
-      let runDownloadTmdbImagesFlag = assetsResult.runDownloadTmdbImagesFlag;
+      // Show-level image discovery resolves against this in-memory listing (the
+      // same readdir that drove `seasons`) — no extra syscall, and a single
+      // shared snapshot so processShowAssets stops sweeping the directory itself.
+      const showFileSet = new Set(allItems.map(item => item.name));
 
-      // Process metadata
-      const metadataResult = await processShowMetadata(showPath, encodedShowName, prefixPath);
-      if (metadataResult.runDownloadTmdbImagesFlag) {
-        runDownloadTmdbImagesFlag = true;
-      }
+      // tmdb.config mtime drives the staleness check inside processShowAssets
+      // / processShowMetadata. Compute it once per show; null when the file
+      // doesn't exist (no overrides ever set), which makes the staleness
+      // check a no-op for that show.
+      const tmdbConfigPath = getTmdbConfigFilePath(showPath);
+      const tmdbConfigLastModified = (await fileExists(tmdbConfigPath))
+        ? await getLastModifiedTime(tmdbConfigPath)
+        : null;
 
-      // Handle missing data attempts
+      // Process show assets (poster / logo / backdrop)
+      const assetsResult = await processShowAssets({
+        showPath,
+        showName,
+        encodedShowName,
+        prefixPath,
+        basePath,
+        fileSet: showFileSet,
+        tmdbConfigLastModified,
+      });
+      const missingImages = assetsResult.missingImages;
+
+      // Process metadata. `let` because we adopt the post-generation result
+      // below (the first read happens before the generator rewrites the file).
+      let metadataResult = await processShowMetadata({
+        showPath,
+        showName,
+        encodedShowName,
+        prefixPath,
+        tmdbConfigLastModified,
+      });
+      const missingMetadata = metadataResult.missingMetadata;
+
+      // Compute the retry gate. The 24h cooldown (RETRY_INTERVAL_HOURS)
+      // applies ONLY to the metadata-missing path — that represents a TMDB
+      // *lookup* failure not worth fast-retrying. Image-download failures
+      // bypass the cooldown because they're typically transient (image CDN
+      // flake, network glitch). See
+      // https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults
       const missingDataShow = missingDataMedia.find(media => media.name === showName);
-      if (missingDataShow) {
-        const lastAttempt = new Date(missingDataShow.lastAttempt);
-        const hoursSinceLastAttempt = (now - lastAttempt) / (1000 * 60 * 60);
-        if (hoursSinceLastAttempt >= RETRY_INTERVAL_HOURS) {
-          runDownloadTmdbImagesFlag = true;
-        } else {
-          runDownloadTmdbImagesFlag = false;
+      const metadataGateAllowsRetry =
+        !missingDataShow ||
+        ((now - new Date(missingDataShow.lastAttempt)) / (1000 * 60 * 60)) >= RETRY_INTERVAL_HOURS;
+
+      let runDownloadTmdbImagesFlag =
+        dirHashChanged ||
+        missingImages ||
+        (missingMetadata && metadataGateAllowsRetry);
+
+      // Fast-skip: nothing changed on disk AND nothing's missing AND we
+      // aren't due for a metadata-cooldown retry. Equivalent to the old
+      // unconditional hash-skip, just applied AFTER the gate so the
+      // image-only retry path isn't suppressed when the dir is unchanged.
+      if (!runDownloadTmdbImagesFlag) {
+        // Thin episodes on an otherwise-stable show still need re-checking — the
+        // full-process path only runs the backfill when the show is reprocessed for
+        // some other reason, which is exactly when it's least needed. Run it here
+        // off the STORED seasons (no FS reprocess). The zero-I/O proxy keeps a
+        // complete show to one read + an in-memory walk; the generator owns the
+        // schema / air-date / cooldown decisions.
+        let backfillWrote = 0;
+        try {
+          const tmdbId = metadataResult.metadata ? JSON.parse(metadataResult.metadata)?.id : null;
+          if (tmdbId) {
+            const dbShow = await getTVShowByName(showName);
+            if (dbShow?.seasons) {
+              // tmdb.config content isn't loaded on this branch (only its mtime,
+              // above, for staleness) — load it here, scoped inside the tmdbId +
+              // dbShow.seasons checks, so a fast-skipped show with no backfill
+              // candidate never pays this extra read.
+              const updateAllowed = isUpdateAllowed(await loadTmdbConfig(tmdbConfigPath));
+              backfillWrote = (await backfillMissingEpisodes(showName, showPath, tmdbId, dbShow.seasons, new Date(), updateAllowed)) || 0;
+            }
+          }
+        } catch (err) {
+          logger.warn(`Episode backfill (fast-skip) failed for ${showName}: ${err.message}`);
         }
+
+        if (!backfillWrote) {
+          // Nothing rewritten → genuine fast-skip.
+          if (isDebugMode) {
+            logger.info(`No changes detected in ${showName}, skipping processing.`);
+          }
+          continue;
+        }
+
+        // The backfill rewrote >=1 episode file. Fall through to the normal
+        // season-rebuild + saveTVShow + generateTVShowHashes below so the new
+        // episode metadata + hash land THIS pass — the frontend then picks it up on
+        // the next sync instead of waiting for a later scan to notice the changed
+        // files via dirHashChanged. The TMDB image-download block is skipped (its
+        // flag is still false); only the cheap rebuild + rehash runs. Fires only
+        // when a fill-in actually landed (rare), so the extra work is bounded.
+        logger.info(`scanner: backfill updated ${showName}, reprocessing inline to refresh hashes`, {
+          'media.name': showName, 'media.type': 'tv', 'episodes.written': backfillWrote,
+        });
       }
 
-      // Download TMDB images if needed
+      // Download TMDB images if needed. The bypass log is emitted AFTER
+      // the download attempt, conditional on actual work having happened
+      // — items where TMDB has nothing to offer for the missing slot
+      // become silent no-ops, which keeps the log channel clean for
+      // genuine retry activity.
       if (runDownloadTmdbImagesFlag) {
-        await markMediaAsMissingData(showName);
-        await downloadTMDBImages(showName);
-        
-        // Retry fetching assets after download
-        const retryAssetsResult = await processShowAssets(showPath, encodedShowName, prefixPath, basePath);
+        // Only persist a cooldown marker for the metadata-missing path.
+        // Images-only retries don't flip this gate.
+        if (missingMetadata) {
+          await markMediaAsMissingData(showName);
+        }
+        // Pull the previously-managed file paths from the DB so the
+        // reconcile step in MetadataGenerator can detect orphans (the path
+        // we'd write now differs from the path we wrote last time). One
+        // extra DB read per affected show — cheap, and only on gate trigger.
+        // `getExistingTVShowHashes()` (used for the iteration) only carries
+        // name+hash; we need the full row for the *FilePath columns.
+        const existingShow = await getTVShowByName(showName);
+        const previousPaths = existingShow ? {
+          poster:   existingShow.posterFilePath || null,
+          backdrop: existingShow.backdropFilePath || null,
+          logo:     existingShow.logoFilePath || null,
+        } : null;
+        // A tmdb.config edit (id change) forces a full per-show refresh so the
+        // generator bypasses the season-poster/thumbnail/episode-metadata
+        // existence/age gates and repulls everything for the new id — a normal
+        // scan only refreshes the show level. Self-limiting: after regeneration
+        // metadata.json is newer than the config, so this won't re-fire.
+        const downloadResult = await downloadTMDBImages({
+          showName,
+          previousPaths,
+          fullScan: metadataResult.staleByConfig,
+        });
+
+        // Post-condition observability: only log when the images-only
+        // bypass produced real download or failure events. cache-hit /
+        // no-url outcomes are uninteresting at the scanner level.
+        const summary = downloadResult?.imageSummary;
+        const didWork =
+          summary &&
+          ((summary.downloaded ?? 0) > 0 || (summary.failed ?? 0) > 0);
+        if (didWork && missingImages && !missingMetadata && !dirHashChanged) {
+          logger.info('scanner: images-only retry performed work', {
+            'media.name': showName,
+            'media.type': 'tv',
+            imageSummary: summary
+          });
+        }
+
+        // Retry fetching assets after download. Re-enumerate the show dir —
+        // a re-pull may have written a new image (or changed its extension),
+        // so the retry resolution must see the current contents. Pass the same
+        // tmdbConfigLastModified — downloadMediaImages may have written fresh
+        // images whose mtime is now newer than tmdb.config, but the threshold
+        // itself hasn't moved.
+        const retryItems = await fs.readdir(showPath, { withFileTypes: true });
+        const retryFileSet = new Set(retryItems.map(item => item.name));
+        const retryAssetsResult = await processShowAssets({
+          showPath,
+          showName,
+          encodedShowName,
+          prefixPath,
+          basePath,
+          fileSet: retryFileSet,
+          tmdbConfigLastModified,
+        });
         Object.assign(assetsResult, retryAssetsResult);
+
+        // Conservative clear: only when BOTH metadata and images are now
+        // present after the retry pass. Partial recovery leaves the marker
+        // in place so the next tick can finish the job.
+        const retryMetadataResult = await processShowMetadata({
+          showPath,
+          showName,
+          encodedShowName,
+          prefixPath,
+          tmdbConfigLastModified,
+        });
+        if (!retryAssetsResult.missingImages && !retryMetadataResult.missingMetadata) {
+          await clearMissingMediaData(showName);
+        }
+
+        // Adopt the post-generation metadata. The initial processShowMetadata
+        // ran BEFORE the generator (re)wrote metadata.json — when tmdb.config
+        // was newer it returned empty `metadata`. Persisting that empty value
+        // would leave tv_shows.metadata blank, defeating the content-folded
+        // show hash (it couldn't see the metadata change). retryMetadataResult
+        // reflects the freshly-written file.
+        metadataResult = retryMetadataResult;
       }
 
       // Process seasons with bounded concurrency
@@ -524,34 +765,22 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         })
       );
 
-      // Extract file paths for direct access
-      const posterFilePath = await fileExists(join(showPath, 'show_poster.jpg'))
-        ? join(showPath, 'show_poster.jpg')
-        : null;
+      // File paths + cache-bust hashes come from the SAME resolve that built the
+      // show-asset URLs (processShowAssets → resolveImage: one set lookup + one
+      // stat per kind). URL filename, *_file_path, and *_hash cannot diverge.
+      const posterFilePath = assetsResult.resolved.poster?.path ?? null;
+      const logoFilePath = assetsResult.resolved.logo?.path ?? null;
+      const backdropFilePath = assetsResult.resolved.backdrop?.path ?? null;
+      const imageHashes = imageHashesFromResolved(assetsResult.resolved);
 
-      let logoFilePath = null;
-      for (const ext of assetsResult.logoExtensions) {
-        const logoPath = join(showPath, `show_logo.${ext}`);
-        if (await fileExists(logoPath)) {
-          logoFilePath = logoPath;
-          break;
-        }
-      }
+      // Calculate final directory hash after all processing (files may have been created).
+      // Use the same depth as the initial check so the stored hash compares
+      // apples-to-apples on the next scan.
+      const finalHash = await calculateDirectoryHash(showPath, TV_DIR_HASH_MAX_DEPTH);
 
-      let backdropFilePath = null;
-      for (const ext of assetsResult.backdropExtensions) {
-        const backdropPath = join(showPath, `show_backdrop.${ext}`);
-        if (await fileExists(backdropPath)) {
-          backdropFilePath = backdropPath;
-          break;
-        }
-      }
-
-      // Calculate final directory hash after all processing (files may have been created)
-      const finalHash = await calculateDirectoryHash(showPath);
-
-      // Load tmdb.config for manual focal override; auto-detect from backdrop
-      const tmdbConfigPath = getTmdbConfigFilePath(showPath);
+      // Load tmdb.config for manual focal override; auto-detect from backdrop.
+      // tmdbConfigPath was already computed earlier for the staleness check
+      // (top of the per-show iteration) — reuse it.
       const tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
       const manualFocal = tmdbConfig.backdrop_focal ?? null;
       const backdropFocalSuggested = backdropFilePath ? await detectBackdropFocal(backdropFilePath) : null;
@@ -574,7 +803,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         basePath,
         finalHash,
         manualFocal,
-        backdropFocalSuggested
+        backdropFocalSuggested,
+        imageHashes
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
@@ -586,6 +816,22 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           await generateTVShowHashes(db, freshShow);
         }
       }
+
+      // Air-date-aware backfill of thin episode metadata. Runs AFTER finalHash
+      // is stored, so any rewrite is picked up by the next scan's dirHashChanged
+      // path (seasons JSON rebuilt → fresh URL token → episode hash moves → resync).
+      try {
+        const tmdbId = metadataResult.metadata ? JSON.parse(metadataResult.metadata)?.id : null;
+        if (tmdbId) {
+          // tmdbConfig is already loaded above (line 779, for backdrop_focal) —
+          // reuse it, zero new I/O. Same update_metadata gate the generator
+          // itself enforces in generateForShow.
+          const updateAllowed = isUpdateAllowed(tmdbConfig);
+          await backfillMissingEpisodes(showName, showPath, tmdbId, sortedSeasons, new Date(), updateAllowed);
+        }
+      } catch (err) {
+        logger.warn(`Episode metadata backfill skipped for ${showName}: ${err.message}`);
+      }
     }
 
     // Remove TV shows from the database that no longer exist in the file system
@@ -595,4 +841,95 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   } catch (error) {
     logger.error('Error during database update: ' + error);
   }
+}
+
+// ── Air-date-aware episode-metadata backfill ──────────────────────────────────
+// An additive trigger (the age-based EPISODE_METADATA_REFRESH_DAYS refresh is
+// untouched) that re-pulls thin per-episode metadata once it's likely available
+// upstream. The scanner does only cheap, schema-free work here — a zero-I/O proxy
+// to spot candidates and cooldown-table bookkeeping. ALL metadata-content /
+// TMDB-schema / air-date decisions live in MetadataGenerator.refreshMissingEpisodes
+// (scanner I/O contract). See plans/AIR_DATE_AWARE_EPISODE_BACKFILL.md.
+//
+// Respects the same update_metadata freeze as the rest of the pipeline (see
+// isUpdateAllowed in generateForShow/generateForMovie): both call sites below
+// pass it in, so a show frozen via tmdb.config gets zero backfill activity.
+
+/**
+ * End-of-scan hook: hand present-but-thin episodes to the generator for an
+ * air-date-aware re-pull, then persist the per-episode cooldown from what it did.
+ *
+ * Performance: a fully-complete show does only an in-memory walk and returns
+ * before any DB/FS work — the pre-filter `ep.metadata && !ep.thumbnail` lets
+ * complete episodes (which have a downloaded thumbnail) fall through with zero
+ * I/O. Scope: pure missing-file episodes (no per-episode JSON) are left to the
+ * existing `dirHashChanged` generator path; this targets "file present but TMDB
+ * was thin at fetch time".
+ *
+ * @param {string} showName
+ * @param {string} showPath - absolute path to the show directory
+ * @param {number} tmdbId
+ * @param {Object} seasons  - the built sortedSeasons (seasonName -> seasonData)
+ * @param {Date}   now
+ * @param {boolean} [updateAllowed=false] - `isUpdateAllowed(tmdbConfig)` for this
+ *   show, computed by the caller (which already owns tmdb.config I/O). Mirrors the
+ *   gate MetadataGenerator.generateForShow/generateForMovie enforce for the rest of
+ *   the TMDB pipeline — an operator-frozen show (`update_metadata:false`, e.g.
+ *   after a bad auto-match) must not have episodes silently re-pulled via this
+ *   side channel. Defaults to `false` (fail closed): a future call site that
+ *   forgets to pass it gets no backfill rather than reproducing this bug.
+ */
+async function backfillMissingEpisodes(showName, showPath, tmdbId, seasons, now, updateAllowed = false) {
+  if (!tmdbId || !updateAllowed) return 0;
+
+  // 1. Zero-I/O pre-filter from presence flags already on episodeData.
+  const candidates = [];
+  for (const [seasonName, seasonData] of Object.entries(seasons || {})) {
+    const seasonNumberMatch = seasonName.match(/\d+/);
+    if (!seasonNumberMatch) continue; // non-numeric folder (e.g. "Specials") — skip
+    const seasonNumber = parseInt(seasonNumberMatch[0], 10);
+    const seasonPath = join(showPath, seasonName);
+    for (const ep of Object.values(seasonData.episodes || {})) {
+      if (ep.episodeNumber == null) continue;
+      // Complete-looking (has file + thumbnail) or no file at all → skip, no I/O.
+      if (!ep.metadata || ep.thumbnail) continue;
+      candidates.push({ seasonNumber, episodeNumber: ep.episodeNumber, seasonPath });
+    }
+  }
+  if (candidates.length === 0) return 0; // healthy show: nothing beyond the in-memory walk
+
+  // 2. Annotate each candidate with its cooldown state (DB), then hand off — the
+  //    generator owns the sparse check, air_date read, due-gate, and fetch.
+  const rows = await getEpisodeRetryRows(showName);
+  const lastAttemptOf = new Map(rows.map((r) => [`${r.seasonNumber}|${r.episodeNumber}`, r.lastAttempt]));
+  for (const c of candidates) {
+    c.lastAttempt = lastAttemptOf.get(`${c.seasonNumber}|${c.episodeNumber}`) ?? null;
+  }
+
+  const outcomes = await refreshMissingEpisodes(tmdbId, candidates, { now, showName });
+
+  // 3. Persist the cooldown purely from the generator's outcomes (no schema here).
+  //    A fresh WRITE (or an already-complete file) resolves the episode → clear any
+  //    cooldown row so it doesn't linger forever. Only a fetch that came back still
+  //    thin (or errored) stamps the cooldown to back off for EPISODE_MISSING_RETRY_DAYS.
+  let written = 0, retried = 0;
+  for (const o of outcomes) {
+    if (o.written || o.resolved) {
+      await clearEpisodeRetry(showName, o.seasonNumber, o.episodeNumber);
+      if (o.written) written++;
+    } else if (o.attempted) {
+      await recordEpisodeAttempt(showName, o.seasonNumber, o.episodeNumber, o.airDate);
+      retried++;
+    }
+  }
+  if (written || retried) {
+    logger.info('scanner: episode metadata backfill pass', {
+      'media.name': showName, 'media.type': 'tv', written, retried,
+    });
+  }
+
+  // Count of episodes (re)written this pass. The fast-skip caller uses this to
+  // decide whether to reprocess the show inline (rebuild seasons + rehash) so a
+  // fill-in reaches the frontend in one scan instead of two.
+  return written;
 }

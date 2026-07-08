@@ -19,6 +19,5 @@ clinet_docs
 temp
 scripts/.pytest_cache
 scripts/.benchmarks
-scripts/tests/__pycache__
 
 tmpclaude-*

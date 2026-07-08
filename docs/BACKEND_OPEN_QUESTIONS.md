@@ -1,0 +1,280 @@
+# Backend Open Questions & Decision Log — nextjs-stream-media-processor
+
+Companion to [`docs/BACKEND_ARCHITECTURE.md`](./BACKEND_ARCHITECTURE.md). That document describes how the backend works today; this one tracks everything that is known to be wrong, undecided, or deliberately accepted — a living backlog of design gaps, owner decisions, and their implementation status.
+
+Items move through a fixed lifecycle:
+
+> **Open** → **Decided** (a direction is chosen, nothing shipped) → **Implemented** (code merged) → **Documented** (current behavior absorbed into `BACKEND_ARCHITECTURE.md`, entry removed here)
+
+Shrinking this file is the goal. An item that reaches "Documented" is deleted from this file, not archived in it.
+
+The current contents come from the design-gap triage round of **2026-07-07**, which re-verified every claim against the code and produced: three hotfixes (shipped, see [Shipped](#shipped-track-a--commit-4aeb30c)), a 13-branch implementation plan ([Track B](#planned--track-b-branch-map); twelve branches remain unimplemented — Branch 13 was promoted into Track A and shipped, retained in the numbering for traceability), a full set of owner decisions on every open judgment call ([Decided 2026-07-07](#decided-2026-07-07)), and twelve behaviors confirmed correct and accepted as-is ([Accepted as documented](#accepted-as-documented)).
+
+**Critical reading rule:** everything in the "Decided" section is *decided but not implemented*. Nothing there describes current behavior. Current behavior is what `BACKEND_ARCHITECTURE.md` and the "Shipped" / "Accepted as documented" sections describe.
+
+## Contents
+
+- [Shipped (Track A — commit `4aeb30c`)](#shipped-track-a--commit-4aeb30c)
+- [Planned — Track B branch map](#planned--track-b-branch-map)
+  - [Cross-branch constraints](#cross-branch-constraints)
+- [Decided 2026-07-07](#decided-2026-07-07)
+  - [TMDB override / pristine-base design](#tmdb-override--pristine-base-design)
+  - [Image reconcile / override system](#image-reconcile--override-system)
+  - [TMDB client hardening](#tmdb-client-hardening)
+  - [SQLite / hash consistency](#sqlite--hash-consistency)
+  - [Admin / config / rescan routes](#admin--config--rescan-routes)
+  - [Scheduling / concurrency](#scheduling--concurrency)
+  - [Captions / chapters / blurhash](#captions--chapters--blurhash)
+  - [Video / transcode](#video--transcode)
+  - [Mongo tier / Discord](#mongo-tier--discord)
+- [Accepted as documented](#accepted-as-documented)
+- [Future feature directions](#future-feature-directions)
+  - [Radarr/Sonarr integration (extends T-3)](#radarrsonarr-integration-extends-t-3)
+  - [On-demand scan routes (extends S-3)](#on-demand-scan-routes-extends-s-3)
+
+---
+
+## Shipped (Track A — commit `4aeb30c`)
+
+These three fixes are merged and are current behavior. They are listed here once for traceability and will be dropped from this file in a future round.
+
+| ID | Status | What shipped |
+|----|--------|--------------|
+| **SEC-1** | Shipped | `node/routes/admin.mjs` defines `safeJoin()` (backed by a `PathTraversalError` class): every user-supplied media title/season segment is resolved against its per-media-type base directory (`join(BASE_PATH, 'movies')` or `join(BASE_PATH, 'tv')`) and any resolved path that escapes that base throws, which the subtitle-save and `GET`/`PUT /metadata/config` handlers translate into an HTTP 400 instead of building the path. |
+| **S-1** | Shipped | `node/app.mjs` enqueues the scheduled blurhash sweep under `TaskType.BLURHASH` (the previously used `TaskType.BLURHASH_GENERATION` did not exist in the concurrency-limit enum, silently granting unlimited concurrency); `TaskType.BLURHASH` carries a concurrency limit of 1 and membership in the `[MEDIA_SCAN, METADATA_HASH, BLURHASH]` exclusivity group in `node/lib/taskManager.mjs`. |
+| **D-1** | Shipped | `node/app.mjs` registers `express.json()` through a conditional wrapper that skips `/api/discord/events`, so the route-level `express.raw()` in the Discord integration sees true raw bytes and webhook signature verification no longer depends on the `JSON.stringify()` re-serialization fallback that `node/integrations/discord/IMPLEMENTATION_NOTES.md` documents as unreliable (key reordering can change the byte sequence and invalidate the signature). |
+
+---
+
+## Planned — Track B branch map
+
+Thirteen theme-grouped branches, cut from `main` after the documentation branch lands. **Twelve are unimplemented; Branch 13 was promoted into Track A and shipped in commit `4aeb30c`, retained in the numbering for traceability.** Three branches bundle items from different analysis lanes because the items edit the identical lines — building them separately guarantees merge conflicts or contradictory edits.
+
+| Branch | Theme | Items | Notes |
+|--------|-------|-------|-------|
+| 1 | Movies table schema parity | G-5 + F-1 | **Must ship together** — both alter the same `CREATE TABLE movies` block and `insertOrUpdateMovie` column list. One migration adds both `pristine_metadata` (both tables) and `metadata` (movies); one hoisted metadata.json read in `movie-scanner.mjs` feeds both. Per P-1a, also extend `getMovieById`'s SELECT list. |
+| 2 | TMDB override & pristine-base helpers | G-2, G-3 | Adds `hasMetadataOverrideKey()` to `node/utils/tmdbConfig.mjs`; makes `generateForShow()`'s up-to-date branch read the id from `metadata.json` before falling back to name search. |
+| 3 | Scanner cooldown & retry gating | G-1a + R-1 + R-2, R-3 | **Must ship together** — G-1a, R-1, and R-2 edit the identical lines in `movie-scanner.mjs` and `tv-scanner.mjs` and contradict each other if applied independently (G-1a guards a block R-1 deletes; G-1a and R-2 both hoist the same tmdb.config load). One reconciled change: delete the pre-retry cooldown mark, decide after the retry (mark only real failures, clear on frozen or resolved), gate the images-missing retry on `isUpdateAllowed()` while leaving the metadata-missing branch ungated. R-3 (clear expired `episode_metadata_missing` rows) is additive, included for cohesion. Also carries G-1b (decided below). |
+| 4 | Metadata-hash first-scan & bootstrap | F-2 | New titles get their content-aware hash on first scan; fixes the bootstrap argument bug where `node/sqlite/metadataHashes.mjs` calls `updateAllMovieHashes(db)` / `updateAllTVShowHashes(db)` — passing the db handle into the `sinceTimestamp` parameter, so every `new Date(sinceTimestamp)` comparison is `Invalid Date` and the self-heal path processes zero rows. |
+| 5 | Removal cascade-delete cleanup | R-4 + F-3 | **Must ship together** — both add calls inside the exact same removal-loop bodies right after `removeMovie`/`removeTVShow`. Clears cooldown rows and `metadata_hashes` rows when a title leaves disk, so a re-added same-named title doesn't inherit a stale cooldown or a frozen hash. `deleteHashesForMedia()` is already implemented and imported in `tv-scanner.mjs` but has zero call sites today. |
+| 6 | Image reconcile & override URL resolution | I-5, I-7a, I-6a | One shared `resolveEffectiveImageUrl()` in `image-conventions.mjs` replaces the duplicated `override_<kind>` > `metadata.<kind>_path` > TMDB precedence in `imageDownloader.mjs` and `metadataGenerator.mjs`, and stops unconditionally prefixing the TMDB CDN base onto override values that are already full URLs. Adds `center-left`/`center-right` to the `backdrop_focal` validator's accepted values (the auto-detector already produces them). |
+| 7 | TMDB client hardening | T-4a, T-5, T-6 (+ decided: T-1, T-4b) | Concurrency cap on collection fan-out (`p-limit` is already a dependency), retry on 5xx/`ECONNREFUSED`/`ECONNRESET`, real return value from `setTmdbCache()` so cache-write telemetry stops reporting `api.cache_hit=false` on every write. Decided additions T-1 (wire up ETag revalidation for real: `etag` column, persisted capture, `If-None-Match` on refetch) and T-4b (shared TMDB-wide limiter) fold in here — same files, no line conflicts. |
+| 8 | SQLite data-access hygiene | P-1b | Trims `node/app.mjs`'s import from `sqliteDatabase.mjs` to the functions `app.mjs` itself calls; seven currently-imported functions are live only via `scanner-repository.mjs`. |
+| 9 | Admin/rescan route hardening | A-1, A-4b (+ decided: A-3) | Adds `authenticateWebhookOrUser` to `GET /rescan/tmdb` (currently registered with zero auth middleware in `node/app.mjs`, unlike its sibling `POST /media/scan`); adds cross-reference comments between the two unrelated "config" resources. **Rebase on Track A before merging** — SEC-1 restructured the same `/metadata/config` handlers. |
+| 10 | Blurhash pipeline cleanup | B-1, B-2a | Passes `false` for `includeBlurhash` at the four scanner-triggered `fetchComprehensiveMediaDetails()` call sites in `metadataGenerator.mjs` (the embedded blurhash is dead weight — the consumed pipeline is the sidecar-file path); fixes telemetry in `tmdbBlurhash.mjs` that reports size-varying blurhash component counts when the encoder (`blurhashNative.mjs` `generateBlurhashNative()`) always uses the fixed 4×3 defaults. |
+| 11 | Video/transcode cache-key & scheduling | V-1, V-3 (+ decided: V-2 eviction, V-4 staleness check) | Deletes the duplicate cache-cleanup `scheduleJob` blocks inside `scheduleTasks()` that call `clearFramesCache()`/`clearSpritesheetCache()`/`clearVideoClipsCache()` directly, bypassing the `CACHE_CLEANUP` task gate — the module-level, task-manager-gated equivalents already cover them. Adds the `getInfo()` file-identity `uuid` to the full-transcode cache key in `videoHandler.mjs` (the video-clips key already includes it; the transcode key today is filename + request params + version only). **V-2's eviction job ships in this branch** — see the V-2 decision below. V-4's stat-based staleness check in `getInfo()` also folds in here (it closes the cache-key fix's residual gap). |
+| 12 | Mongo tier connection/db-name fixes | M-1, M-2 | Adds the missing `closeMongoConnection()` export to `node/database.mjs` (graceful shutdown in `app.mjs` destructures it, gets `undefined`, and silently never closes the client); makes `getUsersDb()` honor `MONGODB_AUTH_DB` instead of hardcoding `"Users"`. |
+| 13 | Discord webhook signature fix | D-1 | **Moot** — promoted into Track A and shipped in commit `4aeb30c`. Retained in the numbering for traceability only. Residual follow-up: the now-dead Buffer-conversion fallback in `node/integrations/discord/routes.mjs` can be removed. |
+
+### Cross-branch constraints
+
+- **Must merge together (same lines):** Branch 3 (G-1a + R-1 + R-2), Branch 1 (G-5 + F-1), Branch 5 (R-4 + F-3). Do not split these into per-item PRs.
+- **Branch 9 rebases on Track A** before merging — SEC-1 restructured the same `routes/admin.mjs` handlers A-4b annotates. All Track B branches touching `app.mjs` rebase on Track A once merged (D-1's conditional middleware sits near the top of the request chain).
+- **Branch 11 before S-4:** merge V-1 (the confirmed duplicate-scheduling bug) before implementing the decided S-4 exclusivity-group removal, so that change is reasoned against a clean, non-duplicated scheduling baseline.
+- **V-2 ships with Branch 11:** V-3's cache-key change strands every existing `cache/video_transcode` entry under the old naming, and V-2's eviction job is the only mechanism that will ever reclaim them.
+- **I-3 coordinates with Branch 1:** the decided source-URL columns (I-3) and Branch 1's `pristine_metadata`/`metadata` columns alter the same two tables — fold into one migration pass or sequence explicitly, not a third ad hoc `ALTER TABLE` function.
+- **The A-2 constraint binds all pristine-base work:** `PUT /admin/metadata/config`'s full-replace semantics are load-bearing for override revert (see A-2 below). Any Branch 1/2 implementation must treat that as a hard invariant.
+
+---
+
+## Decided 2026-07-07
+
+Every entry below records an owner decision from the 2026-07-07 triage round. Entries whose decision requires code are **Decided — not yet implemented** and must not be read as current behavior. Entries resolved purely by documentation carry a **Resolved** status pointing at the relevant `BACKEND_ARCHITECTURE.md` section.
+
+### TMDB override / pristine-base design
+
+**G-1b — No signal distinguishing "confirmed no TMDB match" from "transient API failure."**
+Both outcomes surface as generic errors and collapse into the same `missing_data_media` 24-hour cooldown row; nothing typed distinguishes them (`node/utils/tmdb.mjs` `makeTmdbRequest()` throws plain errors, and no `TmdbNotFoundError`-style class exists anywhere in the client).
+**Decision:** introduce a typed error and plumb a `reason` (`'no-match'` vs `'transient-error'`) through the scanner-facing return contract. **Rationale:** the pristine-base column needs to know when it is safe to (re)populate — a confirmed no-match should suppress writes entirely, a transient failure should leave the previous value untouched and retry — and the return-value contract is already being restructured for G-1a. **Lands:** Branch 3. *Status: Decided — not yet implemented.*
+
+**G-4 — Override merge is shallow.**
+`node/utils/tmdbConfig.mjs` `applyMetadataOverrides()` merges as `{...tmdbData, ...overrides}` — one level deep. An override targeting any nested field (for example a single cast entry) replaces the entire top-level key.
+**Decision:** keep shallow-only merging permanently; document that overriding anything nested requires supplying the complete top-level value. **Rationale:** a recursive deep-merge would not solve the highest-value case anyway (arrays must still replace wholesale — no safe generic array-merge rule exists); if surgical edits are ever wanted, a path-based override syntax is the honest design, and that is a separate future question. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Keypoint Lifecycle Catalog (Override entry) and Appendix B (`metadata` field).*
+
+### Image reconcile / override system
+
+**I-1 — Image reconcile ships inert.**
+The orphan/stale-image reconcile mode defaults to `dry-run` (`node/lib/metadataGenerator.mjs` reads `SCANNER_RECONCILE_MODE` with a `'dry-run'` fallback) and nothing in the repository or deployment config overrides it, so the fix system never actually deletes anything by default.
+**Decision:** flip the default to `enforce`, and emit a startup log line stating the active reconcile mode. **Rationale:** the trigger conditions select only managed (DB-tracked) files — manual files are never touched, so the blast radius is narrow, and a feature that is a silent no-op until someone remembers an env var is worse than a visible default. **Lands:** new branch TBD (thematically adjacent to Branch 6). *Status: Decided — not yet implemented.*
+
+**I-3 — Upstream TMDB image changes are invisible to reconcile.**
+Staleness is judged only by tmdb.config mtime versus file mtime, never by comparing the effective source URL — a genuine upstream TMDB art change (new CDN path, same extension, no local config edit) never triggers a refresh. *(Staleness-mechanism detail carried from the triage round; not re-verified line-by-line.)*
+**Decision:** add `poster_source_url`/`backdrop_source_url`/`logo_source_url` columns mirroring the existing `*_hash`/`*_mtime` provenance pattern, and treat a URL mismatch as stale independent of config mtime. **Rationale:** structurally correct self-healing at modest cost given the column pattern already exists. **Lands:** new branch TBD — **schema migration must be coordinated with Branch 1's** (same two tables). *Status: Decided — not yet implemented.*
+
+**I-4 — Season posters and episode thumbnails can silently clobber manual files.**
+These slots have no override mechanism, and their day-based refresh cadence overwrites whatever file sits at the canonical path — including a manually placed one — with no DB provenance tracking and no `SCANNER_RECONCILE_MODE` gate. *(Cadence/clobber detail carried from the triage round; not re-verified line-by-line.)*
+**Decision:** build the **full override model per slot** — per-season-poster and per-episode-thumbnail override keys, DB-tracked provenance for downloaded files, and reconcile coverage, mirroring the top-level image model. The refresh cadence survives, but with provenance tracking it only ever overwrites system-downloaded files, closing the manual-file clobber as a consequence rather than a special case. **Rationale:** the complete curation mechanism was chosen over the minimal ownership-guard stopgap — it fixes the clobber risk *and* gives season/episode art the same override surface top-level art has. **Lands:** new branch TBD. *Status: Decided — not yet implemented.*
+
+**I-6b — No defined precedence between manual and auto-suggested backdrop focal point.**
+Both `backdrop_focal` (operator-set) and `backdrop_focal_suggested` (auto-detected) are persisted and returned raw, with resolution deferred entirely to the frontend.
+**Decision:** keep exposing both raw values with **no backend-side resolution** — precedence is deliberately the frontend's to resolve (manual-wins as the recommended convention), preserving an accept/reject-suggestion workflow. **Rationale:** a backend-computed effective value would bake in a policy the suggestion-review UX may want to own; with a single known consumer, resolution belongs where the UI decision lives. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` Appendix B (`backdrop_focal` adjacency note).*
+
+**I-7b — Overrides cannot reference an admin-uploaded local file.**
+`override_<kind>` values are resolved as TMDB CDN paths (or, after Branch 6, full URLs); there is no uploads root or copy-from-local branch. The cited use case — curating art for a title with no TMDB match — is already fully solved by placing a file directly at the convention filename with no override set.
+**Decision:** rely on direct file placement; no code. **Rationale:** extending overrides to local references means designing an uploads root, traversal-safe validation, and reconcile semantics for locally sourced files — worth building only alongside a concrete non-filesystem curation surface (for example a Discord bot upload flow), which does not exist yet. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Keypoint Lifecycle Catalog (image files).*
+
+### TMDB client hardening
+
+**T-1 — ETag conditional-revalidation plumbing is dead end-to-end.**
+`node/utils/tmdb.mjs` `makeTmdbRequest()` accepts an `ifNoneMatch` parameter, sends an `If-None-Match` header, and captures `responseETag` — but `node/sqliteDatabase.mjs` `setTmdbCache()` has a five-parameter signature (`endpoint, params, responseData, ttlHours, customCacheKey`) that silently drops the ETag argument, and no `etag` column exists to store one. The path cannot function.
+**Decision:** wire the path up for real — add an `etag` column to `tmdb_cache`, extend `setTmdbCache()` to persist the captured ETag, and pass the stored value as `If-None-Match` when revalidating an expired entry so the existing 304 branch becomes reachable. **Rationale:** the plumbing is already half-built, and conditional revalidation cheaply extends the cache's usefulness beyond the 60-day TTL — a 304 refreshes freshness without payload transfer. Deleting the dead path was considered and rejected. **Lands:** fold into Branch 7. *Status: Decided — not yet implemented.*
+
+**T-2 — Flat 60-day cache TTL for every TMDB endpoint.**
+`setTmdbCache()` defaults `ttlHours` to 1440 for all endpoints; there is no per-endpoint override, and fields with different freshness needs (`vote_average` vs. `genres`) live in the same details response, so only endpoint-level TTLs would be possible anyway.
+**Decision:** keep the uniform TTL. **Rationale:** simplest posture and low stakes for a personal media library; revisit only if displayed-rating freshness becomes a real user complaint. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Keypoint lifecycle catalog (TMDB cache row entry, TTL paragraph).*
+
+**T-3 — Name search blindly takes the first result.**
+`node/utils/tmdb.mjs` `fetchComprehensiveMediaDetails()`'s search fallbacks take `results[0]` with zero disambiguation — reachable for every newly scanned title with no pinned `tmdb_id`. The wrong-auto-match failure mode this produces is exactly what the pristine-base redesign exists to make recoverable.
+**Decision:** add a year-match heuristic upstream — extract a `(YYYY)` year from the directory name when present (the retry-search fallback already strips this suffix, so the signal is a first-class part of the naming convention), score results by release/first-air-date year, and fall back to the popularity-sorted first result only when no year is present or nothing matches. **Rationale:** low-risk, bounded-cost reduction of the wrong-match rate. This is the near-term fix only — the long-term direction is pulling authoritative ids from Radarr/Sonarr; see **Future feature directions**. **Lands:** new branch TBD (may fold into Branch 7). *Status: Decided — not yet implemented.*
+
+**T-4b — No TMDB-wide concurrency ceiling.**
+There is no shared limiter analogous to the image downloader's `IMAGE_DOWNLOAD_CONCURRENCY` (`node/utils/imageDownloader.mjs`); each caller composes its own bounds, and the collection endpoints demonstrably failed to (T-4a). Current scan-time fan-out is layered-bounded in practice, so this is defense-in-depth, not an active hole.
+**Decision:** add one shared `p-limit` ceiling inside `makeTmdbRequest()` itself, so every caller — scanner, admin routes, user-facing routes — draws from the same budget. **Rationale:** cheap (`p-limit` is already a dependency) and prevents any future caller from reintroducing an unbounded fan-out. **Lands:** fold into Branch 7. *Status: Decided — not yet implemented.*
+
+**T-7 — No circuit breaker for a sustained TMDB outage.**
+Protection is per-request retry/backoff plus the per-title 24-hour missing-data cooldown, which only engages after a failure has occurred.
+**Decision:** rely on the existing layered protection. **Rationale:** bounded retry plus per-title cooldown means each in-flight title fails once and goes quiet for 24 hours — acceptable if TMDB outages stay rare and short. Revisit only if an observed incident leaves scan duration unacceptable after the T-4/T-5 fixes land. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § System map (TMDB API boundary, "Accepted posture — no circuit breaker").*
+
+### SQLite / hash consistency
+
+**P-1a — By-id getters have zero callers but are kept deliberately.**
+`node/sqliteDatabase.mjs` `getMovieById()`/`getTVShowById()` have no callers anywhere in the codebase, yet have been maintained in lockstep with their siblings (they received the backdrop-focal columns alongside `getMovies()`/`getTVShows()`).
+**Decision:** keep them, with a comment documenting that they are unused but maintained for API parity. **Rationale:** maintenance cost has proven near-zero and the module clearly values getter symmetry; deleting saves little and loses a ready-made by-id surface. **Reminder:** Branch 1 must add its new `metadata`/`pristine_metadata` columns to these getters' SELECT lists so the parity commitment holds. **Lands:** docs-only (plus the code comment). *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Contracts & Boundaries Between Subsystems (backend ⇄ frontend).*
+
+**F-4 — Hash `data_version` is written but never read back.**
+`node/sqlite/metadataHashes.mjs` writes `HASH_DATA_VERSION` into every `metadata_hashes` row's `data_version` column but nothing ever compares it, so a hashing-logic change has no automated invalidation path. The sibling `node/sqlite/blurhashHashes.mjs` wires the equivalent versioning into its rows for real. This exact gap has already cost a manual full re-sync once (the 2026-05-27 array-replacer fix).
+**Decision:** wire up a real invalidation sweep — find rows where `data_version < HASH_DATA_VERSION` and force-regenerate, mirroring the blurhash table's pattern. **Rationale:** the failure mode has already bitten this repository once, and the working pattern to copy sits next door. **Lands:** new branch TBD (thematically adjacent to Branch 4). *Status: Decided — not yet implemented.*
+
+### Admin / config / rescan routes
+
+**A-2 — `PUT /admin/metadata/config` full-replace semantics are load-bearing.**
+The handler in `node/routes/admin.mjs` writes the submitted `config` object straight through `saveTmdbConfig()`; it never reads or merges the on-disk file, so an omitted key reverts to defaults. This is not a bug: the pristine-base override redesign **deliberately relies on full-replace as the mechanism for "revert this override"** — an operator omits the override key, and it is gone. A well-meaning future change that turns this endpoint into a merge-on-omit PATCH would silently break override revert with no obvious connection between the two changes.
+**Decision:** the full-replace contract is permanent and documented; any single-field-toggle need must be met by a net-new additive endpoint, never by changing this one. **Rationale:** this is the single most important cross-cutting constraint in the whole triage batch, and it must be stated where pristine-base implementers will read it, not only here. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Contracts & Boundaries Between Subsystems.*
+
+**A-3 — Cache "refresh" endpoint only deletes.**
+`POST /api/tmdb/cache/refresh` calls `node/sqliteDatabase.mjs` `refreshTmdbCacheEntry()`, which runs a single `DELETE FROM tmdb_cache WHERE cache_key = ?` — no refetch happens, despite the response wording and docs claiming a refresh.
+**Decision:** implement the eager refetch — call `makeTmdbRequest()` with `forceRefresh` so fresh data is fetched and re-cached through the existing `setTmdbCache()` path. **Rationale:** the fetcher already exists and integration is small; an admin clicking "refresh" reasonably expects fresh data actually fetched, and the added latency of one live TMDB call per admin invocation is acceptable. **Lands:** fold into Branch 9. *Status: Decided — not yet implemented.*
+
+**A-4a — Two unrelated resources share the name "config."**
+`PUT /admin/metadata/config` (per-title tmdb.config) and `GET /api/tmdb/config` (global TMDB settings, `node/routes/tmdb.mjs`) are unrelated resources with the same trailing name. Pure naming clarity — no bug, and a rename breaks whatever external frontend calls either path.
+**Decision:** rename one of the two resources (which one: chosen at implementation time), accepting the breaking-change coordination with the frontend. **Rationale:** ending the name collision was judged worth the one-time migration cost. The cross-reference comments (A-4b, Branch 9) serve as the interim remediation until the rename ships. **Lands:** new branch TBD, sequenced after Branch 9. *Status: Decided — not yet implemented.*
+
+### Scheduling / concurrency
+
+**S-2 — On-demand routes bypass the task manager.**
+`GET /media/tv`, `GET /media/movies`, `POST /media/scan`, `GET /rescan/tmdb`, and the admin metadata routes call scan/generate functions directly rather than through `enqueueTask()`, so they can run concurrently with the every-3-minute scheduled scan or each other. For the write-heavy admin routes this is a genuine correctness race, not just lock contention: a forceRefresh image wipe can interleave with a scan mid-read/write on the same title.
+**Decision:** gate the write-heavy admin routes (`/admin/metadata/show`, `/movie`, `/bulk`) through `enqueueTask()` with the existing task types; leave the read-mostly listing endpoints as-is. **Rationale:** the listing endpoints' race window is essentially cold-start/operator-paced and low stakes; coupling their HTTP latency to the task queue buys little. **Sequencing:** if this gating is later extended to `/rescan/tmdb`, it must wrap the handler that Branch 9's A-1 authenticates — not replace or revert that middleware. **Lands:** new branch TBD. *Status: Decided — not yet implemented.*
+
+**S-3 — `POST /media/scan` only scans movies.**
+The handler in `node/app.mjs` calls `generateListMovies()` only; no TV-only on-demand scan route exists. The asymmetry predates combined TV scanning and looks legacy, but code alone cannot confirm whether an external webhook caller depends on movie-only semantics.
+**Decision:** add the symmetric TV on-demand scan path (a TV equivalent or a `mediaType` parameter), routed through the task manager per S-2's gating decision. Frontend adoption of both the movie and TV variants is explicitly TBD — the `nextjs-stream` frontend does not currently call these routes; they ship as available-but-unadopted surface. See **Future feature directions**. **Lands:** new branch TBD. *Status: Decided — not yet implemented.*
+
+**S-4 — Poster-collage generation blocks all cache cleanup.**
+`node/lib/taskManager.mjs` pairs `[TaskType.DOWNLOAD, TaskType.CACHE_CLEANUP]` in `exclusiveGroups`, and the only current `TaskType.DOWNLOAD` caller is poster-collage generation (`node/app.mjs`) — a job sharing no files or tables with cache cleanup. The `DOWNLOAD` enum comment ("TMDB downloads") describes a workload that today runs outside the task manager entirely.
+**Decision:** remove the pairing. **Rationale:** cache-cleanup jobs are lightweight readdir/stat/unlink scans and the 10-minute original-segments sweep explicitly targets large files; serializing them behind a library-wide image walk buys nothing. **Sequencing:** implement only after Branch 11's V-1 lands, so the change is reasoned against a clean scheduling baseline rather than the currently double-scheduled one. **Lands:** new branch TBD, after Branch 11. *Status: Decided — not yet implemented.*
+
+### Captions / chapters / blurhash
+
+**C-1 — Movie chapter pregeneration at scan time is a silent no-op.**
+`node/components/media-scanner/domain/movie-scanner.mjs` calls `generateChapters(mediaPath, quietMode)`, but `node/chapter-generator.mjs` `generateChapters(mediaPath, chapterData = null)` interprets the second argument as chapter data — a truthy boolean short-circuits the real ffprobe probe, and the returned VTT string is discarded. The call burns a real ffprobe duration probe per movie per scan tick and produces nothing; movies get correct chapters anyway via the lazy `/chapters/movie/:movieName` route on first request.
+**Decision:** wire real scan-time pregeneration for movies, matching the working TV helper — actually probe the chapter atoms and write the VTT file instead of discarding the result. **Rationale:** the scan already pays the ffprobe cost today and produces nothing for it; making it write the file gives movies chapter parity with TV and warm chapters before first play. The lazy route stays as the on-demand fallback. Removing the dead call was considered and rejected in favor of completing the feature. **Lands:** new branch TBD. *Status: Decided — not yet implemented.*
+
+**C-2 — `autoCaptions.maxConcurrent` is defined but never read.**
+`node/components/caption-generator/data-access/caption-config.mjs` defaults `maxConcurrent: 1` and `plans/AUTO_GENERATED_CAPTIONS.md` documents it as driving the task manager's `CAPTION_GENERATE` limit — but `node/lib/taskManager.mjs` hardcodes that limit to 1 and no code reads the config field.
+**Decision:** remove the dead field from the caption-config defaults (and correct the plan document that describes it as live). **Rationale:** nothing reads it, and a tunable that looks authoritative but is ignored is worse than none — the task manager's hardcoded limit is the intended single owner of caption concurrency. If per-deployment tuning is ever wanted, it must be built through a task-manager setter, never a second reader of this field. **Lands:** new branch TBD. *Status: Decided — not yet implemented.*
+
+**B-2b — Three unshared blurhash size-by-image-kind policies.**
+`imageDownloader.mjs`, `utils.mjs`, and `tmdbBlurhash.mjs` each encode their own size-per-image-kind rules; two agree, and the third (the live TMDB API-proxy pipeline) diverges for posters — plausibly deliberately, since it serves browse/search previews rather than library storage. *(Policy-divergence detail carried from the triage round; not re-verified line-by-line.)*
+**Decision:** unify the three sizing policies into one shared policy module. **Rationale:** three unshared policies invite silent drift; the unification exercise must begin by explicitly deciding whether the TMDB-proxy pipeline's poster-size divergence is intentional and, if so, encoding it as a named, documented variant in the shared module rather than an accident. The unrelated telemetry bug in the same file (B-2a) ships in Branch 10 regardless. **Lands:** new branch TBD (thematically adjacent to Branch 10). *Status: Decided — not yet implemented.*
+
+### Video / transcode
+
+**V-2 — The transcode cache has no eviction job at all.**
+`cache/video_transcode` (`node/utils/utils.mjs` `videoTranscodeCacheDir`) is the only one of the five cache directories with no scheduled cleanup — `utils.mjs` exports clear functions for general, video-clips, spritesheet, frames, and original-segments caches, and none for transcodes, which are typically the largest artifacts the subsystem produces.
+**Decision:** add an eviction job mirroring the simplest sibling policy — 30-day mtime-based deletion in the same overnight cadence family — **shipping inside Branch 11**, because Branch 11's V-3 cache-key change strands every existing entry under the old naming scheme and this job is the only mechanism that will ever reclaim them. **Rationale:** matching `clearVideoClipsCache()`'s proven policy is the lowest-risk start; a shorter window or disk-budget-aware LRU can be tuned later if disk pressure shows up. **Lands:** Branch 11. *Status: Decided — not yet implemented.*
+
+**V-4 — `info.uuid` is not guaranteed to rotate on in-place file replacement.**
+`infoManager.getInfo()`'s regeneration gate is version-and-shape only — it never compares the `.info` sidecar against the current file's stat, so the `uuid` that video-clips (and, after V-3, transcodes) key on may not change when a source file is replaced at an unchanged path. *(Gate mechanics carried from the triage round; not re-verified line-by-line.)*
+**Decision:** add the cheap stat-based staleness check in `getInfo()` — compare the `.info` sidecar against the source file's current size/mtime and regenerate on mismatch, so an in-place replacement rotates the `uuid` and Branch 11's cache keys go stale correctly. **Rationale:** closes the known residual gap in Branch 11's cache-key fix for the cost of one `fs.stat` per lookup. **Lands:** fold into Branch 11. *Status: Decided — not yet implemented.*
+
+**V-5 — No auth or rate limiting on ffmpeg-triggering routes.**
+`/video/*` (transcode branch), `/videoClip/*`, `/spritesheet/*`, and `/vtt/*` are registered in `node/app.mjs` with no middleware, unlike `/media/*` and `/processes` which require `authenticateWebhookOrUser`. Unlike plain byte-range mp4 serving, these routes spawn ffmpeg against caller-supplied parameters and write new cache files per distinct parameter combination — and until V-2 ships, the transcode cache has no eviction, so an unauthenticated caller can force unbounded CPU/GPU work and unbounded disk growth. A `createRateLimiter` helper exists in `middleware/auth.mjs` but is wired to nothing here.
+**Decision:** the no-auth posture is an accepted trust boundary — this backend runs on a private network behind layers that control reachability — and that acceptance now explicitly covers *generation-triggering* work, not just the previously documented read-of-existing-artifact precedent. **Rationale:** consistent with the existing unauthenticated streaming posture; the V-2 eviction job bounds the disk-growth half of the exposure. Revisit immediately if any of these routes is ever exposed beyond the trusted network. **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Contracts & Boundaries Between Subsystems (auth posture summary).*
+
+### Mongo tier / Discord
+
+**M-3 — Dead Mongo collection provisioning on every startup.**
+`node/database.mjs` creates `Media.Movies`/`Media.TV`/`Media.PlaybackStatus` and `Cache.cacheEntries` (plus their indexes) on every boot, yet a repo-wide search finds no other reference to them — and the same search across the `nextjs-stream` frontend repo also finds no live consumer: `PlaybackStatus` was superseded there by `WatchHistory` (its migration script keeps the old collection only as a dormant fallback), and live frontend data lives in the `FlatMovies`/`FlatTVShows` collections, not the legacy `Movies`/`TV` ones.
+**Decision:** delete the provisioning for these four collections, keeping only the actively used `app_config.settings` index logic. **Rationale:** vestigial scaffolding predating the Flat* migration; no external consumer is known to touch these collection names, and paying a Mongo round-trip per boot for dead schema misleads readers into thinking the collections are live. **Lands:** new branch TBD (natural fold into Branch 12). *Status: Decided — not yet implemented.*
+
+**M-4 — No documented backup plan for non-derivable Mongo state.**
+The Users DB (real identities/sessions) and admin-customized `app_config.settings` are the only genuinely non-derivable Mongo state — and `app_config.settings` self-heals to hardcoded defaults when a document is missing, so a restore from a stale backup (or a wipe) silently and undetectably reverts deliberate admin customization. An external backup policy covering this state already exists (operator-confirmed 2026-07-07); the gap is purely that nothing in-repo points to it.
+**Decision:** document the durability posture — name Users and `app_config` as the collections the existing external backup/snapshot policy covers, with a pointer in README/`.env.example` — and additionally log `app_config.settings` writes as a revert-detection audit trail, so a silent revert-to-default is at least detectable in retrospect. **Lands:** new branch TBD (docs plus a log line). *Status: Decided — not yet implemented.*
+
+**M-5 — The architecture documentation never mentioned the Mongo tier.**
+The prior architecture doc (`docs/ENTERPRISE_SCANNER_ARCHITECTURE.md`) framed persistence as a strict filesystem/SQLite duality, omitting the Mongo tier that holds the system's only non-derivable identity state alongside self-healing config and (per M-3) dead legacy collections.
+**Decision:** resolved by `BACKEND_ARCHITECTURE.md` itself, which documents the Mongo tier and its three sub-kinds of state (non-derivable identity, self-healing config, legacy collections pending M-3 removal). **Lands:** docs-only. *Status: Resolved — documented in `BACKEND_ARCHITECTURE.md` § Ground truth vs. derived state (§1.4, the MongoDB-backed tier).*
+
+**D-2 — The Discord media-admin plan doc self-reports completion that never happened.**
+`node/integrations/discord/MEDIA_ADMIN_COMMANDS_PLAN.md` marks its 17-item Phase 1-4 checklist complete, but roughly one item (the `/tasks` command and its admin-auth helper) actually shipped; the files the plan describes were never created in git history. *(Completion ratio carried from the triage round's git-history audit; not re-audited.)*
+**Decision:** correct the checklist to reflect real completion and relabel the document as a proposal/backlog, not a finished-work record. **Rationale:** the doc actively misleads future readers (human or agent) into believing a feature exists; relabeling is the minimal honest fix and keeps the design available if Discord-driven media administration is revisited as part of the broader media-management integration direction. **Lands:** new branch TBD (docs-only change within the repo). *Status: Decided — not yet implemented.*
+
+**D-3 — `/status` exposes host infrastructure metrics with no access control.**
+`node/integrations/discord/commands/status.mjs` performs no admin check of any kind, while the sibling `tasks.mjs` gates on `getAdminByDiscordId()` — yet both expose live host CPU/memory/disk/process data, and the app supports user-installable Discord installs, so `/status` is potentially reachable by any Discord user who self-installs it.
+**Decision:** gate `/status` (and its onboarding buttons) the same way `/tasks` is gated — admin-only via `getAdminByDiscordId()`. **Rationale:** host infrastructure metrics were never intended to be public, and the admin-check helper already exists one command over. **Lands:** new branch TBD (Discord lane). *Status: Decided — not yet implemented.*
+
+---
+
+## Accepted as documented
+
+Current behavior in each of these twelve items is correct, or an already-made and still-valid decision. No code changes are planned; each entry exists so the next reader does not re-open the question from scratch.
+
+**I-2 — forceRefresh unconditionally wipes managed images.**
+`node/lib/metadataGenerator.mjs` `_wipeManagedImagesForForceRefresh()` unlinks every accepted-extension file in each image slot on a forced refresh (tmdb.config id change/rescan), explicitly *not* gated by `SCANNER_RECONCILE_MODE` — a deliberate operator-intent signal: changing the pinned id means the old art is definitionally wrong. This matches a standing, explicit prior project decision. Overrides survive because they are re-applied from the freshly fetched, override-merged metadata immediately after the wipe.
+
+**I-8 — The claimed logo-blurhash propagation gap does not hold.**
+Verification across every layer that assembles the poster/backdrop/logo blurhash triplet (scanners, row mappers, routes, both hash tables) found the logo treated identically to poster and backdrop. The sole exception is SVG logos, which are correctly and intentionally skipped — an SVG cannot be encoded as a raster blurhash.
+
+**T-8 — The survey-era "one TMDB field never surfaced by the image-lookup function" claim does not reproduce.**
+The survey critique carried a one-line finding that "one metadata field TMDB provides is never surfaced by the image-lookup function that returns the rest," naming neither the field nor the function. Verification against the current client found no such gap: `getMediaImages()` (`node/utils/tmdb.mjs`) returns `backdrops`, `posters`, `logos`, and a derived `logo_path` — every image array TMDB's `/images` endpoint provides; `getEpisodeImages()` surfaces the full `stills` array plus a derived `thumbnail_url`; and `getCollectionImages()` returns both keys (`backdrops`, `posters`) the collection-images endpoint actually provides (confirmed against a live TMDB response — collections carry no `logos` array). The only unforwarded value anywhere is the redundant numeric `id` envelope on the images responses. Investigated and closed with no identified referent; reopen only with a concrete field-and-function citation.
+
+**P-1c — The surrogate SQLite `id` invariant already holds.**
+`movies.id`/`tv_shows.id` (`AUTOINCREMENT`) never cross a module boundary to an external consumer that could persist them across a `media.db` rebuild; the insert/update paths never capture `lastID` for external use. Needs only a code comment above the CREATE TABLE statements stating the invariant: stable external references must key on `name` or the TMDB-derived `_id`, never on `id`.
+
+**P-2 — The movie/TV upsert-guard asymmetry is intentional.**
+`node/sqliteDatabase.mjs` `insertOrUpdateMovie()` guards its update with `WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash`; `insertOrUpdateTVShow()` always rewrites. This is deliberate: TV directory hashes are computed at a shallow depth (deep episode changes do not move them), and the episode-backfill fall-through can legitimately rewrite season/episode data when the top-level hash has not changed — a movies-style guard on TV would silently drop that write. Needs a comment above the TV insert so a future "make it symmetric" PR does not reintroduce the bug.
+
+**P-3 — Uniform relaxed SQLite durability is acceptable.**
+`PRAGMA synchronous = NORMAL` everywhere means the worst-case loss for the non-derivable bookkeeping tables is one extra premature retry (`missing_data_media`/`episode_metadata_missing` — self-healing on next write) or one duplicate Discord onboarding DM (`discord_intros` — already idempotency-guarded by `INSERT OR REPLACE`). Both bounded and self-correcting; a one-line `synchronous = FULL` branch for the discord connection is the ready remedy if the DM case is ever judged unacceptable.
+
+**F-5 — ~20-minute worst-case hash-propagation staleness is accepted.**
+Four independently reasonable freshness layers stack additively rather than overlapping: the auto-captions config cache (30 s), the 15-minute scheduled hash sweep, the hashes endpoint's `max-age=300` HTTP cache, and the frontend's own polling cache. Nothing coalesces them, so worst-case propagation approaches their sum. Accepted as the current SLA; the ceiling drops substantially once Branch 4's F-2 fix ships, because real content changes then get their hash written within the 3-minute scan tick instead of waiting for the sweep.
+
+**A-5 — The lazy DB write behind unauthenticated `GET /metadata-hashes/...` is already safely hardened.**
+The write fires at most once per title (guarded by `!hash`), only after a 404 gate rejects unknown titles (`node/routes/metadataHashes.mjs`), uses only server-side authoritative data, and `storeHash`'s delete-then-insert pattern is self-healing against duplicates. No auth is consistent with this route being part of the public hash-sync contract the frontend polls, which carries no sensitive data. Needs one comment noting that the 404-before-write ordering and the self-healing dedup are what make the pattern safe, so a refactor does not reorder the guard away.
+
+**S-5 — The residual Python poster-collage script is correctly out of scope.**
+`scripts/generate_poster_collage.py` makes no TMDB API calls — it is a pure filesystem walk plus Pillow composite of already-downloaded posters — so it is genuinely outside the "remove Python from the TMDB pipeline" effort, and `requirements.txt` already states this scoping decision explicitly. A fully Python-free image (reimplementing collage in Node with `sharp`, already a dependency) is a separate future initiative.
+
+**V-0 — The video/transcode cache-directory subsystem is correctly modeled as disposable derived state.**
+The five on-demand cache directories (`general`, `video_clips`, `spritesheet`, `video_transcode`, `frames`) are pure derived artifacts of the source mp4 files; SQLite's only footprint (`process_queue`) is wiped on restart. `cache/general` has no current producer anywhere in the codebase (orphaned/legacy — its scheduling disposition is folded into Branch 11's V-1 work). The unauthenticated-*read* posture matches the intentional streaming precedent; the separate generation-triggering question was decided under V-5 above.
+
+**V-6 — atime-based cache eviction is fragile under `relatime` but low severity.**
+The segment/spritesheet/frames sweeps in `node/utils/utils.mjs` key on `stats.atimeMs`, which under Linux `relatime` semantics can go stale for an actively read file — so a client scrubbing past the window could have a file unlinked mid-use. POSIX unlink of an open descriptor is safe (the in-progress stream keeps reading), so the only cost is the next request taking a cheap cache-miss regeneration. Self-healing failure mode; no change.
+
+**D-4 — The in-memory, single-process webhook idempotency guard is an accepted tradeoff.**
+`node/integrations/discord/IMPLEMENTATION_NOTES.md` already names Redis as the fix if this backend ever runs multi-instance; it runs as a single instance today. The real anti-duplicate-DM guard is the persistent, idempotent SQLite `discord_intros` table — multi-instance duplication would at worst produce redundant webhook-processing log noise, not duplicate DMs.
+
+---
+
+## Future feature directions
+
+Intentions recorded 2026-07-07 that are larger than any single backlog item. Nothing here is scheduled.
+
+### Radarr/Sonarr integration (extends T-3)
+
+The T-3 year-match heuristic is the **near-term** fix for wrong auto-matches. The **long-term** direction is to stop guessing entirely: when a Radarr/Sonarr instance is configured, pull the authoritative `tmdb_id` for each title from its feed instead of running a TMDB name search — those tools have already done the disambiguation, and their library view maps one-to-one onto this backend's media directories. This is intended as part of a deeper media-management integration (library state, quality/upgrade awareness, possibly rename events feeding the V-4 file-identity question), not just an id-lookup shortcut. Design work should treat the year heuristic as the permanent fallback for titles no external manager knows about.
+
+### On-demand scan routes (extends S-3)
+
+S-3's decided outcome is to add the symmetric TV scan path (a TV equivalent of `POST /media/scan`, or a `mediaType` parameter), routed through the task manager per S-2's gating decision. What remains open is **frontend adoption**: the `nextjs-stream` frontend does not call the on-demand scan routes today, so both variants ship as available-but-unadopted surface. Whether the frontend ever drives per-type scans — or the routes are eventually retired in favor of the combined scheduled scan — is a frontend-side product decision, tracked there rather than here.

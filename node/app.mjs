@@ -59,18 +59,14 @@ const BASE_PATH = process.env.BASE_PATH
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || "";
 const scriptsDir = resolve(__dirname, "../scripts");
-// Moderately spaced out interval to check for missing data
-const RETRY_INTERVAL_HOURS = 24; // Interval to retry downloading missing tmdb data
+// (RETRY_INTERVAL_HOURS used to live here but was dead code after the Python
+// scheduled job was removed; the canonical constant now lives in
+// node/components/media-scanner/data-access/scanner-repository.mjs.)
 
 const generatePosterCollageScript = join(
   scriptsDir,
   "generate_poster_collage.py"
 );
-const downloadTmdbImagesScript = join(
-  scriptsDir,
-  "download_tmdb_images.py"
-);
-//const generateThumbnailJsonScript = path.join(scriptsDir, 'generate_thumbnail_json.sh');
 
 const isDebugMode =
   process.env.DEBUG && process.env.DEBUG.toLowerCase() === "true";
@@ -214,8 +210,15 @@ const configureCORS = () => {
 // Apply CORS middleware
 app.use(configureCORS());
 
-// Parse JSON request bodies (with increased size limit for subtitle uploads)
-app.use(express.json({ limit: '30mb' }));
+// Parse JSON request bodies (with increased size limit for subtitle uploads).
+// Skip /api/discord/events: that route needs the raw, unparsed body (via its
+// own express.raw() middleware) to verify the Discord webhook signature —
+// parsing it here first would make that raw parser a no-op and force a
+// lossy JSON.stringify() re-serialization fallback before verification.
+app.use((req, res, next) => {
+  if (req.path === '/api/discord/events') return next();
+  return express.json({ limit: '30mb' })(req, res, next);
+});
 
 ensureCacheDirs();
 
@@ -607,7 +610,7 @@ app.get("/video/movie/:movieName", async (req, res) => {
 
 app.get("/rescan/tmdb", async (req, res) => {
   try {
-    await runDownloadTmdbImages(null, null, true);
+    await runDownloadTmdbImages({ fullScan: true });
     res.status(200).send("Rescan initiated");
   } catch (error) {
     logger.error(error);
@@ -688,7 +691,7 @@ scheduleJob("*/10 * * * *", () => {
 // Use a scheduled job instead of setInterval for better precision and to coordinate with other scheduled tasks
 scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hour
   // Use the task manager to handle concurrency and database access
-  enqueueTask(TaskType.BLURHASH_GENERATION, 'Blurhash Hashes Update', async () => {
+  enqueueTask(TaskType.BLURHASH, 'Blurhash Hashes Update', async () => {
     logger.info("Running Blurhash Hashes Update...");
     const db = await initializeDatabase();
     
@@ -864,42 +867,51 @@ async function runGeneratePosterCollage() {
     }
   });
 }
-async function runDownloadTmdbImages(
-  specificShow = null,
-  specificMovie = null,
-  fullScan = false
-) {
-  const debugMessage = isDebugMode ? ' with debug' : '';
+/**
+ * Run a TMDB image download cycle for a single show, a single movie, or the
+ * whole library. Migrated from the legacy Python `download_tmdb_images.py`
+ * script to the Node MetadataGenerator.
+ *
+ * @param {Object} [options]
+ * @param {string|null} [options.showName=null]  - Run a single show
+ * @param {string|null} [options.movieName=null] - Run a single movie
+ * @param {boolean} [options.fullScan=false]     - Force-refresh entire library
+ *   (sets `forceRefresh: true` on the MetadataGenerator, which propagates
+ *   `forceDownload: true` to `downloadMediaImages`)
+ * @param {Object|null} [options.previousPaths=null] - `{ poster, backdrop, logo }`
+ *   from the scanner's existing DB row for the item. Used by the reconcile
+ *   step in MetadataGenerator to detect orphans (previously-managed file
+ *   path differs from what the current URL would produce). Null is safe —
+ *   reconcile no-ops the orphan branch when previousPaths is null.
+ * @returns {Promise<Object>} Result from `MetadataGenerator.generateImages`,
+ *   includes per-image-type outcomes the scanner uses for post-condition
+ *   logging.
+ */
+async function runDownloadTmdbImages({
+  showName = null,
+  movieName = null,
+  fullScan = false,
+  previousPaths = null,
+} = {}) {
   tmdbLogger.info(
-    `Download tmdb request${specificShow ? ` for show "${specificShow}"` : ''}` +
-    `${specificMovie ? ` for movie "${specificMovie}"` : ''}` +
-    `${fullScan ? ' with full scan' : ''}` +
-    `${debugMessage}`
+    `Running TMDB image download via Node MetadataGenerator` +
+    `${showName ? ` for show "${showName}"` : ''}` +
+    `${movieName ? ` for movie "${movieName}"` : ''}` +
+    `${fullScan ? ' (full scan / forceRefresh)' : ''}`
   );
 
-  // Build args for Python script
-  const args = [];
-  
-  if (specificShow)  args.push('--show', specificShow);
-  if (specificMovie) args.push('--movie', specificMovie);
-  
-  if (fullScan) {
-    args.push('--full-scan');
-  }
+  try {
+    const generator = await MetadataGenerator.create({
+      basePath: BASE_PATH,
+      forceRefresh: fullScan,
+      generateBlurhash: true,
+    });
 
-  await runPython({
-    scriptPath: downloadTmdbImagesScript,
-    args,
-    label: 'DownloadTMDBImages',
-    logger: tmdbLogger,
-    logFile: LOG_FILE,
-    debug: isDebugMode,
-    env: {
-      ...process.env,
-      DEBUG: process.env.DEBUG,
-      TMDB_API_KEY: process.env.TMDB_API_KEY,
-    }
-  });
+    return await generator.generateImages({ showName, movieName, previousPaths });
+  } catch (error) {
+    tmdbLogger.error(`TMDB image download failed: ${error.message}`);
+    throw error;
+  }
 }
 
 // Function to parse and format a log line
@@ -1186,18 +1198,13 @@ async function autoSync() {
 }
 
 function scheduleTasks() {
-  // Schedule for download_tmdb_images.py - stagger with specific minute patterns
-  // Runs at 7, 25, 43 minutes past the hour to avoid overlapping with other tasks
-  scheduleJob("7,25,43 * * * *", () => {
-    // Use task manager instead of isScanning flag
-    enqueueTask(TaskType.DOWNLOAD, 'TMDB Image Download', async () => {
-      logger.info('Running scheduled TMDB image download with task manager');
-      await runDownloadTmdbImages(null, null, false);  // Don't force refresh - respect age checks
-      return 'TMDB image download completed successfully';
-    }).catch(error => {
-      logger.error(`Failed to enqueue TMDB download task: ${error.message}`);
-    });
-  });
+  // NOTE: The scheduled bulk TMDB image refresh that previously ran at
+  // 7, 25, 43 minutes past the hour was removed when the workload moved
+  // from `scripts/download_tmdb_images.py` to the in-process Node
+  // MetadataGenerator. The scanners triggered by `runGenerateList`
+  // (every 3 minutes, below) already drive `runDownloadTmdbImages` for
+  // any media flagged as missing data, so a separate blanket refresh
+  // is redundant.
 
   // Schedule for generate_poster_collage.py
   // Run at 12, 42 minutes past the hour to avoid overlapping with other tasks
