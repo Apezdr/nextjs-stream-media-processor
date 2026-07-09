@@ -24,12 +24,14 @@ export function createSpan(tracer, name, options = {}) {
   return tracer.startSpan(name, options);
 }
 
-// Helper to wrap async functions with span creation
+// Helper to wrap async functions with span creation. The span is passed to
+// the callback so callers can set attributes/events on it mid-flight —
+// callbacks that don't need it just ignore the argument.
 export async function withSpan(tracer, name, fn, attributes = {}) {
   const span = tracer.startSpan(name, { attributes });
-  
+
   try {
-    const result = await fn();
+    const result = await fn(span);
     span.setStatus({ code: SpanStatusCode.OK });
     return result;
   } catch (error) {
