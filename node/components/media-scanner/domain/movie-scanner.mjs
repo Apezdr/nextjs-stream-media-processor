@@ -21,7 +21,9 @@ import {
   RETRY_INTERVAL_HOURS
 } from '../data-access/scanner-repository.mjs';
 import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
-import { loadTmdbConfig } from '../../../utils/tmdbConfig.mjs';
+import { loadTmdbConfig, isUpdateAllowed, getMetadataOverrides } from '../../../utils/tmdbConfig.mjs';
+import { isFrozenReason } from '../../../lib/metadataGenerator.mjs';
+import { resolveCooldownAction } from './cooldown-policy.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
 import {
   iterateConventions,
@@ -410,8 +412,21 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         tmdbConfigLastModified = await getLastModifiedTime(tmdbConfigPath);
       }
 
-      // Extract TMDB ID and manual focal override from config
-      const tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      // Extract TMDB ID, freeze flag, and manual focal override from config.
+      // loadTmdbConfig THROWS on unparseable JSON — tolerate it per movie
+      // (warn-and-continue) so one corrupt config can't reject the whole
+      // Promise.all pass. Fail CLOSED on the freeze flag (§4.2): an
+      // unreadable config means the freeze state is unknown, so no TMDB
+      // write paths may open off assumed defaults.
+      let tmdbConfig;
+      try {
+        tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      } catch (err) {
+        logger.warn(`Unparseable tmdb.config for ${dirName}, treating as frozen this pass: ${err.message}`);
+        tmdbConfig = { update_metadata: false, backdrop_focal: null };
+      }
+      const updateAllowed = isUpdateAllowed(tmdbConfig);
+      const hasOverrides = getMetadataOverrides(tmdbConfig) !== null;
       let _id = tmdbConfig.tmdb_id ? `tmdb_${tmdbConfig.tmdb_id}` : null;
       const manualFocal = tmdbConfig.backdrop_focal ?? null;
 
@@ -454,10 +469,23 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         !missingDataMovie ||
         ((now - new Date(missingDataMovie.lastAttempt)) / (1000 * 60 * 60)) >= RETRY_INTERVAL_HOURS;
 
+      // Freeze-aware retry gates (Branch 3, §4.2 narrowed contract):
+      //  - images-missing consults the freeze flag so a frozen movie with a
+      //    permanently missing image (e.g. TMDB has no logo) can't re-invoke
+      //    the generator every tick forever.
+      //  - metadata-missing opens for a frozen movie ONLY when tmdb.config
+      //    carries metadata overrides — the one frozen case with real work
+      //    to do (_applyOverridesWhileFrozen), and it self-resolves by
+      //    writing metadata.json. A frozen movie with no overrides is left
+      //    alone: since the post-attempt bookkeeping clears (not marks) its
+      //    cooldown row, an ungated branch would re-run the movie on every
+      //    tick its hash keeps it reachable. A config edit / unfreeze is
+      //    still picked up immediately — any tmdb.config write bumps its
+      //    mtime, which flips dirHashChanged and that term bypasses everything.
       runDownloadTmdbImagesFlag =
         dirHashChanged ||
-        missingImages ||
-        (missingMetadata && metadataGateAllowsRetry);
+        (missingImages && updateAllowed) ||
+        (missingMetadata && metadataGateAllowsRetry && (updateAllowed || hasOverrides));
 
       // Download TMDB images if needed. The bypass log is emitted AFTER
       // the download attempt, conditional on actual work having happened
@@ -465,12 +493,6 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // become silent no-ops, which keeps the log channel clean for
       // genuine retry activity.
       if (runDownloadTmdbImagesFlag) {
-        // Only record a cooldown marker when the metadata path itself is
-        // failing. Images-only retries don't flip this gate — otherwise
-        // the 24h cooldown would suppress legitimate fast retries.
-        if (missingMetadata) {
-          await markMediaAsMissingData(dirName);
-        }
         // Previously-managed file paths from the DB row. MetadataGenerator's
         // reconcile step uses these to detect orphans (the path we'd write
         // now differs from the path we wrote last time, e.g. override URL
@@ -516,16 +538,27 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         Object.assign(urls, retryBuilt.urls);
         resolvedImages = retryBuilt.resolved;
 
-        // Conservative clear: only when BOTH metadata and images are now
-        // present after the retry pass. Partial recovery leaves the marker
-        // in place so the next tick has a chance to finish the job.
         const after = await checkTMDBImagesNeeded(
           retryFileSet,
           dirPath,
           dirName,
           tmdbConfigLastModified
         );
-        if (!after.missingMetadata && !after.missingImages) {
+
+        // Cooldown bookkeeping, decided AFTER the attempt from the generator's
+        // returned reason plus the post-attempt disk state. The full decision
+        // table lives in resolveCooldownAction (cooldown-policy.mjs); clears
+        // are skipped when no row exists (missingDataMovie was null) to avoid
+        // a no-op DELETE per tick.
+        const cooldownAction = resolveCooldownAction({
+          metadataStillMissing: after.missingMetadata,
+          imagesStillMissing: after.missingImages,
+          frozen: isFrozenReason(downloadResult?.reason),
+          hasOverrides,
+        });
+        if (cooldownAction === 'mark') {
+          await markMediaAsMissingData(dirName);
+        } else if (cooldownAction === 'clear' && missingDataMovie) {
           await clearMissingMediaData(dirName);
         }
       }

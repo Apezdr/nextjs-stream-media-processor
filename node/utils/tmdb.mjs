@@ -27,6 +27,23 @@ if (!TMDB_API_KEY) {
 }
 
 /**
+ * A TMDB name search legitimately returned zero results — the title has no
+ * match, as opposed to a network/HTTP/rate-limit failure (those stay generic
+ * Errors). Lets MetadataGenerator classify the failure in its return contract
+ * (`reason: 'no-match'` vs `'transient-error'`). Note the scanners currently
+ * apply the same 24h cooldown to both reasons — the type exists so the two
+ * cases stop being indistinguishable at the contract/log layer, not because
+ * they are paced differently today.
+ */
+export class TmdbNoMatchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TmdbNoMatchError";
+    this.code = "no-match";
+  }
+}
+
+/**
  * Helper function to make TMDB API requests with caching and retry logic
  * @param {string} endpoint - TMDB API endpoint (e.g., '/search/movie')
  * @param {Object} params - Query parameters
@@ -663,7 +680,7 @@ export const fetchComprehensiveMediaDetails = async (
       const nameWithoutYear = name.replace(/\s*\(\d{4}\)/, "");
       const retryResults = await searchMedia(type, nameWithoutYear);
       if (!retryResults.results || retryResults.results.length === 0) {
-        throw new Error(`No results found for ${type}: ${name}`);
+        throw new TmdbNoMatchError(`No results found for ${type}: ${name}`);
       }
       id = retryResults.results[0].id;
     } else {
