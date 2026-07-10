@@ -15,7 +15,8 @@ import {
   searchCollections,
   getCollectionDetails,
   getCollectionImages,
-  fetchEnhancedCollectionData
+  fetchEnhancedCollectionData,
+  makeTmdbRequest
 } from '../utils/tmdb.mjs';
 import {
   initializeDatabase,
@@ -303,6 +304,11 @@ router.get('/collection/images', authenticateUser, rateLimiter, async (req, res)
 });
 
 // Admin-only endpoint to get TMDB configuration
+// Naming-collision note (A-4b): this is the GLOBAL TMDB client/cache status
+// resource (GET /api/tmdb/config). The unrelated per-title `tmdb.config`
+// editor is GET/PUT /api/admin/metadata/config in routes/admin.mjs. Decided
+// 2026-07-07 (A-4a): one of the two names will change; until then these
+// cross-references are the disambiguation.
 router.get('/config', authenticateUser, requireAdmin, async (req, res) => {
   try {
     const cacheStats = await getTmdbCacheStats();
@@ -377,22 +383,43 @@ router.delete('/cache/expired', authenticateUser, requireAdmin, async (req, res)
   }
 });
 
-// Admin-only endpoint to force refresh specific cache entry
+// Admin-only endpoint to force refresh specific cache entry: drops the stale
+// row, then eagerly refetches through makeTmdbRequest(forceRefresh) so the
+// fresh response is re-cached via the normal setTmdbCache() path.
+// Limitation: blurhash-enhanced responses live under a different custom key
+// (generateBlurhashCacheKey in utils/tmdbBlurhash.mjs) that this endpoint
+// cannot address — only the plain variant of {endpoint, params} is refreshed;
+// a stale blurhash variant ages out via its TTL.
 router.post('/cache/refresh', authenticateUser, requireAdmin, async (req, res) => {
   try {
     const { endpoint, params = {} } = req.body;
-    
+
     if (!endpoint) {
       return res.status(400).json({ error: 'Endpoint parameter is required' });
     }
 
+    // `refreshed` keeps its original meaning — "a cached row existed and was
+    // dropped" — so existing consumers of the field are unaffected.
     const refreshed = await refreshTmdbCacheEntry(endpoint, params);
 
-    logger.info(`Admin ${req.user.email} refreshed TMDB cache for endpoint: ${endpoint}`);
+    try {
+      await makeTmdbRequest(endpoint, params, 3, 1440, /* forceRefresh */ true);
+    } catch (fetchError) {
+      logger.error(`Cache refresh refetch failed for ${endpoint}: ${fetchError.message}`);
+      return res.status(502).json({
+        success: false,
+        refreshed,
+        fetched: false,
+        error: `Stale entry ${refreshed ? 'cleared' : 'not found'}, but the TMDB refetch failed: ${fetchError.message}`
+      });
+    }
+
+    logger.info(`Admin ${req.user.email} refreshed TMDB cache for endpoint: ${endpoint} (stale row ${refreshed ? 'dropped' : 'absent'}, fresh data fetched and re-cached)`);
     res.json({
       success: true,
       refreshed,
-      message: refreshed ? 'Cache entry refreshed successfully' : 'Cache entry not found'
+      fetched: true,
+      message: 'Fresh TMDB data fetched and re-cached'
     });
   } catch (error) {
     logger.error('Cache refresh error:', error);
