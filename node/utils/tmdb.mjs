@@ -1,7 +1,8 @@
 import axios from "axios";
+import pLimit from "p-limit";
 import { createCategoryLogger } from "../lib/logger.mjs";
 import { withApiRequestSpan, withApiCacheSpan } from "../lib/apiTracer.mjs";
-import { getTmdbCache, setTmdbCache, withWriteTx } from "../sqliteDatabase.mjs";
+import { getTmdbCache, getTmdbCacheEntryAnyAge, setTmdbCache, withWriteTx } from "../sqliteDatabase.mjs";
 import {
   enhanceTmdbResponseWithBlurhash,
   generateBlurhashCacheKey,
@@ -12,6 +13,16 @@ const logger = createCategoryLogger("tmdb-utils");
 // TMDB API configuration
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
+
+// One TMDB-wide concurrency ceiling (T-4b): the limiter wraps the HTTP call
+// inside makeTmdbRequest, so every caller — scanner, admin routes,
+// user-facing routes — draws from the same budget and no future caller can
+// reintroduce an unbounded fan-out. Cache hits never touch the limiter.
+const tmdbRequestLimit = pLimit(Number(process.env.TMDB_REQUEST_CONCURRENCY || 8));
+
+// Per-collection fan-out cap (T-4a) for the parts[] detail fetches below —
+// layered under the global ceiling so one big collection can't monopolize it.
+const COLLECTION_FANOUT_CONCURRENCY = 5;
 
 // Preferred metadata language for episode title/overview. TMDB's episode `name`
 // is the base/primary name and (for English-original shows) is NOT overridden by
@@ -111,6 +122,18 @@ export const makeTmdbRequest = async (
     }
   }
 
+  // Conditional revalidation (T-1): we're about to refetch — either the row
+  // expired or forceRefresh skipped the read. If the caller didn't supply an
+  // If-None-Match, ride the stored ETag out so TMDB can answer 304 instead of
+  // shipping the payload; the 304 branch below then re-ups the stored row.
+  let staleEntry = null;
+  if (!ifNoneMatch) {
+    staleEntry = await getTmdbCacheEntryAnyAge(endpoint, params, cacheKey);
+    if (staleEntry?.etag) {
+      ifNoneMatch = staleEntry.etag;
+    }
+  }
+
   // Make API request with retry logic and ETag support
   let retries = 0;
   let backoffFactor = 1;
@@ -127,29 +150,33 @@ export const makeTmdbRequest = async (
         logger.debug(`Using ETag validation for ${endpoint}: ${ifNoneMatch}`);
       }
 
-      const response = await withApiRequestSpan(
-        {
-          service: "tmdb",
-          method: "GET",
-          url: `${TMDB_BASE_URL}${endpoint}`,
-          endpoint: endpoint,
-          params: params,
-          cacheKey: cacheKey,
-        },
-        async () => {
-          return await axios.get(`${TMDB_BASE_URL}${endpoint}`, {
-            params: {
-              api_key: TMDB_API_KEY,
-              ...params,
-            },
-            headers,
-            timeout: 10000,
-            validateStatus: (status) => {
-              // Accept both 200 (OK) and 304 (Not Modified) as valid responses
-              return status === 200 || status === 304;
-            },
-          });
-        },
+      // Each attempt takes one slot from the shared TMDB-wide ceiling
+      // (T-4b); queued retries requeue fairly behind other callers.
+      const response = await tmdbRequestLimit(() =>
+        withApiRequestSpan(
+          {
+            service: "tmdb",
+            method: "GET",
+            url: `${TMDB_BASE_URL}${endpoint}`,
+            endpoint: endpoint,
+            params: params,
+            cacheKey: cacheKey,
+          },
+          async () => {
+            return await axios.get(`${TMDB_BASE_URL}${endpoint}`, {
+              params: {
+                api_key: TMDB_API_KEY,
+                ...params,
+              },
+              headers,
+              timeout: 10000,
+              validateStatus: (status) => {
+                // Accept both 200 (OK) and 304 (Not Modified) as valid responses
+                return status === 200 || status === 304;
+              },
+            });
+          },
+        ),
       );
 
       // Handle 304 Not Modified response
@@ -157,14 +184,35 @@ export const makeTmdbRequest = async (
         logger.debug(
           `TMDB returned 304 Not Modified for ${endpoint} - content unchanged`,
         );
-        // Return cached data with special flag indicating it's unchanged
-        const cached = await getTmdbCache(endpoint, params, cacheKey);
-        if (cached) {
+        // The stored row (typically expired — that's why we refetched) is
+        // confirmed current: re-up its TTL under the same ETag and return it
+        // without a payload transfer (T-1).
+        const validated =
+          staleEntry || (await getTmdbCacheEntryAnyAge(endpoint, params, cacheKey));
+        if (validated) {
+          await withApiCacheSpan(
+            {
+              service: "tmdb",
+              operation: "SET",
+              cacheKey: cacheKey,
+              ttl: cacheTtlHours,
+              endpoint: endpoint,
+            },
+            async () =>
+              setTmdbCache(
+                endpoint,
+                params,
+                validated.data,
+                cacheTtlHours,
+                cacheKey,
+                ifNoneMatch || validated.etag,
+              ),
+          );
           return {
-            ...cached.data,
+            ...validated.data,
             _cached: true,
-            _cachedAt: cached.cachedAt,
-            _expiresAt: cached.expiresAt,
+            _cachedAt: validated.cachedAt,
+            _expiresAt: validated.expiresAt,
             _notModified: true,
           };
         }
@@ -186,10 +234,17 @@ export const makeTmdbRequest = async (
         await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
         retries++;
         backoffFactor *= 2;
-      } else if (error.code === "ECONNABORTED" || error.code === "ENOTFOUND") {
-        // Network/timeout error
+      } else if (
+        error.code === "ECONNABORTED" ||
+        error.code === "ENOTFOUND" ||
+        error.code === "ECONNREFUSED" ||
+        error.code === "ECONNRESET" ||
+        (error.response?.status >= 500 && error.response?.status <= 599)
+      ) {
+        // Transient network/server error (T-5): connection-level failures and
+        // TMDB 5xx responses back off and retry like timeouts always did.
         logger.warn(
-          `Network error for ${endpoint}, retry ${retries + 1}/${maxRetries}: ${error.message}`,
+          `Transient TMDB error for ${endpoint} (${error.response?.status || error.code}), retry ${retries + 1}/${maxRetries}: ${error.message}`,
         );
         retries++;
         await new Promise((resolve) =>
@@ -755,8 +810,10 @@ export const getCollectionDetails = async (id, includeBlurhash = false) => {
 
   // Format parts (movies in collection) with full poster URLs and runtime data
   if (data.parts) {
-    // Fetch runtime data for each movie in parallel
-    const moviesWithRuntimePromises = data.parts.map(async (movie) => {
+    // Fetch runtime data for each movie, capped per collection (T-4a) — a
+    // large collection previously fanned out one request per part at once.
+    const partLimit = pLimit(COLLECTION_FANOUT_CONCURRENCY);
+    const moviesWithRuntimePromises = data.parts.map((movie) => partLimit(async () => {
       try {
         // Fetch basic movie details to get runtime
         const movieDetails = await makeTmdbRequest(`/movie/${movie.id}`);
@@ -790,7 +847,7 @@ export const getCollectionDetails = async (id, includeBlurhash = false) => {
             : null,
         };
       }
-    });
+    }));
 
     data.parts = await Promise.all(moviesWithRuntimePromises);
   }
@@ -890,8 +947,10 @@ export async function fetchEnhancedCollectionData(
       `[COLLECTION_ENHANCEMENT] Found ${collection.parts.length} movies in collection`,
     );
 
-    // 2. Fetch detailed data for each movie in parallel with error handling
-    const enhancedMoviesPromises = collection.parts.map(async (movie) => {
+    // 2. Fetch detailed data for each movie, capped per collection (T-4a),
+    // with error handling
+    const partLimit = pLimit(COLLECTION_FANOUT_CONCURRENCY);
+    const enhancedMoviesPromises = collection.parts.map((movie) => partLimit(async () => {
       try {
         // Use the enhanced details endpoint that includes credits and videos
         const movieDetails = await makeRequest(`/movie/${movie.id}`, {
@@ -935,7 +994,7 @@ export async function fetchEnhancedCollectionData(
           enhancedMetadata: null,
         };
       }
-    });
+    }));
 
     const enhancedMovies = await Promise.all(enhancedMoviesPromises);
 

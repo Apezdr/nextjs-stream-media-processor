@@ -33,6 +33,7 @@ process.env.TMDB_API_KEY = process.env.TMDB_API_KEY || 'test_api_key';
 // Mock database before importing tmdb
 jest.unstable_mockModule('../../../sqliteDatabase.mjs', () => ({
   getTmdbCache: jest.fn().mockResolvedValue(null),
+  getTmdbCacheEntryAnyAge: jest.fn().mockResolvedValue(null),
   setTmdbCache: jest.fn().mockResolvedValue(true),
   withWriteTx: jest.fn(() => Promise.resolve()),
   withDb: jest.fn(() => Promise.resolve()),

@@ -179,17 +179,34 @@ export async function withApiCacheSpan(options, fn) {
       return await fn();
     }, attributes);
     
+    if ((options.operation || 'GET').toUpperCase() === 'SET') {
+      // Writes report their own success attribute (T-6). Deriving
+      // api.cache_hit from a write's return value polluted every read-side
+      // hit-ratio dashboard with false (void writers) or fake-true entries.
+      // `false` is the only explicit failure signal (setTmdbCache returns
+      // true/false); void writers signal failure by throwing, which the
+      // catch below records instead.
+      const writeSuccess = result !== false;
+      attributes['api.cache_write_success'] = writeSuccess;
+      apiCacheCounter.add(1, {
+        'api.service': options.service || 'unknown',
+        'api.operation': options.operation || 'SET',
+        'api.cache_write_success': writeSuccess.toString()
+      });
+      return result;
+    }
+
     // Record cache hit/miss
     const cacheHit = result !== null && result !== undefined;
     attributes['api.cache_hit'] = cacheHit;
-    
+
     // Record metrics
     apiCacheCounter.add(1, {
       'api.service': options.service || 'unknown',
       'api.operation': options.operation || 'GET',
       'api.cache_hit': cacheHit.toString()
     });
-    
+
     return result;
   } catch (error) {
     // Record error metrics
