@@ -125,6 +125,11 @@ async function generateInfo(filePath, infoFile) {
     const { headerData, mediaQuality, hdr } = await getMediaInfoCombined(filePath);
     const headerHash = createHash('sha256').update(headerData).digest('hex');
 
+    // V-4 provenance: record the source file's stat identity at generation
+    // time so getInfo() can detect an in-place replacement and rotate the
+    // uuid (the video cache keys depend on it rotating).
+    const stats = await fs.stat(filePath);
+
     const info = {
       version: CURRENT_VERSION,
       uuid: headerHash,
@@ -132,7 +137,8 @@ async function generateInfo(filePath, infoFile) {
       dimensions: fileDimensions,
       hdr: hdr, // For backward compatibility
       mediaQuality: mediaQuality, // New structured media quality information
-      additionalMetadata: additionalMetadata // Additional metadata
+      additionalMetadata: additionalMetadata, // Additional metadata
+      source: { size: stats.size, mtimeMs: Math.floor(stats.mtimeMs) }
     };
 
     // Write the info to the .info file
@@ -143,6 +149,26 @@ async function generateInfo(filePath, infoFile) {
   } catch (error) {
     logger.error(`Error generating info for ${filePath}: ${error.message}`);
     throw error; // Rethrow to handle upstream if necessary
+  }
+}
+
+/**
+ * V-4 staleness check: true when the sidecar's recorded source stat no longer
+ * matches the file on disk (or predates provenance tracking entirely — those
+ * sidecars converge by regenerating once on first access). A failed stat
+ * returns false: the source's absence is the caller's problem, and forcing a
+ * regeneration here would just loop into the same failure.
+ */
+async function isInfoStale(filePath, info) {
+  try {
+    const stats = await fs.stat(filePath);
+    return (
+      !info.source ||
+      info.source.size !== stats.size ||
+      info.source.mtimeMs !== Math.floor(stats.mtimeMs)
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -164,6 +190,12 @@ export async function getInfo(filePath) {
       // Regenerate if version is old or missing, or if basic validation fails
       if (!info.version || info.version < CURRENT_VERSION || !validateInfo(info)) {
         logger.info(`Regenerating ${infoFile} due to version update or invalid format`);
+        info = await generateInfo(filePath, infoFile);
+      } else if (await isInfoStale(filePath, info)) {
+        // V-4: the version/shape gate cannot see an in-place file replacement
+        // (same path, new content) — compare the recorded source stat so the
+        // uuid rotates and the uuid-keyed video caches go stale correctly.
+        logger.info(`Regenerating ${infoFile} — source file changed in place (size/mtime mismatch)`);
         info = await generateInfo(filePath, infoFile);
       }
     } catch (error) {
