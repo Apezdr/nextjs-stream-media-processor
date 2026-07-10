@@ -20,12 +20,23 @@ export async function getCacheDb() {
 
 export async function getUsersDb() {
   const client = await getClient();
-  return client.db("Users");
+  // Must resolve the same database the Better Auth instance uses
+  // (lib/auth.mjs), or admin lookups query a DB auth never writes to.
+  return client.db(process.env.MONGODB_AUTH_DB || "Users");
 }
 
 export async function getAppConfigDb() {
   const client = await getClient();
   return client.db("app_config");
+}
+
+/**
+ * Closes the shared MongoClient's connection pool. app.mjs's graceful
+ * shutdown resolves this export by name behind a `typeof` guard, so renaming
+ * it silently turns the close into a no-op.
+ */
+export async function closeMongoConnection() {
+  await mongoClient.close();
 }
 
 
@@ -56,172 +67,16 @@ async function ensureIndex(collection, indexSpec, indexOptions) {
   }
 }
 
-export async function initializeMongoDatabase() {
-  const client = await getClient();
-  try {
-    const mediaDb = client.db("Media");
-    const cacheDB = client.db("Cache");
-
-    // Ensure collections in Media database
-    const collections = await mediaDb.listCollections().toArray();
-    const collectionNames = collections.map((col) => col.name);
-
-    if (!collectionNames.includes("Movies")) {
-      await mediaDb.createCollection("Movies");
-      logger.info("Created collection: Movies");
-    }
-
-    if (!collectionNames.includes("TV")) {
-      await mediaDb.createCollection("TV");
-      logger.info("Created collection: TV");
-    }
-
-    // Ensure collections in PlaybackStatus database
-    const mediaCollection = await mediaDb.listCollections().toArray();
-    const mediaCollectionNames = mediaCollection.map((col) => col.name);
-
-    if (!mediaCollectionNames.includes("PlaybackStatus")) {
-      await mediaDb.createCollection("PlaybackStatus");
-      logger.info("Created collection: PlaybackStatus");
-    }
-
-    // Ensure collections in Cache database
-    const cacheCollections = await cacheDB.listCollections().toArray();
-    const cacheCollectionNames = cacheCollections.map((col) => col.name);
-    if (!cacheCollectionNames.includes("cacheEntries")) {
-      await cacheDB.createCollection("cacheEntries");
-      logger.info("Created collection: cacheEntries");
-    }
-
-    logger.info("Database and collections have been initialized successfully.");
-  } catch (error) {
-    logger.error(
-      "An error occurred while initializing the database and collections:" +
-        error
-    );
-    process.exit(1); // Exit with error
-  }
-}
-
 /**
- * Initializes the indexes for all relevant collections.
- * Ensures that each index exists, creating it if necessary.
+ * Initializes the indexes for the Mongo state this repo actually owns.
+ * Only `app_config` is provisioned here — the legacy Media/Cache collections
+ * (Movies, TV, PlaybackStatus, cacheEntries) had no consumers in either repo
+ * and their startup provisioning was removed (M-3); the live frontend data
+ * lives in the Flat* collections managed by the frontend's own sync.
  */
 export async function initializeIndexes() {
   const client = await getClient();
   try {
-    const mediaDb = client.db("Media");
-    const cacheDB = client.db("Cache");
-
-    // Ensure indexes on Media.Movies collection
-    const moviesCollection = mediaDb.collection("Movies");
-    await ensureIndex(
-      moviesCollection,
-      { videoURL: 1 },
-      { name: "video_lookup" }
-    );
-
-    await ensureIndex(
-      moviesCollection,
-      { mediaLastModified: -1 },
-      { name: "mediaLastModified" }
-    );
-
-    // title lookup
-    await ensureIndex(moviesCollection, { title: 1 }, { name: "title_lookup" });
-
-    // release date lookup
-    await ensureIndex(
-      moviesCollection,
-      { "metadata.release_date": -1 },
-      { name: "release_date" }
-    );
-
-    // genres id lookup
-    await ensureIndex(
-      moviesCollection,
-      {
-        "metadata.genres.id": 1,
-        title: 1,
-      },
-      { name: "genres_id_lookup" }
-    );
-    
-    // Ensure indexes on Media.TV collection
-    const tvCollection = mediaDb.collection("TV");
-    await ensureIndex(
-      tvCollection,
-      { "seasons.episodes.videoURL": 1 },
-      { name: "episode_lookup" }
-    );
-    // Keep the title index as it might be useful for other queries
-    await ensureIndex(tvCollection, { title: -1 }, { name: "title_index" });
-
-    // Track the last modified date of the episodes
-    await ensureIndex(
-      tvCollection,
-      { "seasons.episodes.mediaLastModified": -1 },
-      { name: "episode_last_modified" }
-    );
-
-    // Genres id lookup
-    await ensureIndex(
-      tvCollection,
-      { "metadata.genres.id": 1 },
-      { name: "genres_id_index" }
-    );
-
-    // Ensure indexes on PlaybackStatus collection
-    const playbackStatusCollection = mediaDb.collection("PlaybackStatus");
-    // Compound index for user watch history
-    await ensureIndex(
-      playbackStatusCollection,
-      {
-        userId: 1,
-        "videosWatched.lastUpdated": -1,
-      },
-      { name: "user_watchHistory" }
-    );
-
-    // Single field index on userId
-    await ensureIndex(
-      playbackStatusCollection,
-      {
-        userId: 1,
-      },
-      { name: "user_lookup" }
-    );
-
-    // Compound index for user video lookup
-    await ensureIndex(
-      playbackStatusCollection,
-      {
-        userId: 1,
-        "videosWatched.videoId": 1,
-      },
-      { name: "user_videowatched_lookup" }
-    );
-
-    // Ensure indexes on Cache collection
-    const cacheCollection = cacheDB.collection("cacheEntries");
-
-    // 1. Create a text index on the 'url' field
-    await ensureIndex(
-      cacheCollection,
-      { url: "text" },
-      { name: "url_text_index", background: true }
-    );
-
-    // 2. Create a TTL index on the 'timestamp' field
-    await ensureIndex(
-      cacheCollection,
-      { timestamp: 1 },
-      {
-        name: "cache_ttl_index",
-        expireAfterSeconds: 7 * 24 * 60 * 60, // Example: 7 days
-      }
-    );
-
     // Ensure a unique index on app_config.settings.name so each setting
     // (autoSync, autoCaptions, ...) can only have one document.
     const appConfigDb = client.db("app_config");

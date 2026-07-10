@@ -30,7 +30,7 @@ import {
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
-import { checkAutoSync, updateLastSyncTime, initializeIndexes, initializeMongoDatabase } from "./database.mjs";
+import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
@@ -1350,12 +1350,9 @@ async function initialize() {
   // This will prevent any processes from being stuck in the queue
   await markInProgressAsInterrupted(); // This will use the dedicated processTracking database
   logger.info('Process queue has been reset.');
-    initializeMongoDatabase()
+    initializeIndexes()
       .then(() => {
-        return initializeIndexes();
-      })
-      .then(() => {
-        logger.info("Database and indexes initialized successfully.");
+        logger.info("Mongo indexes initialized successfully.");
       })
       .catch((error) => {
         logger.error("Error during initialization:", error);
