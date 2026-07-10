@@ -1,8 +1,10 @@
 /**
- * Unit tests for Branch 3 decision logic in MetadataGenerator:
+ * Unit tests for Branch 3 + Branch 2 decision logic in MetadataGenerator:
  *  - reason classification on the failure path ('no-match' vs 'transient-error')
  *  - preserved freeze reasons ('updates-disabled' / 'updates-disabled-overrides-applied')
  *  - refreshMissingEpisodes surfacing `expired` for episodes past the give-up window
+ *  - G-3: the up-to-date branch adopts the trusted id from metadata.json
+ *    instead of running an unvalidated name search
  *
  * Follows the caption-controller mock pattern: jest.unstable_mockModule for the
  * TMDB / image-downloader boundaries, real fileUtils + tmdbConfig against a
@@ -170,6 +172,50 @@ describe('isFrozenReason (scanner-facing reason contract)', () => {
     expect(isFrozenReason('up-to-date')).toBe(false);
     expect(isFrozenReason(null)).toBe(false);
     expect(isFrozenReason(undefined)).toBe(false);
+  });
+});
+
+describe('G-3: up-to-date branch adopts the id from metadata.json', () => {
+  it('uses the trusted id from a fresh metadata.json instead of a name search, and pins it via the ratchet', async () => {
+    const dir = join(baseDir, 'tv', 'Fresh Show With Id');
+    await fs.mkdir(dir, { recursive: true });
+    // Fresh metadata.json (mtime = now) with a trusted id → the up-to-date
+    // branch must not fetch at all.
+    await fs.writeFile(
+      join(dir, 'metadata.json'),
+      JSON.stringify({ id: 4242, name: 'Fresh Show With Id', overview: 'from a previous full generation' })
+    );
+
+    const generator = await makeGenerator();
+    const result = await generator.generateForShow('Fresh Show With Id');
+
+    expect(result.success).toBe(true);
+    expect(fetchComprehensiveMediaDetails).not.toHaveBeenCalled();
+    // No fetch happened → no pristine payload this invocation.
+    expect(result.pristineMetadata).toBe(null);
+    // The adopted id is persisted through the add-only ratchet.
+    const config = JSON.parse(await fs.readFile(join(dir, 'tmdb.config'), 'utf8'));
+    expect(config.tmdb_id).toBe(4242);
+  });
+
+  it('falls back to the name search only when the fresh metadata.json carries no usable id', async () => {
+    const dir = join(baseDir, 'tv', 'Fresh Show No Id');
+    await fs.mkdir(dir, { recursive: true });
+    // Fresh, parseable, but id-less (e.g. an override-only file recreated
+    // while frozen, later unfrozen).
+    await fs.writeFile(join(dir, 'metadata.json'), JSON.stringify({ overview: 'no id here' }));
+    fetchComprehensiveMediaDetails.mockResolvedValue({ id: 777, name: 'Fresh Show No Id' });
+
+    const generator = await makeGenerator();
+    const result = await generator.generateForShow('Fresh Show No Id');
+
+    expect(result.success).toBe(true);
+    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledTimes(1);
+    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledWith('Fresh Show No Id', 'tv', null, false);
+    // The corner fetch is genuine → pristine payload captured (G-5).
+    expect(result.pristineMetadata).toBe(JSON.stringify({ id: 777, name: 'Fresh Show No Id' }));
+    const config = JSON.parse(await fs.readFile(join(dir, 'tmdb.config'), 'utf8'));
+    expect(config.tmdb_id).toBe(777);
   });
 });
 

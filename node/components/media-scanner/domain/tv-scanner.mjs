@@ -29,7 +29,7 @@ import {
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
 import { refreshMissingEpisodes, isFrozenReason } from '../../../lib/metadataGenerator.mjs';
-import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed, getMetadataOverrides } from '../../../utils/tmdbConfig.mjs';
+import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed, hasMetadataOverrideKey } from '../../../utils/tmdbConfig.mjs';
 import { resolveCooldownAction } from './cooldown-policy.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
 import {
@@ -587,7 +587,10 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         tmdbConfig = { update_metadata: false, backdrop_focal: null };
       }
       const updateAllowed = isUpdateAllowed(tmdbConfig);
-      const hasOverrides = getMetadataOverrides(tmdbConfig) !== null;
+      // Presence-based opt-in (G-2): a present `metadata` key — even `{}` —
+      // means "override-managed"; only an absent key closes the frozen
+      // branch of the metadata gate below.
+      const hasOverrides = hasMetadataOverrideKey(tmdbConfig);
 
       // Process show assets (poster / logo / backdrop)
       const assetsResult = await processShowAssets({
