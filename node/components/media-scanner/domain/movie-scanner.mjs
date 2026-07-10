@@ -21,6 +21,7 @@ import {
   RETRY_INTERVAL_HOURS
 } from '../data-access/scanner-repository.mjs';
 import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
+import { getMovieByName } from '../../../sqliteDatabase.mjs';
 import { loadTmdbConfig, isUpdateAllowed, getMetadataOverrides } from '../../../utils/tmdbConfig.mjs';
 import { isFrozenReason } from '../../../lib/metadataGenerator.mjs';
 import { resolveCooldownAction } from './cooldown-policy.mjs';
@@ -378,16 +379,30 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
 
       // Check if we need to regenerate info files due to version updates
       let needInfoRegeneration = false;
+      // F-1 one-shot fingerprint backfill: a row written before the
+      // movies.metadata column existed has metadata = NULL, and the
+      // unchanged-directory early return below would otherwise keep it
+      // content-blind until its directory happens to change. Skip the early
+      // return ONCE for such rows (only when a metadata.json actually exists
+      // to fingerprint — otherwise the column legitimately stays NULL and
+      // this must not reprocess the movie every pass). Converges after one
+      // pass: saveMovie's escape hatch persists the fingerprint, so
+      // existingMovie.metadata is non-NULL on the next tick.
+      let needMetadataBackfill = false;
       if (!dirHashChanged && existingMovie) {
         needInfoRegeneration = await needsInfoRegeneration(files, dirPath, dirName, currentVersion);
-        
-        if (!needInfoRegeneration) {
+        needMetadataBackfill =
+          existingMovie.metadata == null && files.includes('metadata.json');
+
+        if (!needInfoRegeneration && !needMetadataBackfill) {
           if (isDebugMode) {
             logger.info(`No changes detected in ${dirName}, skipping processing.`);
           }
           return;
-        } else {
+        } else if (needInfoRegeneration) {
           logger.info(`Processing ${dirName} to update info files`);
+        } else {
+          logger.info(`Processing ${dirName} to backfill its metadata fingerprint (F-1, one-shot)`);
         }
       }
 
@@ -487,6 +502,12 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         (missingImages && updateAllowed) ||
         (missingMetadata && metadataGateAllowsRetry && (updateAllowed || hasOverrides));
 
+      // Raw pre-override TMDB payload (G-5), carried opaquely from the
+      // generator's result to saveMovie. Stays null when no download ran or
+      // when the generator performed no genuine fetch (frozen / up-to-date /
+      // error) — the upsert then preserves the previously stored value.
+      let pristineMetadata = null;
+
       // Download TMDB images if needed. The bypass log is emitted AFTER
       // the download attempt, conditional on actual work having happened
       // — items where TMDB has nothing to offer for the missing slot
@@ -511,6 +532,11 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
           previousPaths,
           fullScan: staleByConfig,
         });
+
+        // Opaque pass-through (§4.1): the scanner never parses this payload —
+        // schema awareness stays in MetadataGenerator. Non-null only when the
+        // generator's genuine-fetch branch ran this invocation.
+        pristineMetadata = downloadResult?.pristineMetadata ?? null;
 
         // Post-condition observability: only log when the images-only
         // bypass produced real download or failure events. cache-hit /
@@ -572,6 +598,38 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // Calculate final hash
       const final_hash = await calculateDirectoryHash(fullDirPath);
 
+      // Metadata content fingerprint (F-1). THE CANONICAL SERIALIZATION LIVES
+      // HERE: compact `JSON.stringify(JSON.parse(file))`, mirroring how
+      // tv-scanner.mjs (processShowMetadata) serializes tv_shows.metadata.
+      // Runs on EVERY pass that reaches saveMovie — not just dirHashChanged —
+      // so movies.metadata always reflects the current on-disk metadata.json
+      // (read AFTER the download block, which may have rewritten the file).
+      //
+      // Oscillation constraint (hard): this exact string is persisted into
+      // movies.metadata, and BOTH movie-hash writers consume that column
+      // verbatim — the inline rehash below via getMovieByName() and the
+      // scheduled updateAllMovieHashes() sweep via getMovies(). Byte-identical
+      // input for the same on-disk state, so the two writers cannot flip the
+      // stored hash back and forth.
+      //
+      // Fallback chain: serialized JSON > serialized {mtime,size} marker >
+      // null. The marker keeps the hash advancing if the file exists but
+      // can't be parsed (rare, but better than the hash silently freezing).
+      // The parse is canonicalization only — the scanner stays TMDB-schema-
+      // blind (§4.1) and never reads fields out of it.
+      const movieMetadataPath = join(dirPath, dirName, 'metadata.json');
+      let metadataFingerprint = null;
+      try {
+        metadataFingerprint = JSON.stringify(JSON.parse(await fs.readFile(movieMetadataPath, 'utf8')));
+      } catch (readErr) {
+        try {
+          const st = await fs.stat(movieMetadataPath);
+          metadataFingerprint = JSON.stringify({ _stat: { mtimeMs: st.mtimeMs, size: st.size } });
+        } catch {
+          // file doesn't exist at all — leave as null
+        }
+      }
+
       // File paths + cache-bust hashes come from the SAME resolve that built the
       // URLs (resolveImage: one set lookup + one stat per kind). The URL
       // filename, *_file_path, and *_hash therefore cannot disagree — the drift
@@ -603,44 +661,40 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         basePath,
         manualFocal,
         backdropFocalSuggested,
-        imageHashes
+        imageHashes,
+        metadataFingerprint,
+        pristineMetadata
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
       // The scheduled hash job filters by mp4 mtime and would miss changes where
       // only tmdb.config or images changed, so we generate here to avoid the gap.
       //
-      // metadata.json content is folded into the hash so it invalidates on
-      // tmdb.config-driven regenerations — symmetric with the TV episode hash
-      // (metadataHashes.mjs `metadata: episodeData.metadata`). Without it the
-      // hash inputs only change when the mp4 mtime advances, so client caches
-      // would keep serving stale metadata after a TMDB-id edit.
+      // Mirrors the TV scanner: save first, then re-read the row through the
+      // SAME read-side accessor family the scheduled sweep uses (getMovieByName
+      // here, getMovies in updateAllMovieHashes — identical row decoration) and
+      // hash THAT. Hashing the DB view instead of the scanner's in-memory
+      // objects guarantees both writers fold byte-identical input — including
+      // the movies.metadata fingerprint persisted just above — for the same
+      // on-disk state, so the stored hash can't oscillate between them.
       //
-      // Fallback chain: parsed JSON > {mtime,size} marker > null. The marker
-      // keeps the hash advancing if the file exists but can't be parsed
-      // (rare, but better than the hash silently freezing).
-      if (dirHashChanged) {
-        const metadataPath = join(dirPath, dirName, 'metadata.json');
-        let metadataFingerprint = null;
-        try {
-          metadataFingerprint = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
-        } catch (readErr) {
-          try {
-            const st = await fs.stat(metadataPath);
-            metadataFingerprint = { _stat: { mtimeMs: st.mtimeMs, size: st.size } };
-          } catch {
-            // file doesn't exist at all — leave as null
-          }
+      // Expected one-time effect: a title whose stored hash was last written
+      // by the previously content-blind sweep (which hashed
+      // `metadata: undefined`) gets a corrected content-aware hash on its
+      // first pass through either writer, and the frontend re-syncs it once.
+      // That is the F-1 bug being fixed, not a regression.
+      //
+      // Gate: any pass that actually rewrote the row must also refresh its
+      // stored hash — dirHashChanged, an info-file regeneration pass, or the
+      // one-shot F-1 fingerprint backfill (which exists precisely to correct
+      // the stored hash; without the rehash the fingerprint would sit in the
+      // column while metadata_hashes kept the content-blind value until the
+      // next directory change). Brand-new INSERTs still skip (F-2, kept).
+      if (dirHashChanged || needInfoRegeneration || needMetadataBackfill) {
+        const freshMovie = await getMovieByName(dirName);
+        if (freshMovie) {
+          await generateMovieHashes(db, freshMovie);
         }
-        await generateMovieHashes(db, {
-          _id,
-          name: dirName,
-          urls,
-          hdr: videoData.hdrInfo,
-          mediaQuality: videoData.mediaQuality,
-          metadataUrl: urls.metadata || '',
-          metadata: metadataFingerprint,
-        });
       }
     })
   );

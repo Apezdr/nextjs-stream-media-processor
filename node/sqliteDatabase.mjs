@@ -15,7 +15,10 @@ import { fileExists } from './utils/utils.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const dbDirectory = join(__dirname, 'db');
+// MEDIA_DB_DIRECTORY is a test seam (unit tests point the SQLite layer at a
+// temp directory so schema/upsert tests never touch the real node/db files).
+// Production deployments should leave it unset and use the default location.
+const dbDirectory = process.env.MEDIA_DB_DIRECTORY || join(__dirname, 'db');
 const dbFilePaths = {
   main: join(dbDirectory, 'media.db'),
   processTracking: join(dbDirectory, 'process_tracking.db'),
@@ -102,8 +105,14 @@ async function applyPragmas(db) {
   // await db.exec("PRAGMA cache_size = -8000"); // ~8MB (optional)
 }
 
-async function initializeSchema(dbType, db) {
+// Exported for schema tests (fresh-DB vs. migrated-DB convergence). Runtime
+// callers go through getOrInitDb/initializeDatabase, never call this directly.
+export async function initializeSchema(dbType, db) {
   if (dbType === "main") {
+    // P-1c: the AUTOINCREMENT `id` on movies/tv_shows is a surrogate key that
+    // never crosses a module boundary — stable external references key on
+    // `name` or the TMDB-derived `_id`, never this `id` (it does not survive
+    // a media.db rebuild).
     await db.exec(`
       CREATE TABLE IF NOT EXISTS movies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +138,15 @@ async function initializeSchema(dbType, db) {
         logo_hash TEXT,
         logo_mtime INTEGER,
         backdrop_focal TEXT,
-        backdrop_focal_suggested TEXT
+        backdrop_focal_suggested TEXT,
+        metadata TEXT,           -- F-1: canonical metadata.json fingerprint (see movie-scanner.mjs)
+        pristine_metadata TEXT,  -- G-5: raw pre-override TMDB payload (trust semantics = Branch 2)
+        -- I-3: *_source_url added now only so this table isn't altered a third
+        -- time later; population + URL-mismatch-means-stale reconcile logic are
+        -- a separate decided branch and are deliberately NOT wired yet.
+        poster_source_url TEXT,
+        backdrop_source_url TEXT,
+        logo_source_url TEXT
       );
     `);
 
@@ -158,7 +175,14 @@ async function initializeSchema(dbType, db) {
         logo_hash TEXT,
         logo_mtime INTEGER,
         backdrop_focal TEXT,
-        backdrop_focal_suggested TEXT
+        backdrop_focal_suggested TEXT,
+        pristine_metadata TEXT,  -- G-5: raw pre-override TMDB payload (trust semantics = Branch 2)
+        -- I-3: *_source_url added now only so this table isn't altered a third
+        -- time later; population + URL-mismatch-means-stale reconcile logic are
+        -- a separate decided branch and are deliberately NOT wired yet.
+        poster_source_url TEXT,
+        backdrop_source_url TEXT,
+        logo_source_url TEXT
       );
     `);
 
@@ -190,6 +214,7 @@ async function initializeSchema(dbType, db) {
     // MIGRATE EXISTING DATABASES: Add hash columns if they don't exist
     await migrateToHashColumns(db);
     await migrateToFocalColumns(db);
+    await migrateToSchemaParityColumns(db);
 
     // Add unique indexes for UPSERT operations
     await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_movies_name ON movies(name);`);
@@ -255,6 +280,45 @@ async function migrateToFocalColumns(db) {
     ['movies',   'backdrop_focal_suggested TEXT'],
     ['tv_shows', 'backdrop_focal TEXT'],
     ['tv_shows', 'backdrop_focal_suggested TEXT'],
+  ];
+  for (const [table, col] of columns) {
+    try {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
+    } catch (err) {
+      if (!err.message.includes('duplicate column name')) throw err;
+    }
+  }
+}
+
+/**
+ * Migration function for the Branch 1 "movies table schema parity" columns
+ * (G-5 + F-1 + I-3, decided 2026-07-07). ALTER TABLE ADD COLUMN only — safe on
+ * a live DB, no rewrites. Safe to run multiple times - ignores duplicate
+ * column name errors. Exported for schema tests (idempotency / convergence).
+ *
+ *  - movies.metadata (F-1): the canonically-serialized metadata.json content
+ *    fingerprint the scanner persists so BOTH movie-hash writers (scanner
+ *    inline path and the scheduled updateAllMovieHashes sweep) fold identical
+ *    content into generateMovieHashes. tv_shows already has `metadata`.
+ *  - pristine_metadata (G-5, both tables): raw pre-override TMDB payload from
+ *    a genuine fetch, persisted opaquely. Trust/merge semantics are Branch 2.
+ *  - *_source_url (I-3, both tables): the upstream TMDB image URL each managed
+ *    image was downloaded from, mirroring the *_hash/*_mtime provenance
+ *    pattern. Added NOW only so these two tables are not altered a third time
+ *    later — their population and the URL-mismatch-means-stale reconcile logic
+ *    are a separate decided branch and are deliberately NOT wired here.
+ */
+export async function migrateToSchemaParityColumns(db) {
+  const columns = [
+    ['movies',   'metadata TEXT'],
+    ['movies',   'pristine_metadata TEXT'],
+    ['movies',   'poster_source_url TEXT'],
+    ['movies',   'backdrop_source_url TEXT'],
+    ['movies',   'logo_source_url TEXT'],
+    ['tv_shows', 'pristine_metadata TEXT'],
+    ['tv_shows', 'poster_source_url TEXT'],
+    ['tv_shows', 'backdrop_source_url TEXT'],
+    ['tv_shows', 'logo_source_url TEXT'],
   ];
   for (const [table, col] of columns) {
     try {
@@ -614,10 +678,13 @@ export async function getTVShows() {
         logoFilePath: show.logo_file_path,
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
-        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
+        // to /media/tv — the app.mjs handler allowlist drops it.
+        pristineMetadata: show.pristine_metadata ?? null
       };
     });
-    
+
     return updatedShows;
   });
 }
@@ -684,10 +751,22 @@ export async function getMovies() {
         logoFilePath: movie.logo_file_path,
         basePath: movie.base_path,
         backdropFocal: movie.backdrop_focal ?? null,
-        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null,
+        // Internal-only columns — never serialized to /media/movies (the
+        // app.mjs handler allowlist drops them).
+        //
+        // `metadata` (F-1): returned VERBATIM from the column so the scheduled
+        // updateAllMovieHashes() sweep folds the exact bytes the scanner
+        // persisted into generateMovieHashes. The canonical serialization
+        // lives in movie-scanner.mjs (compact JSON.stringify of the parsed
+        // metadata.json); do NOT re-parse or re-shape it here or the sweep and
+        // the scanner's inline hash path will oscillate.
+        metadata: movie.metadata,
+        // `pristineMetadata` (G-5): raw pre-override TMDB payload, opaque.
+        pristineMetadata: movie.pristine_metadata ?? null
       };
     });
-    
+
     return updatedMovies;
   });
 }
@@ -703,6 +782,12 @@ export async function getMissingDataMedia() {
   });
 }
 
+// P-1a: kept with zero callers anywhere DELIBERATELY — the by-name/by-id
+// getter pair mirrors the pattern used in the sister nextjs-stream frontend
+// repo, and keeping both codebases on the same idiom makes them easier to
+// reason about together (the frontend does not call this endpoint-side; it is
+// a ready-made by-id surface). Any column added to getMovieByName's
+// processing must be mirrored here.
 export async function getMovieById(id) {
   return withDb("main", async (db) => {
     const movie = await withRetry(() => db.get('SELECT * FROM movies WHERE id = ?', [id]));
@@ -749,7 +834,11 @@ export async function getMovieById(id) {
         logoFilePath: movie.logo_file_path,
         basePath: movie.base_path,
         backdropFocal: movie.backdrop_focal ?? null,
-        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null,
+        // Internal-only: metadata fingerprint (F-1, verbatim column bytes —
+        // see getMovies) + raw pre-override TMDB payload (G-5).
+        metadata: movie.metadata,
+        pristineMetadata: movie.pristine_metadata ?? null
       };
     }
     return null;
@@ -802,13 +891,26 @@ export async function getMovieByName(name) {
         logoFilePath: movie.logo_file_path,
         basePath: movie.base_path,
         backdropFocal: movie.backdrop_focal ?? null,
-        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: movie.backdrop_focal_suggested ?? null,
+        // Internal-only: `metadata` MUST be the verbatim column bytes — the
+        // movie scanner re-reads this row after saveMovie and feeds it to
+        // generateMovieHashes, and the scheduled sweep hashes the same column
+        // via getMovies(). Any divergence here re-opens the hash oscillation
+        // (F-1). Canonical serialization lives in movie-scanner.mjs.
+        metadata: movie.metadata,
+        pristineMetadata: movie.pristine_metadata ?? null
       };
     }
     return null;
   });
 }
 
+// P-1a: kept with zero callers anywhere DELIBERATELY — the by-name/by-id
+// getter pair mirrors the pattern used in the sister nextjs-stream frontend
+// repo, and keeping both codebases on the same idiom makes them easier to
+// reason about together (the frontend does not call this endpoint-side; it is
+// a ready-made by-id surface). Any column added to getTVShowByName's
+// processing must be mirrored here.
 export async function getTVShowById(id) {
   return withDb("main", async (db) => {
     const show = await withRetry(() => db.get('SELECT * FROM tv_shows WHERE id = ?', [id]));
@@ -844,7 +946,9 @@ export async function getTVShowById(id) {
         logoFilePath: show.logo_file_path,
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
-        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Internal-only (G-5): raw pre-override TMDB payload, opaque.
+        pristineMetadata: show.pristine_metadata ?? null
       };
     }
     return null;
@@ -886,7 +990,9 @@ export async function getTVShowByName(name) {
         logoFilePath: show.logo_file_path,
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
-        backdropFocalSuggested: show.backdrop_focal_suggested ?? null
+        backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Internal-only (G-5): raw pre-override TMDB payload, opaque.
+        pristineMetadata: show.pristine_metadata ?? null
       };
     }
     return null;
@@ -919,6 +1025,11 @@ export async function deleteTVShow(name) {
   });
 }
 
+// P-2: the missing change-guard WHERE clause (vs. the movie upsert below) is
+// INTENTIONAL — TV's shallower dir-hash depth (TV_DIR_HASH_MAX_DEPTH) plus the
+// episode-backfill fall-through can legitimately rewrite a show whose
+// directory_hash is unchanged; a movies-style guard here would silently drop
+// those writes. Do not "make it symmetric".
 export async function insertOrUpdateTVShow(
   showName,
   metadata,
@@ -937,7 +1048,8 @@ export async function insertOrUpdateTVShow(
   directoryHash = null,
   backdropFocal = null,
   backdropFocalSuggested = null,
-  imageHashes = null
+  imageHashes = null,
+  pristineMetadata = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -949,7 +1061,12 @@ export async function insertOrUpdateTVShow(
     const logoHash     = imageHashes?.logo     ?? { hash: null, mtime: null };
 
     const seasonsStr = JSON.stringify(seasonsObj);
-    
+
+    // G-5 preservation: this upsert ALWAYS rewrites on conflict (see the P-2
+    // note above), so a save whose generator invocation performed no genuine
+    // TMDB fetch (pristineMetadata === null) must carry the previously stored
+    // pristine payload forward — hence the COALESCE on pristine_metadata
+    // below. Never let an image-only or backfill rewrite null it out.
     await withRetry(() =>
       db.run(
         `INSERT INTO tv_shows (
@@ -957,8 +1074,8 @@ export async function insertOrUpdateTVShow(
           backdrop, backdropBlurhash, seasons,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
-          directory_hash, backdrop_focal, backdrop_focal_suggested
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -981,12 +1098,13 @@ export async function insertOrUpdateTVShow(
           logo_mtime=excluded.logo_mtime,
           directory_hash=excluded.directory_hash,
           backdrop_focal=excluded.backdrop_focal,
-          backdrop_focal_suggested=excluded.backdrop_focal_suggested`,
+          backdrop_focal_suggested=excluded.backdrop_focal_suggested,
+          pristine_metadata=COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata)`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
           posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
-          directoryHash, backdropFocal, backdropFocalSuggested
+          directoryHash, backdropFocal, backdropFocalSuggested, pristineMetadata
         ]
       )
     );
@@ -1011,7 +1129,9 @@ export async function insertOrUpdateMovie(
   basePath = null,
   backdropFocal = null,
   backdropFocalSuggested = null,
-  imageHashes = null
+  imageHashes = null,
+  metadata = null,
+  pristineMetadata = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1022,6 +1142,11 @@ export async function insertOrUpdateMovie(
     const backdropHash = imageHashes?.backdrop ?? { hash: null, mtime: null };
     const logoHash     = imageHashes?.logo     ?? { hash: null, mtime: null };
 
+    // `metadata` (F-1) is the scanner's canonically-serialized metadata.json
+    // fingerprint (see movie-scanner.mjs) — stored verbatim so both hash
+    // writers (scanner inline + scheduled sweep) hash identical bytes.
+    // `pristineMetadata` (G-5) is COALESCE-preserved in the UPDATE below: a
+    // save without a fresh genuine-fetch payload keeps the stored value.
     const movie = {
       name,
       file_names: JSON.stringify(fileNames),
@@ -1045,15 +1170,25 @@ export async function insertOrUpdateMovie(
       logo_mtime: logoHash.mtime
     };
 
+    // Change-guard WHERE clause: the update is skipped when directory_hash is
+    // unchanged, with two backfill escape hatches for rows written before a
+    // column existed — backdrop_focal_suggested (focal migration) and metadata
+    // (F-1 migration; fires only when the scanner actually has a fingerprint
+    // to store, so movies without metadata.json don't rewrite every pass).
+    // The metadata hatch is driven proactively: movie-scanner.mjs skips its
+    // unchanged-directory early return once per row while movies.metadata is
+    // NULL and a metadata.json exists (one-shot backfill), so pre-migration
+    // rows converge on the first scan pass after deploy rather than waiting
+    // for their directory to change.
     await withRetry(() =>
       db.run(
         `INSERT INTO movies (
-          name, file_names, lengths, dimensions, urls, metadata_url, directory_hash, 
+          name, file_names, lengths, dimensions, urls, metadata_url, directory_hash,
           hdr, media_quality, additional_metadata, _id,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
-          backdrop_focal, backdrop_focal_suggested
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           file_names=excluded.file_names,
           lengths=excluded.lengths,
@@ -1076,9 +1211,12 @@ export async function insertOrUpdateMovie(
           logo_hash=excluded.logo_hash,
           logo_mtime=excluded.logo_mtime,
           backdrop_focal=excluded.backdrop_focal,
-          backdrop_focal_suggested=excluded.backdrop_focal_suggested
+          backdrop_focal_suggested=excluded.backdrop_focal_suggested,
+          metadata=excluded.metadata,
+          pristine_metadata=COALESCE(excluded.pristine_metadata, movies.pristine_metadata)
         WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
-        OR movies.backdrop_focal_suggested IS NULL`,
+        OR movies.backdrop_focal_suggested IS NULL
+        OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)`,
         [
           name,
           movie.file_names,
@@ -1102,7 +1240,9 @@ export async function insertOrUpdateMovie(
           logoHash.hash,
           logoHash.mtime,
           backdropFocal,
-          backdropFocalSuggested
+          backdropFocalSuggested,
+          metadata,
+          pristineMetadata
         ]
       )
     );

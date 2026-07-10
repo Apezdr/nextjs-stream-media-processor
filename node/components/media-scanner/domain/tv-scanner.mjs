@@ -241,11 +241,23 @@ async function processShowMetadata({
       metadata = JSON.stringify(JSON.parse(await fs.readFile(metadataFilePath, 'utf8')));
       metadataUrl = `${prefixPath}/tv/${encodedShowName}/metadata.json`;
     } catch (err) {
-      logger.warn('scanner: metadata.json present but unparseable, leaving metadata empty', {
+      logger.warn('scanner: metadata.json present but unparseable, storing stat marker', {
         'media.name': showName,
         'media.type': 'tv',
         error: err.message,
       });
+      // Parity with movie-scanner's fingerprint fallback chain: degrade to a
+      // stable serialized {mtime,size} marker rather than ''. The TV upsert
+      // always rewrites (P-2), so an empty string here would blank a
+      // previously-good tv_shows.metadata and collapse the show hash to a
+      // content-less value on one corrupt write; the marker keeps the hash
+      // advancing (file changed) without destroying the stored content signal.
+      try {
+        const st = await fs.stat(metadataFilePath);
+        metadata = JSON.stringify({ _stat: { mtimeMs: st.mtimeMs, size: st.size } });
+      } catch {
+        // file vanished between read and stat — leave metadata empty
+      }
     }
   }
 
@@ -675,6 +687,13 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         });
       }
 
+      // Raw pre-override TMDB payload (G-5), carried opaquely from the
+      // generator's result to saveTVShow. Stays null when no download ran or
+      // when the generator performed no genuine show-level fetch (frozen /
+      // already-fresh / error) — the upsert's COALESCE then carries the
+      // previously stored value forward instead of nulling it.
+      let pristineMetadata = null;
+
       // Download TMDB images if needed. The bypass log is emitted AFTER
       // the download attempt, conditional on actual work having happened
       // — items where TMDB has nothing to offer for the missing slot
@@ -703,6 +722,11 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           previousPaths,
           fullScan: metadataResult.staleByConfig,
         });
+
+        // Opaque pass-through (§4.1): the scanner never parses this payload —
+        // schema awareness stays in MetadataGenerator. Non-null only when the
+        // generator's genuine show-level fetch branch ran this invocation.
+        pristineMetadata = downloadResult?.pristineMetadata ?? null;
 
         // Post-condition observability: only log when the images-only
         // bypass produced real download or failure events. cache-hit /
@@ -839,7 +863,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         finalHash,
         manualFocal,
         backdropFocalSuggested,
-        imageHashes
+        imageHashes,
+        pristineMetadata
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

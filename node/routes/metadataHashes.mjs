@@ -73,11 +73,12 @@ router.get('/metadata-hashes/:mediaType/:title', async (req, res) => {
       }
 
       // Read the stored hash. Only generate as a fallback when none exists yet
-      // (a movie that hasn't been scanned). We must NOT regenerate on every GET:
-      // getMovieByName carries no metadata.json content, so generateMovieHashes
-      // here would write a CONTENT-LESS hash, clobbering the content-aware hash
-      // the scanner maintains and potentially re-sticking a stale movie on the
-      // client. The scanner (movie-scanner.mjs) is the source of truth.
+      // (a movie that hasn't been scanned). We must NOT regenerate on every GET
+      // — the scanner (movie-scanner.mjs) and the scheduled sweep are the
+      // writers of record. Since Branch 1 (F-1) getMovieByName DOES carry the
+      // movies.metadata fingerprint verbatim, so this fallback now writes the
+      // same content-aware hash the other writers would; keeping it as a
+      // missing-row-only fallback avoids redundant writes per GET.
       let hash = await getHash(db, 'movies', decodedTitle);
       if (!hash) {
         await generateMovieHashes(db, movie);

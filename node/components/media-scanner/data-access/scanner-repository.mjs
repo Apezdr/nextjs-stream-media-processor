@@ -89,6 +89,12 @@ export async function getMissingMediaData() {
  * @param {Object} [imageHashes] - Precomputed `{poster,backdrop,logo}` →
  *   `{hash,mtime}` cache-bust hashes from the scanner's single resolve, so the
  *   DB stores the exact hash for the file the URL points at (no second stat).
+ * @param {string|null} [metadata] - Canonically-serialized metadata.json
+ *   content fingerprint (opaque string; F-1). The scanner produces it, the
+ *   hash writers consume the stored column verbatim — this layer never parses it.
+ * @param {string|null} [pristineMetadata] - Raw pre-override TMDB payload from
+ *   a genuine fetch (opaque string; G-5). Null when no fetch happened this
+ *   pass — the upsert then preserves the previously stored value.
  * @returns {Promise<void>}
  */
 export async function saveMovie(
@@ -109,7 +115,9 @@ export async function saveMovie(
   basePath,
   backdropFocal = null,
   backdropFocalSuggested = null,
-  imageHashes = null
+  imageHashes = null,
+  metadata = null,
+  pristineMetadata = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -129,7 +137,9 @@ export async function saveMovie(
     basePath,
     backdropFocal,
     backdropFocalSuggested,
-    imageHashes
+    imageHashes,
+    metadata,
+    pristineMetadata
   );
 }
 
@@ -155,6 +165,10 @@ export async function saveMovie(
  * @param {Object} [imageHashes] - Precomputed `{poster,backdrop,logo}` →
  *   `{hash,mtime}` cache-bust hashes from the scanner's single resolve, so the
  *   DB stores the exact hash for the file the URL points at (no second stat).
+ * @param {string|null} [pristineMetadata] - Raw pre-override TMDB payload from
+ *   a genuine fetch (opaque string; G-5). Null when no fetch happened this
+ *   pass — the upsert then carries the previously stored value forward
+ *   (the TV upsert always rewrites, so preservation lives in its SQL).
  * @returns {Promise<void>}
  */
 export async function saveTVShow(
@@ -175,7 +189,8 @@ export async function saveTVShow(
   directoryHash = null,
   backdropFocal = null,
   backdropFocalSuggested = null,
-  imageHashes = null
+  imageHashes = null,
+  pristineMetadata = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -195,7 +210,8 @@ export async function saveTVShow(
     directoryHash,
     backdropFocal,
     backdropFocalSuggested,
-    imageHashes
+    imageHashes,
+    pristineMetadata
   );
 }
 
