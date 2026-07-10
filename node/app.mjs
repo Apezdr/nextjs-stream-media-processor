@@ -13,7 +13,11 @@ import compression from "compression";
 import cors from "cors";
 import axios from "axios";
 import { createSpriteRoutes } from "./sprite-route.mjs";
-import { initializeDatabase, insertOrUpdateMovie, getMovies, isDatabaseEmpty, getTVShows, insertOrUpdateTVShow, insertOrUpdateMissingDataMedia, getMissingDataMedia, deleteMovie, deleteTVShow, getMovieByName, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
+// P-1b: only the functions app.mjs itself calls. The scan-pipeline writers
+// (insertOrUpdateMovie/TVShow, delete*, missing-data bookkeeping) are live via
+// scanner-repository.mjs, not here — importing them in app.mjs wrongly implied
+// this file participates in scan persistence.
+import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
