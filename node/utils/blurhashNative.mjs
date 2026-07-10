@@ -6,6 +6,13 @@ import { withApiRequestSpan } from '../lib/apiTracer.mjs';
 
 const logger = createCategoryLogger('blurhash-native');
 
+// The encoder's component grid. Every caller passes only (buffer, size) —
+// `size` selects preview/encode resolution, never the grid — so these are
+// the real constants; telemetry must report these, not size-derived values
+// (B-2a).
+export const BLURHASH_X_COMPONENTS = 4;
+export const BLURHASH_Y_COMPONENTS = 3;
+
 /**
  * Generate blurhash string and base64 PNG preview from image buffer
  * Native Node.js implementation that replicates Python blurhash_cli.py functionality
@@ -26,7 +33,7 @@ const logger = createCategoryLogger('blurhash-native');
  * @param {number} yComponents - Vertical blurhash components (default: 3, optimized for blur)
  * @returns {Promise<string>} - Base64 encoded PNG preview (without data URI prefix)
  */
-export async function generateBlurhashNative(imageBuffer, size = 'large', xComponents = 4, yComponents = 3) {
+export async function generateBlurhashNative(imageBuffer, size = 'large', xComponents = BLURHASH_X_COMPONENTS, yComponents = BLURHASH_Y_COMPONENTS) {
   try {
     // Map size to preview dimensions - optimized for Next.js blur placeholders
     // Tiny sizes work perfectly since Next.js upscales and blurs automatically

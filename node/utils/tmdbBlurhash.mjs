@@ -8,7 +8,7 @@ import {
   cacheTmdbBlurhashWithDb,
   clearExpiredTmdbBlurhashCacheWithDb
 } from '../sqlite/tmdbBlurhashCache.mjs';
-import { generateBlurhashFromBuffer } from './blurhashNative.mjs';
+import { generateBlurhashFromBuffer, BLURHASH_X_COMPONENTS, BLURHASH_Y_COMPONENTS } from './blurhashNative.mjs';
 import pLimit from 'p-limit';
 
 const logger = createCategoryLogger('tmdb-blurhash');
@@ -128,8 +128,10 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
             blurhashBase64 = await withBlurhashSpan({
               type: 'native',
               url: canonicalUrl,
-              componentsX: size === 'large' ? 6 : size === 'medium' ? 4 : 3,
-              componentsY: size === 'large' ? 5 : 3
+              // The encoder's grid is fixed (B-2a) — `size` only selects the
+              // preview/encode resolution, so report the real constants.
+              componentsX: BLURHASH_X_COMPONENTS,
+              componentsY: BLURHASH_Y_COMPONENTS
             }, async () => {
               return await generateBlurhashFromBuffer(imageBuffer, size);
             });
