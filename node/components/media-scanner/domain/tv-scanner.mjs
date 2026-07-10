@@ -24,7 +24,8 @@ import {
   RETRY_INTERVAL_HOURS,
   getEpisodeRetryRows,
   recordEpisodeAttempt,
-  clearEpisodeRetry
+  clearEpisodeRetry,
+  clearEpisodeRetryForShow
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
@@ -899,9 +900,16 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       }
     }
 
-    // Remove TV shows from the database that no longer exist in the file system
+    // Remove TV shows from the database that no longer exist in the file
+    // system. Cascade (R-4 + F-3, Branch 5): clear the show's cooldown row,
+    // its per-episode backfill rows, and its stored metadata hashes too — a
+    // same-named show re-added later must start clean, not inherit its
+    // predecessor's retry history or serve its frozen hash.
     for (const showName of existingShowNames) {
       await removeTVShow(showName);
+      await clearMissingMediaData(showName);
+      await clearEpisodeRetryForShow(showName);
+      await deleteHashesForMedia(db, 'tv', showName);
     }
   } catch (error) {
     logger.error('Error during database update: ' + error);
