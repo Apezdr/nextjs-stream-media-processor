@@ -357,7 +357,7 @@ One sharp edge in the freeze flag itself: `tmdbConfig.mjs` `validateTmdbConfig()
 
 **No-TMDB-match (G‑1a/G‑1b, shipped in Branch 3).** When no `tmdb_id` is pinned and the title search returns nothing (after a retry with the `(year)` suffix stripped), `tmdb.mjs` `fetchComprehensiveMediaDetails()` throws a typed `TmdbNoMatchError` (`code: 'no-match'`); network/HTTP/rate-limit failures stay generic `Error`s. The generator's catch classifies accordingly: `{ success: false, reason: 'no-match' | 'transient-error' }`. The scanners read the returned reason, so "operator froze it" (`'updates-disabled*'` → row cleared or 24h-paced, see above) is now distinguishable from a genuine failure. Within the failure class, `'no-match'` and `'transient-error'` are distinguishable in the contract and logs but **currently receive identical pacing** — both mark the 24 h cooldown row (a deliberately conservative choice: fast-retrying transients per tick would flood retries and error logs during a TMDB outage; differentiated pacing can be added later without another contract change).
 
-**Removed.** After each scan pass, names present in the DB but absent on disk are deleted (`removeMovie()` / `removeTVShow()`). Cooldown rows in `missing_data_media` and `episode_metadata_missing` are **not** cascaded on removal — orphaned rows accumulate silently (tracked as R‑4).
+**Removed.** After each scan pass, names present in the DB but absent on disk are deleted (`removeMovie()` / `removeTVShow()`), with a full cascade (R-4 + F-3, shipped in Branch 5): the `missing_data_media` cooldown row, the show's `episode_metadata_missing` rows (`clearEpisodeRetryForShow()`), and the title's `metadata_hashes` rows (`deleteHashesForMedia()`) are cleared in the same loop — a same-named title re-added later starts clean instead of inheriting its predecessor's retry history or serving its frozen hash.
 
 ---
 
@@ -492,7 +492,7 @@ Operator-supplied field-level replacements, applied by the generator on every wr
 | `movies` / `tv_shows` row | SQLite `main` | Yes (rebuilt by scan) | Yes — scan removal loop |
 | TMDB cache row | SQLite `tmdb_cache` | Yes | Yes — probabilistic sweep + admin routes |
 | TMDB blurhash cache row | SQLite `tmdb_blurhash_cache` | Yes | **No live path** (helpers exist, zero callers) |
-| `metadata_hashes` row | SQLite `main` | Yes (lazily regenerable) | Exported but never called (`deleteHashesForMedia`) |
+| `metadata_hashes` row | SQLite `main` | Yes (lazily regenerable) | Yes — removal-loop cascade (`deleteHashesForMedia`, Branch 5) |
 | Cooldown rows (`missing_data_media`, `episode_metadata_missing`) | SQLite `main` | **No** — genuinely non-derivable | Partial (cleared on resolution; no removal cascade) |
 | `process_queue` row | SQLite `processTracking` | Operational telemetry — fully disposable | No delete in production paths; upsert-bounded |
 | In-memory task/job registries | Process memory | Disposable by design | Lost on restart |
@@ -576,7 +576,7 @@ Two tables in the `main` DB, owned by the repository layer. These are the canoni
 
 **`episode_metadata_missing`** (air-date-aware sparse-episode backfill): *absent* → *inserted with attempt counter* → *retried every ≥3 days* (`EPISODE_MISSING_RETRY_DAYS`) → *cleared on resolution* (`clearEpisodeRetry`) → *given up* past 90 days after air date (`EPISODE_MISSING_WINDOW_DAYS` in `node/lib/metadataGenerator.mjs`; `isEpisodeBackfillExpired()` reports it terminally) — **given-up rows are pruned** (Branch 3, R-3): `refreshMissingEpisodes()` surfaces `expired: true` and the scanner clears the row, gated on the row actually existing so permanently-thin episodes don't cost a no-op DELETE per tick.
 
-Neither table cascades a delete when its title is removed from disk — the movie removal loop in `movie-scanner.mjs` calls only `removeMovie()`. A same-named title re-added later inherits its predecessor's cooldown timestamps. Planned fix (Branch 5, merging R-4 + F-3, not yet implemented).
+Both tables cascade on removal (R-4, shipped in Branch 5): the scanners' removal loops clear the title's `missing_data_media` row and — for shows — every `episode_metadata_missing` row via `clearEpisodeRetryForShow()`, alongside the `metadata_hashes` cascade. A same-named title re-added later starts with clean retry history.
 
 ---
 
@@ -638,7 +638,7 @@ Lifecycle: *absent* → *generated* (scanner immediate path, scheduled sweep, or
 
 **Dead `data_version` field (F-4).** `HASH_DATA_VERSION` is written into every row and **never read back or compared anywhere** — bumping it does nothing. The sibling table gets this right: `node/sqlite/blurhashHashes.mjs` `shouldRegenerateBlurhash()` compares each row's stored `generation_version` against `BLURHASH_GENERATION_VERSION` and regenerates on mismatch. Decided 2026-07-07 (F-4): wire real version-based invalidation for `metadata_hashes` mirroring that pattern — not yet implemented. (This exact gap has already caused one manual-resync incident when hashing logic changed.)
 
-**Exported-but-never-called deletion (F-3).** `deleteHashesForMedia()` is implemented, exported, documented ("call when the scanner detects a directory change"), and imported by `tv-scanner.mjs` — and has **zero call sites**. Removed titles keep their hash rows; a same-named re-added title serves the stale predecessor hash until something rewrites it. Decided 2026-07-07 (Branch 5): call it in both scanners' removal loops, alongside the cooldown cascade — not yet implemented.
+**Removal-loop deletion (F-3, shipped in Branch 5).** `deleteHashesForMedia()` is called from both scanners' removal loops, alongside the cooldown cascade — removed titles drop their hash rows immediately, so a same-named re-added title generates a fresh hash on its first scan (F-2) instead of serving the stale predecessor's.
 
 ---
 

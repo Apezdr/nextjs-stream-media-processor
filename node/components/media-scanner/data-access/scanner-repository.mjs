@@ -14,6 +14,7 @@ import {
   getEpisodeMetadataMissingRows,
   recordEpisodeMetadataAttempt,
   clearEpisodeMetadataMissing,
+  clearEpisodeMetadataMissingForShow,
   releaseDatabase
 } from '../../../sqliteDatabase.mjs';
 
@@ -280,6 +281,15 @@ export async function recordEpisodeAttempt(showName, seasonNumber, episodeNumber
  */
 export async function clearEpisodeRetry(showName, seasonNumber, episodeNumber) {
   await clearEpisodeMetadataMissing(showName, seasonNumber, episodeNumber);
+}
+
+/**
+ * Clear ALL of a show's episode backfill cooldown rows (R-4 removal cascade:
+ * the show left the filesystem, so a same-named show re-added later must not
+ * inherit its predecessor's retry history). Idempotent.
+ */
+export async function clearEpisodeRetryForShow(showName) {
+  await clearEpisodeMetadataMissingForShow(showName);
 }
 
 /**

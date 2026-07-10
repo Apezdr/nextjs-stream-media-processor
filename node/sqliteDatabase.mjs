@@ -1340,6 +1340,19 @@ export async function clearEpisodeMetadataMissing(showName, seasonNumber, episod
 }
 
 /**
+ * Remove ALL of a show's episode backfill cooldown rows (R-4 removal cascade:
+ * called when the show itself leaves the filesystem, so a same-named show
+ * re-added later starts with clean retry history). Idempotent.
+ */
+export async function clearEpisodeMetadataMissingForShow(showName) {
+  return withWriteTx("main", async (db) => {
+    await withRetry(() =>
+      db.run(`DELETE FROM episode_metadata_missing WHERE show_name = ?`, [showName])
+    );
+  });
+}
+
+/**
  * Generate a cache key for TMDB API requests
  * @param {string} endpoint - TMDB API endpoint
  * @param {Object} params - Request parameters

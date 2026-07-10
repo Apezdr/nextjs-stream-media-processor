@@ -20,7 +20,7 @@ import {
   getDatabaseInstance,
   RETRY_INTERVAL_HOURS
 } from '../data-access/scanner-repository.mjs';
-import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
+import { generateMovieHashes, deleteHashesForMedia } from '../../../sqlite/metadataHashes.mjs';
 import { getMovieByName } from '../../../sqliteDatabase.mjs';
 import { loadTmdbConfig, isUpdateAllowed, hasMetadataOverrideKey } from '../../../utils/tmdbConfig.mjs';
 import { isFrozenReason } from '../../../lib/metadataGenerator.mjs';
@@ -700,8 +700,13 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
     })
   );
 
-  // Remove movies from the database that no longer exist in the file system
+  // Remove movies from the database that no longer exist in the file system.
+  // Cascade (R-4 + F-3, Branch 5): clear the cooldown row and the stored
+  // metadata hash too — a same-named movie re-added later must start clean,
+  // not inherit its predecessor's retry timestamp or serve its frozen hash.
   for (const movieName of existingMovieNames) {
     await removeMovie(movieName);
+    await clearMissingMediaData(movieName);
+    await deleteHashesForMedia(db, 'movies', movieName);
   }
 }
