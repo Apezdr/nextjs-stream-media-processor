@@ -171,7 +171,7 @@ The handler in `node/app.mjs` calls `generateListMovies()` only; no TV-only on-d
 
 **S-4 — Poster-collage generation blocks all cache cleanup.**
 `node/lib/taskManager.mjs` pairs `[TaskType.DOWNLOAD, TaskType.CACHE_CLEANUP]` in `exclusiveGroups`, and the only current `TaskType.DOWNLOAD` caller is poster-collage generation (`node/app.mjs`) — a job sharing no files or tables with cache cleanup. The `DOWNLOAD` enum comment ("TMDB downloads") describes a workload that today runs outside the task manager entirely.
-**Decision:** remove the pairing. **Rationale:** cache-cleanup jobs are lightweight readdir/stat/unlink scans and the 10-minute original-segments sweep explicitly targets large files; serializing them behind a library-wide image walk buys nothing. **Sequencing:** implement only after Branch 11's V-1 lands, so the change is reasoned against a clean scheduling baseline rather than the currently double-scheduled one. **Lands:** new branch TBD, after Branch 11. *Status: Decided — not yet implemented.*
+**Decision:** remove the pairing. **Rationale:** cache-cleanup jobs are lightweight readdir/stat/unlink scans and the 10-minute original-segments sweep explicitly targets large files; serializing them behind a library-wide image walk buys nothing. **Sequencing:** implement only after Branch 11's V-1 lands, so the change is reasoned against a clean scheduling baseline rather than the currently double-scheduled one — satisfied: V-1 merged first. **Lands:** follow-up branch after Branch 11. *Status: Implemented (this branch).* The `[DOWNLOAD, CACHE_CLEANUP]` pair is deleted from `exclusiveGroups` (a comment records why); the scan/hash/blurhash group is untouched. Entry removed once absorbed post-merge.
 
 ### Captions / chapters / blurhash
 

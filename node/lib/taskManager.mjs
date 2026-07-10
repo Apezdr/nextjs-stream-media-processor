@@ -44,8 +44,10 @@ const concurrencyLimits = {
 const exclusiveGroups = [
   // These task types cannot run together
   [TaskType.MEDIA_SCAN, TaskType.METADATA_HASH, TaskType.BLURHASH],
-  // Movie and TV scans can happen in parallel
-  [TaskType.DOWNLOAD, TaskType.CACHE_CLEANUP]
+  // No DOWNLOAD/CACHE_CLEANUP pairing (removed, S-4): the only DOWNLOAD
+  // caller is poster-collage generation, which shares no files or tables
+  // with the readdir/stat/unlink cache sweeps — serializing them just
+  // delayed cleanup behind a library-wide image walk.
 ];
 
 /**
