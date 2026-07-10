@@ -397,6 +397,12 @@ router.post('/metadata/bulk', authenticateUser, requireAdmin, async (req, res) =
     }
 });
 
+// Naming-collision note (A-4b): the GET/PUT handlers below expose the
+// PER-TITLE `tmdb.config` file (GET/PUT /api/admin/metadata/config). The
+// unrelated global TMDB client/cache status resource is GET /api/tmdb/config
+// in routes/tmdb.mjs. Decided 2026-07-07 (A-4a): one of the two names will
+// change; until then these cross-references are the disambiguation.
+
 /**
  * Route to get TMDB configuration for a specific media
  * GET /admin/metadata/config

@@ -612,7 +612,7 @@ app.get("/video/movie/:movieName", async (req, res) => {
   await releaseDatabase(db);
 });
 
-app.get("/rescan/tmdb", async (req, res) => {
+app.get("/rescan/tmdb", authenticateWebhookOrUser, async (req, res) => {
   try {
     await runDownloadTmdbImages({ fullScan: true });
     res.status(200).send("Rescan initiated");
