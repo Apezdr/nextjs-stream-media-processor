@@ -580,13 +580,18 @@ export class MetadataGenerator {
       let pristineMetadata = null;
 
       if (needsShowRefresh || this.config.forceRefresh) {
-        // Fetch fresh TMDB data for show metadata
+        // Fetch fresh TMDB data for show metadata.
+        // Embedded-response blurhash stays off for scanner fetches (B-1):
+        // nothing consumes it — the sidecar .blurhash files written by
+        // downloadMediaImages (still governed by config.generateBlurhash) are
+        // the consumed pipeline. `false` also keeps these fetches on the
+        // plain TMDB cache key.
         if (tmdbConfig.tmdb_id) {
           // Use existing TMDB ID
-          tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', tmdbConfig.tmdb_id, this.config.generateBlurhash);
+          tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', tmdbConfig.tmdb_id, false);
         } else {
           // Search for TMDB ID
-          tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, this.config.generateBlurhash);
+          tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, false);
 
           // Update config with found TMDB ID
           if (tmdbData.id) {
@@ -826,14 +831,15 @@ export class MetadataGenerator {
         }
       }
 
-      // Fetch TMDB data
+      // Fetch TMDB data. Embedded-response blurhash stays off for scanner
+      // fetches (B-1) — see the matching note in generateForShow.
       let tmdbData;
       if (tmdbConfig.tmdb_id) {
         // Use existing TMDB ID
-        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', tmdbConfig.tmdb_id, this.config.generateBlurhash);
+        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', tmdbConfig.tmdb_id, false);
       } else {
         // Search for TMDB ID
-        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', null, this.config.generateBlurhash);
+        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', null, false);
 
         // Update config with found TMDB ID
         if (tmdbData.id) {

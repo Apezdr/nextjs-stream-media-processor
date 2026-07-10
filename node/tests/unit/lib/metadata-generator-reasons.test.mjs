@@ -219,6 +219,41 @@ describe('G-3: up-to-date branch adopts the id from metadata.json', () => {
   });
 });
 
+describe('B-1: scanner-triggered fetches never request embedded blurhash', () => {
+  it('generateForMovie fetches with includeBlurhash=false even when configured generateBlurhash=true, while the sidecar path keeps the config value', async () => {
+    await fs.mkdir(join(baseDir, 'movies', 'Blurhash Movie (2020)'), { recursive: true });
+    fetchComprehensiveMediaDetails.mockResolvedValue({ id: 55, title: 'Blurhash Movie' });
+
+    const generator = await MetadataGenerator.create({ basePath: baseDir, forceRefresh: false, generateBlurhash: true });
+    const result = await generator.generateForMovie('Blurhash Movie (2020)');
+
+    expect(result.success).toBe(true);
+    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledWith('Blurhash Movie (2020)', 'movie', null, false);
+    // The consumed pipeline — sidecar .blurhash files via downloadMediaImages —
+    // stays governed by the config flag.
+    expect(downloadMediaImages).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      'movie',
+      expect.objectContaining({ generateBlurhash: true })
+    );
+  });
+
+  it('generateForShow fetches with includeBlurhash=false on the pinned-id path', async () => {
+    const dir = join(baseDir, 'tv', 'Blurhash Show');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(join(dir, 'tmdb.config'), JSON.stringify({ tmdb_id: 4321 }));
+    fetchComprehensiveMediaDetails.mockResolvedValue({ id: 4321, name: 'Blurhash Show' });
+
+    const generator = await MetadataGenerator.create({ basePath: baseDir, forceRefresh: false, generateBlurhash: true });
+    const result = await generator.generateForShow('Blurhash Show');
+
+    expect(result.success).toBe(true);
+    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledWith('Blurhash Show', 'tv', 4321, false);
+  });
+});
+
 describe('refreshMissingEpisodes expired signal', () => {
   let seasonPath;
 
