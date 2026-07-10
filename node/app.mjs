@@ -28,7 +28,7 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, clearVideoTranscodeCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -679,6 +679,21 @@ scheduleJob("15 3 * * *", () => {
   });
 });
 
+// Clear Video Transcode Cache at 4:15 AM daily (V-2) — transcodes are the
+// largest artifacts the subsystem produces and previously had no eviction at
+// all; this sweep is also what reclaims entries stranded under pre-V-3
+// cache keys.
+scheduleJob("15 4 * * *", () => {
+  enqueueTask(TaskType.CACHE_CLEANUP, 'Video Transcode Cache Cleanup', async () => {
+    logger.info("Running Video Transcode Cache Cleanup...");
+    await clearVideoTranscodeCache();
+    logger.info("Video Transcode Cache Cleanup Completed.");
+    return 'Video transcode cache cleanup completed successfully';
+  }).catch(error => {
+    logger.error(`Failed to enqueue video transcode cache cleanup task: ${error.message}`);
+  });
+});
+
 // Clear Original Segments Cache every 10 minutes (aggressive cleanup due to large file sizes)
 scheduleJob("*/10 * * * *", () => {
   enqueueTask(TaskType.CACHE_CLEANUP, 'Original Segments Cache Cleanup', async () => {
@@ -1280,44 +1295,10 @@ function scheduleTasks() {
     });
   });
   
-  // Less frequent cache cleanups run at staggered overnight hours
-  // to minimize impact on active usage times
-  
-  // Frames cache cleanup at 1:30 AM
-  scheduleJob("30 1 * * *", () => {
-    logger.info("Running Frames Cache Cleanup...");
-    clearFramesCache()
-      .then(() => {
-        logger.info("Frames Cache Cleanup Completed.");
-      })
-      .catch((error) => {
-        logger.error(`Frames Cache Cleanup Error: ${error.message}`);
-      });
-  });
-  
-  // Sprite sheet cache cleanup at 2:30 AM
-  scheduleJob("30 2 * * *", () => {
-    logger.info("Running Spritesheet Cache Cleanup...");
-    clearSpritesheetCache()
-      .then(() => {
-        logger.info("Spritesheet Cache Cleanup Completed.");
-      })
-      .catch((error) => {
-        logger.error(`Spritesheet Cache Cleanup Error: ${error.message}`);
-      });
-  });
-  
-  // Video clips cache cleanup at 3:30 AM
-  scheduleJob("30 3 * * *", () => {
-    logger.info("Running Video Clips Cache Cleanup...");
-    clearVideoClipsCache()
-      .then(() => {
-        logger.info("Video Clips Cache Cleanup Completed.");
-      })
-      .catch((error) => {
-        logger.error(`Video Clips Cache Cleanup Error: ${error.message}`);
-      });
-  });
+  // The overnight frames/spritesheet/clips cleanups are scheduled ONCE, at
+  // module level, through the CACHE_CLEANUP task gate. The direct
+  // (gate-bypassing) duplicates that used to live here were removed (V-1) —
+  // re-adding a cleanup here without enqueueTask would race the gated ones.
 }
 
 async function initialize() {

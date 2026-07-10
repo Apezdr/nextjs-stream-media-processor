@@ -143,14 +143,19 @@ export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
 
     // 5) Generate cache key based on video parameters and target codec
     const videoBaseName = basename(videoPath, extname(videoPath)); // Extracts only the filename without extension
+    // File-identity component (V-3): the video-clips key already carries
+    // info.uuid; without it here, replacing a file in place kept serving the
+    // stale transcode forever (filename + params + version never moved).
+    const { uuid: videoIdentity } = await getInfo(videoPath);
     const cacheKeyComponents = [
       videoBaseName,
+      `key_${videoIdentity}`,
       selectedAudioTrack,
       channelCount,
       targetCodec,
       `v${FULL_TRANSCODE_VERSION}`
     ];
-    const cacheKey = cacheKeyComponents.join('-'); // e.g., "videoName-0-2-libx264-v1.0001"
+    const cacheKey = cacheKeyComponents.join('-'); // e.g., "videoName-key_ab12…-0-2-libx264-v1.0001"
 
     // Generate a hashed cache key to ensure it's directory-safe
     const hashedCacheKey = generateCacheKey(cacheKey); // Assuming this hashes the string without adding slashes

@@ -287,6 +287,40 @@ export async function clearVideoClipsCache() {
 }
 
 /**
+ * Clears expired files from the Video Transcode Cache (V-2).
+ * Previously the only cache directory with no eviction at all, despite
+ * holding the largest artifacts the subsystem produces. Also the mechanism
+ * that reclaims entries stranded under pre-V-3 cache keys (the key gained
+ * the file-identity uuid, so old entries can never be addressed again).
+ * Max Age: 1 month
+ */
+export async function clearVideoTranscodeCache() {
+  const now = Date.now();
+  const cacheType = 'video_transcode';
+  const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
+  const dir = videoTranscodeCacheDir;
+
+  try {
+    const files = await fs.readdir(dir);
+    for (const file of files) {
+      const filePath = join(dir, file);
+      try {
+        const stats = await fs.stat(filePath);
+        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
+        if (age > maxAge) {
+          await fs.unlink(filePath);
+          logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
+        }
+      } catch (err) {
+        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
+      }
+    }
+  } catch (err) {
+    logger.error(`Error reading ${cacheType} cache directory:` + err);
+  }
+}
+
+/**
  * Clears expired original video segment files from the Video Clips Cache.
  * These are fast to generate but take up significant space, so we keep them for a shorter time.
  * Uses access time (atimeMs) to preserve recently accessed files regardless of creation time.
