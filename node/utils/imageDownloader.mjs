@@ -8,7 +8,7 @@ import { createCategoryLogger } from '../lib/logger.mjs';
 import { extractFileExtension, touchFile, pathExists, getFileAgeDays } from './fileUtils.mjs';
 import { generateBlurhash } from './blurhashNative.mjs';
 import { withApiRequestSpan, recordImageOutcome } from '../lib/apiTracer.mjs';
-import { getConvention } from '../components/media-scanner/domain/image-conventions.mjs';
+import { getConvention, resolveEffectiveImageUrl } from '../components/media-scanner/domain/image-conventions.mjs';
 
 const logger = createCategoryLogger('image-downloader');
 
@@ -385,20 +385,16 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
           'media.type': mediaType
         };
         try {
-          let imageUrl = null;
-
-          // Check for override first (matches Python script priority)
-          const overridePath = config[imageInfo.overrideKey];
-          if (overridePath) {
-            imageUrl = `https://image.tmdb.org/t/p/original${overridePath}`;
-            logger.debug(`Using override ${imageInfo.key} image: ${overridePath}`, logMeta);
-          } else if (mediaData[dataKey]) {
-            // Use TMDB image
-            if (mediaData[dataKey].startsWith('http')) {
-              imageUrl = mediaData[dataKey];
-            } else {
-              imageUrl = `https://image.tmdb.org/t/p/original${mediaData[dataKey]}`;
-            }
+          // Effective-URL precedence and CDN prefixing live in the shared
+          // resolver (I-5); full-URL override values pass through verbatim
+          // instead of being prefixed into garbage (I-7a).
+          const imageUrl = resolveEffectiveImageUrl({
+            tmdbConfig: config,
+            metadata: mediaData,
+            imageKey: imageInfo.key
+          });
+          if (config?.[imageInfo.overrideKey]) {
+            logger.debug(`Using override ${imageInfo.key} image: ${config[imageInfo.overrideKey]}`, logMeta);
           }
 
           if (!imageUrl) {

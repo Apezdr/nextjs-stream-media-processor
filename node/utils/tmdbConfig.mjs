@@ -119,7 +119,9 @@ export function validateTmdbConfig(config) {
     validated.update_metadata = true;
   }
 
-  const validFocalValues = ['left', 'right', 'center', null];
+  // Must accept everything detectBackdropFocal() can produce — the
+  // auto-detector emits the center-* variants too (I-6a).
+  const validFocalValues = ['left', 'right', 'center', 'center-left', 'center-right', null];
   if (!validFocalValues.includes(validated.backdrop_focal)) {
     logger.warn(`Invalid backdrop_focal value: ${validated.backdrop_focal}, defaulting to null`);
     validated.backdrop_focal = null;

@@ -35,6 +35,7 @@ import {
 import {
   iterateConventions,
   expectedImagePathFromUrl,
+  resolveEffectiveImageUrl,
 } from '../components/media-scanner/domain/image-conventions.mjs';
 
 const logger = createCategoryLogger('metadata-generator');
@@ -338,13 +339,11 @@ export class MetadataGenerator {
     transactionId,
   }) {
     for (const [imageKey, convention] of iterateConventions(mediaType)) {
-      // Resolve the current effective URL. Override wins; otherwise TMDB
-      // metadata. fetchComprehensiveMediaDetails normalizes metadata
-      // `<type>_path` values to full URLs, so both sides of the precedence
-      // are already full URLs.
-      const overrideUrl = tmdbConfig?.[`override_${imageKey}`];
-      const metaUrl = enhancedMetadata?.[`${imageKey}_path`];
-      const effectiveUrl = overrideUrl || metaUrl;
+      // Effective URL via the shared resolver (I-5): override wins, then the
+      // (override-merged) TMDB metadata value; bare TMDB paths get the CDN
+      // base, full URLs pass through (I-7a). Same function the downloader
+      // uses, so the predicted destination below matches what it writes.
+      const effectiveUrl = resolveEffectiveImageUrl({ tmdbConfig, metadata: enhancedMetadata, imageKey });
 
       const previousPath = previousPaths?.[imageKey] || null;
 
