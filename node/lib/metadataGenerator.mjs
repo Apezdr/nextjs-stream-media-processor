@@ -569,7 +569,16 @@ export class MetadataGenerator {
       // Get TMDB data (either fetch fresh or use existing ID for seasons/episodes)
       let tmdbData;
       let imageResults = null;
-      
+      // G-5: raw pre-override TMDB payload, serialized opaquely for the
+      // scanner to persist into tv_shows.pristine_metadata. Set on ANY branch
+      // that performed a genuine TMDB fetch this invocation — the refresh
+      // branch below AND the "fresh but no tmdb_id" corner fetch further down
+      // (a full fetch too, even though its payload isn't the basis of
+      // metadata.json this pass). Never re-synthesized from metadata.json,
+      // never on frozen/no-op paths that fetched nothing. Trust/merge
+      // semantics are Branch 2; this is population plumbing only.
+      let pristineMetadata = null;
+
       if (needsShowRefresh || this.config.forceRefresh) {
         // Fetch fresh TMDB data for show metadata
         if (tmdbConfig.tmdb_id) {
@@ -578,12 +587,17 @@ export class MetadataGenerator {
         } else {
           // Search for TMDB ID
           tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, this.config.generateBlurhash);
-          
+
           // Update config with found TMDB ID
           if (tmdbData.id) {
             await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
           }
         }
+
+        // Capture the pristine payload BEFORE overrides are applied.
+        // (applyMetadataOverrides is non-mutating, but serializing here makes
+        // the pre-override capture point explicit and tamper-proof.)
+        pristineMetadata = JSON.stringify(tmdbData);
 
         // Apply any metadata overrides from config
         const enhancedMetadata = applyMetadataOverrides(tmdbData, tmdbConfig);
@@ -640,6 +654,13 @@ export class MetadataGenerator {
           if (tmdbData.id) {
             await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
           }
+
+          // This corner path is a genuine full TMDB fetch too, so capture the
+          // pristine payload (G-5) — the capture rule keys on "a fetch
+          // happened this invocation", not on whether the payload is written
+          // to metadata.json. One-shot in practice: the id written above
+          // makes the cheap `{ id }` branch take over on the next pass.
+          pristineMetadata = JSON.stringify(tmdbData);
         }
 
         // Even though show metadata is fresh, top-level images (show_poster,
@@ -683,6 +704,10 @@ export class MetadataGenerator {
         imageResults: imageResults || {},
         seasonResults,
         imageSummary,
+        // Non-null ONLY when the genuine-fetch branch ran this invocation
+        // (G-5). The scanner persists it opaquely; null means "no fresh
+        // payload — preserve whatever is stored".
+        pristineMetadata,
         transactionId
       };
 
@@ -789,6 +814,15 @@ export class MetadataGenerator {
         }
       }
 
+      // G-5: capture the raw pre-override TMDB payload for the scanner to
+      // persist into movies.pristine_metadata. This point is reachable ONLY
+      // after a genuine fetch (the frozen and up-to-date paths returned
+      // earlier), so the success return below always carries it. Serialized
+      // before overrides are applied (applyMetadataOverrides is non-mutating,
+      // but this makes the pre-override capture explicit). Trust/merge
+      // semantics are Branch 2; this is population plumbing only.
+      const pristineMetadata = JSON.stringify(tmdbData);
+
       // Apply any metadata overrides from config
       const enhancedMetadata = applyMetadataOverrides(tmdbData, tmdbConfig);
 
@@ -848,6 +882,9 @@ export class MetadataGenerator {
         tmdbId: enhancedMetadata.id,
         imageResults,
         imageSummary,
+        // Raw pre-override TMDB payload from THIS invocation's genuine fetch
+        // (G-5). Absent/null on the frozen and up-to-date returns above.
+        pristineMetadata,
         transactionId
       };
 

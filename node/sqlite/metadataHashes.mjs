@@ -239,10 +239,14 @@ export async function getMediaTypeHashes(db, mediaType) {
         )
       );
       
-      // If no movie hashes exist, generate them
+      // If no movie hashes exist, generate them — full-library pass (no
+      // sinceTimestamp). Passing the db handle here used to land in the
+      // sinceTimestamp parameter, turning the bootstrap into a silent no-op
+      // (Invalid Date filtered every row out); updateAllMovieHashes opens its
+      // own write transaction and never needed the handle.
       if (movieHashCount.count === 0) {
         logger.info('No movie hashes found, generating them now');
-        await updateAllMovieHashes(db);
+        await updateAllMovieHashes();
       }
     } else if (mediaType === 'tv') {
       // Check if we have any TV show hashes
@@ -254,10 +258,11 @@ export async function getMediaTypeHashes(db, mediaType) {
         )
       );
       
-      // If no TV show hashes exist, generate them
+      // If no TV show hashes exist, generate them — full-library pass (no
+      // sinceTimestamp; see the movie bootstrap note above).
       if (tvHashCount.count === 0) {
         logger.info('No TV show hashes found, generating them now');
-        await updateAllTVShowHashes(db);
+        await updateAllTVShowHashes();
       }
     }
     
@@ -441,11 +446,16 @@ export async function getSeasonHashes(db, title, seasonNumber) {
  */
 export async function generateMovieHashes(db, movie) {
   try {
-    // Extract relevant fields for hashing. `metadata` carries the parsed
-    // metadata.json content (or a {mtime,size} fallback marker); without it
-    // the hash only advances on mp4 mtime changes, so TMDB-id edits never
-    // propagate to client caches — mirrors the TV episode hash, which folds
-    // in `episodeData.metadata` for the same reason.
+    // Extract relevant fields for hashing. `metadata` carries the
+    // movies.metadata column value VERBATIM: the scanner's canonically
+    // serialized metadata.json fingerprint (compact JSON.stringify of the
+    // parsed file, or a serialized {mtime,size} fallback marker — the
+    // canonical serialization lives in movie-scanner.mjs). Without it the
+    // hash only advances on mp4 mtime changes, so TMDB-id edits never
+    // propagate to client caches. Both callers must feed the DB read-side
+    // view (scanner: getMovieByName after saveMovie; scheduled sweep:
+    // getMovies) so their inputs are byte-identical — hashing any in-memory
+    // scanner object here would reintroduce the F-1 hash oscillation.
     const hashableData = {
       _id: movie._id,
       name: movie.name,
@@ -454,7 +464,11 @@ export async function generateMovieHashes(db, movie) {
       mediaQuality: movie.mediaQuality,
       metadataUrl: movie.metadataUrl,
       metadata: movie.metadata,
-      lastModified: movie.urls?.mediaLastModified || new Date().toISOString()
+      // Stable null fallback, NOT a fresh timestamp: this value is folded
+      // into the hash, so a per-call `new Date()` would move the stored hash
+      // on every regeneration for rows without a media mtime (no mp4 found /
+      // getInfo failed) and force pointless frontend resyncs.
+      lastModified: movie.urls?.mediaLastModified || null
     };
     
     // Generate hash
@@ -590,7 +604,6 @@ export async function generateTVShowHashes(db, show) {
 
 /**
  * Get movies modified since a specific timestamp
- * @param {Object} db - SQLite database connection
  * @param {string} sinceTimestamp - ISO timestamp to filter by
  * @returns {Promise<Array>} - Array of movies modified since the timestamp
  */
@@ -610,9 +623,9 @@ export async function getMoviesModifiedSince(sinceTimestamp) {
 }
 
 /**
- * Update hashes for all movies in the database
- * @param {Object} db - SQLite database connection
- * @param {string} sinceTimestamp - Optional timestamp to filter movies modified since
+ * Update hashes for all movies in the database. Opens its own write
+ * transaction — callers pass at most a sinceTimestamp, never a db handle.
+ * @param {string} [sinceTimestamp] - Optional timestamp to filter movies modified since
  */
 export async function updateAllMovieHashes(sinceTimestamp = null) {
   return withWriteTx("main", async (db) => {
@@ -643,7 +656,6 @@ export async function updateAllMovieHashes(sinceTimestamp = null) {
 
 /**
  * Get TV shows with episodes modified since a specific timestamp
- * @param {Object} db - SQLite database connection
  * @param {string} sinceTimestamp - ISO timestamp to filter by
  * @returns {Promise<Array>} - Array of TV shows with modified episodes
  */
@@ -673,9 +685,9 @@ export async function getTVShowsModifiedSince(sinceTimestamp) {
 }
 
 /**
- * Update hashes for all TV shows in the database
- * @param {Object} db - SQLite database connection
- * @param {string} sinceTimestamp - Optional timestamp to filter shows modified since
+ * Update hashes for all TV shows in the database. Opens its own per-show
+ * write transactions — callers pass at most a sinceTimestamp, never a db handle.
+ * @param {string} [sinceTimestamp] - Optional timestamp to filter shows modified since
  */
 export async function updateAllTVShowHashes(sinceTimestamp = null) {
   try {
