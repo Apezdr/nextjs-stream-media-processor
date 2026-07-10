@@ -873,11 +873,15 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // Immediately regenerate the metadata hash using the fresh data just saved.
       // The scheduled hash job filters by episode mtime and would miss changes where
       // only tmdb.config or images changed, so we generate here to avoid the gap.
-      if (storedHash) {
-        const freshShow = await getTVShowByName(showName);
-        if (freshShow) {
-          await generateTVShowHashes(db, freshShow);
-        }
+      // Unconditional (F-2, shipped in Branch 4): the old `if (storedHash)` gate
+      // skipped brand-new shows, so their first hash waited for the sweep or a
+      // per-title GET. (A dirHashChanged-only gate would be wrong too — an
+      // images-retry pass can change the row without the tick-start hash having
+      // moved, and the post-download save makes the NEXT tick's hash compare
+      // clean, so this tick is the only one that sees the change.)
+      const freshShow = await getTVShowByName(showName);
+      if (freshShow) {
+        await generateTVShowHashes(db, freshShow);
       }
 
       // Air-date-aware backfill of thin episode metadata. Runs AFTER finalHash

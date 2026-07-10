@@ -687,17 +687,15 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // first pass through either writer, and the frontend re-syncs it once.
       // That is the F-1 bug being fixed, not a regression.
       //
-      // Gate: any pass that actually rewrote the row must also refresh its
-      // stored hash — dirHashChanged, an info-file regeneration pass, or the
-      // one-shot F-1 fingerprint backfill (which exists precisely to correct
-      // the stored hash; without the rehash the fingerprint would sit in the
-      // column while metadata_hashes kept the content-blind value until the
-      // next directory change). Brand-new INSERTs still skip (F-2, kept).
-      if (dirHashChanged || needInfoRegeneration || needMetadataBackfill) {
-        const freshMovie = await getMovieByName(dirName);
-        if (freshMovie) {
-          await generateMovieHashes(db, freshMovie);
-        }
+      // Every pass that reaches this point either inserted or rewrote the row
+      // (the early return above filters out everything else), so ALWAYS
+      // refresh the stored hash — including a brand-new movie's FIRST hash
+      // (F-2, shipped in Branch 4): the old gate skipped fresh INSERTs, so a
+      // new title was invisible to the bulk sync endpoint until the sweep's
+      // 16-minute mtime window or a per-title GET happened to catch it.
+      const freshMovie = await getMovieByName(dirName);
+      if (freshMovie) {
+        await generateMovieHashes(db, freshMovie);
       }
     })
   );
