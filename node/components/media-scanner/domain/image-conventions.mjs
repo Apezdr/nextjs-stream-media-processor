@@ -29,6 +29,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { extractFileExtension } from '../../../utils/fileUtils.mjs';
+import { getOverride } from '../../../utils/tmdbConfig.mjs';
 
 // Direct read of the convention table. Currently used internally by the
 // helpers below; will also be consumed by `MetadataGenerator._reconcileImageOwnership`
@@ -216,4 +217,39 @@ export function expectedImagePathFromUrl(dirPath, prefix, url, fallbackExt = 'jp
   if (!ext) ext = `.${fallbackExt}`;
   if (!ext.startsWith('.')) ext = `.${ext}`;
   return path.join(dirPath, `${prefix}${ext}`);
+}
+
+// TMDB's CDN base for bare image paths (`/abc123.jpg`).
+const TMDB_IMAGE_CDN_BASE = 'https://image.tmdb.org/t/p/original';
+
+/**
+ * Resolve the effective URL for one image kind (I-5) — the single
+ * implementation of the precedence that both the downloader
+ * (`downloadMediaImages()` in `utils/imageDownloader.mjs`) and the
+ * generator's reconcile step (`_reconcileImageOwnership()` in
+ * `lib/metadataGenerator.mjs`) must agree on, byte for byte, or reconcile
+ * predicts a different destination than the downloader writes:
+ *
+ *   `override_<kind>` (tmdb.config) > metadata `<kind>_path`
+ *
+ * The documented middle tier — the tmdb.config `metadata` block — reaches
+ * this function already folded into `metadata` by `applyMetadataOverrides()`,
+ * so two arguments cover all three tiers.
+ *
+ * Either tier may hold a bare TMDB CDN path or a full URL: absolute
+ * `http(s)://` values pass through verbatim, bare paths get the TMDB CDN
+ * base prefixed (I-7a — the downloader previously prefixed override values
+ * unconditionally, mangling full external URLs).
+ *
+ * @param {Object} opts
+ * @param {Object|null} opts.tmdbConfig - Parsed tmdb.config (may be null/undefined)
+ * @param {Object|null} opts.metadata - Override-merged TMDB metadata (may be null/undefined)
+ * @param {'poster'|'backdrop'|'logo'} opts.imageKey
+ * @returns {string|null} Fully-qualified URL, or null when neither tier has a value
+ */
+export function resolveEffectiveImageUrl({ tmdbConfig, metadata, imageKey }) {
+  const override = tmdbConfig ? getOverride(tmdbConfig, imageKey) : null;
+  const raw = override || metadata?.[`${imageKey}_path`] || null;
+  if (!raw) return null;
+  return /^https?:\/\//i.test(raw) ? raw : `${TMDB_IMAGE_CDN_BASE}${raw}`;
 }

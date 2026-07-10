@@ -51,3 +51,18 @@ describe('validateTmdbConfig preserves the metadata key', () => {
     expect(hasMetadataOverrideKey(validated)).toBe(false);
   });
 });
+
+describe('validateTmdbConfig backdrop_focal values (I-6a)', () => {
+  it('accepts every value the auto-detector can produce, including the center-* variants', () => {
+    for (const value of ['left', 'right', 'center', 'center-left', 'center-right', null]) {
+      const validated = validateTmdbConfig({ backdrop_focal: value });
+      expect(validated.backdrop_focal).toBe(value);
+    }
+  });
+
+  it('still resets unknown values to null', () => {
+    expect(validateTmdbConfig({ backdrop_focal: 'top' }).backdrop_focal).toBe(null);
+    expect(validateTmdbConfig({ backdrop_focal: 'CENTER-LEFT' }).backdrop_focal).toBe(null);
+    expect(validateTmdbConfig({ backdrop_focal: 42 }).backdrop_focal).toBe(null);
+  });
+});
