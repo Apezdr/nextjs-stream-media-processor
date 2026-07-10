@@ -170,6 +170,29 @@ export function getMetadataOverrides(config) {
 }
 
 /**
+ * Presence-based override opt-in check (G-2, decided 2026-07-07).
+ *
+ * Deliberately distinct from `getMetadataOverrides()` truthiness: a present
+ * `metadata` key — even `{}` or `null` — is an explicit "this title is
+ * override-managed" signal, while an absent key means overrides were never
+ * opted into (or were reverted via the config endpoint's full-replace-on-omit
+ * semantics — the A-2 contract, where omitting the key IS the revert).
+ *
+ * Any "is this title override-managed?" decision — the scanners'
+ * frozen-metadata retry gate today, and the pristine-base merge/revert
+ * semantics when they land — must call THIS, never a truthiness or
+ * `Object.keys().length` check; both of those collapse `{}` and absent into
+ * the same answer, which is exactly the ambiguity this helper exists to end.
+ *
+ * @param {Object} config - TMDB configuration object
+ * @returns {boolean} Whether the `metadata` override key is present at all
+ */
+export function hasMetadataOverrideKey(config) {
+  return !!config && typeof config === 'object' &&
+         Object.prototype.hasOwnProperty.call(config, 'metadata');
+}
+
+/**
  * Apply metadata overrides to TMDB data
  * Matches Python script behavior for metadata updates
  * @param {Object} tmdbData - TMDB API response data

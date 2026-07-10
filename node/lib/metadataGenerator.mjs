@@ -648,19 +648,46 @@ export class MetadataGenerator {
         if (tmdbConfig.tmdb_id) {
           tmdbData = { id: tmdbConfig.tmdb_id };
         } else {
-          // Need to get TMDB ID to process seasons
-          this.logger.info(`Show metadata up-to-date but need TMDB ID for ${showName}, fetching...`);
-          tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, false); // Don't generate blurhash for this lookup
-          if (tmdbData.id) {
-            await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
+          // G-3: metadata.json is FRESH on this branch — it was written by a
+          // previous full generation, so the id inside it is the trusted one.
+          // Read that first; the unvalidated name search below (first result
+          // wins, no disambiguation) is the last resort only when the file
+          // carries no usable id. Without this, the up-to-date branch could
+          // pin a wrong auto-match id purely to feed season processing — an
+          // id the pristine-base trust rule ("trust the base iff an id is
+          // set") would then wrongly believe.
+          let existingId = null;
+          try {
+            const existing = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+            if (Number.isInteger(existing?.id) && existing.id > 0) {
+              existingId = existing.id;
+            }
+          } catch {
+            // absent or unparseable (e.g. an override-only file recreated
+            // while frozen) — fall through to the search
           }
 
-          // This corner path is a genuine full TMDB fetch too, so capture the
-          // pristine payload (G-5) — the capture rule keys on "a fetch
-          // happened this invocation", not on whether the payload is written
-          // to metadata.json. One-shot in practice: the id written above
-          // makes the cheap `{ id }` branch take over on the next pass.
-          pristineMetadata = JSON.stringify(tmdbData);
+          if (existingId) {
+            tmdbData = { id: existingId };
+            // Persist through the add-only ratchet so the next pass takes the
+            // cheap tmdbConfig.tmdb_id branch without re-reading the file.
+            await updateTmdbConfigWithId(configPath, existingId, showName);
+            this.logger.info(`Show metadata up-to-date; adopted TMDB ID ${existingId} from metadata.json for ${showName}`);
+          } else {
+            // Need to get TMDB ID to process seasons
+            this.logger.info(`Show metadata up-to-date but need TMDB ID for ${showName}, fetching...`);
+            tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, false); // Don't generate blurhash for this lookup
+            if (tmdbData.id) {
+              await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
+            }
+
+            // This corner path is a genuine full TMDB fetch too, so capture the
+            // pristine payload (G-5) — the capture rule keys on "a fetch
+            // happened this invocation", not on whether the payload is written
+            // to metadata.json. One-shot in practice: the id written above
+            // makes the cheap `{ id }` branch take over on the next pass.
+            pristineMetadata = JSON.stringify(tmdbData);
+          }
         }
 
         // Even though show metadata is fresh, top-level images (show_poster,

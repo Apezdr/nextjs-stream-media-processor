@@ -22,7 +22,7 @@ import {
 } from '../data-access/scanner-repository.mjs';
 import { generateMovieHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getMovieByName } from '../../../sqliteDatabase.mjs';
-import { loadTmdbConfig, isUpdateAllowed, getMetadataOverrides } from '../../../utils/tmdbConfig.mjs';
+import { loadTmdbConfig, isUpdateAllowed, hasMetadataOverrideKey } from '../../../utils/tmdbConfig.mjs';
 import { isFrozenReason } from '../../../lib/metadataGenerator.mjs';
 import { resolveCooldownAction } from './cooldown-policy.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
@@ -441,7 +441,10 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         tmdbConfig = { update_metadata: false, backdrop_focal: null };
       }
       const updateAllowed = isUpdateAllowed(tmdbConfig);
-      const hasOverrides = getMetadataOverrides(tmdbConfig) !== null;
+      // Presence-based opt-in (G-2): a present `metadata` key — even `{}` —
+      // means "override-managed"; only an absent key closes the frozen
+      // branch of the metadata gate below.
+      const hasOverrides = hasMetadataOverrideKey(tmdbConfig);
       let _id = tmdbConfig.tmdb_id ? `tmdb_${tmdbConfig.tmdb_id}` : null;
       const manualFocal = tmdbConfig.backdrop_focal ?? null;
 
