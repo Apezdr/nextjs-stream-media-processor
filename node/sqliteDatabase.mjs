@@ -254,9 +254,18 @@ export async function initializeSchema(dbType, db) {
         response_data TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         expires_at TEXT,
-        last_accessed TEXT DEFAULT CURRENT_TIMESTAMP
+        last_accessed TEXT DEFAULT CURRENT_TIMESTAMP,
+        etag TEXT
       );
     `);
+
+    // T-1: the etag column joined CREATE TABLE above for fresh databases;
+    // this ALTER converges databases created before it existed.
+    try {
+      await db.exec(`ALTER TABLE tmdb_cache ADD COLUMN etag TEXT`);
+    } catch (err) {
+      if (!err.message.includes('duplicate column name')) throw err;
+    }
 
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_tmdb_cache_key ON tmdb_cache(cache_key);`);
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expires ON tmdb_cache(expires_at);`);
@@ -1388,15 +1397,16 @@ export async function getTmdbCache(endpoint, params = {}, customCacheKey = null)
       if (cached) {
         // Note: We skip updating last_accessed here to avoid write contention on read path
         // Rely on created_at/expires_at for cache management
-        
+
         return {
           data: JSON.parse(cached.response_data),
           cached: true,
           cachedAt: cached.created_at,
-          expiresAt: cached.expires_at
+          expiresAt: cached.expires_at,
+          etag: cached.etag || null
         };
       }
-      
+
       return null;
     } catch (error) {
       console.error('Error getting TMDB cache:', error);
@@ -1405,33 +1415,62 @@ export async function getTmdbCache(endpoint, params = {}, customCacheKey = null)
   });
 }
 
-export async function setTmdbCache(endpoint, params = {}, responseData, ttlHours = 1440, customCacheKey = null) {
+/**
+ * Fetch a cache entry regardless of expiry — the revalidation lookup (T-1).
+ * An expired row is exactly what conditional revalidation needs: its stored
+ * `etag` rides out as `If-None-Match`, and a 304 lets the caller re-up the
+ * row instead of re-downloading the payload.
+ */
+export async function getTmdbCacheEntryAnyAge(endpoint, params = {}, customCacheKey = null) {
+  return withDb("tmdbCache", async (db) => {
+    const cacheKey = customCacheKey || generateTmdbCacheKey(endpoint, params);
+    try {
+      const row = await withRetry(() =>
+        db.get('SELECT * FROM tmdb_cache WHERE cache_key = ?', [cacheKey])
+      );
+      if (!row) return null;
+      return {
+        data: JSON.parse(row.response_data),
+        etag: row.etag || null,
+        cachedAt: row.created_at,
+        expiresAt: row.expires_at,
+        expired: !row.expires_at || row.expires_at <= new Date().toISOString()
+      };
+    } catch (error) {
+      console.error('Error getting TMDB cache entry (any age):', error);
+      return null;
+    }
+  });
+}
+
+export async function setTmdbCache(endpoint, params = {}, responseData, ttlHours = 1440, customCacheKey = null, etag = null) {
   return withWriteTx("tmdbCache", async (db) => {
     const cacheKey = customCacheKey || generateTmdbCacheKey(endpoint, params);
     const now = new Date();
-    
+
     // Validate ttlHours to prevent invalid Date objects
     const validTtl = (typeof ttlHours === 'number' && isFinite(ttlHours) && ttlHours > 0) ? ttlHours : 1440;
     const expiresAt = new Date(now.getTime() + (validTtl * 60 * 60 * 1000));
-    
+
     // Sanity check: if expiresAt is invalid, log and skip
     if (!isFinite(expiresAt.getTime())) {
       console.error(`Invalid expiresAt calculated for ${endpoint} with ttlHours=${ttlHours}`);
-      return;
+      return false;
     }
-    
+
     try {
       await withRetry(() =>
         db.run(
           `INSERT INTO tmdb_cache (
-            cache_key, endpoint, request_params, response_data, created_at, expires_at, last_accessed
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            cache_key, endpoint, request_params, response_data, created_at, expires_at, last_accessed, etag
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(cache_key) DO UPDATE SET
             endpoint = excluded.endpoint,
             request_params = excluded.request_params,
             response_data = excluded.response_data,
             expires_at = excluded.expires_at,
-            last_accessed = excluded.last_accessed`,
+            last_accessed = excluded.last_accessed,
+            etag = excluded.etag`,
           [
             cacheKey,
             endpoint,
@@ -1439,12 +1478,17 @@ export async function setTmdbCache(endpoint, params = {}, responseData, ttlHours
             JSON.stringify(responseData),
             now.toISOString(),
             expiresAt.toISOString(),
-            now.toISOString()
+            now.toISOString(),
+            etag
           ]
         )
       );
+      // Explicit success signal (T-6): the cache-write telemetry derives its
+      // write-success attribute from this, so a void return would misreport.
+      return true;
     } catch (error) {
       console.error('Error setting TMDB cache:', error);
+      return false;
     }
   });
 }
