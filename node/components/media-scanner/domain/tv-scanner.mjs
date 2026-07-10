@@ -28,8 +28,9 @@ import {
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
-import { refreshMissingEpisodes } from '../../../lib/metadataGenerator.mjs';
-import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed } from '../../../utils/tmdbConfig.mjs';
+import { refreshMissingEpisodes, isFrozenReason } from '../../../lib/metadataGenerator.mjs';
+import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed, getMetadataOverrides } from '../../../utils/tmdbConfig.mjs';
+import { resolveCooldownAction } from './cooldown-policy.mjs';
 import { detectBackdropFocal } from '../../../utils/backdropFocalDetector.mjs';
 import {
   iterateConventions,
@@ -557,6 +558,25 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         ? await getLastModifiedTime(tmdbConfigPath)
         : null;
 
+      // Load the config content once per show (missing file → defaults with
+      // update_metadata: true). Reused by the retry gate, the backdrop-focal
+      // read, and both episode-backfill call sites below.
+      // loadTmdbConfig THROWS on unparseable JSON — tolerate it per show
+      // (warn-and-continue, matching the old fast-skip behavior) so one
+      // corrupt config can't abort every subsequent show plus the removal
+      // loop. Fail CLOSED on the freeze flag (§4.2): an unreadable config
+      // means the freeze state is unknown, so no TMDB write paths (images
+      // gate, episode backfill) may open off assumed defaults.
+      let tmdbConfig;
+      try {
+        tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      } catch (err) {
+        logger.warn(`Unparseable tmdb.config for ${showName}, treating as frozen this pass: ${err.message}`);
+        tmdbConfig = { update_metadata: false, backdrop_focal: null };
+      }
+      const updateAllowed = isUpdateAllowed(tmdbConfig);
+      const hasOverrides = getMetadataOverrides(tmdbConfig) !== null;
+
       // Process show assets (poster / logo / backdrop)
       const assetsResult = await processShowAssets({
         showPath,
@@ -591,10 +611,23 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         !missingDataShow ||
         ((now - new Date(missingDataShow.lastAttempt)) / (1000 * 60 * 60)) >= RETRY_INTERVAL_HOURS;
 
+      // Freeze-aware retry gates (Branch 3, §4.2 narrowed contract):
+      //  - images-missing consults the freeze flag so a frozen show with a
+      //    permanently missing image (e.g. TMDB has no logo) can't re-invoke
+      //    the generator every tick forever.
+      //  - metadata-missing opens for a frozen show ONLY when tmdb.config
+      //    carries metadata overrides — the one frozen case with real work
+      //    to do (_applyOverridesWhileFrozen), and it self-resolves by
+      //    writing metadata.json. A frozen show with no overrides is left
+      //    alone: since the post-attempt bookkeeping clears (not marks) its
+      //    cooldown row, an ungated branch would re-run the whole show every
+      //    tick forever. A config edit / unfreeze is still picked up
+      //    immediately — any tmdb.config write bumps its mtime, which flips
+      //    dirHashChanged and that term bypasses everything.
       let runDownloadTmdbImagesFlag =
         dirHashChanged ||
-        missingImages ||
-        (missingMetadata && metadataGateAllowsRetry);
+        (missingImages && updateAllowed) ||
+        (missingMetadata && metadataGateAllowsRetry && (updateAllowed || hasOverrides));
 
       // Fast-skip: nothing changed on disk AND nothing's missing AND we
       // aren't due for a metadata-cooldown retry. Equivalent to the old
@@ -613,11 +646,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           if (tmdbId) {
             const dbShow = await getTVShowByName(showName);
             if (dbShow?.seasons) {
-              // tmdb.config content isn't loaded on this branch (only its mtime,
-              // above, for staleness) — load it here, scoped inside the tmdbId +
-              // dbShow.seasons checks, so a fast-skipped show with no backfill
-              // candidate never pays this extra read.
-              const updateAllowed = isUpdateAllowed(await loadTmdbConfig(tmdbConfigPath));
+              // tmdb.config content + updateAllowed are hoisted once per show
+              // (top of the iteration) — reuse them, zero new I/O here.
               backfillWrote = (await backfillMissingEpisodes(showName, showPath, tmdbId, dbShow.seasons, new Date(), updateAllowed)) || 0;
             }
           }
@@ -651,11 +681,6 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // become silent no-ops, which keeps the log channel clean for
       // genuine retry activity.
       if (runDownloadTmdbImagesFlag) {
-        // Only persist a cooldown marker for the metadata-missing path.
-        // Images-only retries don't flip this gate.
-        if (missingMetadata) {
-          await markMediaAsMissingData(showName);
-        }
         // Pull the previously-managed file paths from the DB so the
         // reconcile step in MetadataGenerator can detect orphans (the path
         // we'd write now differs from the path we wrote last time). One
@@ -713,9 +738,6 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         });
         Object.assign(assetsResult, retryAssetsResult);
 
-        // Conservative clear: only when BOTH metadata and images are now
-        // present after the retry pass. Partial recovery leaves the marker
-        // in place so the next tick can finish the job.
         const retryMetadataResult = await processShowMetadata({
           showPath,
           showName,
@@ -723,7 +745,21 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           prefixPath,
           tmdbConfigLastModified,
         });
-        if (!retryAssetsResult.missingImages && !retryMetadataResult.missingMetadata) {
+
+        // Cooldown bookkeeping, decided AFTER the attempt from the generator's
+        // returned reason plus the post-attempt disk state. The full decision
+        // table lives in resolveCooldownAction (cooldown-policy.mjs); clears
+        // are skipped when no row exists (missingDataShow was null) to avoid
+        // a no-op DELETE per tick.
+        const cooldownAction = resolveCooldownAction({
+          metadataStillMissing: retryMetadataResult.missingMetadata,
+          imagesStillMissing: retryAssetsResult.missingImages,
+          frozen: isFrozenReason(downloadResult?.reason),
+          hasOverrides,
+        });
+        if (cooldownAction === 'mark') {
+          await markMediaAsMissingData(showName);
+        } else if (cooldownAction === 'clear' && missingDataShow) {
           await clearMissingMediaData(showName);
         }
 
@@ -778,10 +814,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // apples-to-apples on the next scan.
       const finalHash = await calculateDirectoryHash(showPath, TV_DIR_HASH_MAX_DEPTH);
 
-      // Load tmdb.config for manual focal override; auto-detect from backdrop.
-      // tmdbConfigPath was already computed earlier for the staleness check
-      // (top of the per-show iteration) — reuse it.
-      const tmdbConfig = await loadTmdbConfig(tmdbConfigPath);
+      // Manual focal override comes from the tmdb.config hoisted at the top of
+      // the per-show iteration — the generator only ever writes tmdb_id back,
+      // so backdrop_focal can't have moved since that read.
       const manualFocal = tmdbConfig.backdrop_focal ?? null;
       const backdropFocalSuggested = backdropFilePath ? await detectBackdropFocal(backdropFilePath) : null;
 
@@ -823,10 +858,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       try {
         const tmdbId = metadataResult.metadata ? JSON.parse(metadataResult.metadata)?.id : null;
         if (tmdbId) {
-          // tmdbConfig is already loaded above (line 779, for backdrop_focal) —
-          // reuse it, zero new I/O. Same update_metadata gate the generator
-          // itself enforces in generateForShow.
-          const updateAllowed = isUpdateAllowed(tmdbConfig);
+          // updateAllowed is hoisted once per show — same update_metadata gate
+          // the generator itself enforces in generateForShow.
           await backfillMissingEpisodes(showName, showPath, tmdbId, sortedSeasons, new Date(), updateAllowed);
         }
       } catch (err) {
@@ -910,11 +943,17 @@ async function backfillMissingEpisodes(showName, showPath, tmdbId, seasons, now,
 
   // 3. Persist the cooldown purely from the generator's outcomes (no schema here).
   //    A fresh WRITE (or an already-complete file) resolves the episode → clear any
-  //    cooldown row so it doesn't linger forever. Only a fetch that came back still
-  //    thin (or errored) stamps the cooldown to back off for EPISODE_MISSING_RETRY_DAYS.
+  //    cooldown row so it doesn't linger forever. An EXPIRED episode (past the
+  //    give-up window — the backfill will never retry it) gets its row pruned too,
+  //    but only when a row actually exists: `expired` stays true forever for a
+  //    permanently-thin old episode (TMDB has no still), so an unconditional
+  //    DELETE would be a per-tick write-transaction no-op for every such episode.
+  //    Only a fetch that came back still thin (or errored) stamps the cooldown to
+  //    back off for EPISODE_MISSING_RETRY_DAYS.
   let written = 0, retried = 0;
   for (const o of outcomes) {
-    if (o.written || o.resolved) {
+    if (o.written || o.resolved ||
+        (o.expired && lastAttemptOf.has(`${o.seasonNumber}|${o.episodeNumber}`))) {
       await clearEpisodeRetry(showName, o.seasonNumber, o.episodeNumber);
       if (o.written) written++;
     } else if (o.attempted) {

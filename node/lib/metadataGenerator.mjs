@@ -29,7 +29,8 @@ import {
 import {
   fetchComprehensiveMediaDetails,
   getEpisodeDetails,
-  makeTmdbRequest
+  makeTmdbRequest,
+  TmdbNoMatchError
 } from '../utils/tmdb.mjs';
 import {
   iterateConventions,
@@ -70,6 +71,42 @@ function isEpisodeBackfillDue({ airDate, lastAttempt, now }) {
   if (daysBetween(now, air) > EPISODE_MISSING_WINDOW_DAYS) return false;
   if (lastAttempt && daysBetween(now, new Date(lastAttempt)) < EPISODE_MISSING_RETRY_DAYS) return false;
   return true;
+}
+
+/**
+ * Generator-result reason strings for the frozen (`update_metadata: false`)
+ * outcomes. These are the generator's return contract with the scanners: the
+ * scanners' post-attempt cooldown bookkeeping branches on them via
+ * `isFrozenReason()` below, so they must only ever change in lockstep with it.
+ */
+export const REASON_UPDATES_DISABLED = 'updates-disabled';
+export const REASON_UPDATES_DISABLED_OVERRIDES_APPLIED = 'updates-disabled-overrides-applied';
+
+/**
+ * Did this generator result mean "the title is frozen" (paused by the
+ * operator) rather than "the attempt failed"? Single source of truth for the
+ * scanners — do not string-compare the reason values elsewhere.
+ *
+ * @param {string|null|undefined} reason - `result.reason` from
+ *   `generateForShow()` / `generateForMovie()`
+ * @returns {boolean}
+ */
+export function isFrozenReason(reason) {
+  return reason === REASON_UPDATES_DISABLED ||
+         reason === REASON_UPDATES_DISABLED_OVERRIDES_APPLIED;
+}
+
+/**
+ * Past the give-up window (air_date known and more than
+ * EPISODE_MISSING_WINDOW_DAYS ago)? Once true it stays true — the backfill
+ * will never fire again for this episode (the age-based refresh owns it), so
+ * the scanner should prune its cooldown row rather than orphan it.
+ */
+function isEpisodeBackfillExpired({ airDate, now }) {
+  if (!airDate) return false;
+  const air = new Date(airDate);
+  if (isNaN(air.getTime())) return false;
+  return (now - air) / 86400000 > EPISODE_MISSING_WINDOW_DAYS;
 }
 
 /**
@@ -131,9 +168,11 @@ export class MetadataGenerator {
     this.transactionId = randomUUID();
     this.logger = createCategoryLogger('metadata-generator');
     
-    this.logger.info('MetadataGenerator initialized', { 
+    // Debug: one instance is created per scanner-triggered invocation, so at
+    // info this line is pure per-invocation noise.
+    this.logger.debug('MetadataGenerator initialized', {
       transactionId: this.transactionId,
-      basePath: config.basePath 
+      basePath: config.basePath
     });
   }
 
@@ -489,7 +528,9 @@ export class MetadataGenerator {
   async generateForShow(showName, options = {}) {
     const { previousPaths = null } = options;
     const transactionId = randomUUID();
-    this.logger.info('Starting show metadata generation', {
+    // Debug: the invocation may turn out to be a frozen no-op; real work is
+    // announced by the info-level completion log below.
+    this.logger.debug('Starting show metadata generation', {
       showName,
       transactionId,
       forceRefresh: this.config.forceRefresh
@@ -518,10 +559,11 @@ export class MetadataGenerator {
         const { applied } = await this._applyOverridesWhileFrozen(metadataPath, tmdbConfig);
         if (applied) {
           this.logger.info(`Applied manual metadata overrides while updates disabled: ${showName}`, { transactionId });
-          return { success: true, updated: true, reason: 'updates-disabled-overrides-applied' };
+          return { success: true, updated: true, reason: REASON_UPDATES_DISABLED_OVERRIDES_APPLIED };
         }
-        this.logger.info(`Metadata updates disabled for show: ${showName}`, { transactionId });
-        return { success: true, updated: false, reason: 'updates-disabled' };
+        // Debug: frozen skips must stay quiet on per-tick paths.
+        this.logger.debug(`Metadata updates disabled for show: ${showName}`, { transactionId });
+        return { success: true, updated: false, reason: REASON_UPDATES_DISABLED };
       }
 
       // Get TMDB data (either fetch fresh or use existing ID for seasons/episodes)
@@ -645,11 +687,22 @@ export class MetadataGenerator {
       };
 
     } catch (error) {
-      this.logger.error(`Failed to generate metadata for show: ${showName}`, { 
-        transactionId, 
-        error: error.message 
+      this.logger.error(`Failed to generate metadata for show: ${showName}`, {
+        transactionId,
+        error: error.message
       });
-      return { success: false, error: error.message, transactionId };
+      // Classify the failure for the return contract: a typed no-match is a
+      // confirmed "TMDB has no such title"; everything else on the fetch path
+      // (network, HTTP, rate-limit) is transient. Both currently receive the
+      // same scanner-side 24h cooldown — the split exists so logs/consumers
+      // can tell the cases apart and so pacing can diverge later without
+      // another contract change.
+      return {
+        success: false,
+        error: error.message,
+        reason: error instanceof TmdbNoMatchError ? 'no-match' : 'transient-error',
+        transactionId
+      };
     }
   }
 
@@ -662,7 +715,9 @@ export class MetadataGenerator {
   async generateForMovie(movieName, options = {}) {
     const { previousPaths = null } = options;
     const transactionId = randomUUID();
-    this.logger.info('Starting movie metadata generation', {
+    // Debug: the invocation may turn out to be a frozen no-op; real work is
+    // announced by the info-level completion log below.
+    this.logger.debug('Starting movie metadata generation', {
       movieName,
       transactionId,
       forceRefresh: this.config.forceRefresh
@@ -682,10 +737,11 @@ export class MetadataGenerator {
         const { applied } = await this._applyOverridesWhileFrozen(metadataPath, tmdbConfig);
         if (applied) {
           this.logger.info(`Applied manual metadata overrides while updates disabled: ${movieName}`, { transactionId });
-          return { success: true, updated: true, reason: 'updates-disabled-overrides-applied' };
+          return { success: true, updated: true, reason: REASON_UPDATES_DISABLED_OVERRIDES_APPLIED };
         }
-        this.logger.info(`Metadata updates disabled for movie: ${movieName}`, { transactionId });
-        return { success: true, updated: false, reason: 'updates-disabled' };
+        // Debug: frozen skips must stay quiet on per-tick paths.
+        this.logger.debug(`Metadata updates disabled for movie: ${movieName}`, { transactionId });
+        return { success: true, updated: false, reason: REASON_UPDATES_DISABLED };
       }
 
       // Check if refresh is needed (unless forcing). When metadata is fresh
@@ -796,11 +852,18 @@ export class MetadataGenerator {
       };
 
     } catch (error) {
-      this.logger.error(`Failed to generate metadata for movie: ${movieName}`, { 
-        transactionId, 
-        error: error.message 
+      this.logger.error(`Failed to generate metadata for movie: ${movieName}`, {
+        transactionId,
+        error: error.message
       });
-      return { success: false, error: error.message, transactionId };
+      // Same classification as generateForShow: typed no-match vs transient
+      // (identical scanner pacing today; see the comment there).
+      return {
+        success: false,
+        error: error.message,
+        reason: error instanceof TmdbNoMatchError ? 'no-match' : 'transient-error',
+        transactionId
+      };
     }
   }
 
@@ -1189,16 +1252,17 @@ export class MetadataGenerator {
  * @param {Date} [opts.now=new Date()] - evaluation time for the due-gate
  * @param {boolean} [opts.generateBlurhash=true] - blurhash for any newly-downloaded thumbnail
  * @param {string} [opts.showName] - thumbnail bookkeeping / logging
- * @returns {Promise<Array<{seasonNumber:number, episodeNumber:number, attempted:boolean, written:boolean, resolved:boolean, airDate:string|null}>>}
+ * @returns {Promise<Array<{seasonNumber:number, episodeNumber:number, attempted:boolean, written:boolean, resolved:boolean, expired:boolean, airDate:string|null}>>}
  *   `resolved` = the on-disk file is no longer thin (scanner should clear its cooldown row);
- *   `attempted` = a TMDB fetch ran (scanner should stamp the cooldown).
+ *   `attempted` = a TMDB fetch ran (scanner should stamp the cooldown);
+ *   `expired` = past the give-up window, backfill will never retry (scanner should prune the cooldown row).
  */
 export async function refreshMissingEpisodes(tmdbId, candidates, opts = {}) {
   const { now = new Date(), generateBlurhash = true, showName = null } = opts;
   const results = [];
 
   for (const { seasonNumber, episodeNumber, seasonPath, lastAttempt = null } of candidates) {
-    const base = { seasonNumber, episodeNumber, attempted: false, written: false, resolved: false, airDate: null };
+    const base = { seasonNumber, episodeNumber, attempted: false, written: false, resolved: false, expired: false, airDate: null };
     try {
       // Confirm the file is actually thin (the scanner's proxy is a zero-I/O
       // approximation). A non-sparse file means it resolved already (e.g. the
@@ -1209,8 +1273,15 @@ export async function refreshMissingEpisodes(tmdbId, candidates, opts = {}) {
         continue;
       }
 
-      // air_date drives the gate; TBA / cooled-down / out-of-window → not yet.
+      // Past the give-up window → the due-gate below would say "not due"
+      // forever; surface that terminally so the scanner can prune the row.
       const airDate = existing?.air_date || null;
+      if (isEpisodeBackfillExpired({ airDate, now })) {
+        results.push({ ...base, expired: true, airDate });
+        continue;
+      }
+
+      // air_date drives the gate; TBA / cooled-down / future air → not yet.
       if (!isEpisodeBackfillDue({ airDate, lastAttempt, now })) {
         results.push({ ...base, airDate });
         continue;

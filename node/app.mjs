@@ -893,7 +893,10 @@ async function runDownloadTmdbImages({
   fullScan = false,
   previousPaths = null,
 } = {}) {
-  tmdbLogger.info(
+  // Debug: this fires once per scanner gate trigger, including invocations
+  // that resolve to a frozen no-op inside the generator. Real work is logged
+  // at info by the generator's own completion/summary lines.
+  tmdbLogger.debug(
     `Running TMDB image download via Node MetadataGenerator` +
     `${showName ? ` for show "${showName}"` : ''}` +
     `${movieName ? ` for movie "${movieName}"` : ''}` +

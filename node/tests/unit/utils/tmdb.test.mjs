@@ -56,7 +56,9 @@ const {
   getMediaRating,
   getTMDBImageURL,
   formatRuntime,
-  aggregateTopCast
+  aggregateTopCast,
+  fetchComprehensiveMediaDetails,
+  TmdbNoMatchError
 } = await import('../../../utils/tmdb.mjs');
 
 describe('TMDB Utility Functions', () => {
@@ -446,6 +448,47 @@ describe('TMDB Utility Functions', () => {
 
       expect(result.cast).toHaveLength(1);
       expect(result.recurring_cast).toHaveLength(0); // Empty array, not undefined
+    });
+  });
+
+  describe('fetchComprehensiveMediaDetails no-match classification', () => {
+    it('throws a typed TmdbNoMatchError when both name searches return zero results', async () => {
+      // Original name AND the year-stripped retry both come back empty.
+      axios.get.mockResolvedValue({
+        data: { results: [] },
+        status: 200,
+        headers: {}
+      });
+
+      let thrown;
+      try {
+        await fetchComprehensiveMediaDetails('No Such Movie (1999)', 'movie');
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(thrown).toBeInstanceOf(TmdbNoMatchError);
+      expect(thrown.name).toBe('TmdbNoMatchError');
+      expect(thrown.code).toBe('no-match');
+      expect(thrown.message).toMatch(/No results found for movie: No Such Movie \(1999\)/);
+      // Exactly the two search requests ran (original + year-stripped retry);
+      // the details fan-out was never reached.
+      expect(axios.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT use TmdbNoMatchError for HTTP/network failures (those stay generic)', async () => {
+      axios.get.mockRejectedValue(new Error('Request failed with status code 500'));
+
+      let thrown;
+      try {
+        await fetchComprehensiveMediaDetails('Flaky Movie (2001)', 'movie');
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(thrown).toBeDefined();
+      expect(thrown).not.toBeInstanceOf(TmdbNoMatchError);
+      expect(thrown.message).toMatch(/TMDB API request failed/);
     });
   });
 
