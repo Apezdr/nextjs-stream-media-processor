@@ -409,10 +409,13 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
           const destPath = path.join(mediaDir, fileName);
 
           if (!forceDownload && await pathExists(destPath)) {
-            // Skip download if file exists and not forcing
+            // Skip download if file exists and not forcing. `url` carries the
+            // CURRENT effective URL (not necessarily what the existing file was
+            // downloaded from) — consumers must treat it as adoption-quality
+            // provenance only (I-3: adopted when nothing better is stored).
             logger.debug(`${imageInfo.key} image already exists: ${fileName}`, logMeta);
             recordImageOutcome({ imageType: imageInfo.key, outcome: 'cache-hit', mediaType });
-            results[imageInfo.key] = { success: true, path: destPath, skipped: true, outcome: 'cache-hit' };
+            results[imageInfo.key] = { success: true, path: destPath, skipped: true, outcome: 'cache-hit', url: imageUrl };
             return;
           }
 
@@ -432,11 +435,14 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
               path: destPath,
               blurhash: result.blurhash,
               downloaded: true,
-              outcome: 'downloaded'
+              outcome: 'downloaded',
+              // True download provenance (I-3): the bytes at destPath came
+              // from exactly this URL.
+              url: imageUrl
             };
             logger.info(`Successfully downloaded ${imageInfo.key} image: ${fileName}`, logMeta);
           } else {
-            results[imageInfo.key] = { success: false, path: destPath, error: result.error, outcome: 'failed' };
+            results[imageInfo.key] = { success: false, path: destPath, error: result.error, outcome: 'failed', url: imageUrl };
             logger.warn(`Failed to download ${imageInfo.key} image: ${result.error}`, logMeta);
           }
         } catch (error) {

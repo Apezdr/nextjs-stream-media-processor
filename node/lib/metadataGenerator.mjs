@@ -160,6 +160,46 @@ function summarizeImageResults(...sources) {
 }
 
 /**
+ * Project a `downloadMediaImages()` results map down to the per-kind image
+ * source-URL updates the scanner persists into `*_source_url` (I-3). The
+ * columns record download PROVENANCE — the URL the on-disk file actually came
+ * from — not "the currently effective URL", so a pending stale-by-URL mismatch
+ * survives dry-run reconcile passes instead of being papered over.
+ *
+ * Per kind, in priority order:
+ *  - `downloaded`  → the download URL (true provenance).
+ *  - `cache-hit` with NOTHING stored (`previousSourceUrls` null for the kind)
+ *    → adopt the current effective URL. This is the one-time NULL-bootstrap
+ *    rule: pre-I-3 rows have no provenance, and "unknown" must converge by
+ *    adoption, never by treating NULL as a mismatch (which would judge every
+ *    image in the library stale on the first pass).
+ *  - anything else (`cache-hit` with a stored value, `failed`, `no-url`,
+ *    absent) → `null`, meaning "no new information — preserve what's stored"
+ *    (the upserts COALESCE per column).
+ *
+ * Exported for unit tests.
+ *
+ * @param {Object|null} imageResults - downloadMediaImages() results map
+ * @param {Object|null} previousSourceUrls - `{poster,backdrop,logo}` stored values
+ * @returns {{poster: ?string, backdrop: ?string, logo: ?string}|null}
+ */
+export function sourceUrlsFromImageResults(imageResults, previousSourceUrls = null) {
+  if (!imageResults) return null;
+  const out = {};
+  for (const imageKey of ['poster', 'backdrop', 'logo']) {
+    const result = imageResults[imageKey];
+    if (result?.outcome === 'downloaded' && result.url) {
+      out[imageKey] = result.url;
+    } else if (result?.outcome === 'cache-hit' && result.url && !previousSourceUrls?.[imageKey]) {
+      out[imageKey] = result.url;
+    } else {
+      out[imageKey] = null;
+    }
+  }
+  return out;
+}
+
+/**
  * MetadataGenerator - Main orchestrator for generating metadata files
  * Follows Node.js best practices with explicit initialization and business logic separation
  */
@@ -325,6 +365,8 @@ export class MetadataGenerator {
    * @param {Object} opts.tmdbConfig
    * @param {Object} opts.enhancedMetadata  - metadata.json with overrides applied
    * @param {Object|null} opts.previousPaths - { poster, backdrop, logo } from DB (null on first scan)
+   * @param {Object|null} opts.previousSourceUrls - { poster, backdrop, logo } stored
+   *   `*_source_url` provenance from DB (null on first scan / pre-I-3 rows)
    * @param {Date|null} opts.tmdbConfigLastModified
    * @param {string} opts.transactionId
    */
@@ -335,6 +377,7 @@ export class MetadataGenerator {
     tmdbConfig,
     enhancedMetadata,
     previousPaths,
+    previousSourceUrls = null,
     tmdbConfigLastModified,
     transactionId,
   }) {
@@ -407,6 +450,41 @@ export class MetadataGenerator {
           });
         }
       }
+
+      // 3) Stale by source URL (I-3): the DB-tracked file sits at the exact
+      //    expected path (same extension), but its recorded download
+      //    provenance differs from the current effective URL — a genuine
+      //    upstream TMDB art change (new CDN path, same extension) that the
+      //    two mtime-based checks above are structurally blind to. Delete so
+      //    the downloader re-fetches from the new URL.
+      //
+      //    NULL bootstrap rule (hard invariant): a NULL stored provenance
+      //    means "unknown — this row predates I-3", and MUST skip the
+      //    comparison. Treating NULL as a mismatch would judge every image in
+      //    the library stale on the first post-deploy pass and (in enforce
+      //    mode) wipe + re-download all of it. Unknown rows converge by
+      //    adoption instead (see sourceUrlsFromImageResults).
+      //
+      //    Same strict ownership check as branch 2: only a DB-tracked file at
+      //    the path we'd write now is ever deleted, so manual files at
+      //    non-canonical names stay untouched.
+      const previousSourceUrl = previousSourceUrls?.[imageKey] || null;
+      if (
+        previousSourceUrl &&
+        previousSourceUrl !== effectiveUrl &&
+        previousPath &&
+        previousPath === expectedPath &&
+        await pathExists(expectedPath)
+      ) {
+        await this._safeUnlinkOwned(expectedPath, 'stale-source-url', {
+          'media.name': mediaName,
+          'media.type': mediaType,
+          'image.type': imageKey,
+          'reconcile.previous_source_url': previousSourceUrl,
+          'reconcile.effective_url': effectiveUrl,
+          transactionId,
+        });
+      }
     }
   }
 
@@ -434,6 +512,7 @@ export class MetadataGenerator {
     tmdbConfig,
     transactionId,
     previousPaths = null,
+    previousSourceUrls = null,
   }) {
     try {
       const metadataPath = getMetadataFilePath(mediaDir);
@@ -462,6 +541,7 @@ export class MetadataGenerator {
         tmdbConfig,
         enhancedMetadata,
         previousPaths,
+        previousSourceUrls,
         tmdbConfigLastModified,
         transactionId,
       });
@@ -525,7 +605,7 @@ export class MetadataGenerator {
    * @returns {Promise<Object>} Generation results
    */
   async generateForShow(showName, options = {}) {
-    const { previousPaths = null } = options;
+    const { previousPaths = null, previousSourceUrls = null } = options;
     const transactionId = randomUUID();
     // Debug: the invocation may turn out to be a frozen no-op; real work is
     // announced by the info-level completion log below.
@@ -620,6 +700,7 @@ export class MetadataGenerator {
           tmdbConfig,
           enhancedMetadata,
           previousPaths,
+          previousSourceUrls,
           tmdbConfigLastModified,
           transactionId,
         });
@@ -707,6 +788,7 @@ export class MetadataGenerator {
           tmdbConfig,
           transactionId,
           previousPaths,
+          previousSourceUrls,
         });
       }
 
@@ -739,6 +821,10 @@ export class MetadataGenerator {
         // (G-5). The scanner persists it opaquely; null means "no fresh
         // payload — preserve whatever is stored".
         pristineMetadata,
+        // Per-kind image source-URL provenance updates (I-3): download URL on
+        // a real download, adoption on NULL-bootstrap cache-hits, null =
+        // preserve stored. The scanner persists this opaquely too.
+        sourceUrls: sourceUrlsFromImageResults(imageResults, previousSourceUrls),
         transactionId
       };
 
@@ -769,7 +855,7 @@ export class MetadataGenerator {
    * @returns {Promise<Object>} Generation results
    */
   async generateForMovie(movieName, options = {}) {
-    const { previousPaths = null } = options;
+    const { previousPaths = null, previousSourceUrls = null } = options;
     const transactionId = randomUUID();
     // Debug: the invocation may turn out to be a frozen no-op; real work is
     // announced by the info-level completion log below.
@@ -817,6 +903,7 @@ export class MetadataGenerator {
             tmdbConfig,
             transactionId,
             previousPaths,
+            previousSourceUrls,
           });
           const imageSummary = summarizeImageResults(imageResults || {});
           return {
@@ -825,6 +912,7 @@ export class MetadataGenerator {
             reason: 'up-to-date',
             imageResults: imageResults || {},
             imageSummary,
+            sourceUrls: sourceUrlsFromImageResults(imageResults, previousSourceUrls),
             transactionId,
           };
         }
@@ -871,6 +959,7 @@ export class MetadataGenerator {
         tmdbConfig,
         enhancedMetadata,
         previousPaths,
+        previousSourceUrls,
         tmdbConfigLastModified,
         transactionId,
       });
@@ -917,6 +1006,9 @@ export class MetadataGenerator {
         // Raw pre-override TMDB payload from THIS invocation's genuine fetch
         // (G-5). Absent/null on the frozen and up-to-date returns above.
         pristineMetadata,
+        // Per-kind image source-URL provenance updates (I-3); see the note in
+        // generateForShow's return.
+        sourceUrls: sourceUrlsFromImageResults(imageResults, previousSourceUrls),
         transactionId
       };
 
@@ -1283,12 +1375,12 @@ export class MetadataGenerator {
    *   safely no-ops for null previousPaths.
    * @returns {Promise<Object>} Result mirroring `generateForShow`/`generateForMovie`/`processDirectory`
    */
-  async generateImages({ showName = null, movieName = null, previousPaths = null } = {}) {
+  async generateImages({ showName = null, movieName = null, previousPaths = null, previousSourceUrls = null } = {}) {
     if (showName) {
-      return await this.generateForShow(showName, { previousPaths });
+      return await this.generateForShow(showName, { previousPaths, previousSourceUrls });
     }
     if (movieName) {
-      return await this.generateForMovie(movieName, { previousPaths });
+      return await this.generateForMovie(movieName, { previousPaths, previousSourceUrls });
     }
 
     // Full library refresh: TV first, then movies. previousPaths doesn't apply

@@ -511,6 +511,12 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // error) — the upsert then preserves the previously stored value.
       let pristineMetadata = null;
 
+      // Per-kind image source-URL provenance updates (I-3), carried opaquely
+      // from the generator's result to saveMovie. Null (whole object or per
+      // kind) means "no new information" — the upsert COALESCE-preserves the
+      // stored value per column.
+      let sourceUrls = null;
+
       // Download TMDB images if needed. The bypass log is emitted AFTER
       // the download attempt, conditional on actual work having happened
       // — items where TMDB has nothing to offer for the missing slot
@@ -526,6 +532,14 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
           backdrop: existingMovie.backdrop_file_path || null,
           logo:     existingMovie.logo_file_path || null,
         } : null;
+        // Stored download provenance for the reconcile step's
+        // stale-by-source-url check (I-3). NULL per kind = "unknown"
+        // (pre-I-3 row) — the generator skips the comparison and adopts.
+        const previousSourceUrls = existingMovie ? {
+          poster:   existingMovie.poster_source_url || null,
+          backdrop: existingMovie.backdrop_source_url || null,
+          logo:     existingMovie.logo_source_url || null,
+        } : null;
         // A tmdb.config edit (id change) forces a forceRefresh repull so the
         // generator wipes the previous id's images first, then re-downloads —
         // otherwise the downloader's existence check would leave the old id's
@@ -533,6 +547,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         const downloadResult = await downloadTMDBImages({
           movieName: dirName,
           previousPaths,
+          previousSourceUrls,
           fullScan: staleByConfig,
         });
 
@@ -540,6 +555,11 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         // schema awareness stays in MetadataGenerator. Non-null only when the
         // generator's genuine-fetch branch ran this invocation.
         pristineMetadata = downloadResult?.pristineMetadata ?? null;
+
+        // Opaque pass-through too (I-3): per-kind download provenance the
+        // generator decided this invocation. The scanner never inspects the
+        // URLs.
+        sourceUrls = downloadResult?.sourceUrls ?? null;
 
         // Post-condition observability: only log when the images-only
         // bypass produced real download or failure events. cache-hit /
@@ -666,7 +686,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         backdropFocalSuggested,
         imageHashes,
         metadataFingerprint,
-        pristineMetadata
+        pristineMetadata,
+        sourceUrls
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

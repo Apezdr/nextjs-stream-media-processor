@@ -690,7 +690,11 @@ export async function getTVShows() {
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
         // to /media/tv — the app.mjs handler allowlist drops it.
-        pristineMetadata: show.pristine_metadata ?? null
+        pristineMetadata: show.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        posterSourceUrl: show.poster_source_url ?? null,
+        backdropSourceUrl: show.backdrop_source_url ?? null,
+        logoSourceUrl: show.logo_source_url ?? null
       };
     });
 
@@ -772,7 +776,11 @@ export async function getMovies() {
         // the scanner's inline hash path will oscillate.
         metadata: movie.metadata,
         // `pristineMetadata` (G-5): raw pre-override TMDB payload, opaque.
-        pristineMetadata: movie.pristine_metadata ?? null
+        pristineMetadata: movie.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        posterSourceUrl: movie.poster_source_url ?? null,
+        backdropSourceUrl: movie.backdrop_source_url ?? null,
+        logoSourceUrl: movie.logo_source_url ?? null
       };
     });
 
@@ -847,7 +855,11 @@ export async function getMovieById(id) {
         // Internal-only: metadata fingerprint (F-1, verbatim column bytes —
         // see getMovies) + raw pre-override TMDB payload (G-5).
         metadata: movie.metadata,
-        pristineMetadata: movie.pristine_metadata ?? null
+        pristineMetadata: movie.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        posterSourceUrl: movie.poster_source_url ?? null,
+        backdropSourceUrl: movie.backdrop_source_url ?? null,
+        logoSourceUrl: movie.logo_source_url ?? null
       };
     }
     return null;
@@ -907,7 +919,13 @@ export async function getMovieByName(name) {
         // via getMovies(). Any divergence here re-opens the hash oscillation
         // (F-1). Canonical serialization lives in movie-scanner.mjs.
         metadata: movie.metadata,
-        pristineMetadata: movie.pristine_metadata ?? null
+        pristineMetadata: movie.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        // The movie scanner reads these back as previousSourceUrls for the
+        // reconcile step's stale-by-source-url check.
+        posterSourceUrl: movie.poster_source_url ?? null,
+        backdropSourceUrl: movie.backdrop_source_url ?? null,
+        logoSourceUrl: movie.logo_source_url ?? null
       };
     }
     return null;
@@ -957,7 +975,13 @@ export async function getTVShowById(id) {
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
-        pristineMetadata: show.pristine_metadata ?? null
+        pristineMetadata: show.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        // The TV scanner reads these back as previousSourceUrls for the
+        // reconcile step's stale-by-source-url check.
+        posterSourceUrl: show.poster_source_url ?? null,
+        backdropSourceUrl: show.backdrop_source_url ?? null,
+        logoSourceUrl: show.logo_source_url ?? null
       };
     }
     return null;
@@ -1001,7 +1025,13 @@ export async function getTVShowByName(name) {
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
-        pristineMetadata: show.pristine_metadata ?? null
+        pristineMetadata: show.pristine_metadata ?? null,
+        // Internal-only (I-3): per-kind image download provenance, opaque.
+        // The TV scanner reads these back as previousSourceUrls for the
+        // reconcile step's stale-by-source-url check.
+        posterSourceUrl: show.poster_source_url ?? null,
+        backdropSourceUrl: show.backdrop_source_url ?? null,
+        logoSourceUrl: show.logo_source_url ?? null
       };
     }
     return null;
@@ -1058,7 +1088,8 @@ export async function insertOrUpdateTVShow(
   backdropFocal = null,
   backdropFocalSuggested = null,
   imageHashes = null,
-  pristineMetadata = null
+  pristineMetadata = null,
+  sourceUrls = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1076,6 +1107,10 @@ export async function insertOrUpdateTVShow(
     // TMDB fetch (pristineMetadata === null) must carry the previously stored
     // pristine payload forward — hence the COALESCE on pristine_metadata
     // below. Never let an image-only or backfill rewrite null it out.
+    // The three *_source_url columns (I-3) follow the same rule per kind: a
+    // null update value means "no new provenance this pass — keep what's
+    // stored"; only a real download (or the one-time NULL-bootstrap adoption)
+    // supplies a value.
     await withRetry(() =>
       db.run(
         `INSERT INTO tv_shows (
@@ -1083,8 +1118,9 @@ export async function insertOrUpdateTVShow(
           backdrop, backdropBlurhash, seasons,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
-          directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata,
+          poster_source_url, backdrop_source_url, logo_source_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -1108,12 +1144,16 @@ export async function insertOrUpdateTVShow(
           directory_hash=excluded.directory_hash,
           backdrop_focal=excluded.backdrop_focal,
           backdrop_focal_suggested=excluded.backdrop_focal_suggested,
-          pristine_metadata=COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata)`,
+          pristine_metadata=COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata),
+          poster_source_url=COALESCE(excluded.poster_source_url, tv_shows.poster_source_url),
+          backdrop_source_url=COALESCE(excluded.backdrop_source_url, tv_shows.backdrop_source_url),
+          logo_source_url=COALESCE(excluded.logo_source_url, tv_shows.logo_source_url)`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
           posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
-          directoryHash, backdropFocal, backdropFocalSuggested, pristineMetadata
+          directoryHash, backdropFocal, backdropFocalSuggested, pristineMetadata,
+          sourceUrls?.poster ?? null, sourceUrls?.backdrop ?? null, sourceUrls?.logo ?? null
         ]
       )
     );
@@ -1140,7 +1180,8 @@ export async function insertOrUpdateMovie(
   backdropFocalSuggested = null,
   imageHashes = null,
   metadata = null,
-  pristineMetadata = null
+  pristineMetadata = null,
+  sourceUrls = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1180,10 +1221,13 @@ export async function insertOrUpdateMovie(
     };
 
     // Change-guard WHERE clause: the update is skipped when directory_hash is
-    // unchanged, with two backfill escape hatches for rows written before a
-    // column existed — backdrop_focal_suggested (focal migration) and metadata
+    // unchanged, with backfill escape hatches for rows written before a
+    // column existed — backdrop_focal_suggested (focal migration), metadata
     // (F-1 migration; fires only when the scanner actually has a fingerprint
-    // to store, so movies without metadata.json don't rewrite every pass).
+    // to store, so movies without metadata.json don't rewrite every pass),
+    // and the three *_source_url columns (I-3 bootstrap adoption; each fires
+    // only when this pass actually produced a provenance value for a
+    // still-NULL column, so converged rows never rewrite).
     // The metadata hatch is driven proactively: movie-scanner.mjs skips its
     // unchanged-directory early return once per row while movies.metadata is
     // NULL and a metadata.json exists (one-shot backfill), so pre-migration
@@ -1196,8 +1240,9 @@ export async function insertOrUpdateMovie(
           hdr, media_quality, additional_metadata, _id,
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
-          backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata,
+          poster_source_url, backdrop_source_url, logo_source_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           file_names=excluded.file_names,
           lengths=excluded.lengths,
@@ -1222,10 +1267,16 @@ export async function insertOrUpdateMovie(
           backdrop_focal=excluded.backdrop_focal,
           backdrop_focal_suggested=excluded.backdrop_focal_suggested,
           metadata=excluded.metadata,
-          pristine_metadata=COALESCE(excluded.pristine_metadata, movies.pristine_metadata)
+          pristine_metadata=COALESCE(excluded.pristine_metadata, movies.pristine_metadata),
+          poster_source_url=COALESCE(excluded.poster_source_url, movies.poster_source_url),
+          backdrop_source_url=COALESCE(excluded.backdrop_source_url, movies.backdrop_source_url),
+          logo_source_url=COALESCE(excluded.logo_source_url, movies.logo_source_url)
         WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
         OR movies.backdrop_focal_suggested IS NULL
-        OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)`,
+        OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)
+        OR (movies.poster_source_url IS NULL AND excluded.poster_source_url IS NOT NULL)
+        OR (movies.backdrop_source_url IS NULL AND excluded.backdrop_source_url IS NOT NULL)
+        OR (movies.logo_source_url IS NULL AND excluded.logo_source_url IS NOT NULL)`,
         [
           name,
           movie.file_names,
@@ -1251,7 +1302,10 @@ export async function insertOrUpdateMovie(
           backdropFocal,
           backdropFocalSuggested,
           metadata,
-          pristineMetadata
+          pristineMetadata,
+          sourceUrls?.poster ?? null,
+          sourceUrls?.backdrop ?? null,
+          sourceUrls?.logo ?? null
         ]
       )
     );

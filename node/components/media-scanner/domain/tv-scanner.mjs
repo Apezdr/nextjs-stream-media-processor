@@ -698,6 +698,12 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // previously stored value forward instead of nulling it.
       let pristineMetadata = null;
 
+      // Per-kind image source-URL provenance updates (I-3), carried opaquely
+      // from the generator's result to saveTVShow. Null (whole object or per
+      // kind) means "no new information" — the upsert COALESCE-preserves the
+      // stored value per column.
+      let sourceUrls = null;
+
       // Download TMDB images if needed. The bypass log is emitted AFTER
       // the download attempt, conditional on actual work having happened
       // — items where TMDB has nothing to offer for the missing slot
@@ -716,6 +722,14 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           backdrop: existingShow.backdropFilePath || null,
           logo:     existingShow.logoFilePath || null,
         } : null;
+        // Stored download provenance for the reconcile step's
+        // stale-by-source-url check (I-3). NULL per kind = "unknown"
+        // (pre-I-3 row) — the generator skips the comparison and adopts.
+        const previousSourceUrls = existingShow ? {
+          poster:   existingShow.posterSourceUrl || null,
+          backdrop: existingShow.backdropSourceUrl || null,
+          logo:     existingShow.logoSourceUrl || null,
+        } : null;
         // A tmdb.config edit (id change) forces a full per-show refresh so the
         // generator bypasses the season-poster/thumbnail/episode-metadata
         // existence/age gates and repulls everything for the new id — a normal
@@ -724,6 +738,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         const downloadResult = await downloadTMDBImages({
           showName,
           previousPaths,
+          previousSourceUrls,
           fullScan: metadataResult.staleByConfig,
         });
 
@@ -731,6 +746,11 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         // schema awareness stays in MetadataGenerator. Non-null only when the
         // generator's genuine show-level fetch branch ran this invocation.
         pristineMetadata = downloadResult?.pristineMetadata ?? null;
+
+        // Opaque pass-through too (I-3): per-kind download provenance the
+        // generator decided this invocation. The scanner never inspects the
+        // URLs.
+        sourceUrls = downloadResult?.sourceUrls ?? null;
 
         // Post-condition observability: only log when the images-only
         // bypass produced real download or failure events. cache-hit /
@@ -868,7 +888,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         manualFocal,
         backdropFocalSuggested,
         imageHashes,
-        pristineMetadata
+        pristineMetadata,
+        sourceUrls
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

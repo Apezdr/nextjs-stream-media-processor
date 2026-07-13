@@ -96,6 +96,10 @@ export async function getMissingMediaData() {
  * @param {string|null} [pristineMetadata] - Raw pre-override TMDB payload from
  *   a genuine fetch (opaque string; G-5). Null when no fetch happened this
  *   pass — the upsert then preserves the previously stored value.
+ * @param {Object|null} [sourceUrls] - Per-kind `{poster,backdrop,logo}` image
+ *   source-URL provenance updates from the generator (I-3). Null per kind (or
+ *   as a whole) means "no new information" — the upsert COALESCE-preserves
+ *   the stored column value. This layer never inspects the URLs.
  * @returns {Promise<void>}
  */
 export async function saveMovie(
@@ -118,7 +122,8 @@ export async function saveMovie(
   backdropFocalSuggested = null,
   imageHashes = null,
   metadata = null,
-  pristineMetadata = null
+  pristineMetadata = null,
+  sourceUrls = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -140,7 +145,8 @@ export async function saveMovie(
     backdropFocalSuggested,
     imageHashes,
     metadata,
-    pristineMetadata
+    pristineMetadata,
+    sourceUrls
   );
 }
 
@@ -170,6 +176,10 @@ export async function saveMovie(
  *   a genuine fetch (opaque string; G-5). Null when no fetch happened this
  *   pass — the upsert then carries the previously stored value forward
  *   (the TV upsert always rewrites, so preservation lives in its SQL).
+ * @param {Object|null} [sourceUrls] - Per-kind `{poster,backdrop,logo}` image
+ *   source-URL provenance updates from the generator (I-3). Null per kind (or
+ *   as a whole) means "no new information" — the upsert COALESCE-preserves
+ *   the stored column value. This layer never inspects the URLs.
  * @returns {Promise<void>}
  */
 export async function saveTVShow(
@@ -191,7 +201,8 @@ export async function saveTVShow(
   backdropFocal = null,
   backdropFocalSuggested = null,
   imageHashes = null,
-  pristineMetadata = null
+  pristineMetadata = null,
+  sourceUrls = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -212,7 +223,8 @@ export async function saveTVShow(
     backdropFocal,
     backdropFocalSuggested,
     imageHashes,
-    pristineMetadata
+    pristineMetadata,
+    sourceUrls
   );
 }
 
