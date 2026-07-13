@@ -53,16 +53,23 @@ router.post('/discord/events', express.raw({ type: 'application/json' }), async 
 });
 ```
 
-**Option 3: Detection and Conversion**
+**Option 3: Detection and Conversion — rejected and removed**
 ```javascript
-// Handle pre-parsed bodies
+// Handle pre-parsed bodies (DO NOT DO THIS)
 let rawBody = req.body;
 if (!Buffer.isBuffer(rawBody)) {
   rawBody = Buffer.from(JSON.stringify(rawBody), 'utf8');
 }
 ```
 
-⚠️ **Warning**: Option 3 can fail because JSON.stringify() may reorder object keys, changing the byte sequence and invalidating the signature.
+⚠️ **Warning**: Option 3 cannot work reliably — JSON.stringify() may reorder
+object keys, changing the byte sequence and invalidating the signature.
+
+**As-built (D-1 + residual cleanup, 2026-07-12):** Options 1 AND 2 are both
+implemented — app.mjs skips the global JSON parser for `/api/discord/events`
+and the route applies `express.raw()`, so `req.body` is always the exact raw
+Buffer. The Option-3 fallback that used to live in routes.mjs was dead code
+after D-1 (unreachable, and never correct) and has been deleted.
 
 ---
 

@@ -5,12 +5,18 @@ const logger = createCategoryLogger('caption-config');
 
 const SETTING_NAME = 'autoCaptions';
 
+// C-2: no `maxConcurrent` field here, deliberately. Caption concurrency is
+// owned SOLELY by the hardcoded limit in lib/taskManager.mjs
+// (concurrencyLimits[TaskType.CAPTION_GENERATE]); a config field that looks
+// authoritative but is never read is worse than none. A deployed Mongo doc
+// that still carries the old field passes through the merge below harmlessly
+// — nothing reads it. If per-deployment tuning is ever wanted, build it
+// through a task-manager setter, never a second reader of this config.
 const DEFAULTS = Object.freeze({
   enabled: false,
   languages: ['en'],
   model: 'base.en',
-  threads: 4,
-  maxConcurrent: 1
+  threads: 4
 });
 
 /**

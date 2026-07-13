@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   calculateDirectoryHash,
@@ -9,6 +9,7 @@ import {
 } from '../../../utils/utils.mjs';
 import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
+import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
   getExistingMovies,
@@ -36,7 +37,18 @@ import {
 const logger = createCategoryLogger('movie-scanner');
 
 /**
- * Helper function to generate chapter files if they don't exist
+ * Helper function to generate chapter files if they don't exist.
+ * Writes the generated VTT content to disk, mirroring the working TV helper
+ * in tv-scanner.mjs (C-1 — this was historically a silent no-op: it passed
+ * the quietMode boolean into generateChapters' chapterData parameter, which
+ * short-circuited the probe and discarded the returned VTT string). Movies
+ * without chapter atoms (chapterInfo → null) write nothing; the lazy
+ * /chapters/movie/:movieName route remains the on-demand fallback.
+ *
+ * Ordering constraint (hard): scanMovies must call this (via processChapters)
+ * BEFORE computing final_hash — calculateDirectoryHash recurses into
+ * chapters/, so the stored hash must already include the new VTT or every
+ * pregeneration would re-trigger dirHashChanged on the following tick.
  * @param {string} chaptersPath - Path to chapters file
  * @param {string} mediaPath - Path to media file
  * @param {boolean} quietMode - Whether to suppress logging
@@ -44,7 +56,16 @@ const logger = createCategoryLogger('movie-scanner');
 async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode = false) {
   if (!(await fileExists(chaptersPath))) {
     try {
-      await generateChapters(mediaPath, quietMode);
+      const chapterData = await chapterInfo(mediaPath);
+      if (chapterData) {
+        // Create the chapters directory if it doesn't exist
+        await fs.mkdir(dirname(chaptersPath), { recursive: true });
+        const chapterContent = await generateChapters(mediaPath, chapterData);
+        await fs.writeFile(chaptersPath, chapterContent);
+        if (!quietMode) {
+          logger.info(`Generated chapter file: ${chaptersPath}`);
+        }
+      }
     } catch (error) {
       logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
     }
