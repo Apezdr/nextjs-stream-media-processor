@@ -10,6 +10,7 @@ import { createHash } from 'crypto';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import PQueue from 'p-queue';
 import { generateBlurhash } from './blurhashNative.mjs';
+import { sidecarBlurhashSizeForFilename } from './blurhashSizePolicy.mjs';
 const logger = createCategoryLogger('utility');
 //const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
 
@@ -635,21 +636,10 @@ export async function getStoredBlurhash(imagePath, basePath) {
     return relativeUrl;
   }
 
-  // OPTIMIZATION: Detect image type from filename for appropriate sizing
-  // backdrop/show_backdrop → 'small' (16px, ~8-12KB)
-  // poster/show_poster → 'medium' (24px, ~12-18KB)
-  // thumbnail → 'small' (16px, ~8-12KB)
-  // logo/show_logo → 'large' (32px, ~25-35KB)
-  const fileName = imagePath.toLowerCase();
-  let blurhashSize = 'large'; // Default
-  
-  if (fileName.includes('backdrop') || fileName.includes('thumbnail')) {
-    blurhashSize = 'small';
-  } else if (fileName.includes('poster')) {
-    blurhashSize = 'medium';
-  } else if (fileName.includes('logo')) {
-    blurhashSize = 'large';
-  }
+  // Encode size comes from the shared sidecar policy (B-2b), derived from the
+  // filename since this lazy path has no imageType in hand — same table the
+  // download-time writer uses, so the two sidecar pipelines cannot drift.
+  const blurhashSize = sidecarBlurhashSizeForFilename(imagePath);
 
   // Generate the blurhash via the native Node.js implementation. The previous
   // Python `blurhash_cli.py` fallback was removed when the TMDB workflow

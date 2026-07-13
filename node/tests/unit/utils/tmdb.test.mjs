@@ -59,7 +59,8 @@ const {
   formatRuntime,
   aggregateTopCast,
   fetchComprehensiveMediaDetails,
-  TmdbNoMatchError
+  TmdbNoMatchError,
+  pickSearchResultByYear
 } = await import('../../../utils/tmdb.mjs');
 
 describe('TMDB Utility Functions', () => {
@@ -524,6 +525,48 @@ describe('TMDB Utility Functions', () => {
       expect(topCast[0].id).toBe(100);
       expect(topCast[0].appearances).toBe(2);
       expect(topCast[0].characters).toHaveLength(2);
+    });
+  });
+
+  describe('pickSearchResultByYear (T-3 year heuristic)', () => {
+    const movie = (id, releaseDate) => ({ id, release_date: releaseDate });
+    const show = (id, firstAirDate) => ({ id, first_air_date: firstAirDate });
+
+    it('returns the popularity-first result when the name carries no year', () => {
+      const results = [movie(1, '2010-06-01'), movie(2, '1994-01-01')];
+      expect(pickSearchResultByYear(results, 'Some Movie', 'movie').id).toBe(1);
+    });
+
+    it('prefers an exact year match over a more popular non-matching result', () => {
+      // The classic wrong-match case: a popular remake outranks the original.
+      const results = [movie(1, '2019-11-08'), movie(2, '1976-06-18')];
+      expect(pickSearchResultByYear(results, 'Midway (1976)', 'movie').id).toBe(2);
+    });
+
+    it('takes the most popular result among multiple exact-year matches', () => {
+      const results = [movie(1, '2020-01-01'), movie(2, '2020-12-31'), movie(3, '2020-06-15')];
+      expect(pickSearchResultByYear(results, 'Duplicate (2020)', 'movie').id).toBe(1);
+    });
+
+    it('falls back to a ±1-year match when no exact year exists', () => {
+      // Regional release dates / December premieres straddle the folder year.
+      const results = [movie(1, '2005-03-01'), movie(2, '2011-01-14')];
+      expect(pickSearchResultByYear(results, 'Straddler (2010)', 'movie').id).toBe(2);
+    });
+
+    it('falls back to the popularity-first result when nothing is within ±1 year', () => {
+      const results = [movie(1, '1999-01-01'), movie(2, '2003-01-01')];
+      expect(pickSearchResultByYear(results, 'Nowhere Close (2015)', 'movie').id).toBe(1);
+    });
+
+    it('uses first_air_date for tv and tolerates missing/malformed dates', () => {
+      const results = [show(1, undefined), show(2, 'not-a-date'), show(3, '2008-01-20')];
+      expect(pickSearchResultByYear(results, 'Breaking Bad (2008)', 'tv').id).toBe(3);
+    });
+
+    it('never manufactures a match: single result with wrong year still wins (fallback)', () => {
+      const results = [movie(9, '1990-05-05')];
+      expect(pickSearchResultByYear(results, 'Lonely (2024)', 'movie').id).toBe(9);
     });
   });
 });

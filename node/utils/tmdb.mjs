@@ -711,6 +711,55 @@ export const getEpisodeImages = async (
 };
 
 /**
+ * T-3: pick the best name-search result using the `(YYYY)` year embedded in
+ * the directory name (a first-class part of the naming convention — the
+ * year-strip retry below already treats it as such).
+ *
+ * Selection order, always within TMDB's popularity-sorted result order:
+ *   1. exact release/first-air-date year match
+ *   2. ±1 year match (regional release dates and December/January premieres
+ *      routinely straddle the folder-name year)
+ *   3. the popularity-sorted first result (pre-T-3 behavior), also used when
+ *      the name carries no year at all
+ *
+ * This only ever runs for titles with no pinned `tmdb_id` — the
+ * `updateTmdbConfigWithId()` add-only ratchet pins the id on first match, so
+ * already-matched titles never re-enter this path (their result cannot flip).
+ * The heuristic reorders *which* result wins; it never manufactures a match
+ * for an empty result set (the no-match contract is unchanged).
+ *
+ * Exported for unit tests.
+ *
+ * @param {Array<Object>} results - Non-empty TMDB search results (popularity order)
+ * @param {string} name - Directory name, possibly carrying "(YYYY)"
+ * @param {string} type - 'movie' or 'tv' (selects release_date vs first_air_date)
+ * @returns {Object} The chosen result
+ */
+export function pickSearchResultByYear(results, name, type) {
+  const yearToken = name.match(/\((\d{4})\)/);
+  if (!yearToken) return results[0];
+  const wantedYear = parseInt(yearToken[1], 10);
+
+  const yearOf = (result) => {
+    const date = type === "tv" ? result.first_air_date : result.release_date;
+    if (!date) return null;
+    const year = parseInt(String(date).slice(0, 4), 10);
+    return Number.isNaN(year) ? null : year;
+  };
+
+  const exact = results.find((result) => yearOf(result) === wantedYear);
+  if (exact) return exact;
+
+  const near = results.find((result) => {
+    const year = yearOf(result);
+    return year !== null && Math.abs(year - wantedYear) === 1;
+  });
+  if (near) return near;
+
+  return results[0];
+}
+
+/**
  * Fetch comprehensive media details including cast, trailer, logo, and rating
  * Similar to the Python script's fetch_tmdb_media_details function
  * @param {string} name - Media name for search
@@ -727,7 +776,9 @@ export const fetchComprehensiveMediaDetails = async (
 ) => {
   let id = tmdbId;
 
-  // If no TMDB ID provided, search for it
+  // If no TMDB ID provided, search for it. Result selection goes through the
+  // T-3 year heuristic (see pickSearchResultByYear above); the year always
+  // comes from the ORIGINAL name, including on the year-stripped retry.
   if (!id) {
     const searchResults = await searchMedia(type, name);
     if (!searchResults.results || searchResults.results.length === 0) {
@@ -737,9 +788,9 @@ export const fetchComprehensiveMediaDetails = async (
       if (!retryResults.results || retryResults.results.length === 0) {
         throw new TmdbNoMatchError(`No results found for ${type}: ${name}`);
       }
-      id = retryResults.results[0].id;
+      id = pickSearchResultByYear(retryResults.results, name, type).id;
     } else {
-      id = searchResults.results[0].id;
+      id = pickSearchResultByYear(searchResults.results, name, type).id;
     }
   }
 

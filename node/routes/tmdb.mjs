@@ -303,13 +303,14 @@ router.get('/collection/images', authenticateUser, rateLimiter, async (req, res)
   }
 });
 
-// Admin-only endpoint to get TMDB configuration
-// Naming-collision note (A-4b): this is the GLOBAL TMDB client/cache status
-// resource (GET /api/tmdb/config). The unrelated per-title `tmdb.config`
-// editor is GET/PUT /api/admin/metadata/config in routes/admin.mjs. Decided
-// 2026-07-07 (A-4a): one of the two names will change; until then these
-// cross-references are the disambiguation.
-router.get('/config', authenticateUser, requireAdmin, async (req, res) => {
+// Admin-only endpoint reporting global TMDB integration status.
+// A-4a (implemented): this route was GET /api/tmdb/config, which collided by
+// name with the unrelated per-title `tmdb.config` editor at
+// GET/PUT /api/admin/metadata/config (routes/admin.mjs). The read-only global
+// resource was renamed to /status — it *is* a status report, and it sits
+// naturally beside /api/tmdb/health. Breaking change by decision (no alias);
+// external callers of the old path get the router's 404.
+router.get('/status', authenticateUser, requireAdmin, async (req, res) => {
   try {
     const cacheStats = await getTmdbCacheStats();
 
@@ -318,7 +319,9 @@ router.get('/config', authenticateUser, requireAdmin, async (req, res) => {
       base_url: 'https://api.themoviedb.org/3',
       image_base_url: 'https://image.tmdb.org/t/p/original',
       rate_limits: {
-        requests_per_minute: 100,
+        // Matches the actual createRateLimiter(800, 60000) on these routes
+        // (historically misreported as 100).
+        requests_per_minute: 800,
         window_ms: 60000
       },
       cache: {
@@ -329,8 +332,8 @@ router.get('/config', authenticateUser, requireAdmin, async (req, res) => {
       }
     });
   } catch (error) {
-    logger.error('Config error:', error);
-    res.status(500).json({ error: 'Failed to fetch configuration' });
+    logger.error('Status error:', error);
+    res.status(500).json({ error: 'Failed to fetch TMDB status' });
   }
 });
 

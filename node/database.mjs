@@ -135,11 +135,19 @@ export async function checkAutoSync() {
     // Try to find the autoSync setting
     let autoSyncSetting = await settings.findOne({ name: "autoSync" });
 
-    // If it doesn't exist, initialize it to true
+    // If it doesn't exist, initialize it to true.
+    // M-4 revert-detection audit line: app_config.settings self-heals to
+    // defaults when a document is missing, so on an ESTABLISHED deployment
+    // this warn firing means the operator's stored setting was lost (wipe /
+    // stale-backup restore) and silently reverted — exactly the signature the
+    // audit trail exists to catch. On a genuinely fresh install it is normal
+    // first-boot seeding. Grep marker: "app_config.settings audit".
     if (!autoSyncSetting) {
       await settings.insertOne({ name: "autoSync", value: true });
       autoSyncSetting = { value: true };
-      logger.info("Auto Sync setting initialized to true.");
+      logger.warn(
+        'app_config.settings audit: seeded default document (name="autoSync", value=true) — expected on first boot only; on an established deployment this indicates a settings loss/revert'
+      );
     }
 
     // Check the value of autoSync

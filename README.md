@@ -11,6 +11,15 @@
 - LOG_PATH=<your_log_path>
 - DEBUG=TRUE  # Set this to TRUE to enable debugging logs, or omit it/set to false to disable logging
 
+### MongoDB durability & backups
+
+Almost all of this backend's state is derived and rebuildable (SQLite mirrors the filesystem; caches regenerate). Exactly two MongoDB areas are **non-derivable** and must be covered by an external backup/snapshot policy:
+
+- the **auth database** (`MONGODB_AUTH_DB`, default `Users`) — real user identities and sessions, written by the Next.js frontend and only read here;
+- the **`app_config` database** — admin-customized settings (`autoSync`, `autoCaptions`, …).
+
+`app_config.settings` documents **self-heal to hardcoded defaults** when missing: convenient on first boot, dangerous afterward — a wipe or a restore from a stale backup silently reverts deliberate admin customization with no error. As a revert-detection audit trail, the backend logs a warn-level `app_config.settings audit: seeded default document …` line every time it seeds a default; seeing that line on an established deployment means stored settings were lost. Deliberate setting *changes* are written by the frontend, so a full change-audit would live there — this backend can only witness the loss/reseed signature.
+
 ### AVIF Configuration (for low-resource servers)
 
 - ENABLE_AVIF_CONVERSION=false  # Disable AVIF conversion to prevent server stalls on low-resource servers
