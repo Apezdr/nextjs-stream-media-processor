@@ -106,11 +106,18 @@ New document, default-inserted on first boot in
     enabled: false,                 // master switch (default off — opt-in)
     languages: ["en"],              // allowed target languages
     model: "base.en",               // whisper.cpp model name (no .bin, no ggml- prefix)
-    threads: 4,                     // whisper-cli -t
-    maxConcurrent: 1                // queue depth, enforced by taskManager
+    threads: 4                      // whisper-cli -t
   }
 }
 ```
+
+> **Correction (C-2, 2026-07-12):** this plan originally included a
+> `maxConcurrent` field described as "queue depth, enforced by taskManager".
+> That was never true as-built — nothing ever read the field, and it has been
+> removed from the config defaults. Caption concurrency is owned solely by the
+> hardcoded `concurrencyLimits[TaskType.CAPTION_GENERATE] = 1` in
+> `node/lib/taskManager.mjs`. Any future per-deployment tuning must go through
+> a task-manager setter, never a second reader of this config.
 
 Helper in `data-access/caption-config.mjs`:
 
@@ -292,8 +299,10 @@ parse correctly) and **fully backward-compatible** — existing files with no
 8. **Cleanup** — remove temp WAV. Update last-success timestamp in the
    in-memory health state.
 
-Concurrency: `concurrencyLimits[TaskType.CAPTION_GENERATE] = config.maxConcurrent`
-(default 1, configurable). **Add to the existing exclusivity group** at
+Concurrency: `concurrencyLimits[TaskType.CAPTION_GENERATE] = 1`, hardcoded in
+the task manager (see the C-2 correction in §4 — the once-planned
+`config.maxConcurrent` wiring was never built and the field is removed).
+**Add to the existing exclusivity group** at
 [taskManager.mjs:42](node/lib/taskManager.mjs#L42)? No — caption gen does not
 touch the DB or read whole library trees, so it can run alongside scans. Leave
 it independent.

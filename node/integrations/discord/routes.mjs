@@ -44,26 +44,15 @@ router.post('/discord/events', express.raw({ type: 'application/json' }), async 
       return res.status(401).json({ error: 'Missing signature' });
     }
     
-    // Verify the request signature (must use raw buffer, not string)
-    let rawBody = req.body;
-    
-    // Check if body is a Buffer, if not, convert it
-    if (!Buffer.isBuffer(rawBody)) {
-      logger.warn('⚠️ Body is not a Buffer, converting...');
-      logger.warn(`Body type: ${typeof rawBody}`);
-      
-      if (typeof rawBody === 'string') {
-        rawBody = Buffer.from(rawBody, 'utf8');
-      } else if (typeof rawBody === 'object') {
-        rawBody = Buffer.from(JSON.stringify(rawBody), 'utf8');
-      } else {
-        logger.error('❌ Cannot convert body to Buffer');
-        return res.status(400).send('Invalid request body');
-      }
-    }
-    
-    logger.info(`Body is Buffer: ${Buffer.isBuffer(rawBody)}, length: ${rawBody.length} bytes`);
-    
+    // Verify the request signature over the exact raw bytes. The route-level
+    // express.raw() always yields a Buffer here because the global JSON
+    // parser in app.mjs explicitly skips this path (D-1) — the old
+    // re-stringify fallback that lived here could never reproduce the exact
+    // signed bytes anyway and is gone (D-1 residual). Any future
+    // body-consuming global middleware must preserve the app.mjs carve-out,
+    // or verification below fails for ALL events.
+    const rawBody = req.body;
+
     const isValid = await verifyKey(rawBody, signature, timestamp, publicKey);
     
     if (!isValid) {
