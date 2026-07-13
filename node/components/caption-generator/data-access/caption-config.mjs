@@ -30,7 +30,13 @@ export async function getAutoCaptionsConfig() {
   let doc = await settings.findOne({ name: SETTING_NAME });
   if (!doc) {
     await settings.insertOne({ name: SETTING_NAME, value: { ...DEFAULTS } });
-    logger.info(`autoCaptions setting initialized with defaults (enabled=${DEFAULTS.enabled})`);
+    // M-4 revert-detection audit line (see the matching note in
+    // database.mjs checkAutoSync): normal on first boot, a settings
+    // loss/revert signal on an established deployment. Grep marker:
+    // "app_config.settings audit".
+    logger.warn(
+      `app_config.settings audit: seeded default document (name="${SETTING_NAME}", enabled=${DEFAULTS.enabled}) — expected on first boot only; on an established deployment this indicates a settings loss/revert`
+    );
     doc = { value: { ...DEFAULTS } };
   }
 
