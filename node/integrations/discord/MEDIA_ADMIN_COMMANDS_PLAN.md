@@ -1,4 +1,18 @@
-# Discord Media Administration Commands - Implementation Plan
+# Discord Media Administration Commands — PROPOSAL / BACKLOG (not built)
+
+> **⚠️ Status correction (D-2, 2026-07-13).** This document is a **design
+> proposal, not a record of finished work**. An earlier revision marked its
+> entire 17-item implementation checklist complete; a git-history audit found
+> that only the `/tasks` command (and the `getAdminByDiscordId()` admin-auth
+> helper it relies on) ever shipped — none of the `/media` subcommands, the
+> `routes/mediaAdmin.mjs` router, the ServerApiClient media methods, or the
+> autocomplete/pagination infrastructure described below exist in the
+> codebase. `node/integrations/discord/commands/` contains only `ping`,
+> `help`, `status`, and `tasks`. The checklist under "Implementation
+> Priority" now reflects reality. The design remains available if
+> Discord-driven media administration is revisited (see the Radarr/Sonarr
+> media-management direction in `docs/BACKEND_OPEN_QUESTIONS.md`); nothing
+> here may be cited as shipped behavior.
 
 ## Overview
 
@@ -768,30 +782,33 @@ const isAdmin = await getAdminByDiscordId(discordUserId) ||
 
 ## Implementation Priority
 
+Checklist corrected 2026-07-13 (D-2) to reflect what actually exists in git
+history — see the status banner at the top of this document.
+
 ### Phase 1: Core Infrastructure (Week 1)
-1. ✅ Create backend API endpoints for media operations
-2. ✅ Implement file system operations (read/write tmdb.config)
-3. ✅ Add admin authentication middleware
-4. ✅ Extend ServerApiClient with media methods
-5. ✅ Create `/tasks` command
+1. ❌ Create backend API endpoints for media operations *(routes/mediaAdmin.mjs was never created)*
+2. ❌ Implement file system operations (read/write tmdb.config) *(exists in `utils/tmdbConfig.mjs` for the scanner/admin routes, but the Discord-facing wiring described here was never built)*
+3. 🟡 Add admin authentication middleware *(the `getAdminByDiscordId()` helper exists in `database.mjs` and gates `/tasks`; the planned reusable middleware layer does not)*
+4. ❌ Extend ServerApiClient with media methods
+5. ✅ Create `/tasks` command *(the one shipped item — `commands/tasks.mjs`)*
 
 ### Phase 2: Basic Media Commands (Week 2)
-6. ✅ Implement `/media list` command
-7. ✅ Implement `/media info` command
-8. ✅ Implement `/media set-id` command
-9. ✅ Implement `/media toggle-updates` command
+6. ❌ Implement `/media list` command
+7. ❌ Implement `/media info` command
+8. ❌ Implement `/media set-id` command
+9. ❌ Implement `/media toggle-updates` command
 
 ### Phase 3: Advanced Features (Week 3)
-10. ✅ Implement `/media search-tmdb` with buttons
-11. ✅ Implement `/media refresh` command
-12. ✅ Implement `/media override` and `/media remove-override`
-13. ✅ Add autocomplete for media names
+10. ❌ Implement `/media search-tmdb` with buttons
+11. ❌ Implement `/media refresh` command
+12. ❌ Implement `/media override` and `/media remove-override`
+13. ❌ Add autocomplete for media names
 
 ### Phase 4: Bulk Operations (Week 4)
-14. ✅ Implement `/media bulk-scan` command
-15. ✅ Add pagination for list views
-16. ✅ Comprehensive testing
-17. ✅ Documentation updates
+14. ❌ Implement `/media bulk-scan` command
+15. ❌ Add pagination for list views
+16. ❌ Comprehensive testing
+17. ❌ Documentation updates
 
 ## File Structure
 
