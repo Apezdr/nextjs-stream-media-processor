@@ -902,15 +902,21 @@ async function runGeneratePosterCollage() {
  *   step in MetadataGenerator to detect orphans (previously-managed file
  *   path differs from what the current URL would produce). Null is safe —
  *   reconcile no-ops the orphan branch when previousPaths is null.
+ * @param {Object|null} [options.previousSourceUrls=null] - `{ poster, backdrop, logo }`
+ *   stored `*_source_url` download provenance from the scanner's DB row (I-3).
+ *   Used by reconcile to detect upstream URL changes (stale-by-source-url) and
+ *   by the generator to decide per-kind provenance updates. Null is safe —
+ *   NULL provenance means "unknown" and skips the comparison (bootstrap rule).
  * @returns {Promise<Object>} Result from `MetadataGenerator.generateImages`,
  *   includes per-image-type outcomes the scanner uses for post-condition
- *   logging.
+ *   logging, plus the `sourceUrls` provenance updates to persist.
  */
 async function runDownloadTmdbImages({
   showName = null,
   movieName = null,
   fullScan = false,
   previousPaths = null,
+  previousSourceUrls = null,
 } = {}) {
   // Debug: this fires once per scanner gate trigger, including invocations
   // that resolve to a frozen no-op inside the generator. Real work is logged
@@ -929,7 +935,7 @@ async function runDownloadTmdbImages({
       generateBlurhash: true,
     });
 
-    return await generator.generateImages({ showName, movieName, previousPaths });
+    return await generator.generateImages({ showName, movieName, previousPaths, previousSourceUrls });
   } catch (error) {
     tmdbLogger.error(`TMDB image download failed: ${error.message}`);
     throw error;

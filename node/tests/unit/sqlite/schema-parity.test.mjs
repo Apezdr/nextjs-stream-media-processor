@@ -11,6 +11,9 @@
  *  - pristine_metadata preservation (G-5): a save without a fresh payload
  *    keeps the prior value, on BOTH the movie change-guard path and the TV
  *    always-rewrite path.
+ *  - *_source_url persistence (I-3): per-column COALESCE preservation on both
+ *    upserts, plus the movie change-guard's bootstrap escape hatch (a
+ *    provenance value for a still-NULL column lands on an unchanged directory).
  *
  * Uses the MEDIA_DB_DIRECTORY test seam so the real node/db files are never
  * touched. The seam must be set BEFORE sqliteDatabase.mjs is imported (the
@@ -385,5 +388,90 @@ describe('pristine_metadata preservation (G-5)', () => {
 
     await save('{"id":11,"name":"v3"}', '{"raw":"P2"}');
     expect((await sqliteDb.getTVShowByName(NAME)).pristineMetadata).toBe('{"raw":"P2"}');
+  });
+});
+
+describe('image source-url provenance persistence (I-3)', () => {
+  const CDN = 'https://image.tmdb.org/t/p/original';
+
+  it('movie: per-column COALESCE — a null update preserves each stored URL independently', async () => {
+    const NAME = 'Provenance Movie (2024)';
+    const save = (directoryHash, sourceUrls) => sqliteDb.insertOrUpdateMovie(
+      NAME, ['movie.mp4'], {}, {}, { mp4: '/a.mp4' }, '', directoryHash, null, null, {}, 'tmdb_21',
+      null, null, null, null, null, '{"x":0.5,"y":0.5}', null,
+      '{"id":21}', null, sourceUrls
+    );
+
+    await save('h1', { poster: `${CDN}/p1.jpg`, backdrop: `${CDN}/b1.jpg`, logo: null });
+    let row = await sqliteDb.getMovieByName(NAME);
+    expect(row.posterSourceUrl).toBe(`${CDN}/p1.jpg`);
+    expect(row.backdropSourceUrl).toBe(`${CDN}/b1.jpg`);
+    expect(row.logoSourceUrl).toBeNull();
+
+    // Changed directory, no new provenance at all → both stored URLs survive.
+    await save('h2', null);
+    row = await sqliteDb.getMovieByName(NAME);
+    expect(row.posterSourceUrl).toBe(`${CDN}/p1.jpg`);
+    expect(row.backdropSourceUrl).toBe(`${CDN}/b1.jpg`);
+
+    // Per-kind update: only the poster re-downloaded this pass — the backdrop
+    // column must not be nulled by the poster's update.
+    await save('h3', { poster: `${CDN}/p2.jpg`, backdrop: null, logo: null });
+    row = await sqliteDb.getMovieByName(NAME);
+    expect(row.posterSourceUrl).toBe(`${CDN}/p2.jpg`);
+    expect(row.backdropSourceUrl).toBe(`${CDN}/b1.jpg`);
+  });
+
+  it('movie: bootstrap escape hatch lands adoption on an UNCHANGED directory, and converged rows stop rewriting', async () => {
+    const NAME = 'Adoption Movie (2024)';
+    const save = (urls, sourceUrls) => sqliteDb.insertOrUpdateMovie(
+      NAME, [], {}, {}, urls, '', 'h1', null, null, {}, null,
+      null, null, null, null, null, '{"x":0.5,"y":0.5}', null,
+      '{"id":22}', null, sourceUrls
+    );
+
+    // Pre-I-3-shaped row: no provenance stored.
+    await save({ mp4: '/a.mp4' }, null);
+    expect((await sqliteDb.getMovieByName(NAME)).posterSourceUrl).toBeNull();
+
+    // Same directory_hash, but this pass adopted a URL for the NULL column →
+    // the (poster_source_url IS NULL AND excluded IS NOT NULL) hatch fires.
+    await save({ mp4: '/a.mp4' }, { poster: `${CDN}/adopted.jpg`, backdrop: null, logo: null });
+    expect((await sqliteDb.getMovieByName(NAME)).posterSourceUrl).toBe(`${CDN}/adopted.jpg`);
+
+    // Converged: same hash, same adoption value → no hatch is satisfied, the
+    // guard blocks the whole update (urls stay stale), and provenance holds.
+    await save({ mp4: '/CHANGED.mp4' }, { poster: `${CDN}/adopted.jpg`, backdrop: null, logo: null });
+    const row = await sqliteDb.getMovieByName(NAME);
+    expect(row.urls.mp4).toBe('/a.mp4');
+    expect(row.posterSourceUrl).toBe(`${CDN}/adopted.jpg`);
+  });
+
+  it('tv: the always-rewrite upsert COALESCE-preserves each stored URL independently', async () => {
+    const NAME = 'Provenance Show';
+    const save = (metadata, sourceUrls) => sqliteDb.insertOrUpdateTVShow(
+      NAME, metadata, '/tv/Provenance%20Show/metadata.json',
+      null, null, null, null, null, null, {},
+      null, null, null, null, 'dirhash-tv', null, null, null,
+      null, sourceUrls
+    );
+
+    await save('{"id":31,"name":"v1"}', { poster: `${CDN}/p1.jpg`, backdrop: null, logo: `${CDN}/l1.svg` });
+    let row = await sqliteDb.getTVShowByName(NAME);
+    expect(row.posterSourceUrl).toBe(`${CDN}/p1.jpg`);
+    expect(row.logoSourceUrl).toBe(`${CDN}/l1.svg`);
+
+    // The rewrite happens (metadata moves), provenance carries forward.
+    await save('{"id":31,"name":"v2"}', null);
+    row = await sqliteDb.getTVShowByName(NAME);
+    expect(row.metadata).toBe('{"id":31,"name":"v2"}');
+    expect(row.posterSourceUrl).toBe(`${CDN}/p1.jpg`);
+    expect(row.logoSourceUrl).toBe(`${CDN}/l1.svg`);
+
+    // Per-kind replacement leaves the other columns alone.
+    await save('{"id":31,"name":"v3"}', { poster: `${CDN}/p2.jpg`, backdrop: null, logo: null });
+    row = await sqliteDb.getTVShowByName(NAME);
+    expect(row.posterSourceUrl).toBe(`${CDN}/p2.jpg`);
+    expect(row.logoSourceUrl).toBe(`${CDN}/l1.svg`);
   });
 });
