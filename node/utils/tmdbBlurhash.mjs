@@ -9,6 +9,7 @@ import {
   clearExpiredTmdbBlurhashCacheWithDb
 } from '../sqlite/tmdbBlurhashCache.mjs';
 import { generateBlurhashFromBuffer, BLURHASH_X_COMPONENTS, BLURHASH_Y_COMPONENTS } from './blurhashNative.mjs';
+import { TMDB_PROXY_BLURHASH_SIZES } from './blurhashSizePolicy.mjs';
 import pLimit from 'p-limit';
 
 const logger = createCategoryLogger('tmdb-blurhash');
@@ -176,7 +177,7 @@ export async function generateTmdbImageBlurhash(imageUrl, size = 'large') {
  * @returns {Promise<string|null>} - Small base64 encoded blurhash
  */
 export async function generateSmallTmdbImageBlurhash(imageUrl) {
-  return await generateTmdbImageBlurhash(imageUrl, 'small');
+  return await generateTmdbImageBlurhash(imageUrl, TMDB_PROXY_BLURHASH_SIZES.searchResultPoster);
 }
 
 /**
@@ -234,27 +235,27 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
     
     // Process main poster/backdrop/logo if present
     if (enhancedResponse.poster_path) {
-      const posterUrl = getTMDBImageURL(enhancedResponse.poster_path, tmdbSizeForBlurhash('large'));
-      const posterBlurhash = await generateTmdbImageBlurhash(posterUrl);
+      // Sizes come from the shared policy module (B-2b); the details-poster
+      // 'large' is a named, deliberate divergence from the sidecar policy.
+      const posterUrl = getTMDBImageURL(enhancedResponse.poster_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.detailsPoster));
+      const posterBlurhash = await generateTmdbImageBlurhash(posterUrl, TMDB_PROXY_BLURHASH_SIZES.detailsPoster);
       if (posterBlurhash) {
         enhancedResponse.poster_blurhash = posterBlurhash;
       }
     }
     
     if (enhancedResponse.backdrop_path) {
-      // OPTIMIZATION: Use 'small' size for backdrops (w92, 16px preview)
-      // Backdrops are typically blurred backgrounds, so small size is sufficient
-      // Reduces blurhash size from ~30KB to ~8-12KB (60-70% reduction)
-      const backdropUrl = getTMDBImageURL(enhancedResponse.backdrop_path, tmdbSizeForBlurhash('small'));
-      const backdropBlurhash = await generateTmdbImageBlurhash(backdropUrl, 'small');
+      // 'small' (w92, 16px preview): backdrops are blurred backgrounds.
+      const backdropUrl = getTMDBImageURL(enhancedResponse.backdrop_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.detailsBackdrop));
+      const backdropBlurhash = await generateTmdbImageBlurhash(backdropUrl, TMDB_PROXY_BLURHASH_SIZES.detailsBackdrop);
       if (backdropBlurhash) {
         enhancedResponse.backdrop_blurhash = backdropBlurhash;
       }
     }
     
     if (enhancedResponse.logo_path) {
-      const logoUrl = getTMDBImageURL(enhancedResponse.logo_path, tmdbSizeForBlurhash('large'));
-      const logoBlurhash = await generateTmdbImageBlurhash(logoUrl);
+      const logoUrl = getTMDBImageURL(enhancedResponse.logo_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.detailsLogo));
+      const logoBlurhash = await generateTmdbImageBlurhash(logoUrl, TMDB_PROXY_BLURHASH_SIZES.detailsLogo);
       if (logoBlurhash) {
         enhancedResponse.logo_blurhash = logoBlurhash;
       }
@@ -262,15 +263,13 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
     
     // Process images collection if present (for /images endpoint)
     if (endpoint.includes('/images') && enhancedResponse.backdrops) {
-      // OPTIMIZATION: Use 'medium' size for backdrop collections (w300, 50px preview)
-      // Reduces total data transfer for multiple backdrop images by 60-70%
       enhancedResponse.backdrops = await mapLimit(
         enhancedResponse.backdrops,
         enhanceConcurrency,
         async (backdrop) => {
           if (!backdrop.file_path) return backdrop;
-          const imageUrl = getTMDBImageURL(backdrop.file_path, tmdbSizeForBlurhash('medium'));
-          const blurhash = await generateTmdbImageBlurhash(imageUrl, 'medium');
+          const imageUrl = getTMDBImageURL(backdrop.file_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.imagesBackdropCollection));
+          const blurhash = await generateTmdbImageBlurhash(imageUrl, TMDB_PROXY_BLURHASH_SIZES.imagesBackdropCollection);
           return blurhash ? { ...backdrop, blurhash } : backdrop;
         }
       );
@@ -283,8 +282,8 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
         enhanceConcurrency,
         async (poster) => {
           if (!poster.file_path) return poster;
-          const imageUrl = getTMDBImageURL(poster.file_path, tmdbSizeForBlurhash('large'));
-          const blurhash = await generateTmdbImageBlurhash(imageUrl);
+          const imageUrl = getTMDBImageURL(poster.file_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.imagesPosterCollection));
+          const blurhash = await generateTmdbImageBlurhash(imageUrl, TMDB_PROXY_BLURHASH_SIZES.imagesPosterCollection);
           return blurhash ? { ...poster, blurhash } : poster;
         }
       );
@@ -297,8 +296,8 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
         enhanceConcurrency,
         async (logo) => {
           if (!logo.file_path) return logo;
-          const imageUrl = getTMDBImageURL(logo.file_path, tmdbSizeForBlurhash('large'));
-          const blurhash = await generateTmdbImageBlurhash(imageUrl);
+          const imageUrl = getTMDBImageURL(logo.file_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.imagesLogoCollection));
+          const blurhash = await generateTmdbImageBlurhash(imageUrl, TMDB_PROXY_BLURHASH_SIZES.imagesLogoCollection);
           return blurhash ? { ...logo, blurhash } : logo;
         }
       );
@@ -314,18 +313,17 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
           const enhancedPart = { ...part };
           
           if (enhancedPart.poster_path) {
-            const posterUrl = getTMDBImageURL(enhancedPart.poster_path, tmdbSizeForBlurhash('large'));
-            const posterBlurhash = await generateTmdbImageBlurhash(posterUrl);
+            const posterUrl = getTMDBImageURL(enhancedPart.poster_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.collectionPartPoster));
+            const posterBlurhash = await generateTmdbImageBlurhash(posterUrl, TMDB_PROXY_BLURHASH_SIZES.collectionPartPoster);
             if (posterBlurhash) {
               enhancedPart.poster_blurhash = posterBlurhash;
             }
           }
-          
+
           if (enhancedPart.backdrop_path) {
-            // OPTIMIZATION: Use 'small' size for collection part backdrops (w92, 16px preview)
-            // Collection parts typically display many items, so smaller size improves performance
-            const backdropUrl = getTMDBImageURL(enhancedPart.backdrop_path, tmdbSizeForBlurhash('small'));
-            const backdropBlurhash = await generateTmdbImageBlurhash(backdropUrl, 'small');
+            // 'small': collection parts display many items at once.
+            const backdropUrl = getTMDBImageURL(enhancedPart.backdrop_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.collectionPartBackdrop));
+            const backdropBlurhash = await generateTmdbImageBlurhash(backdropUrl, TMDB_PROXY_BLURHASH_SIZES.collectionPartBackdrop);
             if (backdropBlurhash) {
               enhancedPart.backdrop_blurhash = backdropBlurhash;
             }
@@ -348,8 +346,8 @@ export async function enhanceTmdbResponseWithBlurhash(response, endpoint) {
           
           // Only process poster for search results (50% faster than including backdrop)
           if (enhancedResult.poster_path) {
-            const posterUrl = getTMDBImageURL(enhancedResult.poster_path, tmdbSizeForBlurhash('small'));
-            const posterBlurhash = await generateSmallTmdbImageBlurhash(posterUrl);
+            const posterUrl = getTMDBImageURL(enhancedResult.poster_path, tmdbSizeForBlurhash(TMDB_PROXY_BLURHASH_SIZES.searchResultPoster));
+            const posterBlurhash = await generateTmdbImageBlurhash(posterUrl, TMDB_PROXY_BLURHASH_SIZES.searchResultPoster);
             if (posterBlurhash) {
               enhancedResult.poster_blurhash = posterBlurhash;
             }

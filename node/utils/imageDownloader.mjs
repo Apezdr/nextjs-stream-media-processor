@@ -9,6 +9,7 @@ import { extractFileExtension, touchFile, pathExists, getFileAgeDays } from './f
 import { generateBlurhash } from './blurhashNative.mjs';
 import { withApiRequestSpan, recordImageOutcome } from '../lib/apiTracer.mjs';
 import { getConvention, resolveEffectiveImageUrl } from '../components/media-scanner/domain/image-conventions.mjs';
+import { sidecarBlurhashSizeForImageType } from './blurhashSizePolicy.mjs';
 
 const logger = createCategoryLogger('image-downloader');
 
@@ -196,14 +197,10 @@ export async function downloadImageWithBlurhash(imageUrl, destPath, options = {}
     skipExistsCheck = false
   } = options;
   
-  // OPTIMIZATION: Size blurhashes based on image type and usage
-  // - backdrop / episode-thumbnail: 'small' (16px preview, ~8-12KB) - blurred backgrounds, 16:9
-  // - poster / season-poster:        'medium' (24px preview, ~12-18KB) - balanced
-  // - logo:                          'large' (32px preview, ~25-35KB) - needs more detail
-  const blurhashSize =
-    (imageType === 'backdrop' || imageType === 'episode-thumbnail') ? 'small' :
-    (imageType === 'poster' || imageType === 'season-poster') ? 'medium' :
-    'large';
+  // Encode size comes from the shared sidecar policy (B-2b) — the single
+  // source both sidecar writers draw from, so this pipeline and the lazy
+  // getStoredBlurhash() path cannot drift apart again.
+  const blurhashSize = sidecarBlurhashSizeForImageType(imageType);
 
   try {
     const blurhashPath = `${destPath}.blurhash`;
