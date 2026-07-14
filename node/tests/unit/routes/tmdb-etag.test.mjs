@@ -81,8 +81,18 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
-  fetchComprehensiveMediaDetails.mockReset();
-  getMediaCast.mockReset();
+  for (const fn of [
+    fetchComprehensiveMediaDetails,
+    getMediaDetails,
+    getMediaCast,
+    getMediaVideos,
+    getMediaImages,
+    getMediaRating,
+    getEpisodeDetails,
+    getEpisodeImages,
+  ]) {
+    fn.mockReset();
+  }
 });
 
 const getComprehensive = (headers = {}) =>
@@ -232,5 +242,41 @@ describe('GET /api/tmdb/comprehensive/:type content ETag', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'Either name or tmdb_id parameter is required' });
     expect(fetchComprehensiveMediaDetails).not.toHaveBeenCalled();
+  });
+});
+
+describe('content ETag on the other single-resource TMDB GET endpoints', () => {
+  it('revalidates a bare-array payload (/cast) with a 304', async () => {
+    const cast = [{ id: 6384, name: 'Keanu Reeves', character: 'Neo' }];
+    getMediaCast.mockResolvedValue(cast);
+
+    const first = await fetch(`${baseUrl}/api/tmdb/cast/movie?tmdb_id=603`);
+    expect(first.status).toBe(200);
+    const etag = first.headers.get('etag');
+    expect(etag).toMatch(/^W\/"[0-9a-f]{32}"$/);
+    const body = await first.json();
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toEqual(cast);
+
+    const replay = await fetch(`${baseUrl}/api/tmdb/cast/movie?tmdb_id=603`, {
+      headers: { 'If-None-Match': etag },
+    });
+    expect(replay.status).toBe(304);
+    expect(await replay.text()).toBe('');
+  });
+
+  it.each([
+    ['/details/movie?tmdb_id=603', getMediaDetails, () => cacheHitShape()],
+    ['/videos/movie?tmdb_id=603', getMediaVideos, () => ({ trailer_url: 'https://youtu.be/x', videos: [] })],
+    ['/images/movie?tmdb_id=603', getMediaImages, () => ({ logo_path: null, backdrops: [], posters: [], logos: [] })],
+    ['/rating/movie?tmdb_id=603', getMediaRating, () => ({ rating: 'R' })],
+    ['/episode?tmdb_id=1399&season=1&episode=1', getEpisodeDetails, () => cacheHitShape()],
+    ['/episode/images?tmdb_id=1399&season=1&episode=1', getEpisodeImages, () => ({ thumbnail_url: null, stills: [] })],
+  ])('emits a weak content ETag on %s', async (path, mock, payload) => {
+    mock.mockResolvedValue(payload());
+
+    const res = await fetch(`${baseUrl}/api/tmdb${path}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('etag')).toMatch(/^W\/"[0-9a-f]{32}"$/);
   });
 });

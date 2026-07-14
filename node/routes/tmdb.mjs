@@ -151,7 +151,7 @@ router.get('/details/:type', authenticateUser, rateLimiter, async (req, res) => 
     const data = await getMediaDetails(type, tmdb_id, includeBlurhash);
     
     logger.info(`User ${req.user.email} requested ${type} details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(data);
+    return sendJsonWithETag(req, res, data);
   } catch (error) {
     logger.error('Details error:', error);
     res.status(400).json({ error: error.message });
@@ -171,7 +171,7 @@ router.get('/cast/:type', authenticateUser, rateLimiter, async (req, res) => {
     const cast = await getMediaCast(type, tmdb_id);
     
     logger.info(`User ${req.user.email} requested cast for ${type} ID: ${tmdb_id}`);
-    res.json(cast);
+    return sendJsonWithETag(req, res, cast);
   } catch (error) {
     logger.error('Cast error:', error);
     res.status(400).json({ error: error.message });
@@ -212,7 +212,7 @@ router.get('/videos/:type', authenticateUser, rateLimiter, async (req, res) => {
     const videos = await getMediaVideos(type, tmdb_id);
     
     logger.info(`User ${req.user.email} requested videos for ${type} ID: ${tmdb_id}`);
-    res.json(videos);
+    return sendJsonWithETag(req, res, videos);
   } catch (error) {
     logger.error('Videos error:', error);
     res.status(400).json({ error: error.message });
@@ -233,7 +233,7 @@ router.get('/images/:type', authenticateUser, rateLimiter, async (req, res) => {
     const images = await getMediaImages(type, tmdb_id, includeBlurhash);
     
     logger.info(`User ${req.user.email} requested images for ${type} ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(images);
+    return sendJsonWithETag(req, res, images);
   } catch (error) {
     logger.error('Images error:', error);
     res.status(400).json({ error: error.message });
@@ -253,7 +253,7 @@ router.get('/rating/:type', authenticateUser, rateLimiter, async (req, res) => {
     const rating = await getMediaRating(type, tmdb_id);
     
     logger.info(`User ${req.user.email} requested rating for ${type} ID: ${tmdb_id}`);
-    res.json(rating);
+    return sendJsonWithETag(req, res, rating);
   } catch (error) {
     logger.error('Rating error:', error);
     res.status(400).json({ error: error.message });
@@ -272,7 +272,7 @@ router.get('/episode', authenticateUser, rateLimiter, async (req, res) => {
     const data = await getEpisodeDetails(tmdb_id, season, episode);
     
     logger.info(`User ${req.user.email} requested episode details: ${tmdb_id} S${season}E${episode}`);
-    res.json(data);
+    return sendJsonWithETag(req, res, data);
   } catch (error) {
     logger.error('Episode error:', error);
     res.status(400).json({ error: error.message });
@@ -292,7 +292,7 @@ router.get('/episode/images', authenticateUser, rateLimiter, async (req, res) =>
     const images = await getEpisodeImages(tmdb_id, season, episode, includeBlurhash);
     
     logger.info(`User ${req.user.email} requested episode images: ${tmdb_id} S${season}E${episode}${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(images);
+    return sendJsonWithETag(req, res, images);
   } catch (error) {
     logger.error('Episode images error:', error);
     res.status(400).json({ error: error.message });
