@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, createRateLimiter, requireAdmin, requireFullAccess } from '../middleware/auth.mjs';
@@ -31,6 +32,41 @@ const logger = createCategoryLogger('tmdb-api');
 
 // Create rate limiter middleware (800 requests per minute)
 const rateLimiter = createRateLimiter(800, 60000);
+
+/**
+ * Send a JSON payload with a content-derived ETag and honor If-None-Match.
+ *
+ * Callers polling these endpoints (the Next.js proxy revalidates with
+ * If-None-Match on every request) get a bodyless 304 when the payload is
+ * unchanged, instead of re-downloading the full response each time.
+ *
+ * Cache bookkeeping fields (_cached/_cachedAt/_expiresAt) are excluded from
+ * the hash so the ETag stays stable across fresh fetches and SQLite cache
+ * hits of the same underlying payload; the ETag is weak for the same reason —
+ * equivalent responses can still differ byte-for-byte in those fields.
+ */
+function sendJsonWithETag(req, res, data) {
+  const stablePayload = { ...(data ?? {}) };
+  delete stablePayload._cached;
+  delete stablePayload._cachedAt;
+  delete stablePayload._expiresAt;
+
+  const hash = crypto.createHash('md5').update(JSON.stringify(stablePayload)).digest('hex');
+  const etag = `W/"${hash}"`;
+
+  res.set('ETag', etag);
+
+  const ifNoneMatch = req.headers['if-none-match'];
+  if (ifNoneMatch) {
+    const normalize = (tag) => tag.trim().replace(/^W\//, '');
+    const matches = ifNoneMatch.split(',').some((tag) => normalize(tag) === normalize(etag));
+    if (matches) {
+      return res.status(304).end();
+    }
+  }
+
+  return res.json(data);
+}
 
 /**
  * Initialize and configure TMDB API routes
@@ -70,9 +106,9 @@ router.get('/comprehensive/:type', authenticateUser, rateLimiter, async (req, re
     
     const includeBlurhash = blurhash === 'true';
     const data = await fetchComprehensiveMediaDetails(name, type, tmdb_id, includeBlurhash);
-    
+
     logger.info(`User ${req.user.email} requested comprehensive ${type} details for: ${name || `ID ${tmdb_id}`}${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(data);
+    return sendJsonWithETag(req, res, data);
   } catch (error) {
     logger.error('Comprehensive details error:', error);
     res.status(400).json({ error: error.message });
