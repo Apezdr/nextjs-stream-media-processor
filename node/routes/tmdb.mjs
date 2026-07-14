@@ -40,18 +40,40 @@ const rateLimiter = createRateLimiter(800, 60000);
  * If-None-Match on every request) get a bodyless 304 when the payload is
  * unchanged, instead of re-downloading the full response each time.
  *
- * Cache bookkeeping fields (_cached/_cachedAt/_expiresAt) are excluded from
- * the hash so the ETag stays stable across fresh fetches and SQLite cache
- * hits of the same underlying payload; the ETag is weak for the same reason —
- * equivalent responses can still differ byte-for-byte in those fields.
+ * The hash input excludes fields that differ between content-identical
+ * responses, so the ETag stays stable across fresh fetches, SQLite cache
+ * hits, and TMDB 304 re-ups of the same underlying payload:
+ *   - _cached/_cachedAt/_expiresAt/_etag/_notModified — makeTmdbRequest's
+ *     cache bookkeeping, which takes a different shape on each of its three
+ *     paths (cache hit / fresh fetch / TMDB 304 re-up); the same set
+ *     fileUtils strips before persisting metadata.
+ *   - last_updated — THIS SERVER's per-request assembly stamp
+ *     (getMediaDetails/getEpisodeDetails/fetchComprehensiveMediaDetails),
+ *     not a TMDB field. If TMDB ever ships a content field with this name,
+ *     rename our stamp rather than removing the entry.
+ *
+ * INVARIANT: this list may only ever name server-stamped fields — stripping
+ * a real TMDB content field would produce false 304s and pin stale data in
+ * client caches. A missed volatile field merely degrades to extra 200s.
+ *
+ * Fields are removed from the HASH INPUT only; the body is sent unchanged.
+ * The ETag is weak for the same reason — equivalent responses can still
+ * differ byte-for-byte in these fields.
  */
-function sendJsonWithETag(req, res, data) {
-  const stablePayload = { ...(data ?? {}) };
-  delete stablePayload._cached;
-  delete stablePayload._cachedAt;
-  delete stablePayload._expiresAt;
+const ETAG_VOLATILE_FIELDS = ['_cached', '_cachedAt', '_expiresAt', '_etag', '_notModified', 'last_updated'];
 
-  const hash = crypto.createHash('md5').update(JSON.stringify(stablePayload)).digest('hex');
+function sendJsonWithETag(req, res, data) {
+  // Bare-array payloads (e.g. /cast) cannot carry the bookkeeping fields;
+  // hash them as serialized rather than spread into an {"0": ...} object.
+  let hashInput = data;
+  if (!Array.isArray(data)) {
+    hashInput = { ...(data ?? {}) };
+    for (const field of ETAG_VOLATILE_FIELDS) {
+      delete hashInput[field];
+    }
+  }
+
+  const hash = crypto.createHash('md5').update(JSON.stringify(hashInput)).digest('hex');
   const etag = `W/"${hash}"`;
 
   res.set('ETag', etag);
