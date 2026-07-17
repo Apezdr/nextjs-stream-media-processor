@@ -665,6 +665,13 @@ export class MetadataGenerator {
         // downloadMediaImages (still governed by config.generateBlurhash) are
         // the consumed pipeline. `false` also keeps these fetches on the
         // plain TMDB cache key.
+        // Captured BEFORE the id-pin below can rewrite tmdb.config — our own
+        // write must not read back as an operator edit. See the matching note
+        // in generateForMovie.
+        const tmdbConfigLastModified = (await pathExists(configPath))
+          ? await getLastModifiedTime(configPath)
+          : null;
+
         if (tmdbConfig.tmdb_id) {
           // Use existing TMDB ID
           tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', tmdbConfig.tmdb_id, false);
@@ -690,9 +697,6 @@ export class MetadataGenerator {
         // fetched metadata changed the effective URL for an image (e.g.
         // TMDB itself updated a poster_path) so the previously-managed file
         // is now stale by-URL even though tmdb.config hasn't been touched.
-        const tmdbConfigLastModified = (await pathExists(configPath))
-          ? await getLastModifiedTime(configPath)
-          : null;
         await this._reconcileImageOwnership({
           mediaName: showName,
           mediaDir: showDir,
@@ -918,6 +922,16 @@ export class MetadataGenerator {
         }
       }
 
+      // Capture tmdb.config's mtime BEFORE the id-pin below can touch it.
+      // `updateTmdbConfigWithId` rewrites the file when it pins a newly
+      // matched id, so reading the mtime afterwards makes our OWN write look
+      // like an operator edit: reconcile's stale branch then judges art that
+      // was downloaded before the pin as stale and deletes + re-downloads a
+      // byte-identical file. Only an edit we did not make counts as staleness.
+      const tmdbConfigLastModified = (await pathExists(configPath))
+        ? await getLastModifiedTime(configPath)
+        : null;
+
       // Fetch TMDB data. Embedded-response blurhash stays off for scanner
       // fetches (B-1) — see the matching note in generateForShow.
       let tmdbData;
@@ -948,10 +962,8 @@ export class MetadataGenerator {
 
       // Reconcile BEFORE downloading on the fresh-fetch path too. Mirrors
       // the show flow; catches URL-change orphans plus stale-by-tmdb.config
-      // files so the downloader actually re-fetches them.
-      const tmdbConfigLastModified = (await pathExists(configPath))
-        ? await getLastModifiedTime(configPath)
-        : null;
+      // files so the downloader actually re-fetches them. The config mtime
+      // is the pre-pin value captured above.
       await this._reconcileImageOwnership({
         mediaName: movieName,
         mediaDir: movieDir,
