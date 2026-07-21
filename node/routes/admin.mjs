@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import { join, dirname, resolve, sep } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
-import { fileExists } from '../utils/utils.mjs';
+import { fileExists, findVideoFile, stripVideoExtension, findSeasonFolder } from '../utils/utils.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
@@ -103,42 +103,53 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
             const movieDir = safeJoin(join(BASE_PATH, 'movies'), decodedMediaTitle);
 
-            // Find the main movie file to determine the subtitle filename
+            // Find the main movie file (any supported container, .mp4 preferred)
+            // to determine the subtitle filename
             const files = await fs.readdir(movieDir);
-            const mp4File = files.find(file => file.endsWith('.mp4'));
+            const videoFile = findVideoFile(files);
 
-            if (!mp4File) {
+            if (!videoFile) {
                 return res.status(404).json({ error: 'Movie file not found' });
             }
 
-            const baseFileName = mp4File.replace('.mp4', '');
+            const baseFileName = stripVideoExtension(videoFile);
             const subtitleFileName = `${baseFileName}.${langCode}${variantSuffix}.srt`;
 
             subtitleFilePath = join(movieDir, subtitleFileName);
-            mediaFilePath = join(movieDir, mp4File);
+            mediaFilePath = join(movieDir, videoFile);
 
         } else {
             // For TV shows
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
-            const seasonDir = safeJoin(join(BASE_PATH, 'tv'), decodedMediaTitle, `Season ${season}`);
+            const showDir = safeJoin(join(BASE_PATH, 'tv'), decodedMediaTitle);
+
+            // Match the season folder numerically ("Season 1", "Season 01",
+            // "Season 2 - Pilot Arc") instead of assuming a literal
+            // `Season ${season}` name. The folder name comes from readdir, so
+            // it cannot introduce traversal; only the title needs safeJoin.
+            const showEntries = await fs.readdir(showDir);
+            const seasonFolder = findSeasonFolder(showEntries, season);
+            if (!seasonFolder) {
+                return res.status(404).json({ error: `Season ${season} not found` });
+            }
+            const seasonDir = join(showDir, seasonFolder);
 
             // Find the episode file
             const files = await fs.readdir(seasonDir);
 
-            // Look for file matching S01E01 pattern (case insensitive)
-            const paddedSeason = season.toString().padStart(2, '0');
-            const paddedEpisode = episode.toString().padStart(2, '0');
+            // Look for file matching S01E01 pattern (case insensitive);
+            // pad from the parsed integer so pre-padded inputs ("01") work too
+            const paddedSeason = String(parseInt(season, 10)).padStart(2, '0');
+            const paddedEpisode = String(parseInt(episode, 10)).padStart(2, '0');
             const episodePattern = new RegExp(`S${paddedSeason}E${paddedEpisode}`, 'i');
 
-            const episodeFile = files.find(file =>
-                file.endsWith('.mp4') && episodePattern.test(file)
-            );
+            const episodeFile = findVideoFile(files, { pattern: episodePattern });
 
             if (!episodeFile) {
                 return res.status(404).json({ error: 'Episode file not found' });
             }
 
-            const baseFileName = episodeFile.replace('.mp4', '');
+            const baseFileName = stripVideoExtension(episodeFile);
             const subtitleFileName = `${baseFileName}.${langCode}${variantSuffix}.srt`;
 
             subtitleFilePath = join(seasonDir, subtitleFileName);

@@ -461,6 +461,62 @@ export async function findMp4File(directory, specificFileName = null, extraData 
   }
 }
 
+// Containers the video pipeline can serve (getOutputFormat in videoHandler.mjs).
+// .mp4 is listed first deliberately: in mixed folders the scanner treats the mp4
+// as THE video file, so subtitle base-naming must follow it for parity.
+export const VIDEO_EXTENSIONS = ['.mp4', '.m4v', '.mkv', '.webm', '.avi'];
+
+/**
+ * Find the primary video file among directory entries (filenames, not paths).
+ * Extensions are matched case-insensitively in VIDEO_EXTENSIONS priority order;
+ * an optional RegExp `pattern` must also match the filename.
+ *
+ * @param {string[]} files - Directory entries (basenames)
+ * @param {Object} [options]
+ * @param {RegExp} [options.pattern] - Additional filename filter (e.g. /S01E03/i)
+ * @returns {string|null} The matched filename, or null if none
+ */
+export function findVideoFile(files, { pattern = null } = {}) {
+  for (const ext of VIDEO_EXTENSIONS) {
+    const match = files.find(
+      (f) => extname(f).toLowerCase() === ext && (!pattern || pattern.test(f))
+    );
+    if (match) return match;
+  }
+  return null;
+}
+
+/**
+ * Strip a filename's actual extension, whatever its case: 'Movie.MKV' -> 'Movie'.
+ *
+ * @param {string} filename
+ * @returns {string}
+ */
+export function stripVideoExtension(filename) {
+  const ext = extname(filename);
+  return ext ? filename.slice(0, -ext.length) : filename;
+}
+
+/**
+ * Match a season folder by the numeric value of its first digit run, the same
+ * way the scanner derives season numbers ("Season 1", "Season 01",
+ * "Season 2 - Pilot Arc" all match their integer season).
+ *
+ * @param {string[]} entries - Show-directory entries (folder basenames)
+ * @param {string|number} season - Requested season number (may be zero-padded)
+ * @returns {string|null} The matched folder name, or null if absent/non-numeric
+ */
+export function findSeasonFolder(entries, season) {
+  const seasonInt = parseInt(season, 10);
+  if (!Number.isFinite(seasonInt)) return null;
+  return (
+    entries.find((f) => {
+      const m = f.match(/\d+/);
+      return m && parseInt(m[0], 10) === seasonInt;
+    }) || null
+  );
+}
+
 /**
  * Derive a human‑readable episode title from a filename.
  *
