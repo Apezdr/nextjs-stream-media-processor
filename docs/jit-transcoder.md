@@ -14,8 +14,8 @@ them — they are not in the payload yet.
 |---|---|---|
 | P0 | `epic/p0-scanner-baseline` | Scan concurrency bound, dead code removed |
 | P1 | `epic/p1-media-resolution` | Container-agnostic discovery (§1–§3) |
-| **P2** | `epic/p2-info-sidecar` | **`.info` sidecar v1.0011 — probe fields for eligibility (§7)** |
-| P3 | `epic/p3-media-identity` | `mediaIdentity` + `.mediaid.json` sidecar |
+| P2 | `epic/p2-info-sidecar` | `.info` sidecar v1.0011 — probe fields for eligibility (§8) |
+| **P3** | `epic/p3-media-identity` | **`mediaIdentity` + `.mediaid.json` sidecar (§4)** |
 | P4 | `epic/p4-container-sources` | `urls.sources[]`, MKV/MOV titles become visible |
 | P5 | — (frontend) | Identity cutover + WatchHistory remediation |
 | P6 | `epic/p6-jit-emission` | `jitEligible`, `jitKey`, `jitUrl` |
@@ -32,7 +32,7 @@ them — they are not in the payload yet.
 | **Chapter path rebuilt by string surgery** — stripped the real extension, re-appended `.mp4` | 404'd for any non-mp4 title *even when its stored URL was correct* | Resolve the real file, then derive the chapter name from it |
 | **`-original.mp4` clip cache** — remuxed source bytes into a hardcoded `.mp4` name | An `.mkv` source produced matroska bytes in a `.mp4` file served as `video/mp4`; three-way mismatch | Extension derived from the source container, with a matching eviction predicate |
 | **3-entry MIME table** | `.mov` / `.m4v` / `.avi` served as `application/octet-stream`, which browsers refuse to play | One entry per `VIDEO_EXTENSIONS` member |
-| *(P3)* **Identity derived from the played URL** | A rename, remux, or container swap orphaned watch history | `mediaIdentity.id` from a sidecar on the media volume |
+| **Identity derived from the played URL** | A rename, remux, or container swap orphaned watch history — and it already did once in production | `mediaIdentity.id`, derived from the folder path and persisted to a sidecar on the media volume (§4) |
 | *(P6)* **Frontend-constructed JIT URLs** | The backend is co-located with the transcoder and already knows the media root | Backend emits `jitUrl` |
 
 ---
@@ -86,7 +86,79 @@ routes were not.
 
 ---
 
-## 4. Movie payload
+## 4. Identity · Status: **shipped P3**
+
+**`mediaIdentity.id` is what watch history joins on.** Do not derive identity from a URL, a
+filename, or `_id`.
+
+Two constraints decided the design: it must survive a database refresh (so SQLite cannot be
+the source of truth), and it must not depend on a service the operator may not have configured
+(so TMDB cannot be the anchor). What is left is the media volume.
+
+**The id is derived from the library-relative folder path, then persisted to a
+`.mediaid.json` sidecar beside the media.** Derivation makes it self-healing; persistence makes
+it rename-proof.
+
+| Change | Survives | Why |
+|---|---|---|
+| Remux `.mkv` → `.mp4`, re-encode in place | ✅ | Identity is folder-level |
+| Add / remove a container | ✅ | Same |
+| Episode file rename | ✅ | Episode id is `showId` + coordinate, never the filename |
+| **DB drop / rebuild / refresh** | ✅ | Sidecars are read back; ids are byte-identical |
+| **Folder rename** | ✅ | The sidecar travels with the folder and wins over re-derivation |
+| Sidecar deleted, folder unchanged | ✅ | Re-derives identically |
+| Sidecar deleted **and** folder renamed | ❌ | The one accepted gap — needs an admin remap |
+| TMDB re-points, or was never configured | ✅ | No TMDB dependency at all |
+
+```jsonc
+// movies/Dune (2021)/.mediaid.json   —   tv/Breaking Bad/.mediaid.json
+{
+  "v": 1,
+  "id": "mid:a91c04f7e2b6d558",         // sha256(library-relative path)[0:16], frozen at first sight
+  "derivedFrom": "movies/Dune (2021)",  // provenance; stale after a rename, and that is fine
+  "primarySource": "Dune.2021.mkv",     // which file publishes as urls.mp4
+  "firstSeen": "2026-07-25T18:02:11.000Z",
+  "previousIds": []                     // appended on a repoint, never by a normal scan
+}
+```
+
+- **Movie id** — the sidecar's `id`.
+- **Episode id** — `` `${showId}:s${SS}e${EE}` ``, e.g. `mid:3e88b1049fc7a2d1:s01e03`. One
+  sidecar per *show*, not per episode.
+- Separators are normalised before hashing so a Windows host and a Linux host derive the same
+  id — a host migration must not fork watch history.
+
+**Emitted as** `mediaIdentity: { id, scheme: "mid" }`, at the movie level and flat on each
+episode. `null` when identity could not be resolved this pass.
+
+**`mediaIdentity` vs `_id`** — do not conflate them. `mediaIdentity` is *location* identity:
+one per title, stable across re-encodes. `_id` is `info.uuid`, a mediainfo header hash: **per
+file**, so it differs between containers and rotates whenever the bytes change. The video and
+sprite caches key on `_id` precisely because it rotates.
+
+**Scanner behaviour**
+
+| State | Action |
+|---|---|
+| Sidecar present and parseable | Use its `id`. Never re-derive. |
+| No sidecar | Derive, write it, log `identity established` |
+| Sidecar unparseable or a future `v` | **Do not overwrite** — derive for this pass only, log `identity sidecar unreadable` |
+| Id already claimed by another title | Re-derive from this folder's own path, record the displaced id in `previousIds`, log `identity duplicate` + `identity repointed` |
+| Media volume read-only | Use the derived id, log `identity sidecar write failed`, retry next scan |
+
+`primarySource` is seeded **once**, from the row's already-stored `urls.mp4`, and never
+recomputed. Today's scanner picks the *last* `.mp4` in a multi-mp4 folder while priority-order
+selection picks the *first*; recomputing would silently repoint those titles' published URL,
+which the frontend still derives its legacy watch-history key from until its cutover lands.
+
+**`media_identity_index` in SQLite is a rebuildable cache**, not authoritative state — its only
+active job is the duplicate check. `DROP TABLE media_identity_index` and rescan reproduces it
+exactly. Likewise `movies.media_id` / `tv_shows.media_id` are cached copies of the sidecar
+value. Nothing here needs backing up; the media volume already is the backup.
+
+---
+
+## 5. Movie payload
 
 `GET /media/movies` → `urls`:
 
@@ -95,12 +167,12 @@ routes were not.
 | `mp4` | string | shipped | **Legacy name.** The primary source URL, whatever its container — for an MKV-only title this ends in `.mkv`. It is a *locator*, never a container claim. New code should read `identityUrl` and `sources[]`. |
 | `mediaLastModified` | ISO string | shipped | mtime of the primary source. Drives the incremental hash sweep. |
 | `subtitles`, `chapters`, `poster`, `backdrop`, `logo`, `metadata` | — | shipped | Unchanged by this pivot |
-| `identityUrl` | string | **planned P3** | Exact alias of `mp4`. Present so the two can diverge later without another migration. |
-| `sources[]` | array | **planned P4** | Every video file for this title — see §6 |
+| `sources[]` | array | **planned P4** | Every video file for this title — see §7 |
 
-`jitEligible` (boolean) and `mediaIdentity` (object) sit at the movie level, beside `urls`.
+`mediaIdentity` (object, **shipped P3** — see §4) and `jitEligible` (boolean, planned P6) sit
+at the movie level, beside `urls`.
 
-## 5. TV payload
+## 6. TV payload
 
 `GET /media/tv` → `seasons[<Season Name>].episodes[<key>]`:
 
@@ -108,8 +180,9 @@ routes were not.
 |---|---|---|---|
 | `filename` | string | shipped | Basename with extension |
 | `videoURL` | string | shipped | Primary source URL — the TV counterpart of `urls.mp4` |
-| `_id` | string | shipped | `info.uuid`, a mediainfo header hash. **Per file**, so it varies by container and rotates on re-encode. |
-| `mediaIdentity`, `sources[]`, `jitEligible`, `jitUrl` | — | **planned P3/P4/P6** | Flat on the episode object |
+| `_id` | string | shipped | `info.uuid`, a mediainfo header hash. **Per file**, so it varies by container and rotates on re-encode. Not identity — see §4. |
+| `mediaIdentity` | object | **shipped P3** | `{ id, scheme }`, flat on the episode. `id` is `` `${showId}:s##e##` `` |
+| `sources[]`, `jitEligible`, `jitUrl` | — | **planned P4/P6** | Flat on the episode object |
 
 **Episodes carry flat fields by design and will not gain a `urls` bag.** Nesting them would
 reshape a hot payload and change the input shape of `generateTVShowHashes`, forcing a resync
@@ -117,7 +190,7 @@ for no benefit.
 
 ---
 
-## 6. `sources[]` · Status: **planned P4**
+## 7. `sources[]` · Status: **planned P4**
 
 One entry per video file in the title's folder.
 
@@ -159,7 +232,7 @@ consumer recompute it; a derived boolean would silently rot.
 
 ---
 
-## 7. `.info` sidecar v1.0011 · Status: **shipped P2**
+## 8. `.info` sidecar v1.0011 · Status: **shipped P2**
 
 Each video file has a `<filename>.info` sidecar next to it, written by
 [`node/infoManager.mjs`](../node/infoManager.mjs). It is a **cache**, not a source of truth —
@@ -213,7 +286,7 @@ check and converges via the P4 payload-signature bump.
 
 ---
 
-## 8. Non-goals and known gaps
+## 9. Non-goals and known gaps
 
 - **`.avi` is discoverable and playable but will never be JIT-eligible** (P6). Annex-B
   demuxing through the transcode ladder is unverified.
@@ -236,7 +309,32 @@ check and converges via the P4 payload-signature bump.
 
 ---
 
-## 9. Change process
+## 10. Payload versioning
+
+Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``
+(see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+
+It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
+i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT
+toggle flipping — changes nothing on disk, so without the signature the scanner would compute
+the new payload and then decline to store it. The bug looks like "works on my machine": a fresh
+development database has no converged rows to skip.
+
+Comparing the signature turns a version bump into **exactly one** library-wide convergence
+pass, which then settles. It is also the only convergence driver for TV, which has no
+equivalent of the movie scanner's `needsInfoRegeneration` check.
+
+Bumping `MEDIA_PAYLOAD_VERSION`, or flipping `JIT_ELIGIBILITY_ENABLED`, therefore costs one
+full re-scan and one full frontend resync. Schedule off-peak. Rollback is the same operation in
+reverse.
+
+The convergence pass is greppable: `media pivot: reprocessing <title> for payload signature
+<old> -> <new>`. It must appear **once** per release, not on every scheduled tick — if it
+recurs, something is rewriting a hashed input on every pass.
+
+---
+
+## 11. Change process
 
 Any change to `sources[]`, to `mediaIdentity` semantics, or to the transcoder's route shape
 requires a coordinated update to **both**

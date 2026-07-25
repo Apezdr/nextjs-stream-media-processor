@@ -643,6 +643,14 @@ export async function getStoredBlurhash(imagePath, basePath) {
     return null;
   }
 }
+// Files the scanner itself writes into media folders, which must NOT contribute
+// to the directory hash. The hash exists to answer "did the library change?" —
+// folding in our own bookkeeping makes the scanner's write look like a library
+// change, which reprocesses the folder, which rewrites the file. Excluding them
+// also means existing stored hashes stay valid: these files did not exist when
+// those hashes were computed, so nothing spuriously reprocesses on rollout.
+export const HASH_EXCLUDED_FILES = new Set(['.mediaid.json']);
+
 export async function calculateDirectoryHash(dirPath, maxDepth = 5) {
   const hash = createHash('sha256');
 
@@ -652,6 +660,8 @@ export async function calculateDirectoryHash(dirPath, maxDepth = 5) {
     const entries = await fs.readdir(currentPath, { withFileTypes: true });
 
     for (const entry of entries) {
+      if (HASH_EXCLUDED_FILES.has(entry.name)) continue;
+
       const fullPath = join(currentPath, entry.name);
       const stats = await fs.stat(fullPath);
 

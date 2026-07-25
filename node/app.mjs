@@ -842,6 +842,10 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
     const movieData = movies.reduce((acc, movie) => {
       acc[movie.name] = {
         _id: movie._id,
+        // Stable content identity — what watch history joins on. Distinct from
+        // `_id`, which is a mediainfo header hash: per FILE, so it varies by
+        // container and rotates on re-encode. See utils/mediaIdentity.mjs.
+        mediaIdentity: movie.media_id ? { id: movie.media_id, scheme: 'mid' } : null,
         fileNames: movie.fileNames,
         length: movie.lengths,
         dimensions: movie.dimensions,
