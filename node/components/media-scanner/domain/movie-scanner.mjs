@@ -82,31 +82,47 @@ async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode
  * @returns {Promise<boolean>} True if regeneration is needed
  */
 async function needsInfoRegeneration(files, dirPath, dirName, currentVersion) {
-  const mp4Files = files.filter(file => file.endsWith('.mp4'));
-  
-  for (const mp4File of mp4Files) {
-    const filePath = join(dirPath, dirName, mp4File);
+  // DELIBERATELY still .mp4-only, and it must stay that way until
+  // processVideoFiles generates sidecars for every container.
+  //
+  // This function only decides whether to REPROCESS a movie; processVideoFiles
+  // is what actually calls getInfo. Widening this filter first means an .mkv
+  // with a missing or outdated sidecar returns true here, the movie is
+  // reprocessed, processVideoFiles skips the .mkv, the sidecar is still missing
+  // or outdated — and the same movie reprocesses on every single scan tick,
+  // forever. That is an every-tick storm wearing the costume of a one-shot
+  // convergence pass.
+  //
+  // Note this is now reachable: since the serving paths became
+  // container-agnostic, videoHandler's getInfo() can create an .mkv.info
+  // lazily, so non-mp4 sidecars DO exist in the wild.
+  //
+  // Widen this and the processVideoFiles loop in the same commit.
+  const videoFiles = files.filter(file => file.endsWith('.mp4'));
+
+  for (const videoFile of videoFiles) {
+    const filePath = join(dirPath, dirName, videoFile);
     const infoFile = `${filePath}.info`;
-    
+
     if (await fileExists(infoFile)) {
       try {
         const fileInfo = await fs.readFile(infoFile, 'utf-8');
         const info = JSON.parse(fileInfo);
-        
+
         if (!info.version || info.version < currentVersion) {
-          logger.info(`Info file for ${mp4File} has outdated version (${info.version}), regeneration needed`);
+          logger.info(`Info file for ${videoFile} has outdated version (${info.version}), regeneration needed`);
           return true;
         }
       } catch (error) {
-        logger.warn(`Error reading info file for ${mp4File}, regeneration needed: ${error}`);
+        logger.warn(`Error reading info file for ${videoFile}, regeneration needed: ${error}`);
         return true;
       }
     } else {
-      logger.info(`Info file for ${mp4File} doesn't exist, regeneration needed`);
+      logger.info(`Info file for ${videoFile} doesn't exist, regeneration needed`);
       return true;
     }
   }
-  
+
   return false;
 }
 
