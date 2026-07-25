@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import { join, dirname } from 'path';
+import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   calculateDirectoryHash,
@@ -381,8 +382,15 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
   const existingMovies = await getExistingMovies();
   const existingMovieNames = new Set(existingMovies.map(movie => movie.name));
 
+  // Bounded concurrency for movie processing (mirrors the season limiter in
+  // tv-scanner.mjs). Each iteration can invoke ffprobe + mediainfo through
+  // getInfo(); unbounded, a full-library pass spawns one subprocess pair per
+  // movie simultaneously, which matters whenever a version/payload bump forces
+  // every title to reprocess in a single tick.
+  const movieLimit = pLimit(3);
+
   await Promise.all(
-    dirs.map(async (dir, index) => {
+    dirs.map((dir, index) => movieLimit(async () => {
       if (isDebugMode) {
         logger.info(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
       }
@@ -739,7 +747,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       if (freshMovie) {
         await generateMovieHashes(db, freshMovie);
       }
-    })
+    }))
   );
 
   // Remove movies from the database that no longer exist in the file system.
