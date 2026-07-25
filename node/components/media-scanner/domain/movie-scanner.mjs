@@ -324,6 +324,7 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
     urlFor: (filename) =>
       `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent(filename)}`,
     primaryFilename,
+    libraryRelativeDir: `movies/${dirName}`,
   });
 
   const urls = {};
@@ -334,6 +335,12 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
     // it would be permanently invisible to that sweep — silently, with no error.
     if (primary.mediaLastModified) urls.mediaLastModified = primary.mediaLastModified;
     urls.sources = publishableSources(sources);
+    // Emitted beside urls.mp4, per the frozen frontend contract. They describe
+    // the PRIMARY source, which is exactly what urls.mp4 points at, so the two
+    // can never disagree. Episodes carry the same pair flat beside videoURL —
+    // each follows its own container's existing convention.
+    urls.jitEligible = primary.jitEligible;
+    if (primary.jitUrl) urls.jitUrl = primary.jitUrl;
   }
 
   const primaryInfo = primary?._info ?? null;
@@ -342,6 +349,10 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
     fileLengths,
     fileDimensions,
     urls,
+    // Title-level flag and URL describe the PRIMARY source, which is what
+    // urls.mp4 points at — so the two always agree.
+    jitEligible: primary?.jitEligible ?? false,
+    jitUrl: primary?.jitUrl ?? null,
     // Row-level fields describe the PRIMARY source, matching what urls.mp4
     // points at. Per-source equivalents live in urls.sources[].
     hdrInfo: primaryInfo?.hdr,
