@@ -1,9 +1,9 @@
 import express from 'express';
 import { promises as fs } from 'fs';
-import { join, dirname, resolve, sep } from 'path';
+import { join, dirname } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
-import { fileExists, findVideoFile, stripVideoExtension, findSeasonFolder } from '../utils/utils.mjs';
+import { fileExists, findVideoFile, stripVideoExtension, findSeasonFolder, safeJoin, PathTraversalError } from '../utils/utils.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
@@ -14,29 +14,6 @@ const logger = createCategoryLogger('admin-routes');
 
 // BASE_PATH is the path to the media files directory
 const BASE_PATH = process.env.BASE_PATH ? process.env.BASE_PATH : "/var/www/html";
-
-class PathTraversalError extends Error {}
-
-/**
- * Join untrusted segments onto a trusted base dir, verifying the final
- * resolved absolute path cannot escape base. Handles '..', traversal
- * embedded inside a larger segment, and platform separator differences
- * in one check, unlike a naive substring-scan for '..'.
- *
- * `base` should be the most specific directory the caller actually intends
- * to stay within (e.g. `join(BASE_PATH, 'movies')`, not just `BASE_PATH`) —
- * checking only against BASE_PATH would let a crafted title escape into a
- * sibling top-level directory (e.g. into `tv/` from a movie route) while
- * technically staying "inside" BASE_PATH.
- */
-function safeJoin(base, ...segments) {
-    const resolvedBase = resolve(base);
-    const resolvedPath = resolve(resolvedBase, ...segments);
-    if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + sep)) {
-        throw new PathTraversalError(`Rejected path outside base directory: ${segments.join('/')}`);
-    }
-    return resolvedPath;
-}
 
 /**
  * Initialize and configure admin routes

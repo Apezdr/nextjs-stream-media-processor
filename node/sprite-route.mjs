@@ -6,7 +6,8 @@ import sharp from 'sharp';
 import { generateSpriteSheet, generateVttFileFFmpeg } from './sprite.mjs';
 import { initializeDatabase, getTVShowByName, getMovieByName, releaseDatabase } from './sqliteDatabase.mjs';
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getProcessTrackingDb, updateProcessQueue } from './sqlite/processTracking.mjs';
-import { fileExists, shouldUseAvif, convertToAvif, spritesheetCacheDir, getEpisodeKey, getEpisodeFilename, getCleanVideoPath } from './utils/utils.mjs';
+import { fileExists, shouldUseAvif, convertToAvif, spritesheetCacheDir } from './utils/utils.mjs';
+import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from './utils/mediaResolution.mjs';
 import { getInfo } from './infoManager.mjs';
 import { createCategoryLogger } from './lib/logger.mjs';
 
@@ -30,29 +31,38 @@ async function getVideoPath(type, db, { movieName, showName, season, episode }, 
     if (!movie) {
       throw new Error(`Movie not found: ${movieName}`);
     }
-    const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
-    const videoMp4 = decodeURIComponent(urls.mp4);
-    const cleanPath = getCleanVideoPath(videoMp4);
-    return join(BASE_PATH, cleanPath);
+    // Resolve from disk rather than from urls.mp4: the stored URL is a
+    // publishing artifact, and rebuilding a filesystem path out of it broke
+    // whenever the container on disk differed from the one last scanned.
+    const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
+    if (!videoRef) {
+      throw new Error(`Movie file not found: ${movieName}`);
+    }
+    return videoRef.path;
   } else {
     const showData = await getTVShowByName(showName);
     if (!showData) {
       throw new Error(`Show not found: ${showName}`);
     }
-    const _season = showData.seasons[`Season ${season}`];
-    const episodeKey = getEpisodeKey(showData, season, episode);
-    const _episode = getEpisodeFilename(showData, season, episode);
-    let specificFileName = null;
-
-    if (_episode) {
-      const fileNameFromEpisode = _season.episodes[episodeKey].filename;
-      specificFileName = fileNameFromEpisode;
-    } else {
+    const entry = findEpisodeEntry(showData, season, episode);
+    if (!entry) {
       throw new Error(
         `Episode not found: ${showName} - Season ${season} Episode ${episode}`
       );
     }
-    return join(`${BASE_PATH}/tv`, showName, `Season ${season}`, specificFileName);
+    const videoRef = await resolveEpisodeVideo({
+      basePath: BASE_PATH,
+      showName,
+      season,
+      episode,
+      preferFilename: entry.episode.filename,
+    });
+    if (!videoRef) {
+      throw new Error(
+        `Episode file not found: ${showName} - Season ${season} Episode ${episode}`
+      );
+    }
+    return videoRef.path;
   }
 }
 
