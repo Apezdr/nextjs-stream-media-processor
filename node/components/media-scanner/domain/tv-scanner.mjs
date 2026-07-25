@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join, normalize, dirname } from 'path';
+import { join, normalize, dirname, extname } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
@@ -13,9 +13,12 @@ import {
   getStoredBlurhash,
   deriveEpisodeTitle,
   calculateDirectoryHash,
-  getLastModifiedTime
+  getLastModifiedTime,
+  stripVideoExtension,
+  VIDEO_EXTENSIONS
 } from '../../../utils/utils.mjs';
-import { getInfo } from '../../../infoManager.mjs';
+import { isVideoFile } from '../../../utils/mediaResolution.mjs';
+import { buildVideoSources, publishableSources } from './video-sources.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
@@ -283,12 +286,19 @@ async function processShowMetadata({
  * @param {string[]} seasonFiles - Pre-read directory listing for the season (avoids redundant readdir)
  * @returns {Promise<Object>} Subtitles object
  */
-async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, encodedSeasonName, prefixPath, langMap, seasonFiles) {
+async function processEpisodeSubtitles(seasonPath, episodeFiles, encodedShowName, encodedSeasonName, prefixPath, langMap, seasonFiles) {
   const subtitles = {};
   const subtitleFiles = seasonFiles;
-  
+
+  // Was `episode.replace('.mp4', '')` — a no-op for any other container, which
+  // left the test as startsWith('Show.S01E01.mkv') and silently attached ZERO
+  // subtitles to every non-mp4 episode. No error, no log, sidecars sitting
+  // right next to the file. Strip the REAL extension, and accept a stem from
+  // any of this episode's containers.
+  const stems = [...new Set(episodeFiles.map(stripVideoExtension))];
+
   for (const subtitleFile of subtitleFiles) {
-    if (subtitleFile.startsWith(episode.replace('.mp4', '')) && subtitleFile.endsWith('.srt')) {
+    if (subtitleFile.endsWith('.srt') && stems.some(stem => subtitleFile.startsWith(stem))) {
       const parsed = parseSubtitleFilename(subtitleFile, langMap);
       if (!parsed) continue;
 
@@ -318,29 +328,18 @@ async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, enc
  * @param {string[]} seasonFiles - Pre-read directory listing for the season
  * @returns {Promise<Object|null>} Episode data object or null if processing fails
  */
-async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null) {
-  const episodePath = join(seasonPath, episode);
-  const encodedEpisodePath = encodeURIComponent(episode);
+async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null) {
+  // episodeFiles holds EVERY container for this one episode, already ordered by
+  // container priority. The first is the primary — the one that publishes as
+  // videoURL — and the rest ride along in sources[].
+  const episode = episodeFiles[0];
 
   let derivedEpisodeName = deriveEpisodeTitle(episode);
-  let fileLength, fileDimensions, hdrInfo, mediaQuality, additionalMetadata, uuid;
-
-  try {
-    const info = await getInfo(episodePath);
-    fileLength = info.length;
-    fileDimensions = info.dimensions;
-    hdrInfo = info.hdr;
-    mediaQuality = info.mediaQuality;
-    additionalMetadata = info.additionalMetadata;
-    uuid = info.uuid;
-  } catch (error) {
-    logger.error(`Failed to retrieve info for ${episodePath}: ${error}`);
-  }
 
   // Extract episode number
   const episodeNumberMatch = episode.match(/S\d+E(\d+)/i);
   const episodeNumber = episodeNumberMatch ? episodeNumberMatch[1] : (episode.match(/\d+/) || ['0'])[0];
-  
+
   if (!episodeNumber || !seasonNumber) {
     logger.warn(`Could not extract episode or season number from ${episode}, skipping.`);
     return null;
@@ -349,8 +348,22 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
   const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
   const episodeKey = `S${seasonNumber}E${paddedEpisodeNumber}`;
 
+  const { sources, primary, fileLengths, fileDimensions } = await buildVideoSources({
+    videoFiles: episodeFiles,
+    dir: seasonPath,
+    urlFor: (filename) =>
+      `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(filename)}`,
+  });
+
+  if (!primary) {
+    logger.warn(`No resolvable video source for ${showName} ${episodeKey}, skipping.`);
+    return null;
+  }
+
+  const info = primary._info;
+
   const episodeData = {
-    _id: uuid,
+    _id: info?.uuid,
     // Stable identity: the show's id plus the season/episode coordinate.
     // Deliberately not derived from the filename — filenames change on remux
     // and re-release, and an episode's identity must not.
@@ -360,16 +373,17 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
           scheme: 'mid',
         }
       : null,
-    filename: episode,
-    videoURL: `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-    mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
-    hdr: hdrInfo || null,
-    mediaQuality: mediaQuality || null,
-    additionalMetadata: additionalMetadata || {},
+    filename: primary.filename,
+    videoURL: primary.url,
+    sources: publishableSources(sources),
+    mediaLastModified: primary.mediaLastModified,
+    hdr: info?.hdr || null,
+    mediaQuality: info?.mediaQuality || null,
+    additionalMetadata: info?.additionalMetadata || {},
     episodeNumber: parseInt(episodeNumber, 10),
     derivedEpisodeName: derivedEpisodeName,
-    length: parseInt(fileLength, 10),
-    dimensions: fileDimensions
+    length: fileLengths[primary.filename] ?? null,
+    dimensions: fileDimensions[primary.filename] ?? null
   };
 
   // Handle thumbnail
@@ -409,18 +423,20 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
   );
   
-  await generateChapterFileIfNotExists(chaptersPath, episodePath, true);
-  
+  await generateChapterFileIfNotExists(chaptersPath, join(seasonPath, primary.filename), true);
+
   if (await fileExists(chaptersPath)) {
     episodeData.chapters = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
       `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
     )}`;
   }
 
-  // Process subtitles
+  // Process subtitles. Matched against EVERY container's stem, not just the
+  // primary's: a season holding both "Ep.mkv" and "Ep.1080p.mp4" can carry
+  // sidecars named after either.
   const subtitles = await processEpisodeSubtitles(
     seasonPath,
-    episode,
+    episodeFiles,
     encodedShowName,
     encodedSeasonName,
     prefixPath,
@@ -432,7 +448,12 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     episodeData.subtitles = subtitles;
   }
 
-  return { episodeKey, episodeData, length: parseInt(fileLength, 10), dimensions: fileDimensions };
+  return {
+    episodeKey,
+    episodeData,
+    length: fileLengths[primary.filename] ?? null,
+    dimensions: fileDimensions[primary.filename] ?? null
+  };
 }
 
 /**
@@ -456,11 +477,32 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
   const seasonNumber = seasonNumberMatch ? seasonNumberMatch[0].padStart(2, '0') : '00';
 
   const episodes = await fs.readdir(seasonPath);
-  const validEpisodes = episodes.filter(
-    episode => episode.endsWith('.mp4') && !episode.includes('-TdarrCacheFile-')
-  );
-  
+  // Any supported container. isVideoFile already excludes Tdarr's in-progress
+  // transcodes, which are valid containers an extension filter would accept.
+  const validEpisodes = episodes.filter(isVideoFile).sort((a, b) => {
+    const rank =
+      VIDEO_EXTENSIONS.indexOf(extname(a).toLowerCase()) -
+      VIDEO_EXTENSIONS.indexOf(extname(b).toLowerCase());
+    return rank !== 0 ? rank : a.localeCompare(b);
+  });
+
   if (validEpisodes.length === 0) return null;
+
+  // Group every container for the same episode under one key BEFORE processing.
+  //
+  // Without this, a season holding both "S01E01.mp4" and "S01E01.mkv" produces
+  // two results that write to the same seasonData.episodes key, so the last one
+  // by iteration order wins — and which one that is flips with readdir order,
+  // making the episode's published URL and identity flap on every scan. The
+  // list is already in container-priority order, so group[0] is the primary.
+  const episodeGroups = new Map();
+  for (const filename of validEpisodes) {
+    const match = filename.match(/S\d+E(\d+)/i);
+    const number = match ? match[1] : (filename.match(/\d+/) || ['0'])[0];
+    const key = `S${seasonNumber}E${String(number).padStart(2, '0')}`;
+    if (!episodeGroups.has(key)) episodeGroups.set(key, []);
+    episodeGroups.get(key).push(filename);
+  }
 
   const seasonData = {
     episodes: {},
@@ -483,10 +525,11 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
     }
   }
 
-  // Process each episode (pass seasonFiles = episodes to avoid redundant readdir per episode)
-  for (const episode of validEpisodes) {
+  // Process each episode ONCE, with all of its containers (pass seasonFiles =
+  // episodes to avoid a redundant readdir per episode)
+  for (const episodeFiles of episodeGroups.values()) {
     const episodeResult = await processEpisode(
-      episode,
+      episodeFiles,
       seasonPath,
       showName,
       encodedShowName,

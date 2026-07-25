@@ -15,8 +15,8 @@ them — they are not in the payload yet.
 | P0 | `epic/p0-scanner-baseline` | Scan concurrency bound, dead code removed |
 | P1 | `epic/p1-media-resolution` | Container-agnostic discovery (§1–§3) |
 | P2 | `epic/p2-info-sidecar` | `.info` sidecar v1.0011 — probe fields for eligibility (§8) |
-| **P3** | `epic/p3-media-identity` | **`mediaIdentity` + `.mediaid.json` sidecar (§4)** |
-| P4 | `epic/p4-container-sources` | `urls.sources[]`, MKV/MOV titles become visible |
+| P3 | `epic/p3-media-identity` | `mediaIdentity` + `.mediaid.json` sidecar (§4) |
+| **P4** | `epic/p4-container-sources` | **`urls.sources[]`; MKV/MOV titles become visible (§7)** |
 | P5 | — (frontend) | Identity cutover + WatchHistory remediation |
 | P6 | `epic/p6-jit-emission` | `jitEligible`, `jitKey`, `jitUrl` |
 
@@ -167,7 +167,7 @@ value. Nothing here needs backing up; the media volume already is the backup.
 | `mp4` | string | shipped | **Legacy name.** The primary source URL, whatever its container — for an MKV-only title this ends in `.mkv`. It is a *locator*, never a container claim. New code should read `identityUrl` and `sources[]`. |
 | `mediaLastModified` | ISO string | shipped | mtime of the primary source. Drives the incremental hash sweep. |
 | `subtitles`, `chapters`, `poster`, `backdrop`, `logo`, `metadata` | — | shipped | Unchanged by this pivot |
-| `sources[]` | array | **planned P4** | Every video file for this title — see §7 |
+| `sources[]` | array | **shipped P4** | Every video file for this title — see §7 |
 
 `mediaIdentity` (object, **shipped P3** — see §4) and `jitEligible` (boolean, planned P6) sit
 at the movie level, beside `urls`.
@@ -182,7 +182,8 @@ at the movie level, beside `urls`.
 | `videoURL` | string | shipped | Primary source URL — the TV counterpart of `urls.mp4` |
 | `_id` | string | shipped | `info.uuid`, a mediainfo header hash. **Per file**, so it varies by container and rotates on re-encode. Not identity — see §4. |
 | `mediaIdentity` | object | **shipped P3** | `{ id, scheme }`, flat on the episode. `id` is `` `${showId}:s##e##` `` |
-| `sources[]`, `jitEligible`, `jitUrl` | — | **planned P4/P6** | Flat on the episode object |
+| `sources[]` | array | **shipped P4** | Every container for this episode — see §7 |
+| `jitEligible`, `jitUrl` | — | **planned P6** | Flat on the episode object |
 
 **Episodes carry flat fields by design and will not gain a `urls` bag.** Nesting them would
 reshape a hot payload and change the input shape of `generateTVShowHashes`, forcing a resync
@@ -190,9 +191,10 @@ for no benefit.
 
 ---
 
-## 7. `sources[]` · Status: **planned P4**
+## 7. `sources[]` · Status: **shipped P4**
 
-One entry per video file in the title's folder.
+One entry per video file in the title's folder. Present on movies as
+`urls.sources[]` and flat on each episode as `sources[]`.
 
 ```jsonc
 {
@@ -223,7 +225,20 @@ movie hash, so a `readdir`-order-dependent array would make that hash flap betwe
 force a permanent resync loop. Sorted by `VIDEO_EXTENSIONS` index, then by filename.
 
 **Invariants:** exactly one `isPrimary: true` when the array is non-empty; that entry's `url`
-equals `urls.mp4`; an empty array means no `urls.mp4` at all.
+equals `urls.mp4` (movies) or `videoURL` (episodes); an empty array means neither is emitted.
+
+**Which source is primary** — the identity sidecar's pinned `primarySource` when that file is
+still present, otherwise the first entry in `VIDEO_EXTENSIONS` priority order. The pin is what
+keeps an existing title publishing the same URL it published before this shipped.
+
+**An unprobeable file is still a source.** If ffprobe cannot read it, the entry is published
+with null facts rather than dropped — a file that exists and can be served should not vanish
+from the catalog because a probe failed.
+
+**Multiple containers of the same episode collapse to one entry.** A season holding both
+`S01E01.mp4` and `S01E01.mkv` yields a single episode whose primary is the `.mp4`, with the
+`.mkv` alongside in `sources[]`. Previously the two would have written to the same episode key
+and the winner would have flipped with readdir order, moving that episode's URL on every scan.
 
 **`directPlayLikely` is deliberately not emitted.** Whether the transcoder can remux rather
 than re-encode depends on `JIT_DIRECT_PLAY`, `JIT_HDR`, segment-size floors, and a keyframe
@@ -278,11 +293,11 @@ one tagged language yields 3 distinct `language` values and 1 distinct `language
 regenerate, fail again, on every `getInfo` call forever. There is a regression test pinning
 this.
 
-**Convergence.** Movies re-probe through `needsInfoRegeneration`, which is still deliberately
-`.mp4`-only: it decides whether to *reprocess*, while `processVideoFiles` is what actually
-calls `getInfo`. Widening the first without the second makes every folder containing an
-`.mkv` reprocess on every scan tick forever. They widen together in P4. TV has no equivalent
-check and converges via the P4 payload-signature bump.
+**Convergence.** Movies re-probe through `needsInfoRegeneration`, which covers every container
+as of P4. It had to stay `.mp4`-only until then: it decides whether to *reprocess*, while
+`processVideoFiles` is what actually calls `getInfo`, so widening the first without the second
+makes every folder containing an `.mkv` reprocess on every scan tick forever. They widened
+together. TV has no equivalent check and converges via the payload-signature bump instead.
 
 ---
 
@@ -299,13 +314,11 @@ check and converges via the P4 payload-signature bump.
   `JIT_AUDIO_LANG` with no per-request override. This is why multi-language sources will be
   marked ineligible in P6.
 - **DASH is a 501 stub** in the transcoder. HLS only.
-- The scanner still filters video files with `.mp4` checks until P4 — **P1 fixed the serving
-  and derived-asset paths, not discovery.** An MKV-only title is reachable through
-  `/frame`, `/videoClip`, `/spritesheet`, and `/chapters`, but does not yet appear in
-  `/media/movies` or `/media/tv`.
-- Because the serving paths are now container-agnostic, **non-mp4 `.info` sidecars already
-  exist in the wild** — `videoHandler` creates them lazily on first clip/transcode request.
-  They are correct and current; they are simply not yet reflected in any payload.
+- **A title with several containers publishes ONE playable URL** (`urls.mp4` /
+  `videoURL`) — the primary. The others are described in `sources[]` but the backend does not
+  choose between them; that is the client's call. There is no per-source playback endpoint.
+- **`fileNames` / `lengths` / `dimensions` are informational.** They are keyed by filename and
+  now cover every container. `sources[].length` and `sources[].dimensions` are authoritative.
 
 ---
 
