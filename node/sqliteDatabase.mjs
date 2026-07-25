@@ -810,6 +810,11 @@ export async function getMovies() {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -897,6 +902,11 @@ export async function getMovieById(id) {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -958,6 +968,11 @@ export async function getMovieByName(name) {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
