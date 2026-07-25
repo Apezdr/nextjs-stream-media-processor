@@ -3,6 +3,12 @@ import { join, normalize, dirname } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
+  resolveMediaIdentity,
+  repointMediaIdentity,
+  episodeMediaId,
+} from '../../../utils/mediaIdentity.mjs';
+import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
+import {
   fileExists,
   getStoredBlurhash,
   deriveEpisodeTitle,
@@ -25,7 +31,8 @@ import {
   getEpisodeRetryRows,
   recordEpisodeAttempt,
   clearEpisodeRetry,
-  clearEpisodeRetryForShow
+  clearEpisodeRetryForShow,
+  recordMediaIdentity
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
@@ -311,7 +318,7 @@ async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, enc
  * @param {string[]} seasonFiles - Pre-read directory listing for the season
  * @returns {Promise<Object|null>} Episode data object or null if processing fails
  */
-async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles) {
+async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null) {
   const episodePath = join(seasonPath, episode);
   const encodedEpisodePath = encodeURIComponent(episode);
 
@@ -344,6 +351,15 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
 
   const episodeData = {
     _id: uuid,
+    // Stable identity: the show's id plus the season/episode coordinate.
+    // Deliberately not derived from the filename — filenames change on remux
+    // and re-release, and an episode's identity must not.
+    mediaIdentity: showMediaId
+      ? {
+          id: episodeMediaId(showMediaId, seasonNumber, episodeNumber),
+          scheme: 'mid',
+        }
+      : null,
     filename: episode,
     videoURL: `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
     mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
@@ -430,7 +446,7 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
  * @param {Object} langMap - Language code mapping
  * @returns {Promise<Object|null>} Season data object or null if no episodes
  */
-async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap) {
+async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null) {
   if (!season.isDirectory()) return null;
 
   const seasonName = season.name;
@@ -479,9 +495,10 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       prefixPath,
       basePath,
       langMap,
-      episodes
+      episodes,
+      showMediaId
     );
-    
+
     if (episodeResult) {
       seasonData.episodes[episodeResult.episodeKey] = episodeResult.episodeData;
       seasonData.lengths[episodeResult.episodeKey] = episodeResult.length;
@@ -511,6 +528,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // Lightweight hash lookup — avoids loading full show data with seasons/images
   const existingShowHashes = await getExistingTVShowHashes();
   const hashMap = new Map(existingShowHashes.map(s => [s.name, s.directory_hash]));
+  const signatureMap = new Map(existingShowHashes.map(s => [s.name, s.payload_signature]));
   const existingShowNames = new Set(existingShowHashes.map(s => s.name));
 
   // Bounded concurrency for season processing (moderate load — not unbounded)
@@ -543,6 +561,28 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
       if (storedHash && dirHashChanged) {
         logger.info(`Directory hash changed for ${showName}, reprocessing.`);
+      }
+
+      // Stable content identity for the show. Episode ids derive from it plus
+      // the season/episode coordinate, so episodes keep identity through file
+      // renames and remuxes without a sidecar each.
+      const showIdentity = await resolveMediaIdentity({
+        dir: showPath,
+        libraryRelativePath: `tv/${showName}`,
+      });
+      let showMediaId = showIdentity.id;
+      const showClaim = await recordMediaIdentity(db, {
+        mediaId: showMediaId,
+        mediaType: 'tv',
+        mediaName: showName,
+      });
+      if (showClaim.conflict) {
+        showMediaId = await repointMediaIdentity({
+          dir: showPath,
+          libraryRelativePath: `tv/${showName}`,
+        });
+        await recordMediaIdentity(db, { mediaId: showMediaId, mediaType: 'tv', mediaName: showName });
+        logger.warn(`identity repointed for tv/${showName}: ${showIdentity.id} -> ${showMediaId}`);
       }
 
       const allItems = await fs.readdir(showPath, { withFileTypes: true });
@@ -640,6 +680,25 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       //    tick forever. A config edit / unfreeze is still picked up
       //    immediately — any tmdb.config write bumps its mtime, which flips
       //    dirHashChanged and that term bypasses everything.
+      // A payload-shape change (new field, or the JIT toggle flipping) alters
+      // nothing on disk, so dirHashChanged cannot see it and the fast-skip
+      // below would skip this show forever. TV has no needsInfoRegeneration
+      // equivalent, so this signature comparison is the ONLY convergence driver
+      // for shows. Settles in one pass: saveTVShow stores the new signature.
+      const payloadSignature = currentPayloadSignature();
+      const storedSignature = signatureMap.get(showName);
+      const needPayloadRefresh = storedHash != null && storedSignature !== payloadSignature;
+      if (needPayloadRefresh) {
+        logger.info(
+          `media pivot: reprocessing ${showName} for payload signature ` +
+          `${storedSignature ?? 'none'} -> ${payloadSignature}`
+        );
+      }
+
+      // NOTE: needPayloadRefresh is deliberately NOT folded into this flag.
+      // It gates TMDB image downloads as well as reprocessing, and a payload
+      // bump touches no images — folding it in would fire a library-wide TMDB
+      // image pull on the convergence pass. It only bypasses the fast-skip.
       let runDownloadTmdbImagesFlag =
         dirHashChanged ||
         (missingImages && updateAllowed) ||
@@ -649,7 +708,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // aren't due for a metadata-cooldown retry. Equivalent to the old
       // unconditional hash-skip, just applied AFTER the gate so the
       // image-only retry path isn't suppressed when the dir is unchanged.
-      if (!runDownloadTmdbImagesFlag) {
+      if (!runDownloadTmdbImagesFlag && !needPayloadRefresh) {
         // Thin episodes on an otherwise-stable show still need re-checking — the
         // full-process path only runs the backfill when the show is reprocessed for
         // some other reason, which is exactly when it's least needed. Run it here
@@ -831,7 +890,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
             encodedShowName,
             prefixPath,
             basePath,
-            langMap
+            langMap,
+            showMediaId
           );
           
           if (seasonResult) {
@@ -889,7 +949,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         backdropFocalSuggested,
         imageHashes,
         pristineMetadata,
-        sourceUrls
+        sourceUrls,
+        showMediaId
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

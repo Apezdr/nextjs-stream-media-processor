@@ -6,15 +6,23 @@ import {
   calculateDirectoryHash,
   fileExists,
   getLastModifiedTime,
-  getStoredBlurhash
+  getStoredBlurhash,
+  HASH_EXCLUDED_FILES
 } from '../../../utils/utils.mjs';
 import { getInfo } from '../../../infoManager.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
+  resolveMediaIdentity,
+  repointMediaIdentity,
+  filenameFromUrl,
+} from '../../../utils/mediaIdentity.mjs';
+import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
+import {
   getExistingMovies,
   getMissingMediaData,
+  recordMediaIdentity,
   saveMovie,
   removeMovie,
   markMediaAsMissingData,
@@ -36,6 +44,20 @@ import {
 } from './image-conventions.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
+
+/**
+ * Parse the stored `urls` column, which may be a JSON string or already an
+ * object depending on which reader produced the row.
+ */
+function parseStoredUrls(urls) {
+  if (!urls) return null;
+  if (typeof urls !== 'string') return urls;
+  try {
+    return JSON.parse(urls);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Helper function to generate chapter files if they don't exist.
@@ -434,16 +456,28 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // pass: saveMovie's escape hatch persists the fingerprint, so
       // existingMovie.metadata is non-NULL on the next tick.
       let needMetadataBackfill = false;
+      // A payload-shape change (new field, or the JIT toggle flipping) alters
+      // nothing on disk, so directory_hash cannot see it and this early return
+      // would skip the movie forever. Converges in exactly one pass: the upsert
+      // stores the new signature, so the next tick compares equal.
+      const payloadSignature = currentPayloadSignature();
+      const needPayloadRefresh =
+        existingMovie && existingMovie.payload_signature !== payloadSignature;
       if (!dirHashChanged && existingMovie) {
         needInfoRegeneration = await needsInfoRegeneration(files, dirPath, dirName, currentVersion);
         needMetadataBackfill =
           existingMovie.metadata == null && files.includes('metadata.json');
 
-        if (!needInfoRegeneration && !needMetadataBackfill) {
+        if (!needInfoRegeneration && !needMetadataBackfill && !needPayloadRefresh) {
           if (isDebugMode) {
             logger.info(`No changes detected in ${dirName}, skipping processing.`);
           }
           return;
+        } else if (needPayloadRefresh) {
+          logger.info(
+            `media pivot: reprocessing ${dirName} for payload signature ` +
+            `${existingMovie.payload_signature ?? 'none'} -> ${payloadSignature}`
+          );
         } else if (needInfoRegeneration) {
           logger.info(`Processing ${dirName} to update info files`);
         } else {
@@ -455,13 +489,17 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
 
       const fileSet = new Set(files);
       const fileNames = files.filter(file =>
+        // The identity sidecar is our own bookkeeping, not library content. It
+        // matches the .json arm below, so without this it would be published in
+        // file_names and folded into the movie hash.
+        !HASH_EXCLUDED_FILES.has(file) && (
         file.endsWith('.mp4') ||
         file.endsWith('.srt') ||
         file.endsWith('.json') ||
         file.endsWith('.info') ||
         file.endsWith('.nfo') ||
         file.endsWith('.jpg') ||
-        file.endsWith('.png')
+        file.endsWith('.png'))
       );
 
       let runDownloadTmdbImagesFlag = false;
@@ -504,6 +542,36 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // Process video files
       const videoData = await processVideoFiles(fileNames, dirPath, dirName, prefixPath);
       if (videoData._id) _id = videoData._id;
+
+      // Stable content identity. primarySource is seeded from the row's
+      // ALREADY-STORED url, never recomputed: today's processVideoFiles picks
+      // the LAST .mp4 in a multi-mp4 folder (the loop overwrites), while
+      // priority-order selection picks the FIRST. Recomputing would silently
+      // repoint those titles' published URL — and the frontend still derives
+      // watch-history identity from that URL until its cutover lands.
+      const storedUrls = parseStoredUrls(existingMovie?.urls);
+      const libraryRelativePath = `movies/${dirName}`;
+      const identity = await resolveMediaIdentity({
+        dir: fullDirPath,
+        libraryRelativePath,
+        primarySourceHint: filenameFromUrl(storedUrls?.mp4),
+      });
+      let mediaId = identity.id;
+
+      const claim = await recordMediaIdentity(db, {
+        mediaId,
+        mediaType: 'movie',
+        mediaName: dirName,
+      });
+      if (claim.conflict) {
+        // Another folder already owns this id — almost always a copied folder
+        // that brought a cloned sidecar. Re-derive from THIS folder's path,
+        // which is unique by construction, and record the displaced id in
+        // previousIds so the change stays auditable.
+        mediaId = await repointMediaIdentity({ dir: fullDirPath, libraryRelativePath });
+        await recordMediaIdentity(db, { mediaId, mediaType: 'movie', mediaName: dirName });
+        logger.warn(`identity repointed for ${libraryRelativePath}: ${identity.id} -> ${mediaId}`);
+      }
 
       // Build URLs. The resolution map (file path + mtime + hash per kind) comes
       // from the same pass that builds the URLs, so the DB row below stores the
@@ -732,7 +800,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         imageHashes,
         metadataFingerprint,
         pristineMetadata,
-        sourceUrls
+        sourceUrls,
+        mediaId
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

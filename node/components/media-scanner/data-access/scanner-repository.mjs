@@ -26,6 +26,59 @@ const logger = createCategoryLogger('scanner-repository');
  */
 
 /**
+ * Record a resolved identity in the reverse index, reporting whether another
+ * title already owns that id.
+ *
+ * The index is a rebuildable cache; its one active job is this collision check.
+ * The usual cause of a collision is a copied media folder bringing a cloned
+ * .mediaid.json with it — without detection, two distinct titles would share a
+ * resume position.
+ *
+ * Resolution is deliberately NOT "first one wins", which would depend on scan
+ * order and therefore differ between runs. The caller re-derives the loser's id
+ * from its own path, which is unique per folder by construction.
+ *
+ * @returns {Promise<{conflict: boolean, ownedBy: string|null}>}
+ */
+export async function recordMediaIdentity(db, { mediaId, mediaType, mediaName, seasonKey = '', episodeKey = '' }) {
+  if (!mediaId) return { conflict: false, ownedBy: null };
+
+  const existing = await db.get(
+    'SELECT media_name, season_key, episode_key FROM media_identity_index WHERE media_id = ?',
+    [mediaId]
+  );
+
+  if (
+    existing &&
+    (existing.media_name !== mediaName ||
+      existing.season_key !== seasonKey ||
+      existing.episode_key !== episodeKey)
+  ) {
+    logger.warn(
+      `identity duplicate: ${mediaId} is claimed by "${existing.media_name}" ` +
+      `(season="${existing.season_key}" episode="${existing.episode_key}") ` +
+      `but was also presented by "${mediaName}" ` +
+      `(season="${seasonKey}" episode="${episodeKey}")`
+    );
+    return { conflict: true, ownedBy: existing.media_name };
+  }
+
+  await db.run(
+    `INSERT INTO media_identity_index (media_id, media_type, media_name, season_key, episode_key, seen_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(media_id) DO UPDATE SET
+       media_type=excluded.media_type,
+       media_name=excluded.media_name,
+       season_key=excluded.season_key,
+       episode_key=excluded.episode_key,
+       seen_at=excluded.seen_at`,
+    [mediaId, mediaType, mediaName, seasonKey, episodeKey, new Date().toISOString()]
+  );
+
+  return { conflict: false, ownedBy: null };
+}
+
+/**
  * Cooldown (in hours) between retries for media that has been flagged as
  * having missing TMDB data. Owned here because the cooldown semantics belong
  * to the `missing_data_media` table that this repository fronts.
@@ -123,7 +176,8 @@ export async function saveMovie(
   imageHashes = null,
   metadata = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -146,7 +200,8 @@ export async function saveMovie(
     imageHashes,
     metadata,
     pristineMetadata,
-    sourceUrls
+    sourceUrls,
+    mediaId
   );
 }
 
@@ -202,7 +257,8 @@ export async function saveTVShow(
   backdropFocalSuggested = null,
   imageHashes = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -224,7 +280,8 @@ export async function saveTVShow(
     backdropFocalSuggested,
     imageHashes,
     pristineMetadata,
-    sourceUrls
+    sourceUrls,
+    mediaId
   );
 }
 
