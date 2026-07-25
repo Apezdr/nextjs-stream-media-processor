@@ -339,8 +339,13 @@ export async function clearOriginalSegmentsCache() {
     let totalSize = 0;
     
     for (const file of files) {
-      // Only process files that match the original segment naming pattern
-      if (file.includes('-original.mp4')) {
+      // Only process files that match the original segment naming pattern.
+      // The extension is whatever container the SOURCE used (see
+      // serveOriginalVideoWithRanges in videoHandler.mjs) — matching a literal
+      // '-original.mp4' would silently stop evicting the moment a non-mp4
+      // source produced a segment, and this cache has an 8-minute TTL for a
+      // reason. These two must always change together.
+      if (/-original\.[a-z0-9]+$/i.test(file)) {
         const filePath = join(dir, file);
         try {
           const stats = await fs.stat(filePath);
@@ -430,41 +435,43 @@ export async function clearFramesCache() {
   }
 }
 
-//
-// Function to find an MP4 file in a directory, optionally looking for a specific file
-export async function findMp4File(directory, specificFileName = null, extraData = false) {
-  try {
-    const files = await fs.readdir(directory);
-    let targetFile;
+export class PathTraversalError extends Error {}
 
-    // If specificFileName is provided, try to find it
-    if (specificFileName) {
-      targetFile = files.find((file) => file === specificFileName);
-      if (targetFile) {
-        return join(directory, targetFile);
-      }
-      // If the specific file is not found, you can either throw an error or fall back to finding any MP4 file
-      logger.info(
-        `Specific file ${specificFileName} not found, looking for any .mp4 file.`, directory, extraData
-      );
-    }
-
-    // If specificFileName is not provided or specific file not found, find the first .mp4 file
-    const mp4Files = files.filter((file) => file.endsWith(".mp4"));
-    if (mp4Files.length === 0) {
-      throw new Error("No MP4 file found in the directory");
-    }
-    return join(directory, mp4Files[0]);
-  } catch (error) {
-    logger.error(error.message);
-    throw error; // Rethrow the error to be handled by the caller
+/**
+ * Join untrusted segments onto a trusted base dir, verifying the final
+ * resolved absolute path cannot escape base. Handles '..', traversal
+ * embedded inside a larger segment, and platform separator differences
+ * in one check, unlike a naive substring-scan for '..'.
+ *
+ * `base` should be the most specific directory the caller actually intends
+ * to stay within (e.g. `join(BASE_PATH, 'movies')`, not just `BASE_PATH`) —
+ * checking only against BASE_PATH would let a crafted title escape into a
+ * sibling top-level directory (e.g. into `tv/` from a movie route) while
+ * technically staying "inside" BASE_PATH.
+ *
+ * @param {string} base - Trusted base directory
+ * @param {...string} segments - Untrusted path segments
+ * @returns {string} Resolved absolute path, guaranteed inside base
+ * @throws {PathTraversalError}
+ */
+export function safeJoin(base, ...segments) {
+  const resolvedBase = _resolve(base);
+  const resolvedPath = _resolve(resolvedBase, ...segments);
+  if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + sep)) {
+    throw new PathTraversalError(`Rejected path outside base directory: ${segments.join('/')}`);
   }
+  return resolvedPath;
 }
 
 // Containers the video pipeline can serve (getOutputFormat in videoHandler.mjs).
-// .mp4 is listed first deliberately: in mixed folders the scanner treats the mp4
-// as THE video file, so subtitle base-naming must follow it for parity.
-export const VIDEO_EXTENSIONS = ['.mp4', '.m4v', '.mkv', '.webm', '.avi'];
+//
+// ORDER IS LOAD-BEARING. It is the priority order used to pick "the" video file
+// when a folder holds more than one, so it decides which URL a title publishes.
+// .mp4 stays first because that is what the scanner has always chosen, and the
+// published URL is what watch-history identity is derived from today — a
+// reordering would repoint existing titles. New containers are appended or
+// inserted after .mp4, never in front of it.
+export const VIDEO_EXTENSIONS = ['.mp4', '.m4v', '.mov', '.mkv', '.webm', '.avi'];
 
 /**
  * Find the primary video file among directory entries (filenames, not paths).
@@ -587,89 +594,6 @@ export function deriveEpisodeTitle(
 
   // 5) Nothing matched
   return null;
-}
-
-/**
- * Retrieves the filename for a given show, season, and episode.
- * @param {Object} showData - The show data object.
- * @param {string} season - The season number.
- * @param {string} episode - The episode number.
- * @returns {string} - The filename of the episode.
- * @throws Will throw an error if the show, season, or episode is not found.
- */
-export function getEpisodeFilename(showData, season, episode) {
-  const _season = showData.seasons[`Season ${season}`];
-  if (!_season) {
-    throw new Error(`Season not found: ${showData.name} - Season ${season}`);
-  }
-
-  const seasonNumber = season.toString().padStart(2, "0");
-  const episodeNumber = episode.toString().padStart(2, "0");
-
-  const _episodeKey = Object.keys(_season.episodes).find((e) => {
-    // Standard S01E01 format
-    const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-    if (standardMatch) {
-      return (
-        standardMatch[1] === seasonNumber &&
-        standardMatch[2] === episodeNumber
-      );
-    }
-
-    // Alternate "01 - Episode Name.mp4" format
-    const alternateMatch = e.match(/^(\d{2})\s*-/);
-    if (alternateMatch) {
-      return alternateMatch[1] === episodeNumber;
-    }
-
-    // Legacy formats
-    return (
-      e.includes(` - `) &&
-      (e.startsWith(episodeNumber) || e.includes(` ${episodeNumber} - `))
-    );
-  });
-
-  if (_episodeKey) {
-    return _season.episodes[_episodeKey].filename;
-  } else {
-    throw new Error(
-      `Episode not found: ${showData.name} - Season ${season} Episode ${episode}`
-    );
-  }
-}
-
-export function getEpisodeKey(showData, season, episode) {
-  const _season = showData.seasons[`Season ${season}`];
-  if (!_season) {
-    throw new Error(`Season not found: ${showData.name} - Season ${season}`);
-  }
-
-  return Object.keys(_season.episodes).find((e) => {
-    const episodeNumber = episode.padStart(2, "0");
-    const seasonNumber = season.padStart(2, "0");
-  
-    // Match S01E01 format
-    const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-    if (standardMatch) {
-      const matchedSeason = standardMatch[1].padStart(2, "0");
-      const matchedEpisode = standardMatch[2].padStart(2, "0");
-      return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
-    }
-  
-    // Match "01 - Episode Name.mp4" format or variations
-    const alternateMatch = e.match(/^(\d{2})\s*-/);
-    if (alternateMatch) {
-      const matchedEpisode = alternateMatch[1].padStart(2, "0");
-      return matchedEpisode === episodeNumber;
-    }
-  
-    // Legacy format matches (keeping for backward compatibility)
-    return (
-      e.includes(` - `) &&
-      (e.startsWith(episodeNumber) ||
-       e.includes(` ${episodeNumber} - `))
-    );
-  });
 }
 
 export async function getStoredBlurhash(imagePath, basePath) {
