@@ -19,6 +19,9 @@ import { promises as fs } from 'fs';
 import { join, extname } from 'path';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import { getInfo } from '../../../infoManager.mjs';
+import { isJitEligibilityEnabled } from '../../../lib/payloadVersion.mjs';
+import { jitPathKey, jitMasterUrl, isJitUrlConfigured } from '../../../utils/jitUrl.mjs';
+import { evaluateJitEligibility } from './jit-eligibility.mjs';
 
 const logger = createCategoryLogger('video-sources');
 
@@ -49,6 +52,9 @@ export function audioLanguagesOf(additionalMetadata) {
  * @param {string|null} [params.primaryFilename]
  *        The identity sidecar's pinned primary. Honoured when present in the
  *        folder; otherwise the first file in priority order wins.
+ * @param {string|null} [params.libraryRelativeDir]
+ *        Directory path relative to BASE_PATH, e.g. 'movies/Dune (2021)'. Used
+ *        to build the transcoder's path key. Omit to skip JIT emission.
  * @returns {Promise<{
  *   sources: Array<object>,
  *   primary: object|null,
@@ -56,10 +62,21 @@ export function audioLanguagesOf(additionalMetadata) {
  *   fileDimensions: Record<string, string>
  * }>}
  */
-export async function buildVideoSources({ videoFiles, dir, urlFor, primaryFilename = null }) {
+export async function buildVideoSources({
+  videoFiles,
+  dir,
+  urlFor,
+  primaryFilename = null,
+  libraryRelativeDir = null,
+}) {
   const sources = [];
   const fileLengths = {};
   const fileDimensions = {};
+
+  // Read the toggles ONCE per folder, not per file: a scan must not straddle a
+  // config change and emit a half-flipped payload.
+  const hostEnabled = isJitEligibilityEnabled();
+  const urlConfigured = isJitUrlConfigured();
 
   for (const filename of videoFiles) {
     const filePath = join(dir, filename);
@@ -86,11 +103,29 @@ export async function buildVideoSources({ videoFiles, dir, urlFor, primaryFilena
     if (info?.length != null) fileLengths[filename] = parseInt(info.length, 10);
     if (info?.dimensions) fileDimensions[filename] = info.dimensions;
 
+    const container = extname(filename).toLowerCase().replace(/^\./, '');
+    const formatName = meta?.format?.formatName ?? null;
+    const audioLanguages = audioLanguagesOf(meta);
+
+    const verdict = evaluateJitEligibility({
+      container,
+      formatName,
+      videoCodec: video?.codec ?? null,
+      audioLanguages,
+      hostEnabled,
+    });
+
+    // The URL is only emitted for a file the transcoder can actually serve, and
+    // only when a public transcoder URL is configured. Eligibility and reach
+    // are separate concerns: a host can be enabled without one.
+    const relPath = libraryRelativeDir ? `${libraryRelativeDir}/${filename}` : null;
+    const emitJit = verdict.eligible && urlConfigured && relPath;
+
     sources.push({
       url: urlFor(filename),
       filename,
-      container: extname(filename).toLowerCase().replace(/^\./, ''),
-      formatName: meta?.format?.formatName ?? null,
+      container,
+      formatName,
       size: stat ? stat.size : null,
       length: info?.length != null ? parseInt(info.length, 10) : null,
       dimensions: info?.dimensions || null,
@@ -99,13 +134,19 @@ export async function buildVideoSources({ videoFiles, dir, urlFor, primaryFilena
       fieldOrder: video?.field_order ?? null,
       hdr: info?.hdr ?? null,
       audioTrackCount: Array.isArray(meta?.audio) ? meta.audio.length : 0,
-      audioLanguages: audioLanguagesOf(meta),
+      audioLanguages,
       // Stable-null discipline: a source whose stat failed contributes null,
       // never a fresh timestamp. A `new Date()` fallback here would move the
       // movie hash on every single regeneration.
       mediaLastModified: stat ? stat.mtime.toISOString() : null,
       uuid: info?.uuid ?? null,
       isPrimary: false,
+      jitEligible: verdict.eligible,
+      // Why a source is NOT eligible, so this is diagnosable from the payload
+      // instead of requiring a log dive. Null when it is.
+      jitReason: verdict.eligible ? null : verdict.reason,
+      jitKey: emitJit ? jitPathKey(relPath) : null,
+      jitUrl: emitJit ? jitMasterUrl(relPath) : null,
       // Carried out of band for the scanner's own row fields; not published.
       _info: info,
     });

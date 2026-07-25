@@ -16,9 +16,9 @@ them — they are not in the payload yet.
 | P1 | `epic/p1-media-resolution` | Container-agnostic discovery (§1–§3) |
 | P2 | `epic/p2-info-sidecar` | `.info` sidecar v1.0011 — probe fields for eligibility (§8) |
 | P3 | `epic/p3-media-identity` | `mediaIdentity` + `.mediaid.json` sidecar (§4) |
-| **P4** | `epic/p4-container-sources` | **`urls.sources[]`; MKV/MOV titles become visible (§7)** |
-| P5 | — (frontend) | Identity cutover + WatchHistory remediation |
-| P6 | `epic/p6-jit-emission` | `jitEligible`, `jitKey`, `jitUrl` |
+| P4 | `epic/p4-container-sources` | `urls.sources[]`; MKV/MOV titles become visible (§7) |
+| P5 | — (frontend) | Identity cutover + WatchHistory remediation — **not started** |
+| **P6** | `epic/p6-jit-emission` | **`jitEligible`, `jitKey`, `jitUrl` (§9)** — ships disabled |
 
 ---
 
@@ -33,7 +33,7 @@ them — they are not in the payload yet.
 | **`-original.mp4` clip cache** — remuxed source bytes into a hardcoded `.mp4` name | An `.mkv` source produced matroska bytes in a `.mp4` file served as `video/mp4`; three-way mismatch | Extension derived from the source container, with a matching eviction predicate |
 | **3-entry MIME table** | `.mov` / `.m4v` / `.avi` served as `application/octet-stream`, which browsers refuse to play | One entry per `VIDEO_EXTENSIONS` member |
 | **Identity derived from the played URL** | A rename, remux, or container swap orphaned watch history — and it already did once in production | `mediaIdentity.id`, derived from the folder path and persisted to a sidecar on the media volume (§4) |
-| *(P6)* **Frontend-constructed JIT URLs** | The backend is co-located with the transcoder and already knows the media root | Backend emits `jitUrl` |
+| **Frontend-constructed JIT URLs** | The backend is co-located with the transcoder and already knows the library layout, so making every client re-derive the base64 encoding was pointless indirection | Backend emits `jitUrl` and `jitKey` (§9) |
 
 ---
 
@@ -169,8 +169,8 @@ value. Nothing here needs backing up; the media volume already is the backup.
 | `subtitles`, `chapters`, `poster`, `backdrop`, `logo`, `metadata` | — | shipped | Unchanged by this pivot |
 | `sources[]` | array | **shipped P4** | Every video file for this title — see §7 |
 
-`mediaIdentity` (object, **shipped P3** — see §4) and `jitEligible` (boolean, planned P6) sit
-at the movie level, beside `urls`.
+`mediaIdentity` (object, **shipped P3** — see §4) sits at the movie level beside `urls`.
+`jitEligible` / `jitUrl` (**shipped P6** — see §9) live *inside* `urls`, beside `urls.mp4`.
 
 ## 6. TV payload
 
@@ -183,7 +183,7 @@ at the movie level, beside `urls`.
 | `_id` | string | shipped | `info.uuid`, a mediainfo header hash. **Per file**, so it varies by container and rotates on re-encode. Not identity — see §4. |
 | `mediaIdentity` | object | **shipped P3** | `{ id, scheme }`, flat on the episode. `id` is `` `${showId}:s##e##` `` |
 | `sources[]` | array | **shipped P4** | Every container for this episode — see §7 |
-| `jitEligible`, `jitUrl` | — | **planned P6** | Flat on the episode object |
+| `jitEligible`, `jitUrl` | boolean / string\|null | **shipped P6** | Flat on the episode, describing the primary source — see §9 |
 
 **Episodes carry flat fields by design and will not gain a `urls` bag.** Nesting them would
 reshape a hot payload and change the input shape of `generateTVShowHashes`, forcing a resync
@@ -214,7 +214,8 @@ One entry per video file in the title's folder. Present on movies as
   "mediaLastModified": "string",
   "uuid": "string|null",          // info.uuid of THIS file, not of the title
   "isPrimary": "boolean",         // exactly one true
-  "jitEligible": "boolean",
+  "jitEligible": "boolean",       // see §9
+  "jitReason": "string|null",     // why not, when ineligible
   "jitKey": "string|null",
   "jitUrl": "string|null"
 }
@@ -301,7 +302,57 @@ together. TV has no equivalent check and converges via the payload-signature bum
 
 ---
 
-## 9. Non-goals and known gaps
+## 9. JIT emission · Status: **shipped P6**
+
+Three fields per source, plus the same pair at title level describing the primary:
+
+| Field | Meaning |
+|---|---|
+| `jitEligible` | The transcoder can serve this file **without the viewer losing anything** |
+| `jitReason` | Why not, when `jitEligible` is false. `null` when it is. |
+| `jitKey` | base64url of the transcoder-relative path — build variant/init URLs without re-deriving the encoding |
+| `jitUrl` | `{base}/stream/{jitKey}/master.m3u8`. Only emitted when eligible **and** a public base URL is configured. |
+
+Movies carry `urls.jitEligible` / `urls.jitUrl` beside `urls.mp4`; episodes carry them flat
+beside `videoURL`. Each follows its own container's existing convention.
+
+### Capability, not liveness
+
+`jitEligible` says the transcoder *can* serve the file. It says nothing about whether the
+service is up. **The client still health-checks and falls back to the raw URL** — do not treat
+the flag or the URL as a liveness signal.
+
+### The predicate
+
+Deliberately narrower than "can the ladder decode this?", which is nearly always yes and
+therefore useless. It asks whether routing the file through JIT is a strict improvement.
+
+1. `!hostEnabled` → `host-disabled`
+2. Container ∉ {mp4, m4v, mov, mkv, webm} → `container-unsupported`. **`.avi` is excluded** — still discoverable and directly playable, just never advertised.
+3. No `videoCodec` or no `formatName` → `probe-incomplete`. **Fails closed.** A pre-v1.0011 sidecar cannot supply these, so the flag simply does not appear until it converges — which is why the probe bump and this rollout need no sequencing between them.
+4. More than one distinct `audioLanguages` entry → `multi-audio-language`. The transcoder collapses multi-audio to one language via a process-global `JIT_AUDIO_LANG` with no per-request override, so JIT would silently drop languages direct playback exposes. **Lift when audio groups ship.**
+5. Otherwise eligible.
+
+**HDR and Dolby Vision do not disqualify** — the tone-map path is always present and PQ
+passthrough is additive. **Interlaced does not disqualify** — `field_order` gates only the
+zero-cost remux rung, never the ladder.
+
+### Configuration
+
+| Var | Default | Effect |
+|---|---|---|
+| `JIT_ELIGIBILITY_ENABLED` | `false` | Advertise capability at all. Folded into `payload_signature`, so flipping it plus one scan converges the library — and flipping back is the rollback. |
+| `JIT_TRANSCODER_URL` | unset | **Public** base URL, reachable by end clients. Unset ⇒ no `jitUrl` anywhere, even for eligible files. |
+| `JIT_SOURCE_PREFIX` | `''` | Prefix when `BASE_PATH` here and `JIT_SOURCE_DIR` there are not rooted alike. Empty is correct for the standard shared-volume topology. |
+
+> **Security.** The transcoder is unauthenticated with permissive CORS, and `jitKey` is
+> reversible base64. Publishing `JIT_TRANSCODER_URL` makes everything under its media root
+> fetchable by anyone who can reach that host. Front it with something that authenticates, or
+> keep it on a network where that is acceptable. Confirm this before enabling.
+
+---
+
+## 10. Non-goals and known gaps
 
 - **`.avi` is discoverable and playable but will never be JIT-eligible** (P6). Annex-B
   demuxing through the transcode ladder is unverified.
@@ -322,7 +373,7 @@ together. TV has no equivalent check and converges via the payload-signature bum
 
 ---
 
-## 10. Payload versioning
+## 11. Payload versioning
 
 Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``
 (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
@@ -347,7 +398,7 @@ recurs, something is rewriting a hashed input on every pass.
 
 ---
 
-## 11. Change process
+## 12. Change process
 
 Any change to `sources[]`, to `mediaIdentity` semantics, or to the transcoder's route shape
 requires a coordinated update to **both**

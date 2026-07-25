@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join, normalize, dirname, extname } from 'path';
+import { join, normalize, dirname, extname, basename } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
@@ -353,6 +353,9 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
     dir: seasonPath,
     urlFor: (filename) =>
       `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(filename)}`,
+    // basename(seasonPath) is the real folder name on disk, which is what the
+    // transcoder must be handed — not the padded season number.
+    libraryRelativeDir: `tv/${showName}/${basename(seasonPath)}`,
   });
 
   if (!primary) {
@@ -376,6 +379,9 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
     filename: primary.filename,
     videoURL: primary.url,
     sources: publishableSources(sources),
+    // Describe the PRIMARY source, which is what videoURL points at.
+    jitEligible: primary.jitEligible,
+    jitUrl: primary.jitUrl,
     mediaLastModified: primary.mediaLastModified,
     hdr: info?.hdr || null,
     mediaQuality: info?.mediaQuality || null,
