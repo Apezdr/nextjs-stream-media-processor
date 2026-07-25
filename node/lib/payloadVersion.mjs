@@ -17,7 +17,9 @@
 //
 // BUMP THIS when the emitted payload shape changes in a way consumers must see.
 
-export const MEDIA_PAYLOAD_VERSION = 2;
+// 2 — mediaIdentity added (P3)
+// 3 — urls.sources[] / episode.sources[] added; non-mp4 containers discovered (P4)
+export const MEDIA_PAYLOAD_VERSION = 3;
 
 /**
  * Whether this host advertises JIT transcoder capability.
