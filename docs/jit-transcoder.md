@@ -13,8 +13,8 @@ them — they are not in the payload yet.
 | Phase | Branch | Ships |
 |---|---|---|
 | P0 | `epic/p0-scanner-baseline` | Scan concurrency bound, dead code removed |
-| **P1** | `epic/p1-media-resolution` | **Container-agnostic discovery (this document's §1–§3)** |
-| P2 | `epic/p2-info-sidecar` | `.info` sidecar v1.0011 — probe fields for eligibility |
+| P1 | `epic/p1-media-resolution` | Container-agnostic discovery (§1–§3) |
+| **P2** | `epic/p2-info-sidecar` | **`.info` sidecar v1.0011 — probe fields for eligibility (§7)** |
 | P3 | `epic/p3-media-identity` | `mediaIdentity` + `.mediaid.json` sidecar |
 | P4 | `epic/p4-container-sources` | `urls.sources[]`, MKV/MOV titles become visible |
 | P5 | — (frontend) | Identity cutover + WatchHistory remediation |
@@ -159,7 +159,61 @@ consumer recompute it; a derived boolean would silently rot.
 
 ---
 
-## 7. Non-goals and known gaps
+## 7. `.info` sidecar v1.0011 · Status: **shipped P2**
+
+Each video file has a `<filename>.info` sidecar next to it, written by
+[`node/infoManager.mjs`](../node/infoManager.mjs). It is a **cache**, not a source of truth —
+delete one and it regenerates. `additionalMetadata` is published to the frontend as
+`additional_metadata`.
+
+v1.0011 adds the facts needed to decide whether the transcoder can serve a file without
+losing anything, at **zero extra subprocess cost** — the existing
+`ffprobe -show_format -show_streams` call already returned them and threw them away.
+
+```jsonc
+additionalMetadata: {
+  format: {                       // NEW — null when probing failed
+    formatName: "matroska,webm",  // ffprobe format_name, verbatim (comma-joined family)
+    formatLongName: "Matroska / WebM",
+    bitrate: 8000000
+  },
+  video: [{
+    codec, frame_rate, bitrate, aspect_ratio, width, height,
+    pix_fmt, field_order,                            // NEW — gate the remux path
+    color_transfer, color_primaries, color_space,    // NEW — HDR10 / HLG / SDR
+    profile, level                                   // NEW
+  }],
+  audio: [{
+    codec, channels, sample_rate, bitrate,
+    language,      // UNCHANGED, and NOT a language code — see below
+    languageTag,   // NEW — strict code, lowercased; null for absent/"und"
+    title,         // NEW
+    disposition: { default, comment, visual_impaired, descriptions }  // NEW
+  }]
+}
+```
+
+**`language` vs `languageTag`.** The pre-existing `language` field falls back to
+`tags.title` when no language tag is present, so it can hold `"Director Commentary"` or
+`"English [DTS-HD MA 5.1]"`. It is left exactly as-is because it is published and the frontend
+reads it. **Any policy decision about how many languages a file carries must use
+`languageTag`**, which comes only from `tags.language|LANGUAGE|lang`. A three-track file with
+one tagged language yields 3 distinct `language` values and 1 distinct `languageTag`.
+
+**Probe failure writes a shaped empty**, not `{}` — every key present, values null.
+`validateInfo` tests for the *presence* of `format`, so a bare `{}` would fail validation,
+regenerate, fail again, on every `getInfo` call forever. There is a regression test pinning
+this.
+
+**Convergence.** Movies re-probe through `needsInfoRegeneration`, which is still deliberately
+`.mp4`-only: it decides whether to *reprocess*, while `processVideoFiles` is what actually
+calls `getInfo`. Widening the first without the second makes every folder containing an
+`.mkv` reprocess on every scan tick forever. They widen together in P4. TV has no equivalent
+check and converges via the P4 payload-signature bump.
+
+---
+
+## 8. Non-goals and known gaps
 
 - **`.avi` is discoverable and playable but will never be JIT-eligible** (P6). Annex-B
   demuxing through the transcode ladder is unverified.
@@ -176,10 +230,13 @@ consumer recompute it; a derived boolean would silently rot.
   and derived-asset paths, not discovery.** An MKV-only title is reachable through
   `/frame`, `/videoClip`, `/spritesheet`, and `/chapters`, but does not yet appear in
   `/media/movies` or `/media/tv`.
+- Because the serving paths are now container-agnostic, **non-mp4 `.info` sidecars already
+  exist in the wild** — `videoHandler` creates them lazily on first clip/transcode request.
+  They are correct and current; they are simply not yet reflected in any payload.
 
 ---
 
-## 8. Change process
+## 9. Change process
 
 Any change to `sources[]`, to `mediaIdentity` semantics, or to the transcoder's route shape
 requires a coordinated update to **both**
