@@ -30,6 +30,7 @@ import {
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, clearVideoTranscodeCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
+import { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } from "./lib/mediaPayload.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -781,21 +782,7 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
     // Read-time injection of auto-caption stubs.
     await injectTvStubs(shows, langMap);
 
-    const tvData = shows.reduce((acc, show) => {
-      acc[show.name] = {
-        metadata: show.metadata_path,
-        poster: show.poster,
-        posterBlurhash: show.posterBlurhash,
-        logo: show.logo,
-        logoBlurhash: show.logoBlurhash,
-        backdrop: show.backdrop,
-        backdropBlurhash: show.backdropBlurhash,
-        seasons: show.seasons,
-        backdropFocal: show.backdropFocal ?? null,
-        backdropFocalSuggested: show.backdropFocalSuggested ?? null,
-      };
-      return acc;
-    }, {});
+    const tvData = buildPayloadMap(shows, buildTvPayloadEntry);
 
     res.json({ ...tvData, version: TV_LIST_VERSION });
   } catch (error) {
@@ -839,25 +826,7 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
     // autoCaptions flag or language list changes).
     await injectMovieStubs(movies, langMap);
 
-    const movieData = movies.reduce((acc, movie) => {
-      acc[movie.name] = {
-        _id: movie._id,
-        // Stable content identity — what watch history joins on. Distinct from
-        // `_id`, which is a mediainfo header hash: per FILE, so it varies by
-        // container and rotates on re-encode. See utils/mediaIdentity.mjs.
-        mediaIdentity: movie.media_id ? { id: movie.media_id, scheme: 'mid' } : null,
-        fileNames: movie.fileNames,
-        length: movie.lengths,
-        dimensions: movie.dimensions,
-        urls: movie.urls,
-        hdr: movie.hdr,
-        mediaQuality: movie.mediaQuality,
-        additional_metadata: movie.additional_metadata,
-        backdropFocal: movie.backdropFocal ?? null,
-        backdropFocalSuggested: movie.backdropFocalSuggested ?? null,
-      };
-      return acc;
-    }, {});
+    const movieData = buildPayloadMap(movies, buildMoviePayloadEntry);
 
     res.json({...movieData, 'version': MOVIE_LIST_VERSION});
   } catch (error) {
