@@ -17,8 +17,9 @@ them — they are not in the payload yet.
 | P2 | `epic/p2-info-sidecar` | `.info` sidecar v1.0011 — probe fields for eligibility (§8) |
 | P3 | `epic/p3-media-identity` | `mediaIdentity` + `.mediaid.json` sidecar (§4) |
 | P4 | `epic/p4-container-sources` | `urls.sources[]`; MKV/MOV titles become visible (§7) |
-| P5 | — (frontend) | Identity cutover + WatchHistory remediation — **not started** |
-| **P6** | `epic/p6-jit-emission` | **`jitEligible`, `jitKey`, `jitUrl` (§9)** — ships disabled |
+| P5 | — (frontend) | Identity cutover + WatchHistory remediation — in progress |
+| P6 | `epic/p6-jit-emission` | `jitEligible`, `jitKey`, `jitUrl` (§9) — ships disabled |
+| **P7** | `epic/p7-payload-emission-fixes` | **Emit movie `mediaIdentity`; hash the new episode fields; rename-vs-duplicate** |
 
 ---
 
@@ -143,8 +144,17 @@ sprite caches key on `_id` precisely because it rotates.
 | Sidecar present and parseable | Use its `id`. Never re-derive. |
 | No sidecar | Derive, write it, log `identity established` |
 | Sidecar unparseable or a future `v` | **Do not overwrite** — derive for this pass only, log `identity sidecar unreadable` |
-| Id already claimed by another title | Re-derive from this folder's own path, record the displaced id in `previousIds`, log `identity duplicate` + `identity repointed` |
+| Same id presented under a **different name in a later scan** | **Rename.** Follow it — update the index row, keep the id. |
+| Same id claimed by two titles **within one scan** | **Duplicate** (a copied folder with a cloned sidecar). Re-derive the second from its own path, record the displaced id in `previousIds`, log `identity duplicate` + `identity repointed` |
 | Media volume read-only | Use the derived id, log `identity sidecar write failed`, retry next scan |
+
+> The last two rows are the same observation separated only by **time**, and
+> conflating them is a trap worth naming. A rename and a copied folder both present
+> a familiar id under an unfamiliar name; comparing against the *stored* row cannot
+> tell them apart, and treating a rename as a duplicate repoints identity on the
+> first scan after any rename — discarding the one thing persisting the id buys over
+> deriving it. Only two titles claiming one id **in the same pass** prove a duplicate,
+> because only then are both folders known to exist.
 
 `primarySource` is seeded **once**, from the row's already-stored `urls.mp4`, and never
 recomputed. Today's scanner picks the *last* `.mp4` in a multi-mp4 folder while priority-order
@@ -155,6 +165,13 @@ which the frontend still derives its legacy watch-history key from until its cut
 active job is the duplicate check. `DROP TABLE media_identity_index` and rescan reproduces it
 exactly. Likewise `movies.media_id` / `tv_shows.media_id` are cached copies of the sidecar
 value. Nothing here needs backing up; the media volume already is the backup.
+
+**Where the id surfaces.** `movies.media_id` is a column, and the movie readers
+(`getMovies` / `getMovieById` / `getMovieByName`) reshape rows into an explicit allowlist — a
+column missing from that list is invisible to `/media/movies` regardless of what the scanner
+stored. Episode identity instead rides inside the `seasons` JSON blob, which passes through
+untouched. If a new identity field ever fails to appear on movies but works on TV, that
+allowlist is the first place to look.
 
 ---
 
