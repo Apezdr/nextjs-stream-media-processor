@@ -26,6 +26,7 @@ import {
   getExistingMovies,
   getMissingMediaData,
   recordMediaIdentity,
+  createIdentityClaims,
   saveMovie,
   removeMovie,
   markMediaAsMissingData,
@@ -453,6 +454,10 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
   // every title to reprocess in a single tick.
   const movieLimit = pLimit(3);
 
+  // Per-scan identity claims. Scoped to this run so a stale index row from an
+  // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
+  const identityClaims = createIdentityClaims();
+
   await Promise.all(
     dirs.map((dir, index) => movieLimit(async () => {
       if (isDebugMode) {
@@ -595,18 +600,18 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       });
       let mediaId = identity.id;
 
-      const claim = await recordMediaIdentity(db, {
+      const claim = await recordMediaIdentity(db, identityClaims, {
         mediaId,
         mediaType: 'movie',
         mediaName: dirName,
       });
       if (claim.conflict) {
-        // Another folder already owns this id — almost always a copied folder
-        // that brought a cloned sidecar. Re-derive from THIS folder's path,
-        // which is unique by construction, and record the displaced id in
-        // previousIds so the change stays auditable.
+        // Another folder in THIS scan already claimed this id — almost always a
+        // copied folder that brought a cloned sidecar. Re-derive from this
+        // folder's path, which is unique by construction, and record the
+        // displaced id in previousIds so the change stays auditable.
         mediaId = await repointMediaIdentity({ dir: fullDirPath, libraryRelativePath });
-        await recordMediaIdentity(db, { mediaId, mediaType: 'movie', mediaName: dirName });
+        await recordMediaIdentity(db, identityClaims, { mediaId, mediaType: 'movie', mediaName: dirName });
         logger.warn(`identity repointed for ${libraryRelativePath}: ${identity.id} -> ${mediaId}`);
       }
 

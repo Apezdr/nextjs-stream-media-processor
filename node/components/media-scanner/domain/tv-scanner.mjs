@@ -35,7 +35,8 @@ import {
   recordEpisodeAttempt,
   clearEpisodeRetry,
   clearEpisodeRetryForShow,
-  recordMediaIdentity
+  recordMediaIdentity,
+  createIdentityClaims
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
@@ -583,6 +584,10 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // Bounded concurrency for season processing (moderate load — not unbounded)
   const seasonLimit = pLimit(3);
 
+  // Per-scan identity claims. Scoped to this run so a stale index row from an
+  // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
+  const identityClaims = createIdentityClaims();
+
   try {
     for (let index = 0; index < shows.length; index++) {
       const show = shows[index];
@@ -620,7 +625,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         libraryRelativePath: `tv/${showName}`,
       });
       let showMediaId = showIdentity.id;
-      const showClaim = await recordMediaIdentity(db, {
+      const showClaim = await recordMediaIdentity(db, identityClaims, {
         mediaId: showMediaId,
         mediaType: 'tv',
         mediaName: showName,
@@ -630,7 +635,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           dir: showPath,
           libraryRelativePath: `tv/${showName}`,
         });
-        await recordMediaIdentity(db, { mediaId: showMediaId, mediaType: 'tv', mediaName: showName });
+        await recordMediaIdentity(db, identityClaims, { mediaId: showMediaId, mediaType: 'tv', mediaName: showName });
         logger.warn(`identity repointed for tv/${showName}: ${showIdentity.id} -> ${showMediaId}`);
       }
 
