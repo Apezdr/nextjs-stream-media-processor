@@ -1,11 +1,11 @@
-import { exec, spawn } from 'child_process';
-import { join } from 'path';
+import { spawn } from 'child_process';
+import { join, dirname } from 'path';
 import { promises as fs } from 'fs';
 import { fileExists, convertToAvif, fileInfo, shouldUseAvif } from './utils/utils.mjs';
 import sharp from 'sharp';
 import { createCategoryLogger } from './lib/logger.mjs';
 import PQueue from 'p-queue';
-import { getVideoDuration, isVideoHDR } from './ffmpeg/ffprobe.mjs';
+import { getVideoDuration, isVideoHDR, estimateKeyframeInterval } from './ffmpeg/ffprobe.mjs';
 import { getInfo } from './infoManager.mjs';
 
 const logger = createCategoryLogger('sprite');
@@ -84,6 +84,29 @@ async function findOldSpriteFiles(cacheDir, type, name, season, episode, current
 const FFMPEG_CONCURRENCY = parseInt(process.env.FFMPEG_CONCURRENCY) || 2;
 
 const ffmpegQueue = new PQueue({concurrency: FFMPEG_CONCURRENCY});
+
+// Per-sprite-job frame extraction parallelism. Each extraction is a short-lived
+// ffmpeg that seeks and decodes a single GOP, so this multiplies against
+// FFMPEG_CONCURRENCY for total concurrent ffmpeg processes.
+const SPRITE_FRAME_CONCURRENCY = Math.max(1, parseInt(process.env.SPRITE_FRAME_CONCURRENCY, 10) || 2);
+// Optional hardware-accelerated decode for frame extraction, e.g. 'qsv', 'vaapi', 'auto'.
+// Falls back to software decode automatically if the first hwaccel attempt fails.
+const SPRITE_HWACCEL = (process.env.SPRITE_HWACCEL || '').trim().toLowerCase();
+const SPRITE_HWACCEL_DEVICE = (process.env.SPRITE_HWACCEL_DEVICE || '').trim();
+// Extraction strategy:
+//   auto     - probe the keyframe interval; seek per timestamp when GOPs are
+//              short (typical remuxes), fall back to a single linear decode
+//              when GOPs are longer than the thumbnail interval (seeking would
+//              re-decode overlapping GOPs and cost MORE than one linear pass).
+//   accurate - always seek per timestamp, decode to the exact frame.
+//   fast     - seek per timestamp with -noaccurate_seek: emits the nearest
+//              keyframe at/before each timestamp. Cheapest possible I/O, but
+//              thumbnails can land up to a GOP early (and repeat on long-GOP files).
+//   linear   - legacy single-pass fps+tile pipeline.
+const SPRITE_SEEK_MODE = (process.env.SPRITE_SEEK_MODE || 'auto').trim().toLowerCase();
+// In auto mode, seeking pays off when decoding keyframe->timestamp (~half a
+// GOP per tile) beats decoding the full interval between tiles linearly.
+const AUTO_SEEK_MAX_GOP_FACTOR = 1.5;
 
 /**
  * Optimizes a PNG spritesheet using Sharp with configurable options
@@ -354,130 +377,350 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
 }
 
 /**
+ * Plans the frame timestamps for a sprite sheet: one frame every `interval`
+ * seconds from 0 through floor(duration), matching the frame count the old
+ * fps=1/interval filter produced. Timestamps at/past the true end of the video
+ * are pulled back slightly so the seek still lands on a decodable frame.
+ * @param {number} duration - Video duration in seconds (float).
+ * @param {number} interval - Seconds between frames.
+ * @returns {number[]} - Timestamps in seconds, in ascending order.
+ */
+export function planFrameTimestamps(duration, interval) {
+  const floorDuration = Math.floor(duration);
+  const timestamps = [];
+  for (let t = 0; t <= floorDuration; t += interval) {
+    timestamps.push(t >= duration - 0.25 ? Math.max(0, duration - 0.5) : t);
+  }
+  return timestamps;
+}
+
+/**
+ * Builds the per-frame video filter chain (no fps/tile — each ffmpeg call
+ * extracts exactly one frame and tiling happens in sharp).
+ * @param {boolean} hdr - Whether the source is HDR (adds tone mapping).
+ * @returns {string} - ffmpeg -vf filter string.
+ */
+function buildFrameFilters(hdr) {
+  if (hdr) {
+    return (
+      `zscale=transfer=smpte2084:primaries=bt2020:matrix=bt2020nc:rangein=limited,` +
+      `zscale=transfer=linear:npl=100,` +
+      `tonemap=hable,` +
+      `zscale=transfer=bt709:primaries=bt709:matrix=bt709:range=limited,` +
+      `scale=320:-1`
+    );
+  }
+  return `scale=320:-1`;
+}
+
+/**
+ * Runs an ffmpeg process and resolves on exit code 0, rejecting with the
+ * captured stderr tail otherwise.
+ * @param {string[]} args - ffmpeg arguments.
+ * @returns {Promise<void>}
+ */
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const ffmpegProcess = spawn('ffmpeg', args);
+    let stderr = '';
+
+    ffmpegProcess.stderr.on('data', (data) => {
+      stderr += data;
+      if (stderr.length > 8192) stderr = stderr.slice(-8192);
+    });
+
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`));
+      }
+    });
+
+    ffmpegProcess.on('error', (error) => {
+      reject(error);
+    });
+  });
+}
+
+/**
+ * Builds the ffmpeg args for extracting a single frame at a timestamp using
+ * input seeking (-ss before -i), so ffmpeg jumps via the container index and
+ * only decodes from the preceding keyframe instead of reading the whole file.
+ * @param {string} videoPath - Path to the input video.
+ * @param {number} timestamp - Seek target in seconds.
+ * @param {string} vfFilters - Per-frame filter chain.
+ * @param {string} outputPath - Output PNG path.
+ * @param {string|null} hwaccel - Hardware decode method or null for software.
+ * @param {boolean} fastSeek - Snap to nearest keyframe (-noaccurate_seek) instead of the exact frame.
+ * @returns {string[]} - ffmpeg arguments.
+ */
+function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek) {
+  const args = ['-y', '-loglevel', 'error'];
+  if (fastSeek) {
+    args.push('-noaccurate_seek');
+  }
+  args.push('-ss', timestamp.toFixed(3));
+  if (hwaccel) {
+    args.push('-hwaccel', hwaccel);
+    if (SPRITE_HWACCEL_DEVICE) {
+      args.push('-hwaccel_device', SPRITE_HWACCEL_DEVICE);
+    }
+  }
+  args.push(
+    '-i', videoPath,
+    '-an', '-sn', '-dn',
+    '-frames:v', '1',
+    '-vf', vfFilters,
+    outputPath,
+  );
+  return args;
+}
+
+/**
+ * Extracts one frame per timestamp via seek-based ffmpeg calls with bounded
+ * concurrency. Individual frame failures are tolerated (their tile stays
+ * black); hwaccel failures fall back to software decode for the rest of the job.
+ * @param {string} videoPath - Path to the input video.
+ * @param {number[]} timestamps - Seek targets in seconds.
+ * @param {string} vfFilters - Per-frame filter chain.
+ * @param {string} framesDir - Directory to write frame PNGs into.
+ * @param {boolean} fastSeek - Snap to nearest keyframe instead of decoding to the exact frame.
+ * @returns {Promise<(string|null)[]>} - Frame paths by index; null where extraction failed.
+ */
+async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek) {
+  const frameQueue = new PQueue({ concurrency: SPRITE_FRAME_CONCURRENCY });
+  let hwaccel = SPRITE_HWACCEL && SPRITE_HWACCEL !== 'none' ? SPRITE_HWACCEL : null;
+  let hwaccelWarned = false;
+  const framePaths = new Array(timestamps.length).fill(null);
+  let completed = 0;
+  let failedCount = 0;
+
+  await frameQueue.addAll(timestamps.map((timestamp, index) => async () => {
+    const outputPath = join(framesDir, `frame_${String(index).padStart(6, '0')}.png`);
+    try {
+      try {
+        await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek));
+      } catch (error) {
+        if (hwaccel) {
+          if (!hwaccelWarned) {
+            hwaccelWarned = true;
+            logger.warn(`Hardware decode (${hwaccel}) failed, falling back to software for remaining frames: ${error.message}`);
+          }
+          hwaccel = null;
+          await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, null, fastSeek));
+        } else {
+          throw error;
+        }
+      }
+      // ffmpeg can exit 0 without producing a frame when seeking past the last packet
+      if (await fileExists(outputPath)) {
+        framePaths[index] = outputPath;
+      } else {
+        failedCount++;
+        logger.warn(`No frame produced at ${timestamp}s (index ${index})`);
+      }
+    } catch (error) {
+      failedCount++;
+      logger.warn(`Frame extraction failed at ${timestamp}s (index ${index}): ${error.message}`);
+    }
+    completed++;
+    if (completed % 100 === 0 || completed === timestamps.length) {
+      logger.info(`Sprite frames extracted: ${completed}/${timestamps.length}${failedCount ? ` (${failedCount} failed)` : ''}`);
+    }
+  }));
+
+  return framePaths;
+}
+
+/**
+ * Composites individually extracted frames into a single sprite sheet grid.
+ * Missing frames leave their tile black, matching the old tile filter's padding.
+ * @param {(string|null)[]} framePaths - Frame PNGs by grid index (null = skip).
+ * @param {number} columns - Grid columns.
+ * @param {number} rows - Grid rows.
+ * @param {string} outputPath - Output PNG path.
+ * @returns {Promise<void>}
+ */
+async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
+  const firstFrame = framePaths.find(Boolean);
+  if (!firstFrame) {
+    throw new Error('All sprite frame extractions failed; cannot compose sprite sheet');
+  }
+
+  const { width: thumbWidth, height: thumbHeight } = await sharp(firstFrame).metadata();
+  const sheetWidth = columns * thumbWidth;
+  const sheetHeight = rows * thumbHeight;
+  const rowStride = sheetWidth * 3;
+  const canvas = Buffer.alloc(sheetWidth * sheetHeight * 3); // zero-filled = black padding
+
+  for (let index = 0; index < framePaths.length; index++) {
+    if (!framePaths[index]) continue;
+    let data, info;
+    try {
+      ({ data, info } = await sharp(framePaths[index])
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true }));
+    } catch (error) {
+      logger.warn(`Skipping unreadable frame ${index}: ${error.message}`);
+      continue;
+    }
+
+    if (info.width !== thumbWidth || info.height !== thumbHeight || info.channels !== 3) {
+      logger.warn(`Skipping frame ${index}: unexpected dimensions ${info.width}x${info.height}x${info.channels}`);
+      continue;
+    }
+
+    const col = index % columns;
+    const row = Math.floor(index / columns);
+    for (let y = 0; y < thumbHeight; y++) {
+      const src = y * thumbWidth * 3;
+      const dst = (row * thumbHeight + y) * rowStride + col * thumbWidth * 3;
+      data.copy(canvas, dst, src, src + thumbWidth * 3);
+    }
+  }
+
+  await sharp(canvas, {
+    raw: { width: sheetWidth, height: sheetHeight, channels: 3 },
+    limitInputPixels: false,
+  })
+    .png()
+    .toFile(outputPath);
+
+  logger.info(`Composed sprite sheet ${sheetWidth}x${sheetHeight} (${framePaths.length} tiles) at ${outputPath}`);
+}
+
+/**
+ * Runs the legacy single-pass extraction: one linear decode of the whole file
+ * with fps + tile filters. Optimal when GOPs are long relative to the
+ * thumbnail interval (seeking would re-decode overlapping GOPs).
+ * @param {string} videoPath - Path to the input video.
+ * @param {string} outputPath - Output PNG path.
+ * @param {number} interval - Seconds between frames.
+ * @param {number} columns - Grid columns.
+ * @param {number} rows - Grid rows.
+ * @param {boolean} hdr - Whether the source is HDR.
+ * @returns {Promise<void>}
+ */
+async function runLinearSpriteExtraction(videoPath, outputPath, interval, columns, rows, hdr) {
+  const vfFilters = `fps=1/${interval},${buildFrameFilters(hdr)},tile=${columns}x${rows}`;
+  const ffmpegArgs = [
+    '-y',
+    '-loglevel', 'error',
+    '-i', videoPath,
+    '-an', '-sn', '-dn',
+    '-vf', vfFilters,
+    '-pix_fmt', 'rgb24',
+    outputPath,
+  ];
+  logger.info(`Executing linear sprite extraction: ffmpeg ${ffmpegArgs.join(' ')}`);
+  await runFfmpeg(ffmpegArgs);
+}
+
+/**
+ * Resolves which extraction strategy to use based on SPRITE_SEEK_MODE and,
+ * in auto mode, the video's estimated keyframe interval.
+ * @param {string} videoPath - Path to the input video.
+ * @param {number} interval - Seconds between thumbnail frames.
+ * @param {number} duration - Video duration in seconds.
+ * @returns {Promise<{seek: boolean, fastSeek: boolean, reason: string}>}
+ */
+async function resolveExtractionStrategy(videoPath, interval, duration) {
+  switch (SPRITE_SEEK_MODE) {
+    case 'linear':
+      return { seek: false, fastSeek: false, reason: 'SPRITE_SEEK_MODE=linear' };
+    case 'accurate':
+      return { seek: true, fastSeek: false, reason: 'SPRITE_SEEK_MODE=accurate' };
+    case 'fast':
+      return { seek: true, fastSeek: true, reason: 'SPRITE_SEEK_MODE=fast' };
+    default: {
+      const threshold = interval * AUTO_SEEK_MAX_GOP_FACTOR;
+      const gop = await estimateKeyframeInterval(videoPath, {
+        sampleAt: Math.max(0, Math.min(60, Math.floor(duration / 2))),
+        windowSeconds: Math.ceil(threshold * 2),
+      });
+      if (gop === null) {
+        return { seek: true, fastSeek: false, reason: 'auto (keyframe interval unknown, assuming short GOPs)' };
+      }
+      const seek = gop <= threshold;
+      return {
+        seek,
+        fastSeek: false,
+        reason: `auto (keyframe interval ~${Number.isFinite(gop) ? gop.toFixed(2) : '>' + Math.ceil(threshold * 2)}s vs ${interval}s tile interval)`,
+      };
+    }
+  }
+}
+
+/**
  * Generates a sprite sheet from a video, handling HDR frames appropriately.
+ * Instead of decoding the entire video linearly (fps + tile filters), this
+ * seeks to each thumbnail timestamp and decodes a single frame — on large
+ * remuxes that turns a full-file sequential read into a few hundred small
+ * reads around each keyframe. Long-GOP sources automatically fall back to the
+ * linear pipeline, where a single pass is cheaper than overlapping seeks.
  * @param {string} videoPath - Path to the input video.
  * @param {string} spriteSheetPath - Path where the sprite sheet will be saved.
  * @param {number} interval - Time interval between frames in seconds.
  * @param {number} columns - Number of columns in the sprite sheet.
  * @param {number} rows - Number of rows in the sprite sheet.
  * @param {string} outputFormat - 'avif' or 'png'
- * @param {Object} res - Express response object to serve the PNG immediately.
  * @returns {Promise<void>}
  */
-async function generateSpriteSheetWithFFmpeg(
+export async function generateSpriteSheetWithFFmpeg(
   videoPath,
   spriteSheetPath,
   interval,
   columns,
   rows,
-  outputFormat,
-  res
+  outputFormat
 ) {
   try {
-    // Wait until ffmpegQueue is initialized
-    while (!ffmpegQueue) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-
-    // Step 1: Detect if the video is HDR
-    const hdr = await isVideoHDR(videoPath);
-    logger.info(`Video HDR: ${hdr}`);
     const videoExists = await fileExists(videoPath);
-
     if (!videoExists) {
       logger.info(`Video file not found in Spritesheet step: ${videoPath}`);
       return;
     }
 
-    // Step 2: Prepare temporary file path for PNG if needed
-    let tempSpriteSheetPath = spriteSheetPath.replace(/\.[^/.]+$/, '.png');
+    const hdr = await isVideoHDR(videoPath);
+    logger.info(`Video HDR: ${hdr}`);
 
-    // Step 3: Configure FFmpeg command based on HDR and output format
-    let vfFilters;
-    if (hdr) {
-      // HDR processing with color space conversion and tone mapping
-      vfFilters =
-        `fps=1/${interval},` +
-        `zscale=transfer=smpte2084:primaries=bt2020:matrix=bt2020nc:rangein=limited,` +
-        `zscale=transfer=linear:npl=100,` +
-        `tonemap=hable,` +
-        `zscale=transfer=bt709:primaries=bt709:matrix=bt709:range=limited,` +
-        `scale=320:-1,` +
-        `tile=${columns}x${rows}`;
-    } else {
-      // Non-HDR processing
-      vfFilters = `fps=1/${interval},` + `scale=320:-1,` + `tile=${columns}x${rows}`;
-    }
+    const duration = await getVideoDuration(videoPath);
+    const strategy = await resolveExtractionStrategy(videoPath, interval, duration);
+    const tempSpriteSheetPath = spriteSheetPath.replace(/\.[^/.]+$/, '.png');
 
-    // Step 4: Determine output options based on format
-    const pixFmtOption = 'rgb24';
-    const ffmpegOutputPath = tempSpriteSheetPath;
+    logger.info(`Sprite extraction strategy: ${strategy.seek ? (strategy.fastSeek ? 'fast-seek' : 'seek') : 'linear'} — ${strategy.reason}${SPRITE_HWACCEL ? ` (hwaccel: ${SPRITE_HWACCEL})` : ''}`);
 
-    // Step 5: Construct the FFmpeg command as an array
-    const ffmpegArgs = [
-      '-y', // Overwrite output files without asking
-      '-loglevel',
-      'error',
-      '-i',
-      videoPath,
-      '-vf',
-      vfFilters,
-      '-pix_fmt',
-      pixFmtOption,
-      ffmpegOutputPath,
-    ];
-
-    logger.info(`Queuing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
-
-    // Step 6: Add the FFmpeg execution to the queue
+    // The whole job occupies one ffmpegQueue slot so the global cap on
+    // concurrent sprite work still holds; frame-level parallelism inside the
+    // job is governed by SPRITE_FRAME_CONCURRENCY.
     await ffmpegQueue.add(async () => {
-      logger.info(`Executing FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
-
-      await new Promise((resolve, reject) => {
-        const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
-
-        ffmpegProcess.stdout.on('data', (data) => {
-          logger.info(`stdout: ${data}`);
+      if (!strategy.seek) {
+        await runLinearSpriteExtraction(videoPath, tempSpriteSheetPath, interval, columns, rows, hdr);
+        return;
+      }
+      const timestamps = planFrameTimestamps(duration, interval);
+      const vfFilters = buildFrameFilters(hdr);
+      const framesDir = await fs.mkdtemp(join(dirname(spriteSheetPath), 'sprite_frames_'));
+      try {
+        const framePaths = await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek);
+        await composeSpriteSheet(framePaths, columns, rows, tempSpriteSheetPath);
+      } finally {
+        await fs.rm(framesDir, { recursive: true, force: true }).catch((error) => {
+          logger.warn(`Failed to clean up sprite frames dir ${framesDir}: ${error.message}`);
         });
-
-        ffmpegProcess.stderr.on('data', (data) => {
-          logger.error(`stderr: ${data}`);
-        });
-
-        ffmpegProcess.on('close', (code) => {
-          if (code === 0) {
-            logger.info(`Sprite sheet execution completed, stored at ${ffmpegOutputPath}`);
-            resolve();
-          } else {
-            reject(new Error(`FFmpeg process exited with code ${code}`));
-          }
-        });
-
-        ffmpegProcess.on('error', (error) => {
-          reject(error);
-        });
-      });
+      }
     });
 
-    // Step 7: Handle post-processing (e.g., conversion to AVIF)
     if (outputFormat === 'avif') {
       try {
-        await convertToAvif(ffmpegOutputPath, spriteSheetPath, 60, 4);
+        await convertToAvif(tempSpriteSheetPath, spriteSheetPath, 60, 4);
         logger.info(`Converted sprite sheet to AVIF at ${spriteSheetPath}`);
       } catch (conversionError) {
         logger.error(`Error converting PNG to AVIF: ${conversionError}`);
-        // Optionally implement retry mechanisms or handle the error as needed
         throw conversionError;
       }
-    }
-
-    // Optionally, send the response if needed
-    if (res) {
-      res.sendFile(spriteSheetPath, (err) => {
-        if (err) {
-          logger.error(`Error sending file: ${err}`);
-        }
-      });
     }
 
     logger.info('Sprite sheet generation process completed.');
