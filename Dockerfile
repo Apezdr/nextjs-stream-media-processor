@@ -115,6 +115,24 @@ RUN echo "" && \
     fi && \
     echo "node-tests-passed" > /tmp/tests-passed.marker
 
+# Stage: Intel VPL GPU runtime (libmfx-gen) for QSV
+# Alpine ships libvpl (the dispatcher ffmpeg links against) but does not
+# package the GPU runtime it dispatches to — without it every QSV attempt
+# dies with "Error creating a MFX session: -9" and only VAAPI works. Built
+# from source, pinned to the same release train as Alpine's
+# intel-media-driver (25.4.x). Verified to build and decode on musl.
+FROM node:25.2.1-alpine AS vpl-runtime
+ARG VPL_GPU_RT_VERSION=intel-onevpl-25.4.6
+RUN apk add --no-cache cmake make g++ pkgconf libva-dev curl && \
+    curl -fsSL "https://github.com/intel/vpl-gpu-rt/archive/refs/tags/${VPL_GPU_RT_VERSION}.tar.gz" | tar -xz -C /tmp && \
+    cd /tmp/vpl-gpu-rt-* && \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr && \
+    cmake --build build -j"$(nproc)" && \
+    cmake --install build && \
+    mkdir -p /opt/vpl && \
+    cp -a /usr/lib/libmfx-gen.so* /usr/lib/libmfx-gen /opt/vpl/ && \
+    rm -rf /tmp/vpl-gpu-rt-*
+
 # Stage 2: Production Stage
 FROM node:25.2.1-alpine
 
@@ -183,6 +201,11 @@ RUN apk add --no-cache \
     mesa-dri-gallium && \
     # Install libva-utils from the edge community repository explicitly
     apk add --no-cache libva-utils --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community
+
+# Intel VPL GPU runtime so ffmpeg's QSV path can create MFX sessions on
+# Arc/Gen12+ (see the vpl-runtime stage). The libvpl dispatcher dlopens
+# libmfx-gen.so.1.2 from the default library path.
+COPY --from=vpl-runtime /opt/vpl/ /usr/lib/
 
 # Vulkan runtime: loader + Mesa drivers. NVIDIA users get their driver injected
 # by the NVIDIA Container Toolkit at runtime, so no Mesa NVIDIA driver is
