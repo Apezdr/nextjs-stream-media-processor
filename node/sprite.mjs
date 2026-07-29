@@ -453,9 +453,10 @@ function runFfmpeg(args) {
  * @param {string} outputPath - Output PNG path.
  * @param {string|null} hwaccel - Hardware decode method or null for software.
  * @param {boolean} fastSeek - Snap to nearest keyframe (-noaccurate_seek) instead of the exact frame.
+ * @param {boolean} hdr - Whether the source is HDR (drives the qsv download pixel format).
  * @returns {string[]} - ffmpeg arguments.
  */
-function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek) {
+export function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr) {
   const args = ['-y', '-loglevel', 'error'];
   if (fastSeek) {
     args.push('-noaccurate_seek');
@@ -465,6 +466,14 @@ function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, 
     args.push('-hwaccel', hwaccel);
     if (SPRITE_HWACCEL_DEVICE) {
       args.push('-hwaccel_device', SPRITE_HWACCEL_DEVICE);
+    }
+    if (hwaccel === 'qsv') {
+      // Bare -hwaccel qsv leaves decoded frames in GPU memory (a legacy
+      // compat default), which the software scale/zscale filters cannot
+      // consume. Request a system-memory download format: 10-bit for HDR so
+      // the tonemap chain keeps full depth. Rare SDR 10-bit sources may
+      // refuse the nv12 download; the per-frame software fallback covers them.
+      args.push('-hwaccel_output_format', hdr ? 'p010le' : 'nv12');
     }
   }
   args.push(
@@ -486,9 +495,10 @@ function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, 
  * @param {string} vfFilters - Per-frame filter chain.
  * @param {string} framesDir - Directory to write frame PNGs into.
  * @param {boolean} fastSeek - Snap to nearest keyframe instead of decoding to the exact frame.
+ * @param {boolean} hdr - Whether the source is HDR.
  * @returns {Promise<(string|null)[]>} - Frame paths by index; null where extraction failed.
  */
-async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek) {
+async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek, hdr) {
   const frameQueue = new PQueue({ concurrency: SPRITE_FRAME_CONCURRENCY });
   let hwaccel = SPRITE_HWACCEL && SPRITE_HWACCEL !== 'none' ? SPRITE_HWACCEL : null;
   let hwaccelWarned = false;
@@ -500,7 +510,7 @@ async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, frame
     const outputPath = join(framesDir, `frame_${String(index).padStart(6, '0')}.png`);
     try {
       try {
-        await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek));
+        await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr));
       } catch (error) {
         if (hwaccel) {
           if (!hwaccelWarned) {
@@ -508,7 +518,7 @@ async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, frame
             logger.warn(`Hardware decode (${hwaccel}) failed, falling back to software for remaining frames: ${error.message}`);
           }
           hwaccel = null;
-          await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, null, fastSeek));
+          await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, null, fastSeek, hdr));
         } else {
           throw error;
         }
@@ -704,7 +714,7 @@ export async function generateSpriteSheetWithFFmpeg(
       const vfFilters = buildFrameFilters(hdr);
       const framesDir = await fs.mkdtemp(join(dirname(spriteSheetPath), 'sprite_frames_'));
       try {
-        const framePaths = await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek);
+        const framePaths = await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek, hdr);
         await composeSpriteSheet(framePaths, columns, rows, tempSpriteSheetPath);
       } finally {
         await fs.rm(framesDir, { recursive: true, force: true }).catch((error) => {
