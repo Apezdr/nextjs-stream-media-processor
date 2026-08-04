@@ -2,7 +2,8 @@ import { exec, spawn } from "child_process";
 import { join, extname, basename } from "path";
 import { promises as fs } from "fs";
 import { readFileSync, createReadStream } from "fs";
-import { findMp4File, fileExists, ongoingCacheGenerations, fileInfo } from "./utils/utils.mjs";
+import { fileExists, ongoingCacheGenerations, fileInfo } from "./utils/utils.mjs";
+import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { getTVShowByName, getMovieByName } from "./sqliteDatabase.mjs";
 //const execAsync = promisify(exec);
 import { generateCacheKey, getCachedClipPath, getCachedTranscodedPath } from "./utils/utils.mjs";
@@ -63,53 +64,29 @@ export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
   try {
     let videoPath;
     if (type === "movies") {
-      const directoryPath = join(`${BASE_PATH}/movies`, movieName);
-      videoPath = await findMp4File(directoryPath);
+      const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
+      videoPath = videoRef?.path;
     } else if (type === "tv") {
       // Get TV show data from SQLite database
       const showData = await getTVShowByName(showName);
-      
+
       if (!showData) {
         throw new Error(`Show not found: ${showName}`);
       }
 
-      const _season = showData.seasons[`Season ${season}`];
-      if (!_season) {
-        throw new Error(`Season not found: ${showName} - Season ${season}`);
-      }
-
-      // Get episode keys from the season data
-      const episodeKeys = Object.keys(_season.episodes);
-      
-      // Find the matching episode using S01E01 format pattern
-      const episodeNumber = String(episode).padStart(2, "0");
-      const seasonNumber = String(season).padStart(2, "0");
-      const episodeKey = episodeKeys.find((e) => {
-        // Match S01E01 format
-        const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-        if (standardMatch) {
-          const matchedSeason = standardMatch[1];
-          const matchedEpisode = standardMatch[2];
-          return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
-        }
-
-        // Match "01 - Episode Name.mp4" format or variations
-        const alternateMatch = e.match(/^(\d{2})\s*-/);
-        if (alternateMatch) {
-          const matchedEpisode = alternateMatch[1];
-          return matchedEpisode === episodeNumber;
-        }
-
-        return false;
-      });
-
-      if (!episodeKey) {
+      const entry = findEpisodeEntry(showData, season, episode);
+      if (!entry) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
       }
 
-      const episodePath = _season.episodes[episodeKey].filename;
-      const directoryPath = join(`${BASE_PATH}/tv`, showName, `Season ${season}`);
-      videoPath = await findMp4File(directoryPath, episodePath);
+      const videoRef = await resolveEpisodeVideo({
+        basePath: BASE_PATH,
+        showName,
+        season,
+        episode,
+        preferFilename: entry.episode.filename,
+      });
+      videoPath = videoRef?.path;
     }
 
     // If no video path found:
@@ -332,7 +309,15 @@ async function serveOriginalVideoWithRanges(req, res, videoPath, start, end, tit
       
       // Generate cache key including video UUID for cache invalidation (same pattern as handleVideoClipRequest)
       const originalCacheKey = `${title}-key_${videoKey}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}-original`;
-      const cachedOriginalPath = getCachedClipPath(originalCacheKey, '.mp4');
+      // The segment below is remuxed with `-c copy` into the SOURCE's container
+      // (getOutputFormat), so the cached file must carry that container's
+      // extension. Hardcoding '.mp4' wrote matroska bytes into a .mp4 name and
+      // then served them as video/mp4. Paired with the eviction predicate in
+      // clearOriginalSegmentsCache — change one, change the other.
+      const cachedOriginalPath = getCachedClipPath(
+        originalCacheKey,
+        extensionForFormat(getOutputFormat(videoPath))
+      );
       
       // Check if cached original segment already exists
       const cacheExists = await fileExists(cachedOriginalPath);
@@ -540,6 +525,8 @@ function getOutputFormat(videoPath) {
     case '.mp4':
     case '.m4v':
       return 'mp4';
+    case '.mov':
+      return 'mov';
     case '.mkv':
       return 'matroska';
     case '.webm':
@@ -548,6 +535,31 @@ function getOutputFormat(videoPath) {
       return 'avi';
     default:
       return 'mp4'; // Default to MP4
+  }
+}
+
+/**
+ * The file extension a muxer produces, i.e. the inverse of getOutputFormat.
+ * Used so a cached segment's extension matches the bytes actually written to
+ * it — remuxing an .mkv source and naming the result .mp4 produces a file no
+ * player can read and a Content-Type that lies about it.
+ *
+ * @param {string} format - An ffmpeg muxer name from getOutputFormat
+ * @returns {string} Extension including the leading dot
+ */
+function extensionForFormat(format) {
+  switch (format) {
+    case 'matroska':
+      return '.mkv';
+    case 'mov':
+      return '.mov';
+    case 'webm':
+      return '.webm';
+    case 'avi':
+      return '.avi';
+    case 'mp4':
+    default:
+      return '.mp4';
   }
 }
 
@@ -574,8 +586,8 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
         throw new Error(`Movie not found: ${movieName}`);
       }
       videoID = movieData._id;
-      const directoryPath = join(`${basePath}/movies`, movieName);
-      videoPath = await findMp4File(directoryPath);
+      const videoRef = await resolveMovieVideo({ basePath, movieName });
+      videoPath = videoRef?.path;
     } else if (type === "tv") {
       const { showName, season, episode } = req.params;
       const showData = await getTVShowByName(showName);
@@ -585,43 +597,20 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
         throw new Error(`Show not found: ${showName}`);
       }
 
-      const _season = showData.seasons[`Season ${season}`];
-      if (!_season) {
-        throw new Error(`Season not found: ${showName} - Season ${season}`);
-      }
-
-      const arrayOfEpisodes = Object.keys(_season.episodes);
-
-      const _episode = arrayOfEpisodes.find((e) => {
-        const episodeNumber = String(episode).padStart(2, "0");
-        const seasonNumber = String(season).padStart(2, "0");
-
-        // Match S01E01 format
-        const standardMatch = e.match(/S(\d{2})E(\d{2})/i);
-        if (standardMatch) {
-          const matchedSeason = standardMatch[1].padStart(2, "0");
-          const matchedEpisode = standardMatch[2].padStart(2, "0");
-          return matchedSeason === seasonNumber && matchedEpisode === episodeNumber;
-        }
-
-        // Match "01 - Episode Name.mp4" format or variations
-        const alternateMatch = e.match(/^(\d{2})\s*-/);
-        if (alternateMatch) {
-          const matchedEpisode = alternateMatch[1].padStart(2, "0");
-          return matchedEpisode === episodeNumber;
-        }
-
-        return false;
-      });
-
-      if (!_episode) {
+      const entry = findEpisodeEntry(showData, season, episode);
+      if (!entry) {
         throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
       }
 
-      const directoryPath = join(`${basePath}/tv`, showName, `Season ${season}`);
-      const episodePath = _season.episodes[_episode].filename;
-      videoID = _season.episodes[_episode]._id;
-      videoPath = await findMp4File(directoryPath, episodePath);
+      videoID = entry.episode._id;
+      const videoRef = await resolveEpisodeVideo({
+        basePath,
+        showName,
+        season,
+        episode,
+        preferFilename: entry.episode.filename,
+      });
+      videoPath = videoRef?.path;
     }
 
     // Parse and validate start and end parameters
@@ -835,11 +824,16 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
   }
 }
 
+// One entry per VIDEO_EXTENSIONS member. A missing entry falls through to
+// application/octet-stream, which browsers refuse to play — so this table has
+// to stay in step with the container list, not lag behind it.
 const mimeTypes = {
   '.mp4': 'video/mp4',
-  '.webm': 'video/webm',
+  '.m4v': 'video/x-m4v',
+  '.mov': 'video/quicktime',
   '.mkv': 'video/x-matroska',
-  // Add more mappings as needed
+  '.webm': 'video/webm',
+  '.avi': 'video/x-msvideo',
 };
 
 function getMimeType(filePath) {

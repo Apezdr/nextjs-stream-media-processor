@@ -1,8 +1,9 @@
 import { promises as fs } from 'fs';
 import { join } from 'path';
+import { findVideoFile, stripVideoExtension, findSeasonFolder } from '../../../utils/utils.mjs';
 
 /**
- * Resolve the source .mp4 and the target .auto.srt path for a generation request.
+ * Resolve the source video file and the target .auto.srt path for a generation request.
  *
  * @param {Object} req
  * @param {string} req.basePath          - Media root (BASE_PATH)
@@ -29,16 +30,16 @@ async function resolveMovie({ basePath, publicPrefix = '', mediaTitle, langCode 
   const movieDir = join(basePath, 'movies', decodedTitle);
 
   const files = await fs.readdir(movieDir);
-  const mp4File = files.find(f => f.endsWith('.mp4'));
-  if (!mp4File) {
+  const videoFile = findVideoFile(files);
+  if (!videoFile) {
     throw new Error(`Movie file not found in ${movieDir}`);
   }
 
-  const baseFilename = mp4File.replace(/\.mp4$/, '');
+  const baseFilename = stripVideoExtension(videoFile);
   const srtFilename = `${baseFilename}.${langCode}.auto.srt`;
 
   return {
-    videoPath: join(movieDir, mp4File),
+    videoPath: join(movieDir, videoFile),
     srtPath: join(movieDir, srtFilename),
     srtPublicUrl: `${publicPrefix}/movies/${encodeURIComponent(decodedTitle)}/${encodeURIComponent(srtFilename)}`,
     baseFilename,
@@ -68,10 +69,7 @@ async function resolveTvEpisode({ basePath, publicPrefix = '', mediaTitle, langC
   } catch (err) {
     throw new Error(`Show folder not found: ${showDir} (${err.code})`);
   }
-  const seasonName = seasonFolders.find(f => {
-    const m = f.match(/\d+/);
-    return m && parseInt(m[0], 10) === seasonInt;
-  });
+  const seasonName = findSeasonFolder(seasonFolders, season);
   if (!seasonName) {
     throw new Error(`Season ${seasonInt} not found in ${showDir}`);
   }
@@ -83,12 +81,12 @@ async function resolveTvEpisode({ basePath, publicPrefix = '', mediaTitle, langC
   const paddedEpisode = String(episode).padStart(2, '0');
   const episodePattern = new RegExp(`S${paddedSeason}E${paddedEpisode}`, 'i');
 
-  const episodeFile = files.find(f => f.endsWith('.mp4') && episodePattern.test(f));
+  const episodeFile = findVideoFile(files, { pattern: episodePattern });
   if (!episodeFile) {
     throw new Error(`Episode file matching S${paddedSeason}E${paddedEpisode} not found in ${seasonDir}`);
   }
 
-  const baseFilename = episodeFile.replace(/\.mp4$/, '');
+  const baseFilename = stripVideoExtension(episodeFile);
   const srtFilename = `${baseFilename}.${langCode}.auto.srt`;
 
   return {

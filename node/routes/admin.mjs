@@ -1,9 +1,9 @@
 import express from 'express';
 import { promises as fs } from 'fs';
-import { join, dirname, resolve, sep } from 'path';
+import { join, dirname } from 'path';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
-import { fileExists } from '../utils/utils.mjs';
+import { fileExists, findVideoFile, stripVideoExtension, findSeasonFolder, safeJoin, PathTraversalError } from '../utils/utils.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
 import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
@@ -14,29 +14,6 @@ const logger = createCategoryLogger('admin-routes');
 
 // BASE_PATH is the path to the media files directory
 const BASE_PATH = process.env.BASE_PATH ? process.env.BASE_PATH : "/var/www/html";
-
-class PathTraversalError extends Error {}
-
-/**
- * Join untrusted segments onto a trusted base dir, verifying the final
- * resolved absolute path cannot escape base. Handles '..', traversal
- * embedded inside a larger segment, and platform separator differences
- * in one check, unlike a naive substring-scan for '..'.
- *
- * `base` should be the most specific directory the caller actually intends
- * to stay within (e.g. `join(BASE_PATH, 'movies')`, not just `BASE_PATH`) —
- * checking only against BASE_PATH would let a crafted title escape into a
- * sibling top-level directory (e.g. into `tv/` from a movie route) while
- * technically staying "inside" BASE_PATH.
- */
-function safeJoin(base, ...segments) {
-    const resolvedBase = resolve(base);
-    const resolvedPath = resolve(resolvedBase, ...segments);
-    if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + sep)) {
-        throw new PathTraversalError(`Rejected path outside base directory: ${segments.join('/')}`);
-    }
-    return resolvedPath;
-}
 
 /**
  * Initialize and configure admin routes
@@ -103,42 +80,53 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
             const movieDir = safeJoin(join(BASE_PATH, 'movies'), decodedMediaTitle);
 
-            // Find the main movie file to determine the subtitle filename
+            // Find the main movie file (any supported container, .mp4 preferred)
+            // to determine the subtitle filename
             const files = await fs.readdir(movieDir);
-            const mp4File = files.find(file => file.endsWith('.mp4'));
+            const videoFile = findVideoFile(files);
 
-            if (!mp4File) {
+            if (!videoFile) {
                 return res.status(404).json({ error: 'Movie file not found' });
             }
 
-            const baseFileName = mp4File.replace('.mp4', '');
+            const baseFileName = stripVideoExtension(videoFile);
             const subtitleFileName = `${baseFileName}.${langCode}${variantSuffix}.srt`;
 
             subtitleFilePath = join(movieDir, subtitleFileName);
-            mediaFilePath = join(movieDir, mp4File);
+            mediaFilePath = join(movieDir, videoFile);
 
         } else {
             // For TV shows
             const decodedMediaTitle = decodeURIComponent(mediaTitle);
-            const seasonDir = safeJoin(join(BASE_PATH, 'tv'), decodedMediaTitle, `Season ${season}`);
+            const showDir = safeJoin(join(BASE_PATH, 'tv'), decodedMediaTitle);
+
+            // Match the season folder numerically ("Season 1", "Season 01",
+            // "Season 2 - Pilot Arc") instead of assuming a literal
+            // `Season ${season}` name. The folder name comes from readdir, so
+            // it cannot introduce traversal; only the title needs safeJoin.
+            const showEntries = await fs.readdir(showDir);
+            const seasonFolder = findSeasonFolder(showEntries, season);
+            if (!seasonFolder) {
+                return res.status(404).json({ error: `Season ${season} not found` });
+            }
+            const seasonDir = join(showDir, seasonFolder);
 
             // Find the episode file
             const files = await fs.readdir(seasonDir);
 
-            // Look for file matching S01E01 pattern (case insensitive)
-            const paddedSeason = season.toString().padStart(2, '0');
-            const paddedEpisode = episode.toString().padStart(2, '0');
+            // Look for file matching S01E01 pattern (case insensitive);
+            // pad from the parsed integer so pre-padded inputs ("01") work too
+            const paddedSeason = String(parseInt(season, 10)).padStart(2, '0');
+            const paddedEpisode = String(parseInt(episode, 10)).padStart(2, '0');
             const episodePattern = new RegExp(`S${paddedSeason}E${paddedEpisode}`, 'i');
 
-            const episodeFile = files.find(file =>
-                file.endsWith('.mp4') && episodePattern.test(file)
-            );
+            const episodeFile = findVideoFile(files, { pattern: episodePattern });
 
             if (!episodeFile) {
                 return res.status(404).json({ error: 'Episode file not found' });
             }
 
-            const baseFileName = episodeFile.replace('.mp4', '');
+            const baseFileName = stripVideoExtension(episodeFile);
             const subtitleFileName = `${baseFileName}.${langCode}${variantSuffix}.srt`;
 
             subtitleFilePath = join(seasonDir, subtitleFileName);

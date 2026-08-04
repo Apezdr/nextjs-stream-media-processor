@@ -8,8 +8,35 @@ import { extractHDRInfo, extractMediaQuality, getHeaderData, getMediaInfoCombine
 const logger = createCategoryLogger('infoFileManager');
 const exec = promisify(execCallback);
 
-// Used to determine if regenerating info is necessary
-export const CURRENT_VERSION = 1.0010;
+// Used to determine if regenerating info is necessary.
+// 1.0011 adds container/codec detail (additionalMetadata.format, video pix_fmt
+// and field_order, audio languageTag/disposition) used to decide whether the
+// JIT transcoder can serve a file without losing anything.
+export const CURRENT_VERSION = 1.0011;
+
+/**
+ * The shape extractAdditionalMetadata returns when probing fails.
+ *
+ * It must be a SHAPED empty, not `{}`. validateInfo checks for the presence of
+ * the `format` key, so returning a bare object for an unreadable file would
+ * fail validation, regenerate, fail again — regenerating on every single
+ * getInfo call, forever, with no error surfaced. The keys must exist; their
+ * values may be null.
+ *
+ * @returns {object}
+ */
+function emptyAdditionalMetadata() {
+  return {
+    duration: null,
+    size: { kb: null, mb: null, gb: null },
+    format: null,
+    audio: [],
+    video: [],
+    width: null,
+    height: null,
+    dimensions: null
+  };
+}
 
 /**
  * Validates basic info object structure
@@ -25,16 +52,44 @@ function validateInfo(info) {
     typeof info.additionalMetadata === 'object'
   );
 
+  if (!hasBasicFields) return false;
+
   // Check for mediaQuality field in newer versions
   if (info.version >= 1.0006) {
-    return hasBasicFields && (
-      info.mediaQuality === null || 
-      (typeof info.mediaQuality === 'object' && 
+    const hasMediaQuality = (
+      info.mediaQuality === null ||
+      (typeof info.mediaQuality === 'object' &&
        typeof info.mediaQuality.isHDR === 'boolean')
     );
+    if (!hasMediaQuality) return false;
   }
 
-  return hasBasicFields;
+  // 1.0011: the container/codec block must be PRESENT. Deliberately a key
+  // presence test rather than a non-null test — see emptyAdditionalMetadata.
+  if (info.version >= 1.0011) {
+    if (!info.additionalMetadata || !('format' in info.additionalMetadata)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Normalize an ffprobe stream language tag to a comparable code.
+ *
+ * Returns null for absent, empty, or explicitly-undetermined ("und") tags so
+ * callers can distinguish "no language information" from "a language", rather
+ * than treating the string "und" as a distinct language.
+ *
+ * @param {string|undefined} raw
+ * @returns {string|null}
+ */
+function normalizeLanguageTag(raw) {
+  if (typeof raw !== 'string') return null;
+  const tag = raw.trim().toLowerCase();
+  if (!tag || tag === 'und' || tag === 'unknown') return null;
+  return tag;
 }
 
 /**
@@ -63,11 +118,29 @@ async function extractAdditionalMetadata(filePath) {
       sample_rate: stream.sample_rate,
       bitrate: stream.bit_rate ? parseInt(stream.bit_rate) : null,
       // Check multiple possible locations for language tag
-      language: stream.tags?.language || 
-                stream.tags?.LANGUAGE || 
-                stream.tags?.lang || 
-                stream.tags?.title || 
-                null
+      language: stream.tags?.language ||
+                stream.tags?.LANGUAGE ||
+                stream.tags?.lang ||
+                stream.tags?.title ||
+                null,
+      // 1.0011: a STRICT language code, unlike `language` above.
+      //
+      // `language` falls back to tags.title, which is not a language code — it
+      // holds things like "English [DTS-HD MA 5.1]" or "Director Commentary".
+      // Counting distinct `language` values would therefore report almost every
+      // multi-track file as multi-language. That field is left alone because it
+      // is published in additional_metadata and the frontend reads it; this one
+      // is what policy decisions may key on.
+      languageTag: normalizeLanguageTag(
+        stream.tags?.language || stream.tags?.LANGUAGE || stream.tags?.lang
+      ),
+      title: stream.tags?.title ?? null,
+      disposition: {
+        default: Boolean(stream.disposition?.default),
+        comment: Boolean(stream.disposition?.comment),
+        visual_impaired: Boolean(stream.disposition?.visual_impaired),
+        descriptions: Boolean(stream.disposition?.descriptions)
+      }
     }));
 
     // Extract video stream details
@@ -77,7 +150,16 @@ async function extractAdditionalMetadata(filePath) {
       bitrate: stream.bit_rate ? parseInt(stream.bit_rate) : null,
       aspect_ratio: stream.display_aspect_ratio,
       width: stream.width ? parseInt(stream.width) : null,
-      height: stream.height ? parseInt(stream.height) : null
+      height: stream.height ? parseInt(stream.height) : null,
+      // 1.0011: pix_fmt and field_order gate the transcoder's zero-cost remux
+      // path; the color_* fields distinguish HDR10 / HLG / SDR sources.
+      pix_fmt: stream.pix_fmt ?? null,
+      field_order: stream.field_order ?? null,
+      color_transfer: stream.color_transfer ?? null,
+      color_primaries: stream.color_primaries ?? null,
+      color_space: stream.color_space ?? null,
+      profile: stream.profile ?? null,
+      level: stream.level ?? null
     }));
     
     // Derive primary dimensions from the first video stream
@@ -94,6 +176,15 @@ async function extractAdditionalMetadata(filePath) {
         mb: sizeInt ? sizeInt / (1024 * 1024) : null, // in MB
         gb: sizeInt ? sizeInt / (1024 * 1024 * 1024) : null // in GB
       },
+      // 1.0011: the container itself. ffprobe reports a comma-joined family
+      // ("matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"), kept verbatim rather than
+      // normalized — consumers match on substrings and a lossy normalization
+      // here would be impossible to undo downstream.
+      format: {
+        formatName: format.format_name ?? null,
+        formatLongName: format.format_long_name ?? null,
+        bitrate: format.bit_rate ? parseInt(format.bit_rate) : null
+      },
       audio: audioDetails,
       video: videoDetails,
       width,
@@ -102,7 +193,7 @@ async function extractAdditionalMetadata(filePath) {
     };
   } catch (error) {
     logger.error(`Error extracting additional metadata for ${filePath}:`, error);
-    return {};
+    return emptyAdditionalMetadata();
   }
 }
 

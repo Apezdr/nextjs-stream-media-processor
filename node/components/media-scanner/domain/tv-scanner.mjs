@@ -1,15 +1,24 @@
 import { promises as fs } from 'fs';
-import { join, normalize, dirname } from 'path';
+import { join, normalize, dirname, extname, basename } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
+import {
+  resolveMediaIdentity,
+  repointMediaIdentity,
+  episodeMediaId,
+} from '../../../utils/mediaIdentity.mjs';
+import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
 import {
   fileExists,
   getStoredBlurhash,
   deriveEpisodeTitle,
   calculateDirectoryHash,
-  getLastModifiedTime
+  getLastModifiedTime,
+  stripVideoExtension,
+  VIDEO_EXTENSIONS
 } from '../../../utils/utils.mjs';
-import { getInfo } from '../../../infoManager.mjs';
+import { isVideoFile } from '../../../utils/mediaResolution.mjs';
+import { buildVideoSources, publishableSources } from './video-sources.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
@@ -25,7 +34,9 @@ import {
   getEpisodeRetryRows,
   recordEpisodeAttempt,
   clearEpisodeRetry,
-  clearEpisodeRetryForShow
+  clearEpisodeRetryForShow,
+  recordMediaIdentity,
+  createIdentityClaims
 } from '../data-access/scanner-repository.mjs';
 import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
@@ -276,12 +287,19 @@ async function processShowMetadata({
  * @param {string[]} seasonFiles - Pre-read directory listing for the season (avoids redundant readdir)
  * @returns {Promise<Object>} Subtitles object
  */
-async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, encodedSeasonName, prefixPath, langMap, seasonFiles) {
+async function processEpisodeSubtitles(seasonPath, episodeFiles, encodedShowName, encodedSeasonName, prefixPath, langMap, seasonFiles) {
   const subtitles = {};
   const subtitleFiles = seasonFiles;
-  
+
+  // Was `episode.replace('.mp4', '')` — a no-op for any other container, which
+  // left the test as startsWith('Show.S01E01.mkv') and silently attached ZERO
+  // subtitles to every non-mp4 episode. No error, no log, sidecars sitting
+  // right next to the file. Strip the REAL extension, and accept a stem from
+  // any of this episode's containers.
+  const stems = [...new Set(episodeFiles.map(stripVideoExtension))];
+
   for (const subtitleFile of subtitleFiles) {
-    if (subtitleFile.startsWith(episode.replace('.mp4', '')) && subtitleFile.endsWith('.srt')) {
+    if (subtitleFile.endsWith('.srt') && stems.some(stem => subtitleFile.startsWith(stem))) {
       const parsed = parseSubtitleFilename(subtitleFile, langMap);
       if (!parsed) continue;
 
@@ -311,29 +329,18 @@ async function processEpisodeSubtitles(seasonPath, episode, encodedShowName, enc
  * @param {string[]} seasonFiles - Pre-read directory listing for the season
  * @returns {Promise<Object|null>} Episode data object or null if processing fails
  */
-async function processEpisode(episode, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles) {
-  const episodePath = join(seasonPath, episode);
-  const encodedEpisodePath = encodeURIComponent(episode);
+async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null) {
+  // episodeFiles holds EVERY container for this one episode, already ordered by
+  // container priority. The first is the primary — the one that publishes as
+  // videoURL — and the rest ride along in sources[].
+  const episode = episodeFiles[0];
 
   let derivedEpisodeName = deriveEpisodeTitle(episode);
-  let fileLength, fileDimensions, hdrInfo, mediaQuality, additionalMetadata, uuid;
-
-  try {
-    const info = await getInfo(episodePath);
-    fileLength = info.length;
-    fileDimensions = info.dimensions;
-    hdrInfo = info.hdr;
-    mediaQuality = info.mediaQuality;
-    additionalMetadata = info.additionalMetadata;
-    uuid = info.uuid;
-  } catch (error) {
-    logger.error(`Failed to retrieve info for ${episodePath}: ${error}`);
-  }
 
   // Extract episode number
   const episodeNumberMatch = episode.match(/S\d+E(\d+)/i);
   const episodeNumber = episodeNumberMatch ? episodeNumberMatch[1] : (episode.match(/\d+/) || ['0'])[0];
-  
+
   if (!episodeNumber || !seasonNumber) {
     logger.warn(`Could not extract episode or season number from ${episode}, skipping.`);
     return null;
@@ -342,18 +349,48 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
   const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
   const episodeKey = `S${seasonNumber}E${paddedEpisodeNumber}`;
 
+  const { sources, primary, fileLengths, fileDimensions } = await buildVideoSources({
+    videoFiles: episodeFiles,
+    dir: seasonPath,
+    urlFor: (filename) =>
+      `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(filename)}`,
+    // basename(seasonPath) is the real folder name on disk, which is what the
+    // transcoder must be handed — not the padded season number.
+    libraryRelativeDir: `tv/${showName}/${basename(seasonPath)}`,
+  });
+
+  if (!primary) {
+    logger.warn(`No resolvable video source for ${showName} ${episodeKey}, skipping.`);
+    return null;
+  }
+
+  const info = primary._info;
+
   const episodeData = {
-    _id: uuid,
-    filename: episode,
-    videoURL: `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodedEpisodePath}`,
-    mediaLastModified: (await fs.stat(episodePath)).mtime.toISOString(),
-    hdr: hdrInfo || null,
-    mediaQuality: mediaQuality || null,
-    additionalMetadata: additionalMetadata || {},
+    _id: info?.uuid,
+    // Stable identity: the show's id plus the season/episode coordinate.
+    // Deliberately not derived from the filename — filenames change on remux
+    // and re-release, and an episode's identity must not.
+    mediaIdentity: showMediaId
+      ? {
+          id: episodeMediaId(showMediaId, seasonNumber, episodeNumber),
+          scheme: 'mid',
+        }
+      : null,
+    filename: primary.filename,
+    videoURL: primary.url,
+    sources: publishableSources(sources),
+    // Describe the PRIMARY source, which is what videoURL points at.
+    jitEligible: primary.jitEligible,
+    jitUrl: primary.jitUrl,
+    mediaLastModified: primary.mediaLastModified,
+    hdr: info?.hdr || null,
+    mediaQuality: info?.mediaQuality || null,
+    additionalMetadata: info?.additionalMetadata || {},
     episodeNumber: parseInt(episodeNumber, 10),
     derivedEpisodeName: derivedEpisodeName,
-    length: parseInt(fileLength, 10),
-    dimensions: fileDimensions
+    length: fileLengths[primary.filename] ?? null,
+    dimensions: fileDimensions[primary.filename] ?? null
   };
 
   // Handle thumbnail
@@ -393,18 +430,20 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
   );
   
-  await generateChapterFileIfNotExists(chaptersPath, episodePath, true);
-  
+  await generateChapterFileIfNotExists(chaptersPath, join(seasonPath, primary.filename), true);
+
   if (await fileExists(chaptersPath)) {
     episodeData.chapters = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
       `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
     )}`;
   }
 
-  // Process subtitles
+  // Process subtitles. Matched against EVERY container's stem, not just the
+  // primary's: a season holding both "Ep.mkv" and "Ep.1080p.mp4" can carry
+  // sidecars named after either.
   const subtitles = await processEpisodeSubtitles(
     seasonPath,
-    episode,
+    episodeFiles,
     encodedShowName,
     encodedSeasonName,
     prefixPath,
@@ -416,7 +455,12 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
     episodeData.subtitles = subtitles;
   }
 
-  return { episodeKey, episodeData, length: parseInt(fileLength, 10), dimensions: fileDimensions };
+  return {
+    episodeKey,
+    episodeData,
+    length: fileLengths[primary.filename] ?? null,
+    dimensions: fileDimensions[primary.filename] ?? null
+  };
 }
 
 /**
@@ -430,7 +474,7 @@ async function processEpisode(episode, seasonPath, showName, encodedShowName, en
  * @param {Object} langMap - Language code mapping
  * @returns {Promise<Object|null>} Season data object or null if no episodes
  */
-async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap) {
+async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null) {
   if (!season.isDirectory()) return null;
 
   const seasonName = season.name;
@@ -440,11 +484,32 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
   const seasonNumber = seasonNumberMatch ? seasonNumberMatch[0].padStart(2, '0') : '00';
 
   const episodes = await fs.readdir(seasonPath);
-  const validEpisodes = episodes.filter(
-    episode => episode.endsWith('.mp4') && !episode.includes('-TdarrCacheFile-')
-  );
-  
+  // Any supported container. isVideoFile already excludes Tdarr's in-progress
+  // transcodes, which are valid containers an extension filter would accept.
+  const validEpisodes = episodes.filter(isVideoFile).sort((a, b) => {
+    const rank =
+      VIDEO_EXTENSIONS.indexOf(extname(a).toLowerCase()) -
+      VIDEO_EXTENSIONS.indexOf(extname(b).toLowerCase());
+    return rank !== 0 ? rank : a.localeCompare(b);
+  });
+
   if (validEpisodes.length === 0) return null;
+
+  // Group every container for the same episode under one key BEFORE processing.
+  //
+  // Without this, a season holding both "S01E01.mp4" and "S01E01.mkv" produces
+  // two results that write to the same seasonData.episodes key, so the last one
+  // by iteration order wins — and which one that is flips with readdir order,
+  // making the episode's published URL and identity flap on every scan. The
+  // list is already in container-priority order, so group[0] is the primary.
+  const episodeGroups = new Map();
+  for (const filename of validEpisodes) {
+    const match = filename.match(/S\d+E(\d+)/i);
+    const number = match ? match[1] : (filename.match(/\d+/) || ['0'])[0];
+    const key = `S${seasonNumber}E${String(number).padStart(2, '0')}`;
+    if (!episodeGroups.has(key)) episodeGroups.set(key, []);
+    episodeGroups.get(key).push(filename);
+  }
 
   const seasonData = {
     episodes: {},
@@ -467,10 +532,11 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
     }
   }
 
-  // Process each episode (pass seasonFiles = episodes to avoid redundant readdir per episode)
-  for (const episode of validEpisodes) {
+  // Process each episode ONCE, with all of its containers (pass seasonFiles =
+  // episodes to avoid a redundant readdir per episode)
+  for (const episodeFiles of episodeGroups.values()) {
     const episodeResult = await processEpisode(
-      episode,
+      episodeFiles,
       seasonPath,
       showName,
       encodedShowName,
@@ -479,9 +545,10 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       prefixPath,
       basePath,
       langMap,
-      episodes
+      episodes,
+      showMediaId
     );
-    
+
     if (episodeResult) {
       seasonData.episodes[episodeResult.episodeKey] = episodeResult.episodeData;
       seasonData.lengths[episodeResult.episodeKey] = episodeResult.length;
@@ -511,10 +578,15 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // Lightweight hash lookup — avoids loading full show data with seasons/images
   const existingShowHashes = await getExistingTVShowHashes();
   const hashMap = new Map(existingShowHashes.map(s => [s.name, s.directory_hash]));
+  const signatureMap = new Map(existingShowHashes.map(s => [s.name, s.payload_signature]));
   const existingShowNames = new Set(existingShowHashes.map(s => s.name));
 
   // Bounded concurrency for season processing (moderate load — not unbounded)
   const seasonLimit = pLimit(3);
+
+  // Per-scan identity claims. Scoped to this run so a stale index row from an
+  // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
+  const identityClaims = createIdentityClaims();
 
   try {
     for (let index = 0; index < shows.length; index++) {
@@ -543,6 +615,28 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
       if (storedHash && dirHashChanged) {
         logger.info(`Directory hash changed for ${showName}, reprocessing.`);
+      }
+
+      // Stable content identity for the show. Episode ids derive from it plus
+      // the season/episode coordinate, so episodes keep identity through file
+      // renames and remuxes without a sidecar each.
+      const showIdentity = await resolveMediaIdentity({
+        dir: showPath,
+        libraryRelativePath: `tv/${showName}`,
+      });
+      let showMediaId = showIdentity.id;
+      const showClaim = await recordMediaIdentity(db, identityClaims, {
+        mediaId: showMediaId,
+        mediaType: 'tv',
+        mediaName: showName,
+      });
+      if (showClaim.conflict) {
+        showMediaId = await repointMediaIdentity({
+          dir: showPath,
+          libraryRelativePath: `tv/${showName}`,
+        });
+        await recordMediaIdentity(db, identityClaims, { mediaId: showMediaId, mediaType: 'tv', mediaName: showName });
+        logger.warn(`identity repointed for tv/${showName}: ${showIdentity.id} -> ${showMediaId}`);
       }
 
       const allItems = await fs.readdir(showPath, { withFileTypes: true });
@@ -640,6 +734,25 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       //    tick forever. A config edit / unfreeze is still picked up
       //    immediately — any tmdb.config write bumps its mtime, which flips
       //    dirHashChanged and that term bypasses everything.
+      // A payload-shape change (new field, or the JIT toggle flipping) alters
+      // nothing on disk, so dirHashChanged cannot see it and the fast-skip
+      // below would skip this show forever. TV has no needsInfoRegeneration
+      // equivalent, so this signature comparison is the ONLY convergence driver
+      // for shows. Settles in one pass: saveTVShow stores the new signature.
+      const payloadSignature = currentPayloadSignature();
+      const storedSignature = signatureMap.get(showName);
+      const needPayloadRefresh = storedHash != null && storedSignature !== payloadSignature;
+      if (needPayloadRefresh) {
+        logger.info(
+          `media pivot: reprocessing ${showName} for payload signature ` +
+          `${storedSignature ?? 'none'} -> ${payloadSignature}`
+        );
+      }
+
+      // NOTE: needPayloadRefresh is deliberately NOT folded into this flag.
+      // It gates TMDB image downloads as well as reprocessing, and a payload
+      // bump touches no images — folding it in would fire a library-wide TMDB
+      // image pull on the convergence pass. It only bypasses the fast-skip.
       let runDownloadTmdbImagesFlag =
         dirHashChanged ||
         (missingImages && updateAllowed) ||
@@ -649,7 +762,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // aren't due for a metadata-cooldown retry. Equivalent to the old
       // unconditional hash-skip, just applied AFTER the gate so the
       // image-only retry path isn't suppressed when the dir is unchanged.
-      if (!runDownloadTmdbImagesFlag) {
+      if (!runDownloadTmdbImagesFlag && !needPayloadRefresh) {
         // Thin episodes on an otherwise-stable show still need re-checking — the
         // full-process path only runs the backfill when the show is reprocessed for
         // some other reason, which is exactly when it's least needed. Run it here
@@ -831,7 +944,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
             encodedShowName,
             prefixPath,
             basePath,
-            langMap
+            langMap,
+            showMediaId
           );
           
           if (seasonResult) {
@@ -889,7 +1003,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         backdropFocalSuggested,
         imageHashes,
         pristineMetadata,
-        sourceUrls
+        sourceUrls,
+        showMediaId
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

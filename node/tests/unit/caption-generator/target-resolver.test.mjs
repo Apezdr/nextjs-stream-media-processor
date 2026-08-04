@@ -25,6 +25,15 @@ beforeAll(async () => {
   const extras = join(tmpRoot, 'tv', 'Other Show', 'Season 2 - Pilot Arc');
   await fs.mkdir(extras, { recursive: true });
   await fs.writeFile(join(extras, 'Other Show.S02E01.mp4'), 'x');
+  // Movie stored in a container other than .mp4
+  const mkvDir = join(tmpRoot, 'movies', 'Mkv Movie');
+  await fs.mkdir(mkvDir, { recursive: true });
+  await fs.writeFile(join(mkvDir, 'Mkv.Movie.2005.mkv'), 'x');
+  // Movie with multiple containers: the .mp4 must stay THE video file (scanner parity)
+  const mixedDir = join(tmpRoot, 'movies', 'Mixed Movie');
+  await fs.mkdir(mixedDir, { recursive: true });
+  await fs.writeFile(join(mixedDir, 'Mixed Movie.mkv'), 'x');
+  await fs.writeFile(join(mixedDir, 'Mixed Movie.mp4'), 'x');
 });
 
 afterAll(async () => {
@@ -133,6 +142,30 @@ describe('resolveTarget', () => {
         episode: '1'
       })
     ).rejects.toThrow(/Season 99 not found/);
+  });
+
+  it('resolves an MKV-only movie and names the srt after the mkv base', async () => {
+    const r = await resolveTarget({
+      basePath: tmpRoot,
+      publicPrefix: '/media',
+      mediaType: 'movie',
+      mediaTitle: 'Mkv Movie',
+      langCode: 'en'
+    });
+    expect(r.videoPath.endsWith('Mkv.Movie.2005.mkv')).toBe(true);
+    expect(r.srtFilename).toBe('Mkv.Movie.2005.en.auto.srt');
+    expect(r.srtPublicUrl).toBe('/media/movies/Mkv%20Movie/Mkv.Movie.2005.en.auto.srt');
+  });
+
+  it('prefers the .mp4 when both .mp4 and .mkv exist', async () => {
+    const r = await resolveTarget({
+      basePath: tmpRoot,
+      mediaType: 'movie',
+      mediaTitle: 'Mixed Movie',
+      langCode: 'en'
+    });
+    expect(r.videoPath.endsWith('Mixed Movie.mp4')).toBe(true);
+    expect(r.srtFilename).toBe('Mixed Movie.en.auto.srt');
   });
 
   it('rejects non-numeric season values', async () => {

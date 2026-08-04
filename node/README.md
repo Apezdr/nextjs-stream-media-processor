@@ -17,7 +17,6 @@ This application serves as a dynamic backend service for generating and serving 
 - **app.mjs:** Main application logic, route handling, and orchestration of various services.
 - **chapter-generator.js:** Handles extraction of chapter information and generation of chapter WebVTT files.
 - **videoHandler.js:** Manages video serving with custom audio track selection.
-- **snapshotWorker.js:** Worker process for concurrent frame generation to improve performance.
 - **utils.js:** Utility functions for file operations, frame generation, and other common tasks.
 
 ## Prerequisites

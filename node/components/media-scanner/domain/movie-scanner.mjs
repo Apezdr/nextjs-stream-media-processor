@@ -1,19 +1,32 @@
 import { promises as fs } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, extname } from 'path';
+import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
   calculateDirectoryHash,
   fileExists,
   getLastModifiedTime,
-  getStoredBlurhash
+  getStoredBlurhash,
+  stripVideoExtension,
+  VIDEO_EXTENSIONS,
+  HASH_EXCLUDED_FILES
 } from '../../../utils/utils.mjs';
-import { getInfo } from '../../../infoManager.mjs';
+import { isVideoFile } from '../../../utils/mediaResolution.mjs';
+import { buildVideoSources, publishableSources } from './video-sources.mjs';
 import { generateChapters } from '../../../chapter-generator.mjs';
 import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
+  resolveMediaIdentity,
+  repointMediaIdentity,
+  filenameFromUrl,
+} from '../../../utils/mediaIdentity.mjs';
+import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
+import {
   getExistingMovies,
   getMissingMediaData,
+  recordMediaIdentity,
+  createIdentityClaims,
   saveMovie,
   removeMovie,
   markMediaAsMissingData,
@@ -35,6 +48,20 @@ import {
 } from './image-conventions.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
+
+/**
+ * Parse the stored `urls` column, which may be a JSON string or already an
+ * object depending on which reader produced the row.
+ */
+function parseStoredUrls(urls) {
+  if (!urls) return null;
+  if (typeof urls !== 'string') return urls;
+  try {
+    return JSON.parse(urls);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Helper function to generate chapter files if they don't exist.
@@ -81,31 +108,37 @@ async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode
  * @returns {Promise<boolean>} True if regeneration is needed
  */
 async function needsInfoRegeneration(files, dirPath, dirName, currentVersion) {
-  const mp4Files = files.filter(file => file.endsWith('.mp4'));
-  
-  for (const mp4File of mp4Files) {
-    const filePath = join(dirPath, dirName, mp4File);
+  // Safe to cover every container now, and ONLY now: this decides whether to
+  // reprocess a movie, while processVideoFiles is what actually calls getInfo.
+  // Widening this while that stayed .mp4-only would mean an .mkv with a missing
+  // or stale sidecar returns true here, the movie is reprocessed, the .mkv is
+  // skipped, the sidecar is still stale — and the folder reprocesses on every
+  // scan tick forever. The two must move together, and in this commit they do.
+  const videoFiles = files.filter(isVideoFile);
+
+  for (const videoFile of videoFiles) {
+    const filePath = join(dirPath, dirName, videoFile);
     const infoFile = `${filePath}.info`;
-    
+
     if (await fileExists(infoFile)) {
       try {
         const fileInfo = await fs.readFile(infoFile, 'utf-8');
         const info = JSON.parse(fileInfo);
-        
+
         if (!info.version || info.version < currentVersion) {
-          logger.info(`Info file for ${mp4File} has outdated version (${info.version}), regeneration needed`);
+          logger.info(`Info file for ${videoFile} has outdated version (${info.version}), regeneration needed`);
           return true;
         }
       } catch (error) {
-        logger.warn(`Error reading info file for ${mp4File}, regeneration needed: ${error}`);
+        logger.warn(`Error reading info file for ${videoFile}, regeneration needed: ${error}`);
         return true;
       }
     } else {
-      logger.info(`Info file for ${mp4File} doesn't exist, regeneration needed`);
+      logger.info(`Info file for ${videoFile} doesn't exist, regeneration needed`);
       return true;
     }
   }
-  
+
   return false;
 }
 
@@ -264,77 +297,116 @@ async function processSubtitles(fileNames, dirPath, dirName, prefixPath, langMap
 }
 
 /**
- * Process video files and generate URLs
- * @param {Array<string>} fileNames - List of file names
- * @param {string} dirPath - Directory path
- * @param {string} dirName - Directory name
+ * Process every video file in a movie folder and build its published URLs.
+ *
+ * Was .mp4-only, and the loop overwrote `urls.mp4` on each iteration, so a
+ * multi-mp4 folder silently published the LAST file by readdir order and every
+ * non-mp4 container was invisible. Now every supported container becomes a
+ * source, and exactly one of them — the identity's pinned primary — publishes
+ * as `urls.mp4`.
+ *
+ * `urls.mp4` keeps its legacy name for an mkv title. It is a LOCATOR, never a
+ * container claim; see docs/jit-transcoder.md.
+ *
+ * @param {Array<string>} videoFiles - Ordered video basenames (listVideoFiles)
+ * @param {string} dirPath - Movies root
+ * @param {string} dirName - Movie directory name
  * @param {string} prefixPath - URL prefix path
- * @returns {Promise<Object>} Object containing file lengths, dimensions, urls, and video metadata
+ * @param {string|null} primaryFilename - Identity's pinned primary source
+ * @returns {Promise<Object>}
  */
-async function processVideoFiles(fileNames, dirPath, dirName, prefixPath) {
-  const fileLengths = {};
-  const fileDimensions = {};
-  const urls = {};
-  let hdrInfo, mediaQuality, additionalMetadata, _id;
+async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, primaryFilename = null) {
   const encodedDirName = encodeURIComponent(dirName);
+  const dir = join(dirPath, dirName);
 
-  for (const file of fileNames) {
-    if (file.endsWith('.mp4')) {
-      const filePath = join(dirPath, dirName, file);
-      const encodedFilePath = encodeURIComponent(file);
+  const { sources, primary, fileLengths, fileDimensions } = await buildVideoSources({
+    videoFiles,
+    dir,
+    urlFor: (filename) =>
+      `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent(filename)}`,
+    primaryFilename,
+    libraryRelativeDir: `movies/${dirName}`,
+  });
 
-      try {
-        const info = await getInfo(filePath);
-        fileLengths[file] = parseInt(info.length, 10);
-        fileDimensions[file] = info.dimensions;
-        hdrInfo = info.hdr;
-        mediaQuality = info.mediaQuality;
-        additionalMetadata = info.additionalMetadata;
-        _id = info.uuid;
-      } catch (error) {
-        logger.error(`Failed to retrieve info for ${filePath}: ${error}`);
-      }
-
-      urls['mp4'] = `${prefixPath}/movies/${encodedDirName}/${encodedFilePath}`;
-      urls['mediaLastModified'] = (await fs.stat(filePath)).mtime.toISOString();
-    }
+  const urls = {};
+  if (primary) {
+    urls.mp4 = primary.url;
+    // Written for EVERY container, not just mp4. getMoviesModifiedSince keys
+    // the incremental hash sweep off this field, so an mkv-only movie without
+    // it would be permanently invisible to that sweep — silently, with no error.
+    if (primary.mediaLastModified) urls.mediaLastModified = primary.mediaLastModified;
+    urls.sources = publishableSources(sources);
+    // Emitted beside urls.mp4, per the frozen frontend contract. Both describe
+    // the PRIMARY source, which is exactly what urls.mp4 points at. Episodes
+    // carry the same pair flat beside videoURL — each follows its own
+    // container's existing convention.
+    //
+    // These two are INDEPENDENT: a multi-audio primary yields
+    // jitEligible: false with a non-null jitUrl. That combination is the point
+    // — the admin override needs the URL — so do not "simplify" either one from
+    // the other. See docs/jit-url-addressability.md.
+    urls.jitEligible = primary.jitEligible;
+    if (primary.jitUrl) urls.jitUrl = primary.jitUrl;
   }
 
-  return { fileLengths, fileDimensions, urls, hdrInfo, mediaQuality, additionalMetadata, _id };
+  const primaryInfo = primary?._info ?? null;
+
+  return {
+    fileLengths,
+    fileDimensions,
+    urls,
+    // Title-level flag and URL both describe the PRIMARY source, which is what
+    // urls.mp4 points at. They answer different questions and may disagree —
+    // recommendation vs addressability.
+    jitEligible: primary?.jitEligible ?? false,
+    jitUrl: primary?.jitUrl ?? null,
+    // Row-level fields describe the PRIMARY source, matching what urls.mp4
+    // points at. Per-source equivalents live in urls.sources[].
+    hdrInfo: primaryInfo?.hdr,
+    mediaQuality: primaryInfo?.mediaQuality,
+    additionalMetadata: primaryInfo?.additionalMetadata,
+    _id: primaryInfo?.uuid,
+    primaryFilename: primary?.filename ?? null,
+  };
 }
 
 /**
- * Process chapters for a movie
- * @param {string} dirPath - Directory path
- * @param {string} dirName - Directory name
- * @param {Array<string>} fileNames - List of file names
+ * Process chapters for a movie.
+ *
+ * Was three separate .mp4 assumptions in four lines: it found the file by
+ * suffix, stripped '.mp4' with a SUBSTRING replace (which would corrupt
+ * "My.mp4.Movie.mkv"), then re-appended '.mp4' to rebuild the path. Now it
+ * takes the already-resolved primary source's basename.
+ *
+ * @param {string} dirPath - Movies root
+ * @param {string} dirName - Movie directory name
+ * @param {string|null} primaryFilename - Primary source basename, with extension
  * @param {string} prefixPath - URL prefix path
  * @returns {Promise<string|null>} Chapters URL or null
  */
-async function processChapters(dirPath, dirName, fileNames, prefixPath) {
+async function processChapters(dirPath, dirName, primaryFilename, prefixPath) {
   const encodedDirName = encodeURIComponent(dirName);
-  const mp4Filename = fileNames.find(e => e.endsWith('.mp4') && !e.endsWith('.mp4.info'))?.replace('.mp4', '');
-  
-  if (!mp4Filename) return null;
+  if (!primaryFilename) return null;
 
-  const mediaPath = join(dirPath, dirName, `${mp4Filename}.mp4`);
+  const baseFilename = stripVideoExtension(primaryFilename);
+  const mediaPath = join(dirPath, dirName, primaryFilename);
   if (!(await fileExists(mediaPath))) return null;
 
   const chaptersPath = join(dirPath, dirName, 'chapters', `${dirName}_chapters.vtt`);
-  const chaptersPath2 = join(dirPath, dirName, 'chapters', `${mp4Filename}_chapters.vtt`);
-  
+  const chaptersPath2 = join(dirPath, dirName, 'chapters', `${baseFilename}_chapters.vtt`);
+
   await generateChapterFileIfNotExists(chaptersPath, mediaPath, true);
-  
+
   if (!await fileExists(chaptersPath)) {
     await generateChapterFileIfNotExists(chaptersPath2, mediaPath, true);
   }
-  
+
   if (await fileExists(chaptersPath)) {
     return `${prefixPath}/movies/${encodedDirName}/chapters/${encodeURIComponent(`${dirName}_chapters.vtt`)}`;
   } else if (await fileExists(chaptersPath2)) {
-    return `${prefixPath}/movies/${encodedDirName}/chapters/${encodeURIComponent(`${mp4Filename}_chapters.vtt`)}`;
+    return `${prefixPath}/movies/${encodedDirName}/chapters/${encodeURIComponent(`${baseFilename}_chapters.vtt`)}`;
   }
-  
+
   return null;
 }
 
@@ -381,8 +453,19 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
   const existingMovies = await getExistingMovies();
   const existingMovieNames = new Set(existingMovies.map(movie => movie.name));
 
+  // Bounded concurrency for movie processing (mirrors the season limiter in
+  // tv-scanner.mjs). Each iteration can invoke ffprobe + mediainfo through
+  // getInfo(); unbounded, a full-library pass spawns one subprocess pair per
+  // movie simultaneously, which matters whenever a version/payload bump forces
+  // every title to reprocess in a single tick.
+  const movieLimit = pLimit(3);
+
+  // Per-scan identity claims. Scoped to this run so a stale index row from an
+  // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
+  const identityClaims = createIdentityClaims();
+
   await Promise.all(
-    dirs.map(async (dir, index) => {
+    dirs.map((dir, index) => movieLimit(async () => {
       if (isDebugMode) {
         logger.info(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
       }
@@ -410,16 +493,28 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // pass: saveMovie's escape hatch persists the fingerprint, so
       // existingMovie.metadata is non-NULL on the next tick.
       let needMetadataBackfill = false;
+      // A payload-shape change (new field, or the JIT toggle flipping) alters
+      // nothing on disk, so directory_hash cannot see it and this early return
+      // would skip the movie forever. Converges in exactly one pass: the upsert
+      // stores the new signature, so the next tick compares equal.
+      const payloadSignature = currentPayloadSignature();
+      const needPayloadRefresh =
+        existingMovie && existingMovie.payload_signature !== payloadSignature;
       if (!dirHashChanged && existingMovie) {
         needInfoRegeneration = await needsInfoRegeneration(files, dirPath, dirName, currentVersion);
         needMetadataBackfill =
           existingMovie.metadata == null && files.includes('metadata.json');
 
-        if (!needInfoRegeneration && !needMetadataBackfill) {
+        if (!needInfoRegeneration && !needMetadataBackfill && !needPayloadRefresh) {
           if (isDebugMode) {
             logger.info(`No changes detected in ${dirName}, skipping processing.`);
           }
           return;
+        } else if (needPayloadRefresh) {
+          logger.info(
+            `media pivot: reprocessing ${dirName} for payload signature ` +
+            `${existingMovie.payload_signature ?? 'none'} -> ${payloadSignature}`
+          );
         } else if (needInfoRegeneration) {
           logger.info(`Processing ${dirName} to update info files`);
         } else {
@@ -430,14 +525,30 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       logger.info(`Directory Hash invalidated for, ${dirName}`);
 
       const fileSet = new Set(files);
+      // Video files, ordered by container priority then name. This is the
+      // upstream gate: fixing the emitters without fixing this changes nothing,
+      // because a non-mp4 never reached them.
+      const videoFiles = files
+        .filter(isVideoFile)
+        .sort((a, b) => {
+          const rank =
+            VIDEO_EXTENSIONS.indexOf(extname(a).toLowerCase()) -
+            VIDEO_EXTENSIONS.indexOf(extname(b).toLowerCase());
+          return rank !== 0 ? rank : a.localeCompare(b);
+        });
+
       const fileNames = files.filter(file =>
-        file.endsWith('.mp4') ||
+        // The identity sidecar is our own bookkeeping, not library content. It
+        // matches the .json arm below, so without this it would be published in
+        // file_names and folded into the movie hash.
+        !HASH_EXCLUDED_FILES.has(file) && (
+        isVideoFile(file) ||
         file.endsWith('.srt') ||
         file.endsWith('.json') ||
         file.endsWith('.info') ||
         file.endsWith('.nfo') ||
         file.endsWith('.jpg') ||
-        file.endsWith('.png')
+        file.endsWith('.png'))
       );
 
       let runDownloadTmdbImagesFlag = false;
@@ -477,8 +588,48 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         tmdbConfigLastModified
       );
 
-      // Process video files
-      const videoData = await processVideoFiles(fileNames, dirPath, dirName, prefixPath);
+      // Identity is resolved BEFORE the sources are built, because its pinned
+      // primarySource decides which of them publishes as urls.mp4.
+      //
+      // primarySource is seeded from the row's ALREADY-STORED url and never
+      // recomputed: the old processVideoFiles picked the LAST .mp4 in a
+      // multi-mp4 folder (its loop overwrote), while priority-order selection
+      // picks the FIRST. Recomputing would silently repoint those titles'
+      // published URL — and the frontend still derives watch-history identity
+      // from that URL until its cutover lands.
+      const storedUrls = parseStoredUrls(existingMovie?.urls);
+      const libraryRelativePath = `movies/${dirName}`;
+      const identity = await resolveMediaIdentity({
+        dir: fullDirPath,
+        libraryRelativePath,
+        primarySourceHint: filenameFromUrl(storedUrls?.mp4),
+      });
+      let mediaId = identity.id;
+
+      const claim = await recordMediaIdentity(db, identityClaims, {
+        mediaId,
+        mediaType: 'movie',
+        mediaName: dirName,
+      });
+      if (claim.conflict) {
+        // Another folder in THIS scan already claimed this id — almost always a
+        // copied folder that brought a cloned sidecar. Re-derive from this
+        // folder's path, which is unique by construction, and record the
+        // displaced id in previousIds so the change stays auditable.
+        mediaId = await repointMediaIdentity({ dir: fullDirPath, libraryRelativePath });
+        await recordMediaIdentity(db, identityClaims, { mediaId, mediaType: 'movie', mediaName: dirName });
+        logger.warn(`identity repointed for ${libraryRelativePath}: ${identity.id} -> ${mediaId}`);
+      }
+
+      // Process video files — every supported container becomes a source, and
+      // the identity's pinned primary is the one that publishes as urls.mp4.
+      const videoData = await processVideoFiles(
+        videoFiles,
+        dirPath,
+        dirName,
+        prefixPath,
+        identity.primarySource
+      );
       if (videoData._id) _id = videoData._id;
 
       // Build URLs. The resolution map (file path + mtime + hash per kind) comes
@@ -634,7 +785,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       }
 
       // Process chapters
-      const chaptersUrl = await processChapters(dirPath, dirName, fileNames, prefixPath);
+      const chaptersUrl = await processChapters(dirPath, dirName, videoData.primaryFilename, prefixPath);
       if (chaptersUrl) {
         urls.chapters = chaptersUrl;
       }
@@ -708,7 +859,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         imageHashes,
         metadataFingerprint,
         pristineMetadata,
-        sourceUrls
+        sourceUrls,
+        mediaId
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
@@ -739,7 +891,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       if (freshMovie) {
         await generateMovieHashes(db, freshMovie);
       }
-    })
+    }))
   );
 
   // Remove movies from the database that no longer exist in the file system.

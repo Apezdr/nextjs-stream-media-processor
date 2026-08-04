@@ -26,6 +26,81 @@ const logger = createCategoryLogger('scanner-repository');
  */
 
 /**
+ * A per-scan record of which title claimed which id. Create one per scan run
+ * and thread it through every recordMediaIdentity call in that run.
+ *
+ * @returns {Map<string, string>}
+ */
+export function createIdentityClaims() {
+  return new Map();
+}
+
+/**
+ * Record a resolved identity in the reverse index, reporting whether another
+ * title in THIS SAME SCAN already claimed that id.
+ *
+ * The index is a rebuildable cache; its one active job is this collision check.
+ * A genuine collision means a copied media folder brought a cloned
+ * .mediaid.json with it, and two distinct titles would otherwise share a resume
+ * position.
+ *
+ * The "this same scan" qualifier is load-bearing. Comparing against the STORED
+ * row instead treats a folder rename as a duplicate — the stored name is the
+ * old one, the presented name is the new one, they differ, and the caller
+ * repoints. That would destroy the single property the sidecar exists to
+ * provide, on the very next scan after any rename. A stale row from an earlier
+ * pass is not evidence of anything: the other folder may be long gone. Only two
+ * folders both present in one pass prove a duplicate.
+ *
+ * Resolution is deliberately NOT "first one wins", which would depend on scan
+ * order and differ between runs. The caller re-derives the loser's id from its
+ * own path, which is unique per folder by construction.
+ *
+ * @param {Object} db
+ * @param {Map<string,string>} claims - From createIdentityClaims(), per scan run
+ * @returns {Promise<{conflict: boolean, ownedBy: string|null}>}
+ */
+export async function recordMediaIdentity(db, claims, { mediaId, mediaType, mediaName, seasonKey = '', episodeKey = '' }) {
+  if (!mediaId) return { conflict: false, ownedBy: null };
+
+  // Structured, not a joined string: media names contain spaces and arbitrary
+  // punctuation, so parsing a name back out of a delimited key is lossy.
+  const prior = claims.get(mediaId);
+  const isSameClaimant =
+    prior &&
+    prior.mediaName === mediaName &&
+    prior.seasonKey === seasonKey &&
+    prior.episodeKey === episodeKey;
+
+  if (prior && !isSameClaimant) {
+    logger.warn(
+      `identity duplicate: ${mediaId} was claimed by "${prior.mediaName}" ` +
+      `(season="${prior.seasonKey}" episode="${prior.episodeKey}") and again by ` +
+      `"${mediaName}" (season="${seasonKey}" episode="${episodeKey}") in the same scan`
+    );
+    return { conflict: true, ownedBy: prior.mediaName };
+  }
+
+  claims.set(mediaId, { mediaName, seasonKey, episodeKey });
+
+  // Unconditional upsert. A row whose media_name differs is a RENAME, and the
+  // correct response is to follow it, not to fight it.
+  await db.run(
+    `INSERT INTO media_identity_index (media_id, media_type, media_name, season_key, episode_key, seen_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(media_id) DO UPDATE SET
+       media_type=excluded.media_type,
+       media_name=excluded.media_name,
+       season_key=excluded.season_key,
+       episode_key=excluded.episode_key,
+       seen_at=excluded.seen_at`,
+    [mediaId, mediaType, mediaName, seasonKey, episodeKey, new Date().toISOString()]
+  );
+
+  return { conflict: false, ownedBy: null };
+}
+
+/**
  * Cooldown (in hours) between retries for media that has been flagged as
  * having missing TMDB data. Owned here because the cooldown semantics belong
  * to the `missing_data_media` table that this repository fronts.
@@ -123,7 +198,8 @@ export async function saveMovie(
   imageHashes = null,
   metadata = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -146,7 +222,8 @@ export async function saveMovie(
     imageHashes,
     metadata,
     pristineMetadata,
-    sourceUrls
+    sourceUrls,
+    mediaId
   );
 }
 
@@ -202,7 +279,8 @@ export async function saveTVShow(
   backdropFocalSuggested = null,
   imageHashes = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -224,7 +302,8 @@ export async function saveTVShow(
     backdropFocalSuggested,
     imageHashes,
     pristineMetadata,
-    sourceUrls
+    sourceUrls,
+    mediaId
   );
 }
 

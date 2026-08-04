@@ -6,7 +6,7 @@ import { scheduleJob } from "node-schedule";
 import { exec } from "child_process";
 import { promisify } from "util";
 import os from "os";
-import { join, resolve, basename, extname, dirname, normalize } from "path";
+import { join, resolve, basename, dirname, normalize } from "path";
 import { createReadStream } from "fs"; // Callback-based version of fs
 import { promises as fs } from "fs"; // Use the promise-based version of fs
 import compression from "compression";
@@ -28,7 +28,9 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, findMp4File, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, clearVideoTranscodeCache, convertToAvif, generateCacheKey, getEpisodeFilename, getEpisodeKey, deriveEpisodeTitle, getCleanVideoPath, shouldUseAvif } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, clearVideoTranscodeCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
+import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
+import { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } from "./lib/mediaPayload.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
@@ -236,7 +238,6 @@ app.get("/frame/tv/:showName/:season/:episode/:timestamp{.:ext}", (req, res) =>
 
 async function handleFrameRequest(req, res, type) {
   let frameFileName,
-    directoryPath,
     videoPath,
     specificFileName = null,
     wasCached = true;
@@ -247,27 +248,26 @@ async function handleFrameRequest(req, res, type) {
   // Cant use `:` on Windows so replace with `-`
   const sanitizeTimestamp = timestamp.replace(/:/g, '-');
 
+  let episodeNumber;
   if (type === "movies") {
-    directoryPath = join(`${BASE_PATH}/movies`, movie_name);
     frameFileName = `movie_${movie_name}_${sanitizeTimestamp}.avif`;
   } else {
     // Extract episode number
     const episodeMatch =
       episode.match(/E(\d{1,2})/i) || episode.match(/^(\d{1,2})( -)?/);
-    const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
+    episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
 
-    directoryPath = join(`${BASE_PATH}/tv`, show_name, `Season ${season}`);
     frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${sanitizeTimestamp}.avif`;
 
     const showData = await getTVShowByName(show_name);
-    if (showData) {
-      const _episode = getEpisodeFilename(showData, season, episode)
-      specificFileName = _episode;
-      } else {
-        throw new Error(
-          `Season not found: ${show_name} - Season ${season} Episode ${episode}`
-        );
-      }
+    if (!showData) {
+      throw new Error(
+        `Season not found: ${show_name} - Season ${season} Episode ${episode}`
+      );
+    }
+    // The stored filename is only a hint — resolveEpisodeVideo falls back to
+    // matching the episode by S##E## when the container on disk has changed.
+    specificFileName = findEpisodeEntry(showData, season, episode)?.episode?.filename ?? null;
   }
 
   const framePath = join(framesCacheDir, frameFileName);
@@ -278,8 +278,20 @@ async function handleFrameRequest(req, res, type) {
       logger.info(`Serving cached frame: ${frameFileName}`);
     } else {
       wasCached = false;
-      // Find the MP4 file dynamically
-      videoPath = await findMp4File(directoryPath, specificFileName, framePath);
+      const videoRef =
+        type === "movies"
+          ? await resolveMovieVideo({ basePath: BASE_PATH, movieName: movie_name })
+          : await resolveEpisodeVideo({
+              basePath: BASE_PATH,
+              showName: show_name,
+              season,
+              episode,
+              preferFilename: specificFileName,
+            });
+      if (!videoRef) {
+        throw new Error(`Video file not found for ${movie_name || show_name}`);
+      }
+      videoPath = videoRef.path;
 
       // Generate the frame
       await generateFrame(videoPath, timestamp, framePath);
@@ -329,18 +341,17 @@ async function handleChapterRequest(
     if (!movie) {
       return res.status(404).send(`Movie not found: ${movieName}`);
     }
-    const urls = typeof movie.urls === 'string' ? JSON.parse(movie.urls) : movie.urls;
-    let videoMp4 = urls.mp4;
-    videoMp4 = decodeURIComponent(videoMp4);
-    const cleanPath = getCleanVideoPath(videoMp4);
-    let videoPath = join(BASE_PATH, cleanPath);
-    const movieFileName = basename(videoPath, extname(videoPath));
+    // Resolve the real file on disk rather than reconstructing its name. The
+    // previous version stripped the stored URL's actual extension and then
+    // re-appended '.mp4', so a title in any other container pointed mediaPath
+    // at a file that does not exist and 404'd even when its URL was correct.
+    const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
+    if (!videoRef) {
+      return res.status(404).send(`Movie file not found: ${movieName}`);
+    }
+    const movieFileName = stripVideoExtension(videoRef.filename);
     chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = join(
-      `${BASE_PATH}/movies`,
-      movieName,
-      `${movieFileName}.mp4`
-    );
+    mediaPath = videoRef.path;
     chapterFilePath = join(
       `${BASE_PATH}/movies`,
       movieName,
@@ -443,35 +454,30 @@ async function handleChapterRequest(
         return res.status(404).send(`Show not found: ${showName}`);
       }
     } else {
-      const directoryPath = join(
-        `${BASE_PATH}/tv`,
-        showName,
-        `Season ${season}`
-      );
-      const episodeNumber = episode.padStart(2, "0");
-      const seasonNumber = season.padStart(2, "0");
+      const episodeNumber = String(parseInt(episode, 10)).padStart(2, "0");
+      const seasonNumber = String(parseInt(season, 10)).padStart(2, "0");
       chapterFileName = `${showName} - S${seasonNumber}E${episodeNumber}_chapters.vtt`;
-      chapterFilePath = join(directoryPath, "chapters", chapterFileName);
 
       try {
-        const mp4Files = await fs.readdir(directoryPath);
-        const mp4File = mp4Files.find(
-          (file) =>
-            file.includes(`S${seasonNumber}E${episodeNumber}`) &&
-            file.endsWith(".mp4")
-        );
+        const videoRef = await resolveEpisodeVideo({
+          basePath: BASE_PATH,
+          showName,
+          season,
+          episode,
+        });
 
-        if (mp4File) {
-          mediaPath = join(directoryPath, mp4File);
-        } else {
+        if (!videoRef) {
           logger.error(
-            `Associated MP4 file not found for ${showName} - S${seasonNumber}E${episodeNumber}`
+            `Associated video file not found for ${showName} - S${seasonNumber}E${episodeNumber}`
           );
-          return res.status(404).send("Associated MP4 file not found");
+          return res.status(404).send("Associated video file not found");
         }
+
+        mediaPath = videoRef.path;
+        chapterFilePath = join(videoRef.dir, "chapters", chapterFileName);
       } catch (error) {
         logger.error(
-          `Error accessing directory or reading its contents: ${directoryPath}`,
+          `Error resolving episode video for ${showName} - S${seasonNumber}E${episodeNumber}`,
           error
         );
         return res.status(500).send("Internal server error");
@@ -776,21 +782,7 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
     // Read-time injection of auto-caption stubs.
     await injectTvStubs(shows, langMap);
 
-    const tvData = shows.reduce((acc, show) => {
-      acc[show.name] = {
-        metadata: show.metadata_path,
-        poster: show.poster,
-        posterBlurhash: show.posterBlurhash,
-        logo: show.logo,
-        logoBlurhash: show.logoBlurhash,
-        backdrop: show.backdrop,
-        backdropBlurhash: show.backdropBlurhash,
-        seasons: show.seasons,
-        backdropFocal: show.backdropFocal ?? null,
-        backdropFocalSuggested: show.backdropFocalSuggested ?? null,
-      };
-      return acc;
-    }, {});
+    const tvData = buildPayloadMap(shows, buildTvPayloadEntry);
 
     res.json({ ...tvData, version: TV_LIST_VERSION });
   } catch (error) {
@@ -834,21 +826,7 @@ app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
     // autoCaptions flag or language list changes).
     await injectMovieStubs(movies, langMap);
 
-    const movieData = movies.reduce((acc, movie) => {
-      acc[movie.name] = {
-        _id: movie._id,
-        fileNames: movie.fileNames,
-        length: movie.lengths,
-        dimensions: movie.dimensions,
-        urls: movie.urls,
-        hdr: movie.hdr,
-        mediaQuality: movie.mediaQuality,
-        additional_metadata: movie.additional_metadata,
-        backdropFocal: movie.backdropFocal ?? null,
-        backdropFocalSuggested: movie.backdropFocalSuggested ?? null,
-      };
-      return acc;
-    }, {});
+    const movieData = buildPayloadMap(movies, buildMoviePayloadEntry);
 
     res.json({...movieData, 'version': MOVIE_LIST_VERSION});
   } catch (error) {

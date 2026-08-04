@@ -9,6 +9,7 @@ import { initializeTmdbBlurhashCacheTable } from './sqlite/tmdbBlurhashCache.mjs
 import { initializeDiscordIntrosTable } from './sqlite/discordIntros.mjs';
 import { createHash } from 'crypto';
 import { fileExists } from './utils/utils.mjs';
+import { currentPayloadSignature } from './lib/payloadVersion.mjs';
 
 // Singleton connections + per-DB write mutex to reduce SQLITE_BUSY under concurrency
 
@@ -146,7 +147,9 @@ export async function initializeSchema(dbType, db) {
         -- a separate decided branch and are deliberately NOT wired yet.
         poster_source_url TEXT,
         backdrop_source_url TEXT,
-        logo_source_url TEXT
+        logo_source_url TEXT,
+        payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
+        media_id TEXT            -- stable identity; cache of the .mediaid.json sidecar
       );
     `);
 
@@ -182,7 +185,9 @@ export async function initializeSchema(dbType, db) {
         -- a separate decided branch and are deliberately NOT wired yet.
         poster_source_url TEXT,
         backdrop_source_url TEXT,
-        logo_source_url TEXT
+        logo_source_url TEXT,
+        payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
+        media_id TEXT            -- stable identity; cache of the .mediaid.json sidecar
       );
     `);
 
@@ -210,6 +215,33 @@ export async function initializeSchema(dbType, db) {
         PRIMARY KEY (show_name, season_number, episode_number)
       );
     `);
+
+    // Reverse index of the .mediaid.json sidecars on the media volume.
+    //
+    // THIS TABLE IS A REBUILDABLE CACHE, NOT AUTHORITATIVE STATE. The durable
+    // copy of every id lives in a sidecar beside the media, which is precisely
+    // so that losing media.db costs a rescan and never a user's watch history.
+    // `DROP TABLE media_identity_index` followed by a scan reproduces it
+    // exactly; there is a test asserting that. Do not add anything here that
+    // cannot be recomputed from the filesystem.
+    //
+    // Its one active job is duplicate detection: the PRIMARY KEY on media_id
+    // makes a folder carrying an id another folder already owns (usually a
+    // copied folder bringing a cloned sidecar) surface as a conflict instead of
+    // silently merging two titles' resume positions.
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS media_identity_index (
+        media_id TEXT PRIMARY KEY,
+        media_type TEXT NOT NULL,
+        media_name TEXT NOT NULL,
+        season_key TEXT NOT NULL DEFAULT '',
+        episode_key TEXT NOT NULL DEFAULT '',
+        seen_at TEXT NOT NULL
+      );
+    `);
+    await db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_media_identity_name ON media_identity_index(media_type, media_name);`
+    );
 
     // MIGRATE EXISTING DATABASES: Add hash columns if they don't exist
     await migrateToHashColumns(db);
@@ -328,6 +360,19 @@ export async function migrateToSchemaParityColumns(db) {
     ['tv_shows', 'poster_source_url TEXT'],
     ['tv_shows', 'backdrop_source_url TEXT'],
     ['tv_shows', 'logo_source_url TEXT'],
+    // Records WHICH payload shape produced the stored row. The upsert's change
+    // guard only fires when directory_hash moves, i.e. when the library
+    // changed on disk — but a payload-shape change (new field, flipped
+    // feature flag) changes nothing on disk, so without this the scanner
+    // computes the new payload and then declines to store it. Works perfectly
+    // on a fresh dev DB and does nothing at all on a converged production one.
+    ['movies',   'payload_signature TEXT'],
+    ['tv_shows', 'payload_signature TEXT'],
+    // Stable content identity (see utils/mediaIdentity.mjs). A CACHE of the
+    // .mediaid.json sidecar on the media volume, which is the durable copy —
+    // dropping this column and rescanning restores it unchanged.
+    ['movies',   'media_id TEXT'],
+    ['tv_shows', 'media_id TEXT'],
   ];
   for (const [table, col] of columns) {
     try {
@@ -709,7 +754,13 @@ export async function getTVShows() {
  */
 export async function getTVShowNamesAndHashes() {
   return withDb("main", async (db) => {
-    return await withRetry(() => db.all('SELECT name, directory_hash FROM tv_shows'));
+    // payload_signature rides along on the same scan: the TV scanner needs it
+    // per show to decide whether a payload-shape change requires reprocessing,
+    // and pulling it here keeps that check free rather than costing a full-row
+    // read per show per tick.
+    return await withRetry(() =>
+      db.all('SELECT name, directory_hash, payload_signature FROM tv_shows')
+    );
   });
 }
 
@@ -759,6 +810,11 @@ export async function getMovies() {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -846,6 +902,11 @@ export async function getMovieById(id) {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -907,6 +968,11 @@ export async function getMovieByName(name) {
         mediaQuality: safeJson(movie.media_quality, null),
         additional_metadata: safeJson(movie.additional_metadata, {}),
         _id: movie._id,
+        // Stable content identity. These readers reshape into an explicit
+        // allowlist, so a column missing from here is invisible to the media
+        // endpoints no matter what the scanner stored — which is exactly how
+        // mediaIdentity shipped as a permanent null.
+        media_id: movie.media_id ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -1089,7 +1155,8 @@ export async function insertOrUpdateTVShow(
   backdropFocalSuggested = null,
   imageHashes = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1119,8 +1186,8 @@ export async function insertOrUpdateTVShow(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -1147,13 +1214,20 @@ export async function insertOrUpdateTVShow(
           pristine_metadata=COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata),
           poster_source_url=COALESCE(excluded.poster_source_url, tv_shows.poster_source_url),
           backdrop_source_url=COALESCE(excluded.backdrop_source_url, tv_shows.backdrop_source_url),
-          logo_source_url=COALESCE(excluded.logo_source_url, tv_shows.logo_source_url)`,
+          logo_source_url=COALESCE(excluded.logo_source_url, tv_shows.logo_source_url),
+          payload_signature=excluded.payload_signature,
+          media_id=COALESCE(excluded.media_id, tv_shows.media_id)`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
           posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
           directoryHash, backdropFocal, backdropFocalSuggested, pristineMetadata,
-          sourceUrls?.poster ?? null, sourceUrls?.backdrop ?? null, sourceUrls?.logo ?? null
+          sourceUrls?.poster ?? null, sourceUrls?.backdrop ?? null, sourceUrls?.logo ?? null,
+          // No WHERE guard on this upsert — it always rewrites — so the
+          // signature is recorded for the TV scanner's own fast-skip to compare
+          // against, not to gate the write.
+          currentPayloadSignature(),
+          mediaId
         ]
       )
     );
@@ -1181,7 +1255,8 @@ export async function insertOrUpdateMovie(
   imageHashes = null,
   metadata = null,
   pristineMetadata = null,
-  sourceUrls = null
+  sourceUrls = null,
+  mediaId = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1217,7 +1292,8 @@ export async function insertOrUpdateMovie(
       backdrop_hash: backdropHash.hash,
       backdrop_mtime: backdropHash.mtime,
       logo_hash: logoHash.hash,
-      logo_mtime: logoHash.mtime
+      logo_mtime: logoHash.mtime,
+      payload_signature: currentPayloadSignature()
     };
 
     // Change-guard WHERE clause: the update is skipped when directory_hash is
@@ -1241,8 +1317,8 @@ export async function insertOrUpdateMovie(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           file_names=excluded.file_names,
           lengths=excluded.lengths,
@@ -1270,13 +1346,22 @@ export async function insertOrUpdateMovie(
           pristine_metadata=COALESCE(excluded.pristine_metadata, movies.pristine_metadata),
           poster_source_url=COALESCE(excluded.poster_source_url, movies.poster_source_url),
           backdrop_source_url=COALESCE(excluded.backdrop_source_url, movies.backdrop_source_url),
-          logo_source_url=COALESCE(excluded.logo_source_url, movies.logo_source_url)
+          logo_source_url=COALESCE(excluded.logo_source_url, movies.logo_source_url),
+          payload_signature=excluded.payload_signature,
+          -- COALESCE-preserved: identity comes from the sidecar, and a pass
+          -- that could not read it (unmounted share, transient IO error) must
+          -- not blank the cached value.
+          media_id=COALESCE(excluded.media_id, movies.media_id)
         WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
         OR movies.backdrop_focal_suggested IS NULL
         OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)
         OR (movies.poster_source_url IS NULL AND excluded.poster_source_url IS NOT NULL)
         OR (movies.backdrop_source_url IS NULL AND excluded.backdrop_source_url IS NOT NULL)
-        OR (movies.logo_source_url IS NULL AND excluded.logo_source_url IS NOT NULL)`,
+        OR (movies.logo_source_url IS NULL AND excluded.logo_source_url IS NOT NULL)
+        -- Payload-shape change (new field, or the JIT toggle flipping). Nothing
+        -- on disk moved, so directory_hash cannot see it. IS NOT rather than <>
+        -- so the NULL -> '2:jit0' transition on pre-migration rows fires.
+        OR movies.payload_signature IS NOT excluded.payload_signature`,
         [
           name,
           movie.file_names,
@@ -1305,7 +1390,9 @@ export async function insertOrUpdateMovie(
           pristineMetadata,
           sourceUrls?.poster ?? null,
           sourceUrls?.backdrop ?? null,
-          sourceUrls?.logo ?? null
+          sourceUrls?.logo ?? null,
+          movie.payload_signature,
+          mediaId
         ]
       )
     );

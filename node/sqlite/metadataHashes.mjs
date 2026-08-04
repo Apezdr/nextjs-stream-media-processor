@@ -550,10 +550,27 @@ export async function generateTVShowHashes(db, show) {
       // Generate and store episode-level hashes
       for (const [episodeKey, episodeData] of Object.entries(seasonData.episodes)) {
         // Generate episode-level hash
+        // The frontend's incremental sync is gated on these hashes: an episode
+        // whose hash has not moved is skipped entirely, whatever else changed
+        // in its payload. So every field the payload publishes and a consumer
+        // acts on MUST be folded in here, or that field can never converge.
+        //
+        // mediaIdentity / sources / jitEligible / jitUrl were emitted for a
+        // release without being hashed, which meant TV clients would never see
+        // them and — worse — flipping the JIT toggle off could not propagate to
+        // episodes. Movies were unaffected because generateMovieHashes folds
+        // `urls` wholesale, which is where their copies live.
+        //
+        // sources[] ordering is deterministic (VIDEO_EXTENSIONS priority, then
+        // filename), so including it cannot make this hash flap.
         const episodeHashableData = {
           _id: episodeData._id,
+          mediaIdentity: episodeData.mediaIdentity,
           filename: episodeData.filename,
           videoURL: episodeData.videoURL,
+          sources: episodeData.sources,
+          jitEligible: episodeData.jitEligible,
+          jitUrl: episodeData.jitUrl,
           mediaLastModified: episodeData.mediaLastModified,
           hdr: episodeData.hdr,
           mediaQuality: episodeData.mediaQuality,
