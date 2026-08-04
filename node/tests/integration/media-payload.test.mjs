@@ -65,6 +65,14 @@ const PROBE = {
       audio: [{ codec: 'eac3', languageTag: 'eng' }, { codec: 'aac', languageTag: 'jpn' }],
     },
   },
+  // A pre-v1.0011 sidecar: no format/codec block at all. Not RECOMMENDED (the
+  // predicate fails closed) but still addressable — the transcoder runs its own
+  // probe at serve time.
+  'Unprobed.1080p.mkv': {
+    uuid: 'uuid-unprobed', length: 4200000, dimensions: '1920x1080', hdr: null,
+    mediaQuality: { isHDR: false },
+    additionalMetadata: { audio: [{ codec: 'aac', languageTag: 'eng' }] },
+  },
   'Legacy.Only.avi': {
     uuid: 'uuid-avi', length: 3000000, dimensions: '640x480', hdr: null,
     mediaQuality: { isHDR: false },
@@ -159,9 +167,11 @@ beforeAll(async () => {
     'Remux.2160p.mkv',
     'Solo.1080p.mp4',
   ]);
-  // Movie: multi-language audio — servable, but not JIT-eligible
+  // Movie: multi-language audio — addressable, but not JIT-recommended
   await writeFiles(join(MEDIA, 'movies', 'Multi Lang'), ['Multi.Lang.mkv']);
-  // Movie: .avi — discoverable and playable, never JIT-advertised
+  // Movie: sidecar with no codec block — addressable, but not JIT-recommended
+  await writeFiles(join(MEDIA, 'movies', 'Probe Gap'), ['Unprobed.1080p.mkv']);
+  // Movie: .avi — discoverable and playable, never addressable
   await writeFiles(join(MEDIA, 'movies', 'Avi Only'), ['Legacy.Only.avi']);
 
   // TV: mkv episodes with sidecar subtitles, in a zero-padded season folder
@@ -273,19 +283,45 @@ describe('/media/movies payload', () => {
     );
   });
 
-  it('marks a multi-language source ineligible, with a reason, but still publishes it', async () => {
+  it('ADDRESSES a multi-language source while still marking it ineligible', async () => {
+    // The whole point of the addressability split: an admin who sets "Always
+    // JIT" on this title accepts losing the second language, and that decision
+    // needs a URL the payload used to refuse to carry. false + non-null is the
+    // intended combination, not a contradiction.
     const m = (await moviePayload())['Multi Lang'];
-    expect(m.urls.mp4).toMatch(/Multi\.Lang\.mkv$/); // still playable
+    expect(m.urls.mp4).toMatch(/Multi\.Lang\.mkv$/); // still directly playable
     expect(m.urls.jitEligible).toBe(false);
-    expect(m.urls.jitUrl).toBeUndefined();
     expect(m.urls.sources[0].jitReason).toBe('multi-audio-language');
+
+    expect(m.urls.jitUrl).toMatch(
+      /^https:\/\/transcoder\.test\/stream\/[A-Za-z0-9_-]+\/master\.m3u8$/
+    );
+    expect(m.urls.sources[0].jitKey).toBeTruthy();
+    expect(Buffer.from(m.urls.sources[0].jitKey, 'base64url').toString('utf8')).toBe(
+      'movies/Multi Lang/Multi.Lang.mkv'
+    );
   });
 
-  it('discovers .avi but never advertises it', async () => {
+  it('ADDRESSES a probe-incomplete source — the transcoder probes it itself', async () => {
+    const m = (await moviePayload())['Probe Gap'];
+    expect(m.urls.jitEligible).toBe(false);
+    expect(m.urls.sources[0].jitReason).toBe('probe-incomplete');
+    expect(m.urls.jitUrl).toMatch(/\/stream\/[A-Za-z0-9_-]+\/master\.m3u8$/);
+    expect(Buffer.from(m.urls.sources[0].jitKey, 'base64url').toString('utf8')).toBe(
+      'movies/Probe Gap/Unprobed.1080p.mkv'
+    );
+  });
+
+  it('discovers .avi but never advertises OR addresses it', async () => {
+    // The one case where the URL really must stay absent: Annex-B demuxing
+    // through the ladder is unverified, so .avi is not addressable at all.
     const m = (await moviePayload())['Avi Only'];
     expect(m.urls.mp4).toMatch(/Legacy\.Only\.avi$/);
     expect(m.urls.jitEligible).toBe(false);
     expect(m.urls.sources[0].jitReason).toBe('container-unsupported');
+    expect(m.urls.jitUrl).toBeUndefined();
+    expect(m.urls.sources[0].jitKey).toBeNull();
+    expect(m.urls.sources[0].jitUrl).toBeNull();
   });
 });
 
@@ -409,6 +445,42 @@ describe('convergence and stability', () => {
       // ...and the payload really did change, so the hash is tracking reality.
       const eps = (await tvPayload())['Mkv Show'].seasons['Season 01'].episodes;
       expect(eps.S01E01.jitEligible).toBe(false);
+    } finally {
+      process.env.JIT_ELIGIBILITY_ENABLED = 'true';
+      await runScan();
+    }
+  });
+
+  it('ROLLBACK: the host toggle removes every URL, not just every flag', async () => {
+    // Decoupling URL emission from eligibility must not weaken the kill switch.
+    // Multi Lang and Probe Gap now carry URLs while INELIGIBLE, so a rollback
+    // implemented as "eligible ⇒ no URL" would leave them addressable forever.
+    process.env.JIT_ELIGIBILITY_ENABLED = 'false';
+    try {
+      await runScan();
+
+      for (const m of Object.values(await moviePayload())) {
+        expect(m.urls.jitEligible).toBe(false);
+        expect(m.urls.jitUrl).toBeUndefined();
+        for (const s of m.urls.sources) {
+          expect(s.jitKey).toBeNull();
+          expect(s.jitUrl).toBeNull();
+          expect(s.jitReason).toBe('host-disabled');
+        }
+      }
+
+      for (const show of Object.values(await tvPayload())) {
+        for (const season of Object.values(show.seasons)) {
+          for (const ep of Object.values(season.episodes)) {
+            expect(ep.jitEligible).toBe(false);
+            expect(ep.jitUrl).toBeNull();
+            for (const s of ep.sources) {
+              expect(s.jitKey).toBeNull();
+              expect(s.jitUrl).toBeNull();
+            }
+          }
+        }
+      }
     } finally {
       process.env.JIT_ELIGIBILITY_ENABLED = 'true';
       await runScan();

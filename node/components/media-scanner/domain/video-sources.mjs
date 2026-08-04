@@ -21,7 +21,7 @@ import { createCategoryLogger } from '../../../lib/logger.mjs';
 import { getInfo } from '../../../infoManager.mjs';
 import { isJitEligibilityEnabled } from '../../../lib/payloadVersion.mjs';
 import { jitPathKey, jitMasterUrl, isJitUrlConfigured } from '../../../utils/jitUrl.mjs';
-import { evaluateJitEligibility } from './jit-eligibility.mjs';
+import { evaluateJitEligibility, isJitAddressableContainer } from './jit-eligibility.mjs';
 
 const logger = createCategoryLogger('video-sources');
 
@@ -115,11 +115,19 @@ export async function buildVideoSources({
       hostEnabled,
     });
 
-    // The URL is only emitted for a file the transcoder can actually serve, and
-    // only when a public transcoder URL is configured. Eligibility and reach
-    // are separate concerns: a host can be enabled without one.
+    // ADDRESSABILITY, not eligibility. The URL is emitted for every file the
+    // transcoder can technically serve — even one the predicate does not
+    // RECOMMEND. A multi-audio file keeps `jitEligible: false` and still gets a
+    // URL, because the frontend's per-title "Always JIT" override is an admin
+    // saying "I accept losing the second language" and it cannot conjure a
+    // manifest URL the payload declined to carry. Nothing downstream may derive
+    // one of these from the other; see docs/jit-url-addressability.md.
+    //
+    // hostEnabled still gates everything (rollback stays "flip the env var,
+    // run one scan"), and urlConfigured is separate reach: a host can be
+    // enabled without a public transcoder URL.
     const relPath = libraryRelativeDir ? `${libraryRelativeDir}/${filename}` : null;
-    const emitJit = verdict.eligible && urlConfigured && relPath;
+    const emitJit = hostEnabled && urlConfigured && relPath && isJitAddressableContainer(container);
 
     sources.push({
       url: urlFor(filename),
@@ -141,9 +149,12 @@ export async function buildVideoSources({
       mediaLastModified: stat ? stat.mtime.toISOString() : null,
       uuid: info?.uuid ?? null,
       isPrimary: false,
+      // RECOMMENDATION: routing this file through JIT costs the viewer nothing.
+      // Not "servable" — jitUrl answers that, and the two legitimately disagree.
       jitEligible: verdict.eligible,
-      // Why a source is NOT eligible, so this is diagnosable from the payload
-      // instead of requiring a log dive. Null when it is.
+      // Why a source is NOT recommended, so this is diagnosable from the payload
+      // instead of requiring a log dive. Null when it is. Doubles as the "what
+      // you'd lose" label for the frontend's override UI.
       jitReason: verdict.eligible ? null : verdict.reason,
       jitKey: emitJit ? jitPathKey(relPath) : null,
       jitUrl: emitJit ? jitMasterUrl(relPath) : null,

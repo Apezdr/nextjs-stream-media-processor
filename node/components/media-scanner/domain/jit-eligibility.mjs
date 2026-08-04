@@ -9,15 +9,39 @@
 // routing this file through JIT a strict improvement, or does it quietly cost
 // the viewer an audio language?
 //
-// Eligibility is CAPABILITY, not liveness. It says nothing about whether the
-// transcoder is up right now — that is the client's serve-time health check,
-// which falls back to the raw URL. Do not fold liveness in here.
+// Eligibility is a RECOMMENDATION, not addressability and not liveness. Three
+// separate facts, deliberately not folded together:
+//
+//   recommendation  — this module. "Routing through JIT loses nothing."
+//   addressability  — isJitAddressableContainer below. "The transcoder can
+//                     reach and serve this file at all." Gates jitKey/jitUrl.
+//   liveness        — nobody's claim. The client health-checks at serve time
+//                     and falls back to the raw URL.
+//
+// A multi-audio file is addressable but not recommended: an admin who accepts
+// losing the second language needs the URL to exist, which is why URL emission
+// no longer keys off this verdict. See docs/jit-url-addressability.md.
 //
 // Zero I/O by design, mirroring cooldown-policy.mjs: every input is a fact the
 // scanner already has from the .info sidecar.
 
 /** Containers the transcoder is known to handle. */
 const SUPPORTED_CONTAINERS = new Set(['mp4', 'm4v', 'mov', 'mkv', 'webm']);
+
+/**
+ * Can the transcoder address and serve this container at all?
+ *
+ * The addressability half of the split — this, not the eligibility verdict, is
+ * what gates `jitKey`/`jitUrl`. Shares SUPPORTED_CONTAINERS with the predicate
+ * on purpose: the two must never disagree about `.avi`, whose Annex-B/legacy
+ * demuxing through the ladder is unverified and therefore stays unaddressable.
+ *
+ * @param {string} container - Extension without the dot, any case
+ * @returns {boolean}
+ */
+export function isJitAddressableContainer(container) {
+  return SUPPORTED_CONTAINERS.has(String(container).toLowerCase());
+}
 
 /**
  * @typedef {Object} EligibilityVerdict
@@ -45,7 +69,7 @@ export function evaluateJitEligibility({
     return { eligible: false, reason: 'host-disabled' };
   }
 
-  if (!SUPPORTED_CONTAINERS.has(String(container).toLowerCase())) {
+  if (!isJitAddressableContainer(container)) {
     // .avi and anything else stays fully discoverable and directly playable —
     // it simply never carries the flag. Annex-B/legacy demuxing through the
     // ladder is unverified, and a capability claim should be conservative.

@@ -19,7 +19,10 @@
 
 // 2 — mediaIdentity added (P3)
 // 3 — urls.sources[] / episode.sources[] added; non-mp4 containers discovered (P4)
-export const MEDIA_PAYLOAD_VERSION = 3;
+// 4 — jitKey/jitUrl decoupled from jitEligible: emitted for every addressable
+//     container, so ineligible-but-servable files (multi-audio, probe-incomplete)
+//     now carry a URL. Nothing on disk changes, so ONLY this bump converges it.
+export const MEDIA_PAYLOAD_VERSION = 4;
 
 /**
  * Whether this host advertises JIT transcoder capability.

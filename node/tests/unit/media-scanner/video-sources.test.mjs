@@ -31,7 +31,7 @@ let dir;
 beforeAll(async () => {
   dir = join(tmpdir(), `video-sources-${randomUUID()}`);
   await fs.mkdir(dir, { recursive: true });
-  for (const f of ['Movie.mp4', 'Movie.mkv', 'Movie.mov']) {
+  for (const f of ['Movie.mp4', 'Movie.mkv', 'Movie.mov', 'Movie.avi']) {
     await fs.writeFile(join(dir, f), 'x'.repeat(f.length * 10));
   }
 
@@ -61,6 +61,18 @@ beforeAll(async () => {
         { codec: 'aac', languageTag: 'jpn' },
         { codec: 'aac', languageTag: null },
       ],
+    },
+  });
+  infoByFile.set('Movie.avi', {
+    uuid: 'uuid-avi',
+    length: 3000000,
+    dimensions: '640x480',
+    hdr: null,
+    mediaQuality: { isHDR: false },
+    additionalMetadata: {
+      format: { formatName: 'avi' },
+      video: [{ codec: 'mpeg4', pix_fmt: 'yuv420p', field_order: 'progressive' }],
+      audio: [{ codec: 'mp3', languageTag: 'eng' }],
     },
   });
   // Movie.mov intentionally has NO info entry — getInfo throws for it.
@@ -197,6 +209,104 @@ describe('buildVideoSources', () => {
     expect(fileLengths['Movie.mkv']).toBe(7200500);
     expect(fileDimensions['Movie.mkv']).toBe('3840x2160');
   });
+});
+
+/**
+ * `jitEligible` is a RECOMMENDATION ("routing this through JIT loses nothing");
+ * `jitKey`/`jitUrl` are ADDRESSABILITY ("the transcoder can serve this at all").
+ * They were one field, which meant a multi-audio file could never get a URL —
+ * so the frontend's per-title "Always JIT" override had nothing to point at.
+ * See docs/jit-url-addressability.md.
+ */
+describe('buildVideoSources — JIT emission', () => {
+  const withEnv = async (vars, fn) => {
+    const saved = {};
+    for (const [k, v] of Object.entries(vars)) {
+      saved[k] = process.env[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return await fn();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  };
+
+  const ON = { JIT_ELIGIBILITY_ENABLED: 'true', JIT_TRANSCODER_URL: 'https://t.test', JIT_SOURCE_PREFIX: '' };
+
+  const build = (videoFiles) =>
+    buildVideoSources({ videoFiles, dir, urlFor, libraryRelativeDir: 'movies/Test' });
+
+  const decode = (key) => Buffer.from(key, 'base64url').toString('utf8');
+
+  it('emits a URL for an eligible source', () =>
+    withEnv(ON, async () => {
+      const { sources } = await build(['Movie.mp4']);
+      expect(sources[0].jitEligible).toBe(true);
+      expect(sources[0].jitReason).toBeNull();
+      expect(sources[0].jitUrl).toBe(`https://t.test/stream/${sources[0].jitKey}/master.m3u8`);
+      expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mp4');
+    }));
+
+  it('ADDRESSES a multi-language source it does not recommend', () =>
+    withEnv(ON, async () => {
+      // Movie.mkv is eng+jpn. The admin override accepts the dropped language;
+      // it cannot conjure a URL the payload declined to carry.
+      const { sources } = await build(['Movie.mkv']);
+      expect(sources[0].jitEligible).toBe(false);
+      expect(sources[0].jitReason).toBe('multi-audio-language');
+      expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mkv');
+      expect(sources[0].jitUrl).toContain('/stream/');
+    }));
+
+  it('ADDRESSES a probe-incomplete source — the transcoder probes at serve time', () =>
+    withEnv(ON, async () => {
+      // Movie.mov has no sidecar at all, so the predicate fails closed. That is
+      // a recommendation gap, not an addressing one.
+      const { sources } = await build(['Movie.mov']);
+      expect(sources[0].jitEligible).toBe(false);
+      expect(sources[0].jitReason).toBe('probe-incomplete');
+      expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mov');
+    }));
+
+  it('does NOT address .avi — unsupported container means no URL, still', () =>
+    withEnv(ON, async () => {
+      const { sources } = await build(['Movie.avi']);
+      expect(sources[0].jitEligible).toBe(false);
+      expect(sources[0].jitReason).toBe('container-unsupported');
+      expect(sources[0].jitKey).toBeNull();
+      expect(sources[0].jitUrl).toBeNull();
+    }));
+
+  it('emits nothing anywhere when the host toggle is off — the rollback', () =>
+    withEnv({ ...ON, JIT_ELIGIBILITY_ENABLED: 'false' }, async () => {
+      const { sources } = await build(['Movie.mp4', 'Movie.mkv']);
+      for (const s of sources) {
+        expect(s.jitEligible).toBe(false);
+        expect(s.jitReason).toBe('host-disabled');
+        expect(s.jitKey).toBeNull();
+        expect(s.jitUrl).toBeNull();
+      }
+    }));
+
+  it('emits no URL when no transcoder URL is configured, flag or not', () =>
+    withEnv({ ...ON, JIT_TRANSCODER_URL: undefined }, async () => {
+      const { sources } = await build(['Movie.mp4']);
+      expect(sources[0].jitEligible).toBe(true);
+      expect(sources[0].jitKey).toBeNull();
+      expect(sources[0].jitUrl).toBeNull();
+    }));
+
+  it('emits no URL without a library-relative dir to key on', () =>
+    withEnv(ON, async () => {
+      const { sources } = await buildVideoSources({ videoFiles: ['Movie.mp4'], dir, urlFor });
+      expect(sources[0].jitKey).toBeNull();
+      expect(sources[0].jitUrl).toBeNull();
+    }));
 });
 
 describe('publishableSources', () => {

@@ -7,7 +7,10 @@
  */
 
 import { describe, it, expect } from '@jest/globals';
-import { evaluateJitEligibility } from '../../../components/media-scanner/domain/jit-eligibility.mjs';
+import {
+  evaluateJitEligibility,
+  isJitAddressableContainer,
+} from '../../../components/media-scanner/domain/jit-eligibility.mjs';
 import { jitPathKey, jitMasterUrl, isJitUrlConfigured } from '../../../utils/jitUrl.mjs';
 
 const h264 = {
@@ -77,6 +80,34 @@ describe('evaluateJitEligibility', () => {
     expect(
       evaluateJitEligibility({ ...h264, videoCodec: 'hevc', formatName: 'matroska,webm' }).eligible
     ).toBe(true);
+  });
+});
+
+describe('isJitAddressableContainer', () => {
+  it.each(['mp4', 'm4v', 'mov', 'mkv', 'webm'])('addresses %s', (c) => {
+    expect(isJitAddressableContainer(c)).toBe(true);
+  });
+
+  it('does NOT address .avi — the one case where no URL may be emitted', () => {
+    expect(isJitAddressableContainer('avi')).toBe(false);
+  });
+
+  it('is case-insensitive and safe on junk input', () => {
+    expect(isJitAddressableContainer('MKV')).toBe(true);
+    expect(isJitAddressableContainer(null)).toBe(false);
+    expect(isJitAddressableContainer(undefined)).toBe(false);
+    expect(isJitAddressableContainer('')).toBe(false);
+  });
+
+  it('agrees with the predicate about which containers are out', () => {
+    // The two share SUPPORTED_CONTAINERS deliberately. If they ever diverge, a
+    // container could be "eligible" with no URL, or unaddressable yet
+    // recommended — both nonsense states for the frontend.
+    for (const container of ['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', 'ts']) {
+      const containerRejected =
+        evaluateJitEligibility({ ...h264, container }).reason === 'container-unsupported';
+      expect(containerRejected).toBe(!isJitAddressableContainer(container));
+    }
   });
 });
 

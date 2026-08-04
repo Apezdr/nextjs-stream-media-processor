@@ -319,36 +319,63 @@ together. TV has no equivalent check and converges via the payload-signature bum
 
 ---
 
-## 9. JIT emission · Status: **shipped P6**
+## 9. JIT emission · Status: **shipped P6**, addressability split in **payload v4**
 
-Three fields per source, plus the same pair at title level describing the primary:
+Four fields per source, plus `jitEligible`/`jitUrl` at title level describing the primary:
 
 | Field | Meaning |
 |---|---|
-| `jitEligible` | The transcoder can serve this file **without the viewer losing anything** |
-| `jitReason` | Why not, when `jitEligible` is false. `null` when it is. |
-| `jitKey` | base64url of the transcoder-relative path — build variant/init URLs without re-deriving the encoding |
-| `jitUrl` | `{base}/stream/{jitKey}/master.m3u8`. Only emitted when eligible **and** a public base URL is configured. |
+| `jitEligible` | **Recommendation.** The transcoder can serve this file **without the viewer losing anything** |
+| `jitReason` | Why not recommended, when `jitEligible` is false. `null` when it is. Doubles as the "what you'd lose" label for override UIs. |
+| `jitKey` | **Addressability.** base64url of the transcoder-relative path — build variant/init URLs without re-deriving the encoding |
+| `jitUrl` | `{base}/stream/{jitKey}/master.m3u8`. Emitted for every **addressable** file when a public base URL is configured — eligible or not. |
 
 Movies carry `urls.jitEligible` / `urls.jitUrl` beside `urls.mp4`; episodes carry them flat
 beside `videoURL`. Each follows its own container's existing convention.
 
-### Capability, not liveness
+### Three separate facts
 
-`jitEligible` says the transcoder *can* serve the file. It says nothing about whether the
-service is up. **The client still health-checks and falls back to the raw URL** — do not treat
-the flag or the URL as a liveness signal.
+| Fact | Field | Answers |
+|---|---|---|
+| Recommendation | `jitEligible` + `jitReason` | "Does routing this through JIT lose the viewer anything?" |
+| Addressability | `jitKey` / `jitUrl` | "Can the transcoder reach and serve this file at all?" |
+| Liveness | *nobody's* | "Is the transcoder up right now?" — **the client health-checks at serve time and falls back to the raw URL.** |
+
+These were two fields, and URL emission was gated on eligibility. That made the frontend's
+per-title "Always JIT" override unimplementable: an admin could force the serve-time *decision*
+but there was no manifest URL to point at, because the payload had declined to carry one. See
+[`jit-url-addressability.md`](./jit-url-addressability.md).
+
+`jitEligible: false` **with a non-null `jitUrl`** is the intended combination for multi-audio
+and probe-incomplete sources, not a contradiction. **Nothing downstream may derive one from the
+other.** Default serve modes still require `jitEligible === true` to auto-swap, so no viewer
+silently loses an audio track; only an explicit per-title override uses the URL regardless.
+
+Emission rule (`node/components/media-scanner/domain/video-sources.mjs`):
+
+```
+jitKey/jitUrl emitted  ⟺  JIT_ELIGIBILITY_ENABLED
+                          && JIT_TRANSCODER_URL configured
+                          && container ∈ {mp4, m4v, mov, mkv, webm}
+```
+
+`.avi` is the only content-based exclusion that still suppresses the URL — Annex-B/legacy
+demuxing through the ladder is unverified, so the file is not addressable at all. The host
+toggle remains the master switch: off ⇒ no flags and **no URLs**, anywhere.
 
 ### The predicate
 
 Deliberately narrower than "can the ladder decode this?", which is nearly always yes and
-therefore useless. It asks whether routing the file through JIT is a strict improvement.
+therefore useless. It asks whether routing the file through JIT is a strict improvement. This
+governs `jitEligible` only — since payload v4 it no longer gates the URL.
 
 1. `!hostEnabled` → `host-disabled`
 2. Container ∉ {mp4, m4v, mov, mkv, webm} → `container-unsupported`. **`.avi` is excluded** — still discoverable and directly playable, just never advertised.
-3. No `videoCodec` or no `formatName` → `probe-incomplete`. **Fails closed.** A pre-v1.0011 sidecar cannot supply these, so the flag simply does not appear until it converges — which is why the probe bump and this rollout need no sequencing between them.
-4. More than one distinct `audioLanguages` entry → `multi-audio-language`. The transcoder collapses multi-audio to one language via a process-global `JIT_AUDIO_LANG` with no per-request override, so JIT would silently drop languages direct playback exposes. **Lift when audio groups ship.**
+3. No `videoCodec` or no `formatName` → `probe-incomplete`. **Fails closed.** A pre-v1.0011 sidecar cannot supply these, so the flag simply does not appear until it converges — which is why the probe bump and this rollout need no sequencing between them. Still addressable: the transcoder runs its own probe at serve time.
+4. More than one distinct `audioLanguages` entry → `multi-audio-language`. The transcoder collapses multi-audio to one language via a process-global `JIT_AUDIO_LANG` with no per-request override, so JIT would silently drop languages direct playback exposes. **Lift when audio groups ship.** Still addressable — see the override note above.
 5. Otherwise eligible.
+
+Only rule 1 (`host-disabled`) and rule 2 (`container-unsupported`) also suppress `jitKey`/`jitUrl`.
 
 **HDR and Dolby Vision do not disqualify** — the tone-map path is always present and PQ
 passthrough is additive. **Interlaced does not disqualify** — `field_order` gates only the
@@ -362,6 +389,16 @@ zero-cost remux rung, never the ladder.
 | `JIT_TRANSCODER_URL` | unset | **Public** base URL, reachable by end clients. Unset ⇒ no `jitUrl` anywhere, even for eligible files. |
 | `JIT_SOURCE_PREFIX` | `''` | Prefix when `BASE_PATH` here and `JIT_SOURCE_DIR` there are not rooted alike. Empty is correct for the standard shared-volume topology. |
 
+**`JIT_AUDIO_LANG` is set on the transcoder, not here** — this backend never reads it, which is
+why it has no row above. It decides **which language survives** when a multi-audio source is
+collapsed, and since payload v4 those sources are addressable, an admin can now route one
+through JIT deliberately. Confirm the deployed value in the transcoder's own environment before
+telling anyone what "Always JIT on a multi-audio title" will do: with `JIT_AUDIO_LANG=eng` on an
+eng+ger title, `eng` plays and `ger` is gone — silently, and with no client-side track picker to
+recover it, because the collapse happens upstream of the manifest. `jitReason:
+"multi-audio-language"` plus `sources[].audioLanguages` is what an override UI should show the
+admin so the trade is explicit.
+
 > **Security.** The transcoder is unauthenticated with permissive CORS, and `jitKey` is
 > reversible base64. Publishing `JIT_TRANSCODER_URL` makes everything under its media root
 > fetchable by anyone who can reach that host. Front it with something that authenticates, or
@@ -371,16 +408,18 @@ zero-cost remux rung, never the ladder.
 
 ## 10. Non-goals and known gaps
 
-- **`.avi` is discoverable and playable but will never be JIT-eligible** (P6). Annex-B
-  demuxing through the transcode ladder is unverified.
+- **`.avi` is discoverable and playable but will never be JIT-eligible *or addressable*** (P6).
+  Annex-B demuxing through the transcode ladder is unverified, so it is the one container that
+  carries no `jitUrl` even under an override.
 - **`.ts` / `.m2ts` are not discovered at all.** Adding them is a one-line change to
   `VIDEO_EXTENSIONS` plus a MIME entry, deliberately deferred.
 - **Subtitles are entirely this backend's job.** The transcoder emits no
   `EXT-X-MEDIA:TYPE=SUBTITLES` and no WebVTT — sidecar SRT only. A client playing through JIT
   must attach subtitle tracks itself.
 - **Multi-audio collapses to one language** in the transcoder, selected by a process-global
-  `JIT_AUDIO_LANG` with no per-request override. This is why multi-language sources will be
-  marked ineligible in P6.
+  `JIT_AUDIO_LANG` with no per-request override. This is why multi-language sources are
+  `jitEligible: false` — they are still addressable, so an admin can accept the loss per title,
+  but nothing routes them through JIT by default.
 - **DASH is a 501 stub** in the transcoder. HLS only.
 - **A title with several containers publishes ONE playable URL** (`urls.mp4` /
   `videoURL`) — the primary. The others are described in `sources[]` but the backend does not
@@ -392,8 +431,14 @@ zero-cost remux rung, never the ladder.
 
 ## 11. Payload versioning
 
-Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``
-(see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``,
+at **v4** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+
+| Version | Change |
+|---|---|
+| 2 | `mediaIdentity` added (P3) |
+| 3 | `urls.sources[]` / `episode.sources[]` added; non-mp4 containers discovered (P4) |
+| 4 | `jitKey`/`jitUrl` decoupled from `jitEligible` (§9) — nothing changes on disk, so the bump is the *only* thing that converges it |
 
 It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
 i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT
