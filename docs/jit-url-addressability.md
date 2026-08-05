@@ -7,6 +7,17 @@ into [`jit-transcoder.md` §9](./jit-transcoder.md). **The convergence pass has
 not been observed in production yet** — acceptance criterion 5 stays open until
 the deploy runs and the reprocessing log line settles.
 
+> **The motivating example has since evaporated (payload v5).** The transcoder
+> gained multi-language audio support: it publishes every track as an HLS audio
+> group and the player picks, so `multi-audio-language` was deleted from the
+> predicate and Primate is now plainly `jitEligible: true` — no override
+> needed. **The split itself still stands.** `probe-incomplete` files are
+> addressable but not recommended, an override must be able to point at
+> *anything* servable, and the general principle — a recommendation is not a
+> capability — is what let this change be a one-line deletion instead of
+> another emission redesign. Read the argument below with Primate as history;
+> acceptance criterion 1 is now obsolete, 2 through 7 still hold.
+
 Companion to [`jit-transcoder.md`](./jit-transcoder.md) — this was the next
 evolution of §9 (JIT emission). Requested by the frontend after the per-title
 "Always JIT" override shipped.

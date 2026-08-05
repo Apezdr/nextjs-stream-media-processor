@@ -167,7 +167,7 @@ beforeAll(async () => {
     'Remux.2160p.mkv',
     'Solo.1080p.mp4',
   ]);
-  // Movie: multi-language audio — addressable, but not JIT-recommended
+  // Movie: multi-language audio — eligible since the transcoder shipped audio groups
   await writeFiles(join(MEDIA, 'movies', 'Multi Lang'), ['Multi.Lang.mkv']);
   // Movie: sidecar with no codec block — addressable, but not JIT-recommended
   await writeFiles(join(MEDIA, 'movies', 'Probe Gap'), ['Unprobed.1080p.mkv']);
@@ -283,15 +283,16 @@ describe('/media/movies payload', () => {
     );
   });
 
-  it('ADDRESSES a multi-language source while still marking it ineligible', async () => {
-    // The whole point of the addressability split: an admin who sets "Always
-    // JIT" on this title accepts losing the second language, and that decision
-    // needs a URL the payload used to refuse to carry. false + non-null is the
-    // intended combination, not a contradiction.
+  it('publishes a multi-language source as fully eligible — audio groups shipped', async () => {
+    // This title was the reason the eligibility predicate existed, and then the
+    // reason addressability was split out of it. The transcoder now publishes
+    // every audio track as an HLS audio group, so it is simply eligible: no
+    // reason, no override needed, auto-swap allowed under the default modes.
     const m = (await moviePayload())['Multi Lang'];
     expect(m.urls.mp4).toMatch(/Multi\.Lang\.mkv$/); // still directly playable
-    expect(m.urls.jitEligible).toBe(false);
-    expect(m.urls.sources[0].jitReason).toBe('multi-audio-language');
+    expect(m.urls.jitEligible).toBe(true);
+    expect(m.urls.sources[0].jitReason).toBeNull();
+    expect(m.urls.sources[0].audioLanguages).toEqual(['eng', 'jpn']);
 
     expect(m.urls.jitUrl).toMatch(
       /^https:\/\/transcoder\.test\/stream\/[A-Za-z0-9_-]+\/master\.m3u8$/

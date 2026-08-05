@@ -107,11 +107,13 @@ export async function buildVideoSources({
     const formatName = meta?.format?.formatName ?? null;
     const audioLanguages = audioLanguagesOf(meta);
 
+    // audioLanguages is published below but deliberately NOT passed: since the
+    // transcoder gained audio groups, the language count is no longer a policy
+    // input. See jit-eligibility.mjs.
     const verdict = evaluateJitEligibility({
       container,
       formatName,
       videoCodec: video?.codec ?? null,
-      audioLanguages,
       hostEnabled,
     });
 

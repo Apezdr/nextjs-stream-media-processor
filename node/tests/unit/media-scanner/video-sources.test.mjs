@@ -252,13 +252,16 @@ describe('buildVideoSources — JIT emission', () => {
       expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mp4');
     }));
 
-  it('ADDRESSES a multi-language source it does not recommend', () =>
+  it('RECOMMENDS a multi-language source now that audio groups ship', () =>
     withEnv(ON, async () => {
-      // Movie.mkv is eng+jpn. The admin override accepts the dropped language;
-      // it cannot conjure a URL the payload declined to carry.
+      // Movie.mkv is eng+jpn+untagged. It was the canonical ineligible file
+      // (`multi-audio-language`); the transcoder publishes every track as an
+      // audio group now, so it is a plain eligible source with no reason.
       const { sources } = await build(['Movie.mkv']);
-      expect(sources[0].jitEligible).toBe(false);
-      expect(sources[0].jitReason).toBe('multi-audio-language');
+      expect(sources[0].jitEligible).toBe(true);
+      expect(sources[0].jitReason).toBeNull();
+      // The languages are still PUBLISHED — they just stopped gating anything.
+      expect(sources[0].audioLanguages).toEqual(['eng', 'jpn']);
       expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mkv');
       expect(sources[0].jitUrl).toContain('/stream/');
     }));
