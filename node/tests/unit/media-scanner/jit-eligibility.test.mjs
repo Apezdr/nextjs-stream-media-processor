@@ -60,20 +60,25 @@ describe('evaluateJitEligibility', () => {
     });
   });
 
-  it('rejects multi-language sources — JIT would silently drop languages', () => {
+  it('ACCEPTS multi-language sources — the transcoder publishes audio groups', () => {
+    // Was `multi-audio-language`, the rule this whole predicate was built
+    // around: the transcoder used to collapse multi-audio to one language via a
+    // process-global, so JIT silently cost the viewer a track. It now publishes
+    // every track as an HLS audio group and the player picks, so there is
+    // nothing left to lose. Lifted in payload v5.
     expect(evaluateJitEligibility({ ...h264, audioLanguages: ['eng', 'jpn'] })).toEqual({
-      eligible: false,
-      reason: 'multi-audio-language',
+      eligible: true,
+      reason: 'ok',
     });
   });
 
-  it('accepts a multi-TRACK source that carries only one language', () => {
-    // Several tracks of the same language (stereo + 5.1) lose nothing.
-    expect(evaluateJitEligibility({ ...h264, audioLanguages: ['eng'] }).eligible).toBe(true);
-  });
-
-  it('accepts untagged audio — loss is unprovable, so do not assume it', () => {
-    expect(evaluateJitEligibility({ ...h264, audioLanguages: [] }).eligible).toBe(true);
+  it('ignores audioLanguages entirely — the count is no longer a policy input', () => {
+    // The field is still published in sources[]; it just stops steering this
+    // verdict. Nine languages, one, or none all land the same way.
+    const langs = [[], ['eng'], ['eng', 'jpn'], ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']];
+    for (const audioLanguages of langs) {
+      expect(evaluateJitEligibility({ ...h264, audioLanguages }).eligible).toBe(true);
+    }
   });
 
   it('does NOT disqualify HDR — the tone-map path is always present', () => {

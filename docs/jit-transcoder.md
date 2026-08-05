@@ -319,7 +319,7 @@ together. TV has no equivalent check and converges via the payload-signature bum
 
 ---
 
-## 9. JIT emission · Status: **shipped P6**, addressability split in **payload v4**
+## 9. JIT emission · Status: **shipped P6**, addressability split in **v4**, audio groups in **v5**
 
 Four fields per source, plus `jitEligible`/`jitUrl` at title level describing the primary:
 
@@ -346,10 +346,14 @@ per-title "Always JIT" override unimplementable: an admin could force the serve-
 but there was no manifest URL to point at, because the payload had declined to carry one. See
 [`jit-url-addressability.md`](./jit-url-addressability.md).
 
-`jitEligible: false` **with a non-null `jitUrl`** is the intended combination for multi-audio
-and probe-incomplete sources, not a contradiction. **Nothing downstream may derive one from the
-other.** Default serve modes still require `jitEligible === true` to auto-swap, so no viewer
-silently loses an audio track; only an explicit per-title override uses the URL regardless.
+`jitEligible: false` **with a non-null `jitUrl`** is the intended combination for
+probe-incomplete sources, not a contradiction. **Nothing downstream may derive one from the
+other.** Default serve modes still require `jitEligible === true` to auto-swap; only an explicit
+per-title override uses the URL regardless.
+
+> Multi-audio was the motivating case for this split and, as of v5, no longer produces that
+> combination — those titles are plainly eligible. The split stays: probe-incomplete still needs
+> it, and the override needs a URL for whatever it is pointed at.
 
 Emission rule (`node/components/media-scanner/domain/video-sources.mjs`):
 
@@ -372,10 +376,17 @@ governs `jitEligible` only — since payload v4 it no longer gates the URL.
 1. `!hostEnabled` → `host-disabled`
 2. Container ∉ {mp4, m4v, mov, mkv, webm} → `container-unsupported`. **`.avi` is excluded** — still discoverable and directly playable, just never advertised.
 3. No `videoCodec` or no `formatName` → `probe-incomplete`. **Fails closed.** A pre-v1.0011 sidecar cannot supply these, so the flag simply does not appear until it converges — which is why the probe bump and this rollout need no sequencing between them. Still addressable: the transcoder runs its own probe at serve time.
-4. More than one distinct `audioLanguages` entry → `multi-audio-language`. The transcoder collapses multi-audio to one language via a process-global `JIT_AUDIO_LANG` with no per-request override, so JIT would silently drop languages direct playback exposes. **Lift when audio groups ship.** Still addressable — see the override note above.
-5. Otherwise eligible.
+4. Otherwise eligible.
 
 Only rule 1 (`host-disabled`) and rule 2 (`container-unsupported`) also suppress `jitKey`/`jitUrl`.
+
+**Multi-language audio no longer disqualifies (v5).** It was rule 4, and the original reason this
+predicate existed: the transcoder collapsed multi-audio to a single language chosen by a
+process-global, so JIT silently cost the viewer a track that direct play gave them. It now
+publishes **every audio track as an HLS audio group** and the player picks, so nothing is lost
+and those titles auto-swap under the default serve modes like any other. `audioLanguages` is no
+longer an input to this predicate at all — it stays in `sources[]` for consumers that surface
+which languages a file has.
 
 **HDR and Dolby Vision do not disqualify** — the tone-map path is always present and PQ
 passthrough is additive. **Interlaced does not disqualify** — `field_order` gates only the
@@ -390,14 +401,10 @@ zero-cost remux rung, never the ladder.
 | `JIT_SOURCE_PREFIX` | `''` | Prefix when `BASE_PATH` here and `JIT_SOURCE_DIR` there are not rooted alike. Empty is correct for the standard shared-volume topology. |
 
 **`JIT_AUDIO_LANG` is set on the transcoder, not here** — this backend never reads it, which is
-why it has no row above. It decides **which language survives** when a multi-audio source is
-collapsed, and since payload v4 those sources are addressable, an admin can now route one
-through JIT deliberately. Confirm the deployed value in the transcoder's own environment before
-telling anyone what "Always JIT on a multi-audio title" will do: with `JIT_AUDIO_LANG=eng` on an
-eng+ger title, `eng` plays and `ger` is gone — silently, and with no client-side track picker to
-recover it, because the collapse happens upstream of the manifest. `jitReason:
-"multi-audio-language"` plus `sources[].audioLanguages` is what an override UI should show the
-admin so the trade is explicit.
+why it has no row above. It used to decide which language *survived* a collapse; now that every
+track is published as an audio group, it selects the **default** track and the player can switch
+away from it. That demotion from "silently destroys the other languages" to "picks a default" is
+what made rule 4 removable.
 
 > **Security.** The transcoder is unauthenticated with permissive CORS, and `jitKey` is
 > reversible base64. Publishing `JIT_TRANSCODER_URL` makes everything under its media root
@@ -416,10 +423,9 @@ admin so the trade is explicit.
 - **Subtitles are entirely this backend's job.** The transcoder emits no
   `EXT-X-MEDIA:TYPE=SUBTITLES` and no WebVTT — sidecar SRT only. A client playing through JIT
   must attach subtitle tracks itself.
-- **Multi-audio collapses to one language** in the transcoder, selected by a process-global
-  `JIT_AUDIO_LANG` with no per-request override. This is why multi-language sources are
-  `jitEligible: false` — they are still addressable, so an admin can accept the loss per title,
-  but nothing routes them through JIT by default.
+- ~~**Multi-audio collapses to one language**~~ **Resolved (v5).** The transcoder publishes every
+  audio track as an HLS audio group; `JIT_AUDIO_LANG` now picks the default rather than
+  discarding the rest, and multi-language sources are `jitEligible: true`.
 - **DASH is a 501 stub** in the transcoder. HLS only.
 - **A title with several containers publishes ONE playable URL** (`urls.mp4` /
   `videoURL`) — the primary. The others are described in `sources[]` but the backend does not
@@ -432,13 +438,14 @@ admin so the trade is explicit.
 ## 11. Payload versioning
 
 Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``,
-at **v4** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+at **v5** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 
 | Version | Change |
 |---|---|
 | 2 | `mediaIdentity` added (P3) |
 | 3 | `urls.sources[]` / `episode.sources[]` added; non-mp4 containers discovered (P4) |
 | 4 | `jitKey`/`jitUrl` decoupled from `jitEligible` (§9) — nothing changes on disk, so the bump is the *only* thing that converges it |
+| 5 | `multi-audio-language` rule dropped (§9): multi-language titles flip to `jitEligible: true` and lose their `jitReason`. Again nothing on disk changes. |
 
 It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
 i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT

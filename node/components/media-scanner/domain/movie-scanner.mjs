@@ -341,7 +341,7 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
     // carry the same pair flat beside videoURL — each follows its own
     // container's existing convention.
     //
-    // These two are INDEPENDENT: a multi-audio primary yields
+    // These two are INDEPENDENT: a probe-incomplete primary yields
     // jitEligible: false with a non-null jitUrl. That combination is the point
     // — the admin override needs the URL — so do not "simplify" either one from
     // the other. See docs/jit-url-addressability.md.

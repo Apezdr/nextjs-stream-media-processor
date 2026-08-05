@@ -7,7 +7,7 @@
 // ffmpeg can demux, so "can it play this at all" is nearly always yes and would
 // be a useless predicate. What this answers is narrower and more useful: is
 // routing this file through JIT a strict improvement, or does it quietly cost
-// the viewer an audio language?
+// the viewer something?
 //
 // Eligibility is a RECOMMENDATION, not addressability and not liveness. Three
 // separate facts, deliberately not folded together:
@@ -18,9 +18,10 @@
 //   liveness        — nobody's claim. The client health-checks at serve time
 //                     and falls back to the raw URL.
 //
-// A multi-audio file is addressable but not recommended: an admin who accepts
-// losing the second language needs the URL to exist, which is why URL emission
-// no longer keys off this verdict. See docs/jit-url-addressability.md.
+// The split still matters even though multi-audio no longer disqualifies:
+// probe-incomplete files are addressable but not recommended, and the admin
+// override needs a URL for anything it is pointed at. See
+// docs/jit-url-addressability.md.
 //
 // Zero I/O by design, mirroring cooldown-policy.mjs: every input is a fact the
 // scanner already has from the .info sidecar.
@@ -54,7 +55,6 @@ export function isJitAddressableContainer(container) {
  * @param {string} facts.container       - Extension without the dot, lowercased
  * @param {string|null} facts.formatName - ffprobe format_name
  * @param {string|null} facts.videoCodec
- * @param {string[]} [facts.audioLanguages] - Distinct strict language codes
  * @param {boolean} facts.hostEnabled
  * @returns {EligibilityVerdict}
  */
@@ -62,7 +62,6 @@ export function evaluateJitEligibility({
   container,
   formatName,
   videoCodec,
-  audioLanguages = [],
   hostEnabled,
 }) {
   if (!hostEnabled) {
@@ -84,15 +83,15 @@ export function evaluateJitEligibility({
     return { eligible: false, reason: 'probe-incomplete' };
   }
 
-  // The transcoder collapses multi-audio sources to ONE language, chosen by a
-  // process-global JIT_AUDIO_LANG with no per-request override. Routing a
-  // multi-language file through it would silently drop languages the viewer
-  // gets today. Lift this when audio-group support ships.
-  if (audioLanguages.length > 1) {
-    return { eligible: false, reason: 'multi-audio-language' };
-  }
-
   // Deliberately NOT disqualifying:
+  //   Multi-language audio — WAS `multi-audio-language`, the whole reason this
+  //     predicate existed. The transcoder now publishes every audio track as an
+  //     HLS audio group and the player picks, so nothing is dropped;
+  //     JIT_AUDIO_LANG selects the DEFAULT rather than collapsing the rest
+  //     away. Removed in payload v5 — see docs/jit-transcoder.md §9. This is
+  //     why `audioLanguages` is no longer a parameter at all: the count stops
+  //     being a policy input, though it stays published in sources[] for
+  //     consumers that surface available languages.
   //   HDR / Dolby Vision — the tone-map path is always present (JIT_HDR
   //     defaults to tonemap) and PQ passthrough is additive on top of it.
   //   Interlaced content — field_order gates only the zero-cost remux rung,

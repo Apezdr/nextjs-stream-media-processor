@@ -22,7 +22,10 @@
 // 4 — jitKey/jitUrl decoupled from jitEligible: emitted for every addressable
 //     container, so ineligible-but-servable files (multi-audio, probe-incomplete)
 //     now carry a URL. Nothing on disk changes, so ONLY this bump converges it.
-export const MEDIA_PAYLOAD_VERSION = 4;
+// 5 — multi-audio no longer disqualifies: the transcoder publishes audio groups
+//     and the player picks, so those titles flip to jitEligible: true and lose
+//     their jitReason. Again nothing on disk changes.
+export const MEDIA_PAYLOAD_VERSION = 5;
 
 /**
  * Whether this host advertises JIT transcoder capability.
