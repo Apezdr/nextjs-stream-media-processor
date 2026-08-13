@@ -154,18 +154,28 @@ async function processShowAssets({
 
     // Staleness: tmdb.config is newer than the image, meaning the user
     // edited config (or it was otherwise touched) since this image was
-    // written. Treat as missing so the scanner gate triggers a refresh.
-    // Mirrors the movie scanner's `checkTMDBImagesNeeded` behavior. Reuses
-    // the resolver's single stat (`r.mtime`) — no extra syscall.
+    // written. Flag it so the scanner gate triggers a refresh — but do NOT
+    // discard the file we just resolved. Flagging for refresh and throwing
+    // away the current art are separate concerns, and conflating them breaks
+    // two ways:
+    //   - `update_metadata: false` freezes the TMDB download that would
+    //     satisfy the flag, so the image is dropped every tick forever and
+    //     the show renders with no poster at all (observed on a library
+    //     whose tmdb.config files were all written after the artwork).
+    //   - even with updates allowed, blanking leaves the show art-less for
+    //     the window between detection and a successful download.
+    // The movie scanner already behaves this way: `checkTMDBImagesNeeded`
+    // only *detects* staleness, and URL building is a separate pass that
+    // keeps serving what is on disk. Reuses the resolver's single stat
+    // (`r.mtime`) — no extra syscall.
     if (tmdbConfigLastModified && tmdbConfigLastModified > r.mtime) {
-      logger.info('scanner: tmdb.config newer than asset, marking missing', {
+      logger.info('scanner: tmdb.config newer than asset, flagging for refresh', {
         'media.name': showName,
         'media.type': 'tv',
         'image.type': imageKey,
         'image.path': r.path,
       });
       missingImages = true;
-      continue;
     }
 
     resolved[imageKey] = r;
