@@ -278,23 +278,38 @@ GET /api/tmdb/images/movie/27205
 
 Get content rating for a movie or TV show.
 
-**Endpoint**: `GET /api/tmdb/rating/:type/:id`
+**Endpoint**: `GET /api/tmdb/rating/:type?tmdb_id=:id`
 
 **Parameters**:
 - `type` (path): `movie` or `tv`
-- `id` (path): TMDB ID
+- `tmdb_id` (query): TMDB ID
 
 **Example**:
 ```http
-GET /api/tmdb/rating/movie/27205
+GET /api/tmdb/rating/movie?tmdb_id=27205
 ```
 
 **Response**:
 ```json
 {
-  "rating": "PG-13"
+  "rating": "PG-13",
+  "descriptors": ["Violence", "Strong Language"],
+  "release_dates": {
+    "results": []
+  }
 }
 ```
+
+Movie responses include a bounded US-only subset of TMDB `release_dates`; TV
+responses use a bounded US-only `content_ratings` subset instead. Foreign rows,
+release notes, unknown fields and internal cache bookkeeping are omitted. The
+legacy `rating` string remains for existing clients, while `descriptors`
+contains only sanitized values attached to that same US classification. TMDB
+may return an empty descriptor array even when a certification is present.
+
+The comprehensive movie/TV endpoints expose the same additive bounded fields so
+clients can apply deterministic selection and normalization without a second
+TMDB request.
 
 ### 8. Get TV Episode Details
 

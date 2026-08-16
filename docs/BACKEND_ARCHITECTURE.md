@@ -825,7 +825,7 @@ All user-facing routes here proxy the shared TMDB client in `node/utils/tmdb.mjs
 | GET | `/api/tmdb/structured-cast/:type` | user + rate | Cast split into main/recurring (and optionally guest) groups. | |
 | GET | `/api/tmdb/videos/:type` | user + rate | Trailers/videos by `?tmdb_id=`. | |
 | GET | `/api/tmdb/images/:type` | user + rate | Posters/backdrops/logos by `?tmdb_id=`. | |
-| GET | `/api/tmdb/rating/:type` | user + rate | Content rating by `?tmdb_id=`. | |
+| GET | `/api/tmdb/rating/:type` | user + rate | Content rating by `?tmdb_id=`. | Preserves legacy `rating` and adds selected `descriptors` plus a bounded, US-only `release_dates` (movie) or `content_ratings` (TV) subset. Foreign rows, notes, unknown fields and cache bookkeeping are omitted. Comprehensive responses include the same fields. |
 | GET | `/api/tmdb/episode` | user + rate | Episode details (`?tmdb_id=&season=&episode=`). | |
 | GET | `/api/tmdb/episode/images` | user + rate | Episode stills (`?tmdb_id=&season=&episode=`). | |
 | GET | `/api/tmdb/search/collection` | user + rate | Collection name search. | As registered, unreachable: `/search/:type` is declared earlier in the same router and matches first with `type = 'collection'`. |

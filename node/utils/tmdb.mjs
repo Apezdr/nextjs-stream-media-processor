@@ -609,24 +609,127 @@ export const getMediaRating = async (type, id) => {
   const data = await makeTmdbRequest(`/${type}/${id}/${endpoint}`);
 
   let rating = null;
+  let descriptors = [];
+  const results = Array.isArray(data?.results)
+    ? data.results.filter((entry) => entry && typeof entry === "object")
+    : [];
+
+  const sanitizeDescriptors = (values) => {
+    if (!Array.isArray(values)) return [];
+    const accepted = [];
+    const seen = new Set();
+    for (const value of values.slice(0, 32)) {
+      if (typeof value !== "string" || value.length > 160) continue;
+      const descriptor = value.normalize("NFC").trim().replace(/\s+/g, " ");
+      if (
+        !descriptor ||
+        descriptor.includes("<") ||
+        descriptor.includes(">") ||
+        /&(?:lt|gt|#0*(?:60|62)|#x0*3[ce]);/i.test(descriptor) ||
+        [...descriptor].some((character) => {
+          const codePoint = character.codePointAt(0);
+          return (
+            codePoint <= 31 ||
+            (codePoint >= 127 && codePoint <= 159) ||
+            (codePoint >= 0x202a && codePoint <= 0x202e) ||
+            (codePoint >= 0x2066 && codePoint <= 0x2069)
+          );
+        })
+      ) {
+        continue;
+      }
+      const key = descriptor.toLocaleLowerCase("en-US");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      accepted.push(descriptor);
+      if (accepted.length === 8) break;
+    }
+    return accepted;
+  };
 
   // Match Python script logic for rating extraction
-  if (type === "movie" && data.results) {
-    const usRelease = data.results.find(
+  if (type === "movie") {
+    const usRelease = results.find(
       (country) => country.iso_3166_1 === "US",
     );
-    const certifiedRelease = usRelease?.release_dates?.find(
+    const usReleaseDates = Array.isArray(usRelease?.release_dates)
+      ? usRelease.release_dates
+          .filter((release) => release && typeof release === "object")
+          .slice(0, 128)
+          .map((release) => ({
+            certification:
+              typeof release.certification === "string" && release.certification.length <= 32
+                ? release.certification.trim()
+                : "",
+            descriptors: sanitizeDescriptors(release.descriptors),
+            release_date:
+              typeof release.release_date === "string" && release.release_date.length <= 64
+                ? release.release_date
+                : null,
+            type: Number.isInteger(release.type) && release.type >= 1 && release.type <= 6
+              ? release.type
+              : null,
+          }))
+      : [];
+    const certifiedRelease = usReleaseDates.find(
       (release) => release.certification,
     );
     rating = certifiedRelease?.certification || null;
-  } else if (type === "tv" && data.results) {
-    const usRating = data.results.find(
-      (ratingInfo) => ratingInfo.iso_3166_1 === "US",
-    );
-    rating = usRating?.rating || null;
+    descriptors = rating
+      ? [
+          ...(usReleaseDates.find(
+            (release) =>
+              release.certification === rating && release.descriptors.length > 0,
+          )?.descriptors || certifiedRelease?.descriptors || []),
+        ]
+      : [];
+
+    return {
+      rating,
+      descriptors,
+      release_dates: {
+        ...(Number.isInteger(data?.id) ? { id: data.id } : {}),
+        results: usRelease
+          ? [{ iso_3166_1: "US", release_dates: usReleaseDates }]
+          : [],
+      },
+    };
   }
 
-  return { rating };
+  const usRatings = results
+    .filter(
+      (ratingInfo) => ratingInfo.iso_3166_1 === "US",
+    )
+    .slice(0, 128)
+    .map((ratingInfo) => ({
+      descriptors: sanitizeDescriptors(ratingInfo.descriptors),
+      iso_3166_1: "US",
+      rating:
+        typeof ratingInfo.rating === "string" && ratingInfo.rating.length <= 32
+          ? ratingInfo.rating.trim()
+          : "",
+    }));
+  const usRating = usRatings.find((ratingInfo) => ratingInfo.rating);
+  if (usRating) {
+    rating = usRating?.rating || null;
+    descriptors = rating
+      ? [
+          ...(usRatings.find(
+            (ratingInfo) =>
+              ratingInfo.rating === rating && ratingInfo.descriptors.length > 0,
+          )?.descriptors || usRating.descriptors || []),
+        ]
+      : [];
+  }
+
+  return {
+    rating,
+    descriptors,
+    content_ratings: {
+      ...(Number.isInteger(data?.id) ? { id: data.id } : {}),
+      results: usRatings,
+    },
+  };
 };
 
 /**
@@ -809,7 +912,7 @@ export const fetchComprehensiveMediaDetails = async (
     ...castData, // Spread cast, recurring_cast (and guest_cast if present)
     trailer_url: videos.trailer_url,
     logo_path: images.logo_path,
-    rating: rating.rating,
+    ...rating,
     last_updated: new Date().toISOString(),
   };
 };
