@@ -49,6 +49,12 @@ jest.unstable_mockModule('axios', () => ({
 
 // Import after mocks
 const axios = (await import('axios')).default;
+
+const getWikidataRatingEnrichment = jest.fn().mockResolvedValue(null);
+jest.unstable_mockModule('../../../utils/wikidata.mjs', () => ({
+  getWikidataRatingEnrichment: (...args) => getWikidataRatingEnrichment(...args),
+}));
+
 const {
   getMediaCast,
   getStructuredMediaCast,
@@ -312,6 +318,9 @@ describe('TMDB Utility Functions', () => {
         '<strong>Language</strong>',
         '&lt;Encoded&gt;',
         'Strong\u0000Language',
+        '\u061cHidden direction',
+        '\u200eLeft-to-right mark',
+        '\u200fRight-to-left mark',
         ...Array.from({ length: 12 }, (_, index) => `Descriptor ${index}`),
         'x'.repeat(161),
       ];
@@ -453,6 +462,167 @@ describe('TMDB Utility Functions', () => {
       expect(result.rating).toBe('PG-13');
       expect(result.descriptors).toEqual(['Violence']);
       expect(result.release_dates).toEqual(releaseDates);
+    });
+
+    it('attaches cached Wikidata evidence without allowing request-path network access', async () => {
+      const previousMode = process.env.WIKIDATA_RATING_ENRICHMENT;
+      process.env.WIKIDATA_RATING_ENRICHMENT = 'scanner';
+      const enrichment = {
+        schema: 1,
+        entityId: 'Q136163067',
+        tmdbMovieId: '1339713',
+        contentRating: 'R',
+        ratingEntityId: 'Q18665344',
+        descriptors: [],
+      };
+      getWikidataRatingEnrichment.mockResolvedValueOnce(enrichment);
+      axios.get.mockImplementation(async (url) => {
+        if (url.includes('/release_dates')) {
+          return {
+            data: {
+              results: [{
+                iso_3166_1: 'US',
+                release_dates: [{ certification: 'R', descriptors: [] }],
+              }],
+            },
+            status: 200,
+            headers: {},
+          };
+        }
+        if (url.includes('/credits')) return { data: { cast: [], crew: [] }, status: 200, headers: {} };
+        if (url.includes('/videos')) return { data: { results: [] }, status: 200, headers: {} };
+        if (url.includes('/images')) return { data: { logos: [], backdrops: [], posters: [] }, status: 200, headers: {} };
+        return { data: { id: 1339713, imdb_id: 'tt37287335', title: 'Obsession' }, status: 200, headers: {} };
+      });
+
+      try {
+        const result = await fetchComprehensiveMediaDetails(
+          'Obsession',
+          'movie',
+          1339713,
+          false,
+          { allowWikidataNetwork: false },
+        );
+
+        expect(getWikidataRatingEnrichment).toHaveBeenCalledWith({
+          mediaType: 'movie',
+          tmdbId: 1339713,
+          imdbId: 'tt37287335',
+          allowNetwork: false,
+        });
+        expect(result.contentRatingEnrichments).toEqual({ wikidata: enrichment });
+      } finally {
+        if (previousMode === undefined) delete process.env.WIKIDATA_RATING_ENRICHMENT;
+        else process.env.WIKIDATA_RATING_ENRICHMENT = previousMode;
+      }
+    });
+
+    it('skips Wikidata without a supported TMDB MPA code and omits code conflicts', async () => {
+      const previousMode = process.env.WIKIDATA_RATING_ENRICHMENT;
+      process.env.WIKIDATA_RATING_ENRICHMENT = 'scanner';
+      axios.get.mockImplementation(async (url) => {
+        if (url.includes('/release_dates')) return { data: { results: [] }, status: 200, headers: {} };
+        if (url.includes('/credits')) return { data: { cast: [], crew: [] }, status: 200, headers: {} };
+        if (url.includes('/videos')) return { data: { results: [] }, status: 200, headers: {} };
+        if (url.includes('/images')) return { data: { logos: [], backdrops: [], posters: [] }, status: 200, headers: {} };
+        return { data: { id: 1339713, imdb_id: 'tt37287335', title: 'Obsession' }, status: 200, headers: {} };
+      });
+
+      try {
+        const absent = await fetchComprehensiveMediaDetails(
+          'Obsession',
+          'movie',
+          1339713,
+          false,
+          { allowWikidataNetwork: true },
+        );
+        expect(getWikidataRatingEnrichment).not.toHaveBeenCalled();
+        expect(absent).not.toHaveProperty('contentRatingEnrichments');
+
+        jest.clearAllMocks();
+        getWikidataRatingEnrichment.mockResolvedValueOnce({
+          schema: 1,
+          entityId: 'Q1',
+          tmdbMovieId: '1339713',
+          contentRating: 'PG-13',
+          ratingEntityId: 'Q18665339',
+          descriptors: ['Violence'],
+        });
+        axios.get.mockImplementation(async (url) => {
+          if (url.includes('/release_dates')) {
+            return {
+              data: {
+                results: [{
+                  iso_3166_1: 'US',
+                  release_dates: [{ certification: 'R', descriptors: [] }],
+                }],
+              },
+              status: 200,
+              headers: {},
+            };
+          }
+          if (url.includes('/credits')) return { data: { cast: [], crew: [] }, status: 200, headers: {} };
+          if (url.includes('/videos')) return { data: { results: [] }, status: 200, headers: {} };
+          if (url.includes('/images')) return { data: { logos: [], backdrops: [], posters: [] }, status: 200, headers: {} };
+          return { data: { id: 1339713, imdb_id: 'tt37287335', title: 'Obsession' }, status: 200, headers: {} };
+        });
+
+        const conflict = await fetchComprehensiveMediaDetails(
+          'Obsession',
+          'movie',
+          1339713,
+          false,
+          { allowWikidataNetwork: true },
+        );
+        expect(conflict.rating).toBe('R');
+        expect(conflict).not.toHaveProperty('contentRatingEnrichments');
+      } finally {
+        if (previousMode === undefined) delete process.env.WIKIDATA_RATING_ENRICHMENT;
+        else process.env.WIKIDATA_RATING_ENRICHMENT = previousMode;
+      }
+    });
+
+    it('keeps comprehensive TMDB metadata intact when scanner enrichment fails', async () => {
+      const previousMode = process.env.WIKIDATA_RATING_ENRICHMENT;
+      process.env.WIKIDATA_RATING_ENRICHMENT = 'scanner';
+      getWikidataRatingEnrichment.mockRejectedValueOnce(new Error('Wikidata unavailable'));
+      axios.get.mockImplementation(async (url) => {
+        if (url.includes('/release_dates')) {
+          return {
+            data: {
+              results: [{
+                iso_3166_1: 'US',
+                release_dates: [{ certification: 'R', descriptors: [] }],
+              }],
+            },
+            status: 200,
+            headers: {},
+          };
+        }
+        if (url.includes('/credits')) return { data: { cast: [], crew: [] }, status: 200, headers: {} };
+        if (url.includes('/videos')) return { data: { results: [] }, status: 200, headers: {} };
+        if (url.includes('/images')) return { data: { logos: [], backdrops: [], posters: [] }, status: 200, headers: {} };
+        return { data: { id: 1339713, imdb_id: 'tt37287335', title: 'Obsession' }, status: 200, headers: {} };
+      });
+
+      try {
+        const result = await fetchComprehensiveMediaDetails(
+          'Obsession',
+          'movie',
+          1339713,
+          false,
+          { allowWikidataNetwork: true },
+        );
+
+        expect(result.rating).toBe('R');
+        expect(result).not.toHaveProperty('contentRatingEnrichments');
+        expect(getWikidataRatingEnrichment).toHaveBeenCalledWith(expect.objectContaining({
+          allowNetwork: true,
+        }));
+      } finally {
+        if (previousMode === undefined) delete process.env.WIKIDATA_RATING_ENRICHMENT;
+        else process.env.WIKIDATA_RATING_ENRICHMENT = previousMode;
+      }
     });
   });
 

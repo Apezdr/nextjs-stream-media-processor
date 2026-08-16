@@ -189,7 +189,21 @@ One entry per subsystem. Each entry states what the subsystem owns (its exclusiv
 
 **Key files:**
 - `node/utils/tmdb.mjs` — fetch/cache/retry core plus aggregation helpers (`fetchEnhancedCollectionData`, `aggregateCollectionData`, etc.)
+- `node/utils/wikidata.mjs` — optional movie-rating evidence fetched by exact
+  P4947 identity through the fixed Wikidata Action API. It reuses
+  `tmdb_cache.db` under a versioned `wikidata:` namespace, applies separate
+  concurrency/single-flight/backoff controls, and never throws into TMDB.
 - `node/routes/tmdb.mjs` — authenticated proxy routes (`/api/tmdb/*`) exposing search/details/cast/images/collection endpoints, plus admin cache-stats and cache-refresh endpoints
+
+Wikidata access is deliberately asymmetric. With
+`WIKIDATA_RATING_ENRICHMENT=scanner`, movie metadata generation may populate
+the cache after the normal TMDB fan-out succeeds. The shared authenticated
+comprehensive route can consume a warm entry but cannot trigger live Wikidata,
+so external watchlist fan-out cannot become upstream Wikidata fan-out. The
+provider is movie-only, stable-ID-only and optional; absent, malformed,
+conflicting, rate-limited or unavailable Wikidata data leaves the comprehensive
+TMDB payload unchanged. Existing unchanged metadata is enriched on a natural
+or forced metadata refresh, not by a migration or card request.
 
 ### 2.5 Image and blurhash pipeline
 

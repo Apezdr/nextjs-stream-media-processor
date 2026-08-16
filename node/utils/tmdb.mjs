@@ -7,6 +7,7 @@ import {
   enhanceTmdbResponseWithBlurhash,
   generateBlurhashCacheKey,
 } from "./tmdbBlurhash.mjs";
+import { getWikidataRatingEnrichment } from "./wikidata.mjs";
 
 const logger = createCategoryLogger("tmdb-utils");
 
@@ -23,6 +24,13 @@ const tmdbRequestLimit = pLimit(Number(process.env.TMDB_REQUEST_CONCURRENCY || 8
 // Per-collection fan-out cap (T-4a) for the parts[] detail fetches below —
 // layered under the global ceiling so one big collection can't monopolize it.
 const COLLECTION_FANOUT_CONCURRENCY = 5;
+const WIKIDATA_COMPATIBLE_MOVIE_RATINGS = new Set([
+  "G",
+  "PG",
+  "PG-13",
+  "R",
+  "NC-17",
+]);
 
 // Preferred metadata language for episode title/overview. TMDB's episode `name`
 // is the base/primary name and (for English-original shows) is NOT overridden by
@@ -631,6 +639,9 @@ export const getMediaRating = async (type, id) => {
           return (
             codePoint <= 31 ||
             (codePoint >= 127 && codePoint <= 159) ||
+            codePoint === 0x061c ||
+            codePoint === 0x200e ||
+            codePoint === 0x200f ||
             (codePoint >= 0x202a && codePoint <= 0x202e) ||
             (codePoint >= 0x2066 && codePoint <= 0x2069)
           );
@@ -869,6 +880,7 @@ export function pickSearchResultByYear(results, name, type) {
  * @param {string} type - 'movie' or 'tv'
  * @param {string|number} tmdbId - Optional TMDB ID (if known)
  * @param {boolean} includeBlurhash - Include blurhash data for images
+ * @param {{allowWikidataNetwork?: boolean}} options - Optional provider access policy
  * @returns {Promise<Object>} Comprehensive media details
  */
 export const fetchComprehensiveMediaDetails = async (
@@ -876,6 +888,7 @@ export const fetchComprehensiveMediaDetails = async (
   type = "tv",
   tmdbId = null,
   includeBlurhash = false,
+  options = {},
 ) => {
   let id = tmdbId;
 
@@ -906,13 +919,40 @@ export const fetchComprehensiveMediaDetails = async (
     getMediaRating(type, id),
   ]);
 
+  let wikidataRating = null;
+  const wikidataMode = String(process.env.WIKIDATA_RATING_ENRICHMENT || "off")
+    .trim()
+    .toLowerCase();
+  if (
+    type === "movie"
+    && wikidataMode === "scanner"
+    && WIKIDATA_COMPATIBLE_MOVIE_RATINGS.has(rating.rating)
+  ) {
+    try {
+      const candidate = await getWikidataRatingEnrichment({
+        mediaType: "movie",
+        tmdbId: id,
+        imdbId: details.imdb_id,
+        allowNetwork: options.allowWikidataNetwork === true,
+      });
+      wikidataRating = candidate?.contentRating === rating.rating ? candidate : null;
+    } catch {
+      wikidataRating = null;
+    }
+  }
+
+  const { contentRatingEnrichments: _ignoredProviderEnvelope, ...safeDetails } = details;
+
   // Combine all data similar to Python script
   return {
-    ...details,
+    ...safeDetails,
     ...castData, // Spread cast, recurring_cast (and guest_cast if present)
     trailer_url: videos.trailer_url,
     logo_path: images.logo_path,
     ...rating,
+    ...(wikidataRating
+      ? { contentRatingEnrichments: { wikidata: wikidataRating } }
+      : {}),
     last_updated: new Date().toISOString(),
   };
 };
