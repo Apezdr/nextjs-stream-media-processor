@@ -598,18 +598,31 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
   const identityClaims = createIdentityClaims();
 
-  try {
-    for (let index = 0; index < shows.length; index++) {
-      const show = shows[index];
-      
-      if (isDebugMode) {
-        logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
-      }
-      
-      if (!show.isDirectory()) continue;
+  // Per-pass failure accounting (SI-P0, "failed ≠ absent"). Previously ONE
+  // try/catch wrapped the whole show loop AND the removal loop, so the first
+  // throwing show silently skipped every later show and all removals, every
+  // 3-minute tick, while the task still reported success. Each show is now
+  // isolated; a failing show is retained and re-examined next tick.
+  const failedShows = [];
+  let scannedDirs = 0;
 
-      const showName = show.name;
-      existingShowNames.delete(showName);
+  for (let index = 0; index < shows.length; index++) {
+    const show = shows[index];
+      
+    if (isDebugMode) {
+      logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
+    }
+      
+    if (!show.isDirectory()) continue;
+    scannedDirs += 1;
+
+    const showName = show.name;
+    // "failed ≠ absent": the name leaves the removal set BEFORE any I/O, so a
+    // show that throws below is retained, never removed. (This ordering has
+    // always held here; movie-scanner.mjs was brought in line in SI-P0.)
+    existingShowNames.delete(showName);
+
+    try {
       const encodedShowName = encodeURIComponent(showName);
       const showPath = normalize(join(dirPath, showName));
 
@@ -679,9 +692,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // update_metadata: true). Reused by the retry gate, the backdrop-focal
       // read, and both episode-backfill call sites below.
       // loadTmdbConfig THROWS on unparseable JSON — tolerate it per show
-      // (warn-and-continue, matching the old fast-skip behavior) so one
-      // corrupt config can't abort every subsequent show plus the removal
-      // loop. Fail CLOSED on the freeze flag (§4.2): an unreadable config
+      // (warn-and-continue) so the show is still PROCESSED this pass with
+      // fail-closed defaults, rather than retained-and-skipped by the SI-P0
+      // per-show catch. Fail CLOSED on the freeze flag (§4.2): an unreadable config
       // means the freeze state is unknown, so no TMDB write paths (images
       // gate, episode backfill) may open off assumed defaults.
       let tmdbConfig;
@@ -1044,21 +1057,73 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       } catch (err) {
         logger.warn(`Episode metadata backfill skipped for ${showName}: ${err.message}`);
       }
+    } catch (err) {
+      // "Retained" = not removed; the row is whatever it was when the throw
+      // happened (untouched pre-save; as saved post-save, with any stale hash
+      // row left to SI-P3). Stack attached only for non-fs errors.
+      const message = err?.message ?? String(err);
+      failedShows.push({ name: showName, code: err?.code, message });
+      logger.error('scanner: show directory failed this pass — retained (not removed), re-examined next tick', {
+        'media.name': showName,
+        'media.type': 'tv',
+        'error.code': err?.code,
+        'error.message': message,
+        ...(err?.code ? {} : { 'error.stack': err?.stack }),
+      });
     }
+  }
 
-    // Remove TV shows from the database that no longer exist in the file
-    // system. Cascade (R-4 + F-3, Branch 5): clear the show's cooldown row,
-    // its per-episode backfill rows, and its stored metadata hashes too — a
-    // same-named show re-added later must start clean, not inherit its
-    // predecessor's retry history or serve its frozen hash.
-    for (const showName of existingShowNames) {
-      await removeTVShow(showName);
-      await clearMissingMediaData(showName);
-      await clearEpisodeRetryForShow(showName);
-      await deleteHashesForMedia(db, 'tv', showName);
+  // Per-pass summary of isolated failures (SI-P0): WARN for a partial failure,
+  // ERROR with a stable prefix when every show failed (library-wide fault) —
+  // alertable, deliberately not a rethrow (see the movie scanner's note).
+  if (failedShows.length > 0) {
+    const libraryWide = failedShows.length === scannedDirs;
+    const summary = {
+      'media.type': 'tv',
+      scannedCount: scannedDirs,
+      failedCount: failedShows.length,
+      failed: failedShows.slice(0, 20).map(f => `${f.name} (${f.code || f.message})`),
+    };
+    if (libraryWide) {
+      logger.error(`scanner: every show directory failed this pass (${failedShows.length} of ${scannedDirs}) — library-wide fault, nothing removed`, summary);
+    } else {
+      logger.warn(`scanner: ${failedShows.length} of ${scannedDirs} show directories failed this pass and were retained`, summary);
     }
-  } catch (error) {
-    logger.error('Error during database update: ' + error);
+  }
+
+  // Remove TV shows from the database that no longer exist in the file
+  // system. Cascade (R-4 + F-3, Branch 5): clear the show's cooldown row,
+  // its per-episode backfill rows, and its stored metadata hashes too — a
+  // same-named show re-added later must start clean, not inherit its
+  // predecessor's retry history or serve its frozen hash.
+  //
+  // Observability + isolation (SI-P0): removals are logged at info (they used
+  // to leave no trail), and each title's cascade is isolated so one failure
+  // cannot stop the others. The show row is deleted LAST so a half-applied
+  // cascade keeps its retry anchor (the removal set is rebuilt from tv_shows
+  // each tick). SI-P2 makes the cascade a single transaction; SI-P1 adds the
+  // zero-dirs / fraction guard in front of this loop.
+  if (existingShowNames.size > 0) {
+    logger.info(`scanner: removing ${existingShowNames.size} show${existingShowNames.size === 1 ? '' : 's'} no longer on disk`, {
+      'media.type': 'tv',
+      removedCount: existingShowNames.size,
+      removed: [...existingShowNames].slice(0, 20),
+    });
+  }
+  for (const showName of existingShowNames) {
+    try {
+      await deleteHashesForMedia(db, 'tv', showName);
+      await clearEpisodeRetryForShow(showName);
+      await clearMissingMediaData(showName);
+      await removeTVShow(showName);
+    } catch (err) {
+      logger.error('scanner: show removal cascade failed — show row kept as retry anchor, retried next tick', {
+        'media.name': showName,
+        'media.type': 'tv',
+        'error.code': err?.code,
+        'error.message': err?.message ?? String(err),
+      });
+    }
   }
 }
 
