@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { join, dirname } from 'path';
+import { join, dirname, basename } from 'path';
 import { promises as fs } from 'fs';
 import { fileExists, convertToAvif, fileInfo, shouldUseAvif } from './utils/utils.mjs';
 import sharp from 'sharp';
@@ -216,7 +216,40 @@ Blur: ${enableBlur ? blur : 'disabled'}
   }
 }
 
-export async function generateSpriteSheet({ videoPath, type, name, season, episode, cacheDir, onProgress = async () => {} }) {
+// Concurrent generations of one title share a run. The VTT and sprite-sheet
+// routes dedupe their own requests separately, so a request to each can arrive
+// while the other's generation is in flight; two runs would write and consume
+// the same temp PNG, and the loser fails at its final rename with ENOENT.
+const inFlightGenerations = new Map();
+
+export function generateSpriteSheet(options) {
+  const { type, name, season, episode, cacheDir } = options;
+  const key = [cacheDir, type, name, season ?? '', episode ?? ''].join('|');
+  const inFlight = inFlightGenerations.get(key);
+  if (inFlight) {
+    logger.info(`Sprite sheet generation already in flight for ${type} ${name}${season ? ` S${season}E${episode}` : ''}; joining it`);
+    return inFlight;
+  }
+  const run = generateSpriteSheetUncoalesced(options).finally(() => {
+    inFlightGenerations.delete(key);
+  });
+  inFlightGenerations.set(key, run);
+  return run;
+}
+
+/**
+ * Last resort after PNG optimization failed: keep ffmpeg's unoptimized output
+ * as the final sprite sheet. If that output is already gone, the optimization
+ * failure is the real story; a rename would only bury it under ENOENT.
+ */
+export async function keepUnoptimizedPng(tempPath, finalPath, optimizationError) {
+  if (!await fileExists(tempPath)) {
+    throw new Error(`Sprite sheet ${basename(tempPath)} is missing after optimization failed: ${optimizationError.message}`);
+  }
+  await fs.rename(tempPath, finalPath);
+}
+
+async function generateSpriteSheetUncoalesced({ videoPath, type, name, season, episode, cacheDir, onProgress = async () => {} }) {
   try {
     // Step 1: Get video UUID for filename versioning
     await onProgress(1, "Analyzing video file for versioning");
@@ -312,7 +345,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
             await fs.unlink(ffmpegOutputPath).catch(logger.error);
           } catch (pngError) {
             logger.error('PNG optimization also failed, using unoptimized PNG:' + pngError.message);
-            await fs.rename(ffmpegOutputPath, pngFallbackPath);
+            await keepUnoptimizedPng(ffmpegOutputPath, pngFallbackPath, pngError);
             finalSpriteSheetPath = pngFallbackPath;
             actualFormat = 'png';
           }
@@ -338,7 +371,7 @@ export async function generateSpriteSheet({ videoPath, type, name, season, episo
         } catch (optimizeError) {
           logger.error('PNG optimization failed, using unoptimized PNG:' + optimizeError.message);
           // If optimization fails, just move the FFmpeg output to final destination
-          await fs.rename(ffmpegOutputPath, finalSpriteSheetPath);
+          await keepUnoptimizedPng(ffmpegOutputPath, finalSpriteSheetPath, optimizeError);
           actualFormat = 'png';
         }
       }
@@ -687,10 +720,10 @@ export async function generateSpriteSheetWithFFmpeg(
   outputFormat
 ) {
   try {
-    const videoExists = await fileExists(videoPath);
-    if (!videoExists) {
-      logger.info(`Video file not found in Spritesheet step: ${videoPath}`);
-      return;
+    if (!await fileExists(videoPath)) {
+      // Returning quietly here left the caller to fail later on a PNG that
+      // was never written, with an error naming the wrong step.
+      throw new Error(`Video file not found in Spritesheet step: ${videoPath}`);
     }
 
     const hdr = await isVideoHDR(videoPath);
@@ -722,6 +755,10 @@ export async function generateSpriteSheetWithFFmpeg(
         });
       }
     });
+
+    if (!await fileExists(tempSpriteSheetPath)) {
+      throw new Error(`Sprite extraction produced no output at ${tempSpriteSheetPath}`);
+    }
 
     if (outputFormat === 'avif') {
       try {

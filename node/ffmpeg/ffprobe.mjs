@@ -52,7 +52,13 @@ export async function isVideoHDR(videoPath) {
 }
 
 /**
- * Gets the duration of the specified video file.
+ * Gets the duration of the specified video file in seconds.
+ *
+ * One ffprobe call reads both the first video stream's duration and the
+ * container's. The stream value is preferred where it exists (MP4/MOV carry
+ * one per stream), but Matroska stores duration only on the container and
+ * ffprobe reports the per-stream value as N/A for every MKV, so the container
+ * value is a fallback rather than a failure. Throws only when neither parses.
  * @param {string} videoPath - The path to the video file.
  * @returns {Promise<number>} - The duration of the video in seconds.
  */
@@ -60,24 +66,45 @@ export async function getVideoDuration(videoPath) {
   const args = [
     "-v", "error",
     "-select_streams", "v:0",
-    "-show_entries", "stream=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
+    "-show_entries", "stream=duration:format=duration",
+    "-of", "json",
     videoPath
   ];
 
   try {
     // Use execFileAsync
     const { stdout } = await execFileAsync(ffprobeBinary, args);
-    const duration = parseFloat(stdout.trim());
-    if (!isNaN(duration)) {
-      return duration;
-    } else {
-      throw new Error('Failed to parse video duration.');
+    const probe = JSON.parse(stdout);
+    const duration = pickDuration(probe);
+    if (duration === null) {
+      const streamRaw = probe?.streams?.[0]?.duration ?? 'N/A';
+      const formatRaw = probe?.format?.duration ?? 'N/A';
+      throw new Error(`Failed to parse video duration (stream=${streamRaw}, format=${formatRaw}).`);
     }
+    return duration;
   } catch (error) {
     logger.error(`Error getting video duration: ${error.message || error.stderr}`);
     throw error;
   }
+}
+
+/**
+ * Picks the usable duration out of parsed `ffprobe -of json` output: the
+ * first selected stream's duration when it is a positive number, otherwise
+ * the container's. ffprobe's JSON writer omits N/A fields entirely, and other
+ * writers print the literal string "N/A"; both parse as NaN and are skipped.
+ * @param {object} probe - Parsed ffprobe JSON with `streams` and `format`.
+ * @returns {number|null} - Duration in seconds, or null when neither is usable.
+ */
+export function pickDuration(probe) {
+  const candidates = [probe?.streams?.[0]?.duration, probe?.format?.duration];
+  for (const raw of candidates) {
+    const seconds = parseFloat(raw);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return seconds;
+    }
+  }
+  return null;
 }
 
 /**
@@ -133,13 +160,17 @@ export async function estimateKeyframeInterval(videoPath, { sampleAt = 60, windo
 /**
  * Checks if the given media file has chapter information.
  * @param {string} mediaPath - The path to the media file.
- * @returns {Promise<Array<object>|null>} - Resolves to an array of chapter objects if the media file has chapter information, null otherwise.
+ * @returns {Promise<Array<{start_time: string, tags?: {title?: string}}>|null>} -
+ *   Resolves to the chapters (title, when the source names one, under
+ *   `tags`) if the media file has chapter information, null otherwise.
  */
 export async function chapterInfo(mediaPath) {
-  // Define arguments as an array of strings
+  // Chapter titles are a tags sub-section in ffprobe, selected with
+  // chapter_tags. There is no "metadata" entry on a chapter, so the old
+  // request for one returned bare start times and every chapter was generic.
   const args = [
     "-show_entries",
-    "chapter=start_time,metadata",
+    "chapter=start_time:chapter_tags=title",
     "-print_format",
     "json",
     "-v",
