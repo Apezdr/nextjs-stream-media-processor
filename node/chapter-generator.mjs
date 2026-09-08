@@ -20,7 +20,7 @@ export async function generateChapters(mediaPath, chapterData = null) {
       const chapterIndex = i + 1;
       const startTime = formatTime(chapter.start_time);
       const endTime = i === chapters.length - 1 ? formatDuration(duration) : formatTime(chapters[i + 1].start_time);
-      const chapterTitle = chapter.metadata ? chapter.metadata.title : `Chapter ${chapterIndex.toString().padStart(2, "0")}`;
+      const chapterTitle = chapterTitleFor(chapter, chapterIndex);
 
       vttContent += `${startTime} --> ${endTime}\n${chapterTitle}\n\n`;
     }
@@ -36,6 +36,31 @@ export async function generateChapters(mediaPath, chapterData = null) {
     logger.error(errorMessage);
     throw new Error(errorMessage);
   }
+}
+
+/**
+ * Cue text for a chapter: the source title when it carries information,
+ * otherwise "Chapter NN". ffprobe exposes titles under `tags`; the old
+ * `metadata` lookup matched nothing, so every chapter was generic.
+ *
+ * The frontend shows raw cue text, so nothing is entity-escaped; the title is
+ * only forced onto one line (a blank line ends a cue) with no "-->" in it.
+ * Titles that are empty, all punctuation (a lone backslash), or a bare timestamp (what
+ * some muxers write when a chapter has no name) fall back too.
+ * @param {{tags?: {title?: string}}} chapter - One entry from chapterInfo.
+ * @param {number} index - 1-based chapter number, used by the fallback.
+ * @returns {string}
+ */
+export function chapterTitleFor(chapter, index) {
+  const fallback = `Chapter ${String(index).padStart(2, "0")}`;
+  const raw = chapter?.tags?.title;
+  if (typeof raw !== "string") {
+    return fallback;
+  }
+  const title = raw.replace(/\s+/g, " ").replace(/-->/g, "-").trim();
+  const hasContent = /[\p{L}\p{N}]/u.test(title);
+  const isBareTimestamp = /^\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?$/.test(title);
+  return hasContent && !isBareTimestamp ? title : fallback;
 }
 
 function formatTime(timeString) {

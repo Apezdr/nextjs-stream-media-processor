@@ -23,6 +23,21 @@ const vttProcessingFiles = new Set();
 const vttRequestQueues = new Map();
 
 /**
+ * Answers every request that queued behind an in-flight generation which has
+ * now failed. They were parked in the map with no timer, so without this they
+ * are never responded to and hang until the client gives up.
+ */
+function failQueuedRequests(queues, fileKey, message = "Internal server error") {
+  const queued = queues.get(fileKey) || [];
+  queues.delete(fileKey);
+  for (const queuedRes of queued) {
+    if (!queuedRes.headersSent) {
+      queuedRes.status(500).send(message);
+    }
+  }
+}
+
+/**
  * Helper function to get video path from database
  */
 async function getVideoPath(type, db, { movieName, showName, season, episode }, BASE_PATH) {
@@ -228,15 +243,16 @@ async function handleSpriteSheetRequest(req, res, type, BASE_PATH) {
         },
       });
 
-      // Process queued requests
-      const queuedRequests = spriteSheetRequestQueues.get(fileKey) || [];
-      spriteSheetRequestQueues.delete(fileKey);
-      spriteSheetProcessingFiles.delete(fileKey);
-      
       // Mark the process as completed
       const dbFinal = await getProcessTrackingDb();
       await finalizeProcessQueue(dbFinal, fileKey + "_spritesheet");
       await releaseDatabase(dbFinal);
+
+      // Process queued requests. Taken only now, so anything thrown above
+      // still leaves them in the map for the catch block to answer.
+      const queuedRequests = spriteSheetRequestQueues.get(fileKey) || [];
+      spriteSheetRequestQueues.delete(fileKey);
+      spriteSheetProcessingFiles.delete(fileKey);
 
       queuedRequests.forEach((queuedRes) => {
         queuedRes.setHeader(
@@ -265,6 +281,7 @@ async function handleSpriteSheetRequest(req, res, type, BASE_PATH) {
       return res.sendFile(spriteSheetPath);
     } catch (error) {
       spriteSheetProcessingFiles.delete(fileKey);
+      failQueuedRequests(spriteSheetRequestQueues, fileKey);
       // Mark the queue as errored
       const dbErr = await getProcessTrackingDb();
       await finalizeProcessQueue(dbErr, fileKey + "_spritesheet", "error", error.message);
@@ -411,10 +428,12 @@ async function handleVttRequest(req, res, type, BASE_PATH) {
         fileStream.pipe(res);
       } else {
         vttProcessingFiles.delete(fileKey);
+        failQueuedRequests(vttRequestQueues, fileKey, "Failed to generate VTT file");
         res.status(500).send("Failed to generate VTT file");
       }
     } catch (error) {
       vttProcessingFiles.delete(fileKey);
+      failQueuedRequests(vttRequestQueues, fileKey);
       const dbErr = await getProcessTrackingDb();
       await finalizeProcessQueue(dbErr, fileKey + "_vtt", "error", error.message);
       await finalizeProcessQueue(dbErr, fileKey + "_spritesheet", "error", error.message);
