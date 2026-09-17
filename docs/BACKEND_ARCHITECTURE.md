@@ -778,8 +778,8 @@ A JSON body parser (`express.json({ limit: '30mb' })`) is applied globally in `n
 | GET | `/frame/tv/:showName/:season/:episode/:timestamp{.:ext}` | none | Same, for a TV episode. | |
 | GET | `/spritesheet/movie/:movieName` | none | Serve (generating on demand) the scrub-preview spritesheet for a movie. | |
 | GET | `/spritesheet/tv/:showName/:season/:episode` | none | Same, for a TV episode. | |
-| GET | `/vtt/movie/:movieName` | none | Serve the WebVTT index for the movie spritesheet. | |
-| GET | `/vtt/tv/:showName/:season/:episode` | none | Same, for a TV episode. | |
+| GET | `/vtt/movie/:movieName` | none | Serve the WebVTT index for the movie spritesheet. | Delivery contract (2026-09-08): cached → `200 text/vtt`; not cached → generation starts in the background and the response is `202` with `Retry-After: 5` and `{status:"generating", step, totalSteps:3, progress (0..1 of the current step), message}` — every request while it runs gets the live progress, no socket is held; no video for the title or a probe failure (ffprobe cannot read it) → `404 {status:"unavailable"}`, the client stops asking; ffmpeg/avifenc exit → `502`, anything else → `500`, both `{status:"failed", message}`. A failure is remembered for `VTT_FAILURE_HOLD_MS` (default 60 s) and answered with its status; the first request after that retries from scratch. Progress is mirrored into `process_queue` (`<fileKey>_vtt` / `_spritesheet`, message carries the percentage). |
+| GET | `/vtt/tv/:showName/:season/:episode` | none | Same, for a TV episode. | Same contract. |
 | GET | `/chapters/movie/:movieName` | none | Serve (generating if absent) the chapter VTT for a movie. | |
 | GET | `/chapters/tv/:showName` | none | Bulk-generate chapter VTTs for **every** episode of a show; returns a status string, not a file. | |
 | GET | `/chapters/tv/:showName/:season/:episode` | none | Serve (generating if absent) the chapter VTT for one episode. | |
