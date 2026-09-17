@@ -92,11 +92,11 @@ async function findExistingUUIDSpriteFile(cacheDir, type, name, season, episode,
     
     let pattern;
     if (type === 'movies') {
-      pattern = new RegExp(`^movie_${sanitizedName}_spritesheet_${shortUUID}_v\\d{4}\\.(avif|png)$`);
+      pattern = new RegExp(`^movie_${sanitizedName}_spritesheet_${shortUUID}_v\\d+\\.(avif|png)$`);
     } else {
       const sanitizedSeason = season.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
       const sanitizedEpisode = episode.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-      pattern = new RegExp(`^tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_${shortUUID}_v\\d{4}\\.(avif|png)$`);
+      pattern = new RegExp(`^tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_${shortUUID}_v\\d+\\.(avif|png)$`);
     }
     
     const matchedFiles = files.filter(file => pattern.test(file));

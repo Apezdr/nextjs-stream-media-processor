@@ -64,11 +64,11 @@ async function findOldSpriteFiles(cacheDir, type, name, season, episode, current
     
     let pattern;
     if (type === 'movies') {
-      pattern = new RegExp(`^movie_${sanitizedName}_spritesheet_([a-f0-9]{8})_v\\d{4}\\.(avif|png|vtt)$`);
+      pattern = new RegExp(`^movie_${sanitizedName}_spritesheet_([a-f0-9]{8})_v\\d+\\.(avif|png|vtt)$`);
     } else {
       const sanitizedSeason = sanitizeName(season);
       const sanitizedEpisode = sanitizeName(episode);
-      pattern = new RegExp(`^tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_([a-f0-9]{8})_v\\d{4}\\.(avif|png|vtt)$`);
+      pattern = new RegExp(`^tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_([a-f0-9]{8})_v\\d+\\.(avif|png|vtt)$`);
     }
     
     return files.filter(file => {
