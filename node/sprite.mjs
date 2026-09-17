@@ -108,6 +108,9 @@ const SPRITE_SEEK_MODE = (process.env.SPRITE_SEEK_MODE || 'auto').trim().toLower
 // GOP per tile) beats decoding the full interval between tiles linearly.
 const AUTO_SEEK_MAX_GOP_FACTOR = 1.5;
 
+// Frames decoded at once while composing a sprite sheet (see composeSpriteSheet).
+const COMPOSE_DECODE_CONCURRENCY = 4;
+
 /**
  * Optimizes a PNG spritesheet using Sharp with configurable options
  * @param {string} inputPath - Path to the input PNG file
@@ -705,8 +708,11 @@ async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
   const rowStride = sheetWidth * 3;
   const canvas = Buffer.alloc(sheetWidth * sheetHeight * 3); // zero-filled = black padding
 
-  for (let index = 0; index < framePaths.length; index++) {
-    if (!framePaths[index]) continue;
+  // Each tile lands in its own region of the canvas, so frames can be decoded
+  // in parallel. Decoding them one at a time was the slowest part of the
+  // whole compose (about 3 ms per frame of pipeline setup); a few workers
+  // recover most of it, and more than that gains little.
+  const placeFrame = async (index) => {
     let data, info;
     try {
       ({ data, info } = await sharp(framePaths[index])
@@ -715,12 +721,12 @@ async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
         .toBuffer({ resolveWithObject: true }));
     } catch (error) {
       logger.warn(`Skipping unreadable frame ${index}: ${error.message}`);
-      continue;
+      return;
     }
 
     if (info.width !== thumbWidth || info.height !== thumbHeight || info.channels !== 3) {
       logger.warn(`Skipping frame ${index}: unexpected dimensions ${info.width}x${info.height}x${info.channels}`);
-      continue;
+      return;
     }
 
     const col = index % columns;
@@ -730,7 +736,16 @@ async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
       const dst = (row * thumbHeight + y) * rowStride + col * thumbWidth * 3;
       data.copy(canvas, dst, src, src + thumbWidth * 3);
     }
-  }
+  };
+
+  let next = 0;
+  const worker = async () => {
+    while (next < framePaths.length) {
+      const index = next++;
+      if (framePaths[index]) await placeFrame(index);
+    }
+  };
+  await Promise.all(Array.from({ length: COMPOSE_DECODE_CONCURRENCY }, worker));
 
   await sharp(canvas, {
     raw: { width: sheetWidth, height: sheetHeight, channels: 3 },
