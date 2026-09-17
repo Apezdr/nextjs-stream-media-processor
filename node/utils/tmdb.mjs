@@ -458,6 +458,58 @@ function formatBasicCast(castData) {
 }
 
 /**
+ * The crew jobs a viewer looks for. TMDB's full crew list runs to hundreds
+ * of entries per film (every gaffer and driver); only these are carried
+ * into the metadata file. Lower-cased for matching.
+ */
+const KEY_CREW_JOBS = new Set([
+  "director",
+  "writer",
+  "screenplay",
+  "story",
+  "novel",
+  "characters",
+  "original story",
+  "author",
+  "teleplay",
+  "producer",
+  "original music composer",
+  "music",
+  "director of photography",
+  "editor",
+]);
+
+/**
+ * Format credits crew data (movies), keeping only the key jobs. TMDB lists
+ * a person once per job, so the same name can appear twice with different
+ * jobs (director + screenplay); exact duplicates are dropped.
+ * @param {Array} crewData - Raw credits crew data from TMDB
+ * @returns {Array} Formatted crew array: { id, name, job, department, profile_path }
+ */
+function formatKeyCrew(crewData) {
+  if (!Array.isArray(crewData)) return [];
+  const seen = new Set();
+  const crew = [];
+  for (const member of crewData) {
+    const job = typeof member?.job === "string" ? member.job.trim() : "";
+    if (!member?.name || !KEY_CREW_JOBS.has(job.toLowerCase())) continue;
+    const key = `${member.id ?? member.name}|${job.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    crew.push({
+      id: member.id,
+      name: member.name,
+      job,
+      department: member.department || "",
+      profile_path: member.profile_path
+        ? `https://image.tmdb.org/t/p/original${member.profile_path}`
+        : null,
+    });
+  }
+  return crew;
+}
+
+/**
  * Classify role type based on episode count for TV shows
  * @param {number} episodeCount - Number of episodes appeared in
  * @returns {string} Role classification
@@ -497,9 +549,11 @@ export const getStructuredMediaCast = async (
   }
 
   if (type === "movie") {
-    // For movies, return all cast in the cast field (no separation)
-    const cast = await getMediaCast(type, id);
-    return { cast };
+    // One credits call serves both lists: every cast member (films get no
+    // recurring/guest split) plus the key crew, so the info page can credit
+    // the director, writers, producers, composer, cinematographer and editor.
+    const data = await makeTmdbRequest(`/movie/${id}/credits`);
+    return { cast: formatBasicCast(data.cast), crew: formatKeyCrew(data.crew) };
   }
 
   // For TV shows, use aggregate_credits to get episode counts

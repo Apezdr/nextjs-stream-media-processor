@@ -325,6 +325,45 @@ describe('TMDB Utility Functions', () => {
       expect(result.cast[0].id).toBe(54693);
     });
 
+    it('keeps only the key crew jobs for movies, one entry per person and job', async () => {
+      axios.get.mockResolvedValue({
+        data: {
+          cast: [],
+          crew: [
+            { id: 1, name: 'Ada Director', job: 'Director', department: 'Directing', profile_path: '/ada.jpg' },
+            { id: 2, name: 'Bo Writer', job: 'Writer', department: 'Writing', profile_path: null },
+            { id: 2, name: 'Bo Writer', job: 'Writer', department: 'Writing', profile_path: null },
+            { id: 2, name: 'Bo Writer', job: 'Screenplay', department: 'Writing', profile_path: null },
+            { id: 3, name: 'Cy Gaffer', job: 'Gaffer', department: 'Lighting', profile_path: null },
+            { id: 4, name: 'Di Producer', job: 'Producer', department: 'Production', profile_path: null },
+            { id: 5, name: 'Ed Composer', job: 'Original Music Composer', department: 'Sound', profile_path: null }
+          ]
+        },
+        status: 200,
+        headers: {}
+      });
+
+      const result = await getStructuredMediaCast('movie', 424242);
+
+      expect(result.cast).toEqual([]);
+      expect(result.crew.map((c) => `${c.name}:${c.job}`)).toEqual([
+        'Ada Director:Director',
+        'Bo Writer:Writer',
+        'Bo Writer:Screenplay',
+        'Di Producer:Producer',
+        'Ed Composer:Original Music Composer'
+      ]);
+      expect(result.crew[0]).toEqual({
+        id: 1,
+        name: 'Ada Director',
+        job: 'Director',
+        department: 'Directing',
+        profile_path: 'https://image.tmdb.org/t/p/original/ada.jpg'
+      });
+      // One credits request serves both lists
+      expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
     it('should return cast and recurring_cast arrays for TV shows', async () => {
       // Mock TMDB aggregate_credits endpoint response for TV
       axios.get.mockResolvedValue({
