@@ -3,7 +3,7 @@ import { join } from 'path';
 import { createReadStream } from 'fs';
 import { promises as fs } from 'fs';
 import sharp from 'sharp';
-import { generateSpriteSheet, generateVttFileFFmpeg } from './sprite.mjs';
+import { generateSpriteSheet, generateVttFileFFmpeg, FAILURE_KIND } from './sprite.mjs';
 import { initializeDatabase, getTVShowByName, getMovieByName, releaseDatabase } from './sqliteDatabase.mjs';
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getProcessTrackingDb, updateProcessQueue } from './sqlite/processTracking.mjs';
 import { fileExists, shouldUseAvif, convertToAvif, spritesheetCacheDir } from './utils/utils.mjs';
@@ -19,8 +19,73 @@ const CHROME_HEIGHT_LIMIT = 30780;
 // Track processing files to avoid duplicate work
 const spriteSheetProcessingFiles = new Set();
 const spriteSheetRequestQueues = new Map();
-const vttProcessingFiles = new Set();
-const vttRequestQueues = new Map();
+// VTT generation is fire-and-forget: the first request starts it and every
+// request while it runs gets a 202 with progress, so no socket is held for
+// the minutes a long film takes. Jobs are keyed by the UUID-versioned VTT
+// filename, so a replaced source file starts clean. A failure is remembered
+// for VTT_FAILURE_HOLD_MS and answered with its status, so a polling client
+// does not restart the job on every probe; the first request after that
+// window retries from scratch.
+const vttJobs = new Map();
+const VTT_TOTAL_STEPS = 3;
+const VTT_RETRY_AFTER_SECONDS = 5;
+const VTT_FAILURE_HOLD_MS = Math.max(0, parseInt(process.env.VTT_FAILURE_HOLD_MS, 10) || 60_000);
+const VTT_MESSAGE_MAX = 120;
+
+function truncateMessage(message) {
+  return String(message ?? '').slice(0, VTT_MESSAGE_MAX);
+}
+
+// The contract's progress is the fraction of the current step: 0 while the
+// file is analysed, the share of frames done while extracting, 1 while the
+// sheet is converted and the VTT written.
+function normalizeProgress(progress, step) {
+  if (typeof progress === 'number' && Number.isFinite(progress)) {
+    return Math.max(0, Math.min(1, progress));
+  }
+  return step >= VTT_TOTAL_STEPS ? 1 : 0;
+}
+
+function sendGenerating(res, job) {
+  res.status(202);
+  res.setHeader('Retry-After', String(VTT_RETRY_AFTER_SECONDS));
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    status: 'generating',
+    step: job.step,
+    totalSteps: VTT_TOTAL_STEPS,
+    progress: job.progress,
+    message: job.message,
+  });
+}
+
+/**
+ * Maps a generation failure onto the delivery contract: a probe failure means
+ * the title cannot have previews as it stands (404, the client stops asking);
+ * a tool failure is ffmpeg or avifenc exiting non-zero (502); anything else
+ * is ours (500).
+ */
+export function classifyVttFailure(error) {
+  const message = truncateMessage(error?.message || error);
+  if (error?.failureKind === FAILURE_KIND.PROBE) {
+    return { status: 404, body: { status: 'unavailable', message } };
+  }
+  if (error?.failureKind === FAILURE_KIND.TOOL) {
+    return { status: 502, body: { status: 'failed', message } };
+  }
+  return { status: 500, body: { status: 'failed', message } };
+}
+
+function vttFileNameFor(type, { movieName, showName, season, episode }, videoUUID) {
+  const sanitize = (value) => value.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  const sanitizedName = sanitize(movieName || showName);
+  const shortUUID = videoUUID.substring(0, 8);
+  const version = Math.floor(1.0001 * 10000).toString().padStart(4, '0'); // Use same version as SPRITE_VERSION
+  if (type === 'movies') {
+    return `movie_${sanitizedName}_spritesheet_${shortUUID}_v${version}.vtt`;
+  }
+  return `tv_${sanitizedName}_${sanitize(season)}_${sanitize(episode)}_spritesheet_${shortUUID}_v${version}.vtt`;
+}
 
 /**
  * Answers every request that queued behind an in-flight generation which has
@@ -301,149 +366,142 @@ async function handleSpriteSheetRequest(req, res, type, BASE_PATH) {
  * Handles VTT file requests with UUID-based file lookup
  */
 async function handleVttRequest(req, res, type, BASE_PATH) {
+  let db;
   try {
-    const db = await initializeDatabase();
-    const processDB = await getProcessTrackingDb();
+    db = await initializeDatabase();
     const { movieName, showName, season, episode } = req.params;
 
-    // Get video path to determine UUID
-    const videoPath = await getVideoPath(type, db, {
-      movieName,
-      showName,
-      season,
-      episode,
-    }, BASE_PATH);
-
-    const videoInfo = await getInfo(videoPath);
-    const videoUUID = videoInfo.uuid;
-
-    // Generate UUID-based VTT filename
-    const sanitizedName = (movieName || showName).replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-    const shortUUID = videoUUID.substring(0, 8);
-    const version = Math.floor(1.0001 * 10000).toString().padStart(4, '0'); // Use same version as SPRITE_VERSION
-    
-    let vttFileName;
-    if (type === 'movies') {
-      vttFileName = `movie_${sanitizedName}_spritesheet_${shortUUID}_v${version}.vtt`;
-    } else {
-      const sanitizedSeason = season.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-      const sanitizedEpisode = episode.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-      vttFileName = `tv_${sanitizedName}_${sanitizedSeason}_${sanitizedEpisode}_spritesheet_${shortUUID}_v${version}.vtt`;
+    let videoPath;
+    try {
+      videoPath = await getVideoPath(type, db, { movieName, showName, season, episode }, BASE_PATH);
+    } catch (error) {
+      // Unknown title, or no video on disk: there is nothing to generate from.
+      logger.warn(`VTT requested for a title with no video: ${error.message}`);
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(404).json({ status: 'unavailable', message: truncateMessage(error.message) });
     }
 
+    const { uuid: videoUUID } = await getInfo(videoPath);
+    const vttFileName = vttFileNameFor(type, { movieName, showName, season, episode }, videoUUID);
     const vttFilePath = join(spritesheetCacheDir, vttFileName);
 
     if (await fileExists(vttFilePath)) {
       logger.info(`Serving UUID-based VTT file from cache: ${vttFileName}`);
       res.setHeader("Content-Type", "text/vtt");
-      const fileStream = createReadStream(vttFilePath);
-      await releaseDatabase(db);
-      return fileStream.pipe(res);
+      return createReadStream(vttFilePath).pipe(res);
     }
 
     logger.info(`UUID-based VTT file not found in cache: ${vttFileName}`);
+
+    const existing = vttJobs.get(vttFileName);
+    if (existing?.state === 'generating') {
+      return sendGenerating(res, existing);
+    }
+    if (existing?.state === 'failed') {
+      if (Date.now() - existing.at < VTT_FAILURE_HOLD_MS) {
+        res.setHeader('Cache-Control', 'no-store');
+        if (existing.status >= 500) {
+          res.setHeader('Retry-After', String(Math.ceil(VTT_FAILURE_HOLD_MS / 1000)));
+        }
+        return res.status(existing.status).json(existing.body);
+      }
+      vttJobs.delete(vttFileName);
+    }
 
     const fileKey =
       type === "movies"
         ? `movie_${movieName}`
         : `tv_${showName}_${season}_${episode}`;
-        
-    if (vttProcessingFiles.has(fileKey)) {
-      logger.info(
-        `VTT file ${fileKey} is already being processed. Adding request to queue.`
-      );
-      if (!vttRequestQueues.has(fileKey)) {
-        vttRequestQueues.set(fileKey, []);
-      }
-      vttRequestQueues.get(fileKey).push(res);
-      await releaseDatabase(db);
-      return;
-    }
-    
-    vttProcessingFiles.add(fileKey);
-
-    // Create or update the queue record for the VTT process
-    await createOrUpdateProcessQueue(
-      processDB,
-      fileKey + "_vtt",  // so we don't conflict with the sprite sheet queue
-      "vtt",
-      3, // total steps for VTT
-      1, // start on step 1
-      "in-progress",
-      "Starting VTT generation"
-    );
-
-    // Create a queue for the spritesheet process
-    await createOrUpdateProcessQueue(
-      processDB,
-      fileKey + "_spritesheet",
-      "spritesheet",
-      3,        // total steps
-      0,        // current step
-      "in-progress",
-      "Starting sprite sheet creation"
-    );
-
-    try {
-      await releaseDatabase(db);
-
-      // Generate sprite sheet and VTT with UUID versioning
-      await generateSpriteSheet({
-        videoPath,
-        type,
-        name: movieName || showName,
-        season,
-        episode,
-        cacheDir: spritesheetCacheDir,
-        onProgress: async (stepNumber, message) => {
-          // Utility callback to track each step
-          const dbInner = await getProcessTrackingDb();
-          await updateProcessQueue(dbInner, fileKey + "_vtt", stepNumber, "in-progress", message);
-          await updateProcessQueue(dbInner, fileKey + "_spritesheet", stepNumber, "in-progress", message);
-          await releaseDatabase(dbInner);
-        },
-      });
-
-      const finalizeDBqueue = await getProcessTrackingDb();
-      // Finalize the queue
-      await finalizeProcessQueue(finalizeDBqueue, fileKey + "_vtt", "completed", "VTT generation done");
-      await finalizeProcessQueue(finalizeDBqueue, fileKey + "_spritesheet", "completed", "Spritesheet generation done");
-      await releaseDatabase(finalizeDBqueue);
-
-      vttProcessingFiles.delete(fileKey);
-
-      if (await fileExists(vttFilePath)) {
-        // Process queued requests
-        const queuedRequests = vttRequestQueues.get(fileKey) || [];
-        vttRequestQueues.delete(fileKey);
-        queuedRequests.forEach((queuedRes) => {
-          queuedRes.setHeader("Content-Type", "text/vtt");
-          const fileStream = createReadStream(vttFilePath);
-          fileStream.pipe(queuedRes);
-        });
-
-        // Stream the generated VTT file
-        res.setHeader("Content-Type", "text/vtt");
-        const fileStream = createReadStream(vttFilePath);
-        fileStream.pipe(res);
-      } else {
-        vttProcessingFiles.delete(fileKey);
-        failQueuedRequests(vttRequestQueues, fileKey, "Failed to generate VTT file");
-        res.status(500).send("Failed to generate VTT file");
-      }
-    } catch (error) {
-      vttProcessingFiles.delete(fileKey);
-      failQueuedRequests(vttRequestQueues, fileKey);
-      const dbErr = await getProcessTrackingDb();
-      await finalizeProcessQueue(dbErr, fileKey + "_vtt", "error", error.message);
-      await finalizeProcessQueue(dbErr, fileKey + "_spritesheet", "error", error.message);
-      await releaseDatabase(dbErr);
-      throw error;
-    }
+    const job = {
+      state: 'generating',
+      startedAt: Date.now(),
+      step: 1,
+      progress: 0,
+      message: 'Starting VTT generation',
+    };
+    vttJobs.set(vttFileName, job);
+    runVttGeneration({
+      job,
+      vttFileName,
+      vttFilePath,
+      videoPath,
+      type,
+      name: movieName || showName,
+      season,
+      episode,
+      fileKey,
+    }).catch((error) => {
+      logger.error(`VTT generation runner failed unexpectedly for ${fileKey}: ${error.message}`);
+    });
+    return sendGenerating(res, job);
   } catch (error) {
     logger.error(error);
     if (!res.headersSent) {
-      res.status(500).send("Internal server error");
+      res.status(500).json({ status: 'failed', message: 'Internal server error' });
+    }
+  } finally {
+    if (db) {
+      await releaseDatabase(db).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Runs one VTT generation in the background, keeping the job the route
+ * answers 202 from up to date and mirroring progress into process_queue.
+ * On failure the job becomes a remembered failure for VTT_FAILURE_HOLD_MS.
+ */
+async function runVttGeneration({ job, vttFileName, vttFilePath, videoPath, type, name, season, episode, fileKey }) {
+  const vttKey = fileKey + "_vtt";
+  const spriteKey = fileKey + "_spritesheet";
+  try {
+    const processDB = await getProcessTrackingDb();
+    await createOrUpdateProcessQueue(processDB, vttKey, "vtt", VTT_TOTAL_STEPS, 1, "in-progress", job.message);
+    await createOrUpdateProcessQueue(processDB, spriteKey, "spritesheet", VTT_TOTAL_STEPS, 0, "in-progress", "Starting sprite sheet creation");
+    await releaseDatabase(processDB);
+
+    await generateSpriteSheet({
+      videoPath,
+      type,
+      name,
+      season,
+      episode,
+      cacheDir: spritesheetCacheDir,
+      onProgress: async (stepNumber, message, progress) => {
+        job.step = stepNumber;
+        job.message = truncateMessage(message);
+        job.progress = normalizeProgress(progress, stepNumber);
+        // The generator already throttles fraction events to about one per
+        // second, so each one can be mirrored into process_queue.
+        const dbInner = await getProcessTrackingDb();
+        const dbMessage = stepNumber === 2 ? `${job.message} ${Math.round(job.progress * 100)}%` : job.message;
+        await updateProcessQueue(dbInner, vttKey, stepNumber, "in-progress", dbMessage);
+        await updateProcessQueue(dbInner, spriteKey, stepNumber, "in-progress", dbMessage);
+        await releaseDatabase(dbInner);
+      },
+    });
+
+    if (!await fileExists(vttFilePath)) {
+      throw new Error("Failed to generate VTT file");
+    }
+
+    const dbFinal = await getProcessTrackingDb();
+    await finalizeProcessQueue(dbFinal, vttKey, "completed", "VTT generation done");
+    await finalizeProcessQueue(dbFinal, spriteKey, "completed", "Spritesheet generation done");
+    await releaseDatabase(dbFinal);
+    vttJobs.delete(vttFileName);
+    logger.info(`VTT generation finished for ${fileKey} in ${Math.round((Date.now() - job.startedAt) / 1000)}s`);
+  } catch (error) {
+    const failure = classifyVttFailure(error);
+    vttJobs.set(vttFileName, { state: 'failed', at: Date.now(), ...failure });
+    logger.error(`VTT generation failed for ${fileKey} (${failure.status}): ${error.message}`);
+    try {
+      const dbErr = await getProcessTrackingDb();
+      await finalizeProcessQueue(dbErr, vttKey, "error", error.message);
+      await finalizeProcessQueue(dbErr, spriteKey, "error", error.message);
+      await releaseDatabase(dbErr);
+    } catch (dbError) {
+      logger.error(`Could not record the VTT failure for ${fileKey}: ${dbError.message}`);
     }
   }
 }

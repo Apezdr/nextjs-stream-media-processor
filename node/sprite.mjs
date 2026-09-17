@@ -216,25 +216,119 @@ Blur: ${enableBlur ? blur : 'disabled'}
   }
 }
 
+/**
+ * Why a generation failed, for callers that answer HTTP: a probe failure
+ * means the title cannot have previews as it stands (ffprobe cannot read it,
+ * or it has no usable duration); a tool failure means ffmpeg or avifenc
+ * exited non-zero. Anything untagged is an internal error.
+ */
+export const FAILURE_KIND = Object.freeze({ PROBE: 'probe', TOOL: 'tool' });
+
+function tagFailure(error, kind) {
+  if (error && typeof error === 'object' && !error.failureKind) {
+    error.failureKind = kind;
+  }
+  return error;
+}
+
+/**
+ * Turns raw completion fractions into progress callbacks at most once per
+ * `minIntervalMs`, always forwarding 1 so the step is seen finishing.
+ * @param {(fraction: number) => void} onFraction
+ * @param {{minIntervalMs?: number, now?: () => number}} [options]
+ * @returns {(fraction: number) => void}
+ */
+export function createProgressReporter(onFraction, { minIntervalMs = 1000, now = Date.now } = {}) {
+  let lastFraction = -1;
+  let lastAt = -Infinity;
+  return (fraction) => {
+    const clamped = Math.max(0, Math.min(1, Number(fraction) || 0));
+    if (clamped === lastFraction) return;
+    const at = now();
+    if (clamped < 1 && at - lastAt < minIntervalMs) return;
+    lastFraction = clamped;
+    lastAt = at;
+    onFraction(clamped);
+  };
+}
+
+/**
+ * Parses the key=value blocks ffmpeg writes with `-progress pipe:1`. Feed it
+ * stdout chunks; `onBlock` fires at the end of each block with the frame
+ * count and output time so far. ffmpeg's out_time_ms is in microseconds
+ * (a long-standing quirk), so both time keys are read as microseconds.
+ * @param {(block: {frame: number, outTimeUs: number, done: boolean}) => void} onBlock
+ * @returns {(chunk: string|Buffer) => void}
+ */
+export function createFfmpegProgressParser(onBlock) {
+  let pending = '';
+  let frame = 0;
+  let outTimeUs = 0;
+  return (chunk) => {
+    pending += chunk.toString();
+    let newline;
+    while ((newline = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, newline).trim();
+      pending = pending.slice(newline + 1);
+      const eq = line.indexOf('=');
+      if (eq === -1) continue;
+      const key = line.slice(0, eq);
+      const value = line.slice(eq + 1).trim();
+      if (key === 'frame') {
+        const n = parseInt(value, 10);
+        if (Number.isFinite(n)) frame = n;
+      } else if (key === 'out_time_us' || key === 'out_time_ms') {
+        const n = parseInt(value, 10);
+        if (Number.isFinite(n)) outTimeUs = n;
+      } else if (key === 'progress') {
+        onBlock({ frame, outTimeUs, done: value === 'end' });
+      }
+    }
+  };
+}
+
 // Concurrent generations of one title share a run. The VTT and sprite-sheet
 // routes dedupe their own requests separately, so a request to each can arrive
 // while the other's generation is in flight; two runs would write and consume
 // the same temp PNG, and the loser fails at its final rename with ENOENT.
+// Every caller's onProgress hears the shared run; a late joiner first gets
+// the most recent event so it never sits on a stale step.
 const inFlightGenerations = new Map();
 
 export function generateSpriteSheet(options) {
-  const { type, name, season, episode, cacheDir } = options;
+  const { type, name, season, episode, cacheDir, onProgress } = options;
   const key = [cacheDir, type, name, season ?? '', episode ?? ''].join('|');
   const inFlight = inFlightGenerations.get(key);
   if (inFlight) {
     logger.info(`Sprite sheet generation already in flight for ${type} ${name}${season ? ` S${season}E${episode}` : ''}; joining it`);
-    return inFlight;
+    if (typeof onProgress === 'function') {
+      inFlight.listeners.add(onProgress);
+      if (inFlight.lastEvent) {
+        Promise.resolve(onProgress(...inFlight.lastEvent)).catch((error) => {
+          logger.warn(`Progress listener failed: ${error.message}`);
+        });
+      }
+    }
+    return inFlight.promise;
   }
-  const run = generateSpriteSheetUncoalesced(options).finally(() => {
+
+  const entry = { listeners: new Set(), lastEvent: null, promise: null };
+  if (typeof onProgress === 'function') entry.listeners.add(onProgress);
+  const broadcast = async (...event) => {
+    entry.lastEvent = event;
+    for (const listener of entry.listeners) {
+      try {
+        await listener(...event);
+      } catch (error) {
+        logger.warn(`Progress listener failed: ${error.message}`);
+      }
+    }
+  };
+  entry.promise = generateSpriteSheetUncoalesced({ ...options, onProgress: broadcast }).finally(() => {
     inFlightGenerations.delete(key);
   });
-  inFlightGenerations.set(key, run);
-  return run;
+  inFlightGenerations.set(key, entry);
+  return entry.promise;
 }
 
 /**
@@ -251,15 +345,18 @@ export async function keepUnoptimizedPng(tempPath, finalPath, optimizationError)
 
 async function generateSpriteSheetUncoalesced({ videoPath, type, name, season, episode, cacheDir, onProgress = async () => {} }) {
   try {
-    // Step 1: Get video UUID for filename versioning
-    await onProgress(1, "Analyzing video file for versioning");
-    const videoInfo = await getInfo(videoPath);
-    const videoUUID = videoInfo.uuid;
-    
-    // Step 2: FFmpeg (generating the raw spritesheet)
-    await onProgress(1, "Running FFmpeg to create raw sprite sheet");
-
-    const duration = await getVideoDuration(videoPath);
+    // Step 1: probe the file. Failures here mean the title cannot have
+    // previews as it stands, which the route reports differently from a
+    // tool crash.
+    await onProgress(1, "Analyzing video", 0);
+    let videoUUID;
+    let duration;
+    try {
+      ({ uuid: videoUUID } = await getInfo(videoPath));
+      duration = await getVideoDuration(videoPath);
+    } catch (error) {
+      throw tagFailure(error, FAILURE_KIND.PROBE);
+    }
     const floorDuration = Math.floor(duration);
     const interval = 5; // Interval between frames
 
@@ -299,23 +396,26 @@ async function generateSpriteSheetUncoalesced({ videoPath, type, name, season, e
     if (!await fileExists(finalSpriteSheetPath)) {
       logger.info(`Generating new sprite sheet with UUID versioning: ${spriteSheetFileName}`);
       
-      // Generate initial PNG with FFmpeg (using temporary filename based on UUID)
+      // Step 2: extract the frames. The fraction is the share of frames done.
+      await onProgress(2, "Extracting frames", 0);
       const tempFileName = `temp_${generateSpriteFilename(type, name, season, episode, videoUUID, '.png')}`;
       const ffmpegOutputPath = join(cacheDir, tempFileName);
-      
+
       await generateSpriteSheetWithFFmpeg(
         videoPath,
         ffmpegOutputPath,
         interval,
         columns,
         rows,
-        'png'
+        'png',
+        { onProgress: (fraction) => onProgress(2, "Extracting frames", fraction) }
       );
 
-      // Step 2: AVIF conversion or PNG optimization based on configuration
-      await onProgress(2, useAvif
+      // Step 3: conversion or optimization, then the VTT. Short, reported as 1.
+      await onProgress(3, useAvif
         ? "Converting PNG to AVIF"
-        : "Optimizing PNG"
+        : "Optimizing PNG",
+        1
       );
 
       if (useAvif) {
@@ -383,7 +483,7 @@ async function generateSpriteSheetUncoalesced({ videoPath, type, name, season, e
 
     // Generate VTT if needed
     if (!await fileExists(vttFilePath)) {
-      await onProgress(3, "Generating VTT file");
+      await onProgress(3, "Generating VTT file", 1);
       await generateVttFileFFmpeg(
         finalSpriteSheetPath,
         vttFilePath,
@@ -452,7 +552,7 @@ function buildFrameFilters(hdr) {
  * @param {string[]} args - ffmpeg arguments.
  * @returns {Promise<void>}
  */
-function runFfmpeg(args) {
+function runFfmpeg(args, { onProgressBlock } = {}) {
   return new Promise((resolve, reject) => {
     const ffmpegProcess = spawn('ffmpeg', args);
     let stderr = '';
@@ -462,16 +562,23 @@ function runFfmpeg(args) {
       if (stderr.length > 8192) stderr = stderr.slice(-8192);
     });
 
+    // Only meaningful when the args carry `-progress pipe:1`; otherwise stdout
+    // is empty and this just drains it.
+    const parse = onProgressBlock ? createFfmpegProgressParser(onProgressBlock) : null;
+    ffmpegProcess.stdout.on('data', (data) => {
+      if (parse) parse(data);
+    });
+
     ffmpegProcess.on('close', (code) => {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`));
+        reject(tagFailure(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`), FAILURE_KIND.TOOL));
       }
     });
 
     ffmpegProcess.on('error', (error) => {
-      reject(error);
+      reject(tagFailure(error, FAILURE_KIND.TOOL));
     });
   });
 }
@@ -531,7 +638,7 @@ export function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hw
  * @param {boolean} hdr - Whether the source is HDR.
  * @returns {Promise<(string|null)[]>} - Frame paths by index; null where extraction failed.
  */
-async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek, hdr) {
+async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek, hdr, { onProgress = () => {} } = {}) {
   const frameQueue = new PQueue({ concurrency: SPRITE_FRAME_CONCURRENCY });
   let hwaccel = SPRITE_HWACCEL && SPRITE_HWACCEL !== 'none' ? SPRITE_HWACCEL : null;
   let hwaccelWarned = false;
@@ -568,6 +675,7 @@ async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, frame
       logger.warn(`Frame extraction failed at ${timestamp}s (index ${index}): ${error.message}`);
     }
     completed++;
+    onProgress(completed / timestamps.length);
     if (completed % 100 === 0 || completed === timestamps.length) {
       logger.info(`Sprite frames extracted: ${completed}/${timestamps.length}${failedCount ? ` (${failedCount} failed)` : ''}`);
     }
@@ -646,19 +754,39 @@ async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
  * @param {boolean} hdr - Whether the source is HDR.
  * @returns {Promise<void>}
  */
-async function runLinearSpriteExtraction(videoPath, outputPath, interval, columns, rows, hdr) {
-  const vfFilters = `fps=1/${interval},${buildFrameFilters(hdr)},tile=${columns}x${rows}`;
+/**
+ * Decodes the whole file once and writes one PNG per `interval` seconds into
+ * `framesDir`, numbered from 0 so index n is the frame at n * interval, the
+ * same layout extractFramesAtTimestamps produces. The old tile-filter form
+ * emitted a single frame at the very end, so ffmpeg's -progress output stayed
+ * silent for the whole decode; per-frame output makes it count up.
+ * @returns {Promise<(string|null)[]>} - Frame PNGs by grid index (null = missing).
+ */
+async function runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, totalFrames, { onProgress = () => {} } = {}) {
   const ffmpegArgs = [
     '-y',
     '-loglevel', 'error',
     '-i', videoPath,
     '-an', '-sn', '-dn',
-    '-vf', vfFilters,
+    '-vf', `fps=1/${interval},${vfFilters}`,
     '-pix_fmt', 'rgb24',
-    outputPath,
+    '-start_number', '0',
+    '-progress', 'pipe:1',
+    join(framesDir, 'frame_%06d.png'),
   ];
   logger.info(`Executing linear sprite extraction: ffmpeg ${ffmpegArgs.join(' ')}`);
-  await runFfmpeg(ffmpegArgs);
+  await runFfmpeg(ffmpegArgs, {
+    onProgressBlock: ({ frame }) => onProgress(totalFrames > 0 ? frame / totalFrames : 1),
+  });
+
+  const framePaths = [];
+  for (let index = 0; index < totalFrames; index++) {
+    const framePath = join(framesDir, `frame_${String(index).padStart(6, '0')}.png`);
+    framePaths.push((await fileExists(framePath)) ? framePath : null);
+  }
+  const produced = framePaths.filter(Boolean).length;
+  logger.info(`Linear extraction produced ${produced}/${totalFrames} frames`);
+  return framePaths;
 }
 
 /**
@@ -717,37 +845,46 @@ export async function generateSpriteSheetWithFFmpeg(
   interval,
   columns,
   rows,
-  outputFormat
+  outputFormat,
+  { onProgress = () => {} } = {}
 ) {
   try {
     if (!await fileExists(videoPath)) {
       // Returning quietly here left the caller to fail later on a PNG that
       // was never written, with an error naming the wrong step.
-      throw new Error(`Video file not found in Spritesheet step: ${videoPath}`);
+      throw tagFailure(new Error(`Video file not found in Spritesheet step: ${videoPath}`), FAILURE_KIND.PROBE);
     }
 
-    const hdr = await isVideoHDR(videoPath);
+    let hdr;
+    let duration;
+    try {
+      hdr = await isVideoHDR(videoPath);
+      duration = await getVideoDuration(videoPath);
+    } catch (error) {
+      throw tagFailure(error, FAILURE_KIND.PROBE);
+    }
     logger.info(`Video HDR: ${hdr}`);
 
-    const duration = await getVideoDuration(videoPath);
     const strategy = await resolveExtractionStrategy(videoPath, interval, duration);
     const tempSpriteSheetPath = spriteSheetPath.replace(/\.[^/.]+$/, '.png');
+    const timestamps = planFrameTimestamps(duration, interval);
+    const report = createProgressReporter(onProgress);
 
     logger.info(`Sprite extraction strategy: ${strategy.seek ? (strategy.fastSeek ? 'fast-seek' : 'seek') : 'linear'} — ${strategy.reason}${SPRITE_HWACCEL ? ` (hwaccel: ${SPRITE_HWACCEL})` : ''}`);
 
     // The whole job occupies one ffmpegQueue slot so the global cap on
     // concurrent sprite work still holds; frame-level parallelism inside the
-    // job is governed by SPRITE_FRAME_CONCURRENCY.
+    // job is governed by SPRITE_FRAME_CONCURRENCY. Both strategies leave one
+    // PNG per grid index in a temp dir and are composed the same way; that is
+    // also what makes linear progress observable, since ffmpeg's tile filter
+    // emits nothing until the whole file is decoded.
     await ffmpegQueue.add(async () => {
-      if (!strategy.seek) {
-        await runLinearSpriteExtraction(videoPath, tempSpriteSheetPath, interval, columns, rows, hdr);
-        return;
-      }
-      const timestamps = planFrameTimestamps(duration, interval);
       const vfFilters = buildFrameFilters(hdr);
       const framesDir = await fs.mkdtemp(join(dirname(spriteSheetPath), 'sprite_frames_'));
       try {
-        const framePaths = await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek, hdr);
+        const framePaths = strategy.seek
+          ? await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek, hdr, { onProgress: report })
+          : await runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, timestamps.length, { onProgress: report });
         await composeSpriteSheet(framePaths, columns, rows, tempSpriteSheetPath);
       } finally {
         await fs.rm(framesDir, { recursive: true, force: true }).catch((error) => {
@@ -755,6 +892,7 @@ export async function generateSpriteSheetWithFFmpeg(
         });
       }
     });
+    report(1);
 
     if (!await fileExists(tempSpriteSheetPath)) {
       throw new Error(`Sprite extraction produced no output at ${tempSpriteSheetPath}`);
