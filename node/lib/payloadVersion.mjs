@@ -25,7 +25,11 @@
 // 5 — multi-audio no longer disqualifies: the transcoder publishes audio groups
 //     and the player picks, so those titles flip to jitEligible: true and lose
 //     their jitReason. Again nothing on disk changes.
-export const MEDIA_PAYLOAD_VERSION = 5;
+// 6 — mediaIdentity.firstSeen added on movies and episodes, and the show-level
+//     mediaIdentity published for the first time. The dates come from the
+//     identity sidecar (already on disk for folders; the per-episode map is
+//     seeded on this pass), so nothing the directory hash sees changes.
+export const MEDIA_PAYLOAD_VERSION = 6;
 
 /**
  * Whether this host advertises JIT transcoder capability.

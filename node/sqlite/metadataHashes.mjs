@@ -464,6 +464,12 @@ export async function generateMovieHashes(db, movie) {
       mediaQuality: movie.mediaQuality,
       metadataUrl: movie.metadataUrl,
       metadata: movie.metadata,
+      // Identity lives OUTSIDE `urls`, so it was the one published movie field
+      // no hash covered: an identity-only change (a repoint, or firstSeen
+      // landing) could never reach a hash-gated consumer. Both values come from
+      // the DB read-side view like everything else here, and firstSeen is the
+      // durable sidecar date or null — never a per-pass timestamp.
+      mediaIdentity: { id: movie.media_id ?? null, firstSeen: movie.first_seen ?? null },
       // Stable null fallback, NOT a fresh timestamp: this value is folded
       // into the hash, so a per-call `new Date()` would move the stored hash
       // on every regeneration for rows without a media mtime (no mp4 found /
@@ -511,6 +517,9 @@ export async function generateTVShowHashes(db, show) {
       poster: show.poster,
       logo: show.logo,
       backdrop: show.backdrop,
+      // Show-level identity is published on /media/tv; fold it in so it can
+      // converge on a hash-gated consumer (same rule as the episode hash below).
+      mediaIdentity: { id: show.media_id ?? null, firstSeen: show.first_seen ?? null },
       seasonKeys: Object.keys(show.seasons)
     };
 

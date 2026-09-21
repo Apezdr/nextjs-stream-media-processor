@@ -149,7 +149,8 @@ export async function initializeSchema(dbType, db) {
         backdrop_source_url TEXT,
         logo_source_url TEXT,
         payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
-        media_id TEXT            -- stable identity; cache of the .mediaid.json sidecar
+        media_id TEXT,           -- stable identity; cache of the .mediaid.json sidecar
+        first_seen TEXT          -- when the folder entered the library; cache of the sidecar's firstSeen
       );
     `);
 
@@ -187,7 +188,8 @@ export async function initializeSchema(dbType, db) {
         backdrop_source_url TEXT,
         logo_source_url TEXT,
         payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
-        media_id TEXT            -- stable identity; cache of the .mediaid.json sidecar
+        media_id TEXT,           -- stable identity; cache of the .mediaid.json sidecar
+        first_seen TEXT          -- when the folder entered the library; cache of the sidecar's firstSeen
       );
     `);
 
@@ -373,6 +375,12 @@ export async function migrateToSchemaParityColumns(db) {
     // dropping this column and rescanning restores it unchanged.
     ['movies',   'media_id TEXT'],
     ['tv_shows', 'media_id TEXT'],
+    // When the folder first entered the library — a CACHE of the sidecar's
+    // firstSeen, published as mediaIdentity.firstSeen. Consumers rank "recently
+    // added" on it because file mtime lies in both directions (a quality
+    // upgrade bumps it, a preserved download mtime buries it).
+    ['movies',   'first_seen TEXT'],
+    ['tv_shows', 'first_seen TEXT'],
   ];
   for (const [table, col] of columns) {
     try {
@@ -733,6 +741,11 @@ export async function getTVShows() {
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Stable content identity + first-seen date. Same allowlist trap as the
+        // movie readers: a column missing here is invisible to /media/tv and to
+        // the show hash.
+        media_id: show.media_id ?? null,
+        first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
         // to /media/tv — the app.mjs handler allowlist drops it.
         pristineMetadata: show.pristine_metadata ?? null,
@@ -759,7 +772,7 @@ export async function getTVShowNamesAndHashes() {
     // and pulling it here keeps that check free rather than costing a full-row
     // read per show per tick.
     return await withRetry(() =>
-      db.all('SELECT name, directory_hash, payload_signature FROM tv_shows')
+      db.all('SELECT name, directory_hash, payload_signature, first_seen FROM tv_shows')
     );
   });
 }
@@ -815,6 +828,7 @@ export async function getMovies() {
         // endpoints no matter what the scanner stored — which is exactly how
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
+        first_seen: movie.first_seen ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -907,6 +921,7 @@ export async function getMovieById(id) {
         // endpoints no matter what the scanner stored — which is exactly how
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
+        first_seen: movie.first_seen ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -973,6 +988,7 @@ export async function getMovieByName(name) {
         // endpoints no matter what the scanner stored — which is exactly how
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
+        first_seen: movie.first_seen ?? null,
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -1040,6 +1056,11 @@ export async function getTVShowById(id) {
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Stable content identity + first-seen date. Same allowlist trap as the
+        // movie readers: a column missing here is invisible to /media/tv and to
+        // the show hash.
+        media_id: show.media_id ?? null,
+        first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
         pristineMetadata: show.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
@@ -1090,6 +1111,11 @@ export async function getTVShowByName(name) {
         basePath: show.base_path,
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
+        // Stable content identity + first-seen date. Same allowlist trap as the
+        // movie readers: a column missing here is invisible to /media/tv and to
+        // the show hash.
+        media_id: show.media_id ?? null,
+        first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
         pristineMetadata: show.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
@@ -1156,7 +1182,8 @@ export async function insertOrUpdateTVShow(
   imageHashes = null,
   pristineMetadata = null,
   sourceUrls = null,
-  mediaId = null
+  mediaId = null,
+  firstSeen = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1186,8 +1213,8 @@ export async function insertOrUpdateTVShow(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           metadata=excluded.metadata,
           metadata_path=excluded.metadata_path,
@@ -1216,7 +1243,10 @@ export async function insertOrUpdateTVShow(
           backdrop_source_url=COALESCE(excluded.backdrop_source_url, tv_shows.backdrop_source_url),
           logo_source_url=COALESCE(excluded.logo_source_url, tv_shows.logo_source_url),
           payload_signature=excluded.payload_signature,
-          media_id=COALESCE(excluded.media_id, tv_shows.media_id)`,
+          media_id=COALESCE(excluded.media_id, tv_shows.media_id),
+          -- Same discipline as media_id: the sidecar is the durable copy, and a
+          -- pass that could not read or write it must not blank the cached date.
+          first_seen=COALESCE(excluded.first_seen, tv_shows.first_seen)`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
@@ -1227,7 +1257,8 @@ export async function insertOrUpdateTVShow(
           // signature is recorded for the TV scanner's own fast-skip to compare
           // against, not to gate the write.
           currentPayloadSignature(),
-          mediaId
+          mediaId,
+          firstSeen
         ]
       )
     );
@@ -1256,7 +1287,8 @@ export async function insertOrUpdateMovie(
   metadata = null,
   pristineMetadata = null,
   sourceUrls = null,
-  mediaId = null
+  mediaId = null,
+  firstSeen = null
 ) {
   return withWriteTx("main", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1317,8 +1349,8 @@ export async function insertOrUpdateMovie(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           file_names=excluded.file_names,
           lengths=excluded.lengths,
@@ -1351,7 +1383,8 @@ export async function insertOrUpdateMovie(
           -- COALESCE-preserved: identity comes from the sidecar, and a pass
           -- that could not read it (unmounted share, transient IO error) must
           -- not blank the cached value.
-          media_id=COALESCE(excluded.media_id, movies.media_id)
+          media_id=COALESCE(excluded.media_id, movies.media_id),
+          first_seen=COALESCE(excluded.first_seen, movies.first_seen)
         WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
         OR movies.backdrop_focal_suggested IS NULL
         OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)
@@ -1392,7 +1425,8 @@ export async function insertOrUpdateMovie(
           sourceUrls?.backdrop ?? null,
           sourceUrls?.logo ?? null,
           movie.payload_signature,
-          mediaId
+          mediaId,
+          firstSeen
         ]
       )
     );

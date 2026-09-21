@@ -199,7 +199,8 @@ export async function saveMovie(
   metadata = null,
   pristineMetadata = null,
   sourceUrls = null,
-  mediaId = null
+  mediaId = null,
+  firstSeen = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -223,7 +224,8 @@ export async function saveMovie(
     metadata,
     pristineMetadata,
     sourceUrls,
-    mediaId
+    mediaId,
+    firstSeen
   );
 }
 
@@ -280,7 +282,8 @@ export async function saveTVShow(
   imageHashes = null,
   pristineMetadata = null,
   sourceUrls = null,
-  mediaId = null
+  mediaId = null,
+  firstSeen = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -303,7 +306,8 @@ export async function saveTVShow(
     imageHashes,
     pristineMetadata,
     sourceUrls,
-    mediaId
+    mediaId,
+    firstSeen
   );
 }
 

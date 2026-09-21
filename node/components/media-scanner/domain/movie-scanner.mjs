@@ -603,6 +603,9 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         dir: fullDirPath,
         libraryRelativePath,
         primarySourceHint: filenameFromUrl(storedUrls?.mp4),
+        // If the sidecar was deleted, it self-heals to the date consumers
+        // already hold rather than re-dating the title to this scan.
+        firstSeenHint: existingMovie?.first_seen ?? null,
       });
       let mediaId = identity.id;
 
@@ -860,7 +863,11 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         metadataFingerprint,
         pristineMetadata,
         sourceUrls,
-        mediaId
+        mediaId,
+        // The DURABLE date only — null when the sidecar could not be written.
+        // It is published and folded into the movie hash, so a per-pass `now`
+        // here would move that hash on every rescan of an unwritable folder.
+        identity.durableFirstSeen
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
