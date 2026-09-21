@@ -10,6 +10,25 @@
 // to be callable without an HTTP server, or that class of bug stays invisible.
 
 /**
+ * The published identity object for a movie or show row.
+ *
+ * `firstSeen` is when this folder first entered the library, read back from the
+ * .mediaid.json sidecar — NOT a file mtime. Consumers rank "recently added" on
+ * it precisely because mtime lies in both directions: a quality upgrade bumps
+ * it, a download with a preserved mtime buries it. It is null when the sidecar
+ * could not be written, never a per-pass timestamp (it is folded into the hash).
+ *
+ * Shared by both builders so the movie and show shapes cannot drift apart.
+ *
+ * @param {{media_id?: string|null, first_seen?: string|null}} row
+ * @returns {{id: string, scheme: 'mid', firstSeen: string|null}|null}
+ */
+export function buildMediaIdentity(row) {
+  if (!row?.media_id) return null;
+  return { id: row.media_id, scheme: 'mid', firstSeen: row.first_seen ?? null };
+}
+
+/**
  * One entry of the `/media/movies` response, keyed by movie name.
  *
  * @param {Object} movie - A row as returned by getMovies()
@@ -23,9 +42,10 @@ export function buildMoviePayloadEntry(movie) {
     // container and rotates on re-encode. See utils/mediaIdentity.mjs.
     //
     // NOTE: getMovies/getMovieById/getMovieByName reshape rows into an explicit
-    // allowlist. If media_id is ever dropped from that list, this silently
-    // emits null forever — which is exactly what happened once already.
-    mediaIdentity: movie.media_id ? { id: movie.media_id, scheme: 'mid' } : null,
+    // allowlist. If media_id (or first_seen) is ever dropped from that list,
+    // this silently emits null forever — which is exactly what happened once
+    // already.
+    mediaIdentity: buildMediaIdentity(movie),
     fileNames: movie.fileNames,
     length: movie.lengths,
     dimensions: movie.dimensions,
@@ -50,6 +70,11 @@ export function buildMoviePayloadEntry(movie) {
  */
 export function buildTvPayloadEntry(show) {
   return {
+    // Show-level identity. Episode ids already derive from it, but the show's
+    // own id and first-seen date were never on the wire. Same allowlist trap as
+    // movies: getTVShows/getTVShowById/getTVShowByName must carry media_id and
+    // first_seen or this is a permanent null.
+    mediaIdentity: buildMediaIdentity(show),
     metadata: show.metadata_path,
     poster: show.poster,
     posterBlurhash: show.posterBlurhash,

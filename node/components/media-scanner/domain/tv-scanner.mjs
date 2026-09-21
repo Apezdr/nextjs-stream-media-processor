@@ -6,6 +6,8 @@ import {
   resolveMediaIdentity,
   repointMediaIdentity,
   episodeMediaId,
+  episodeSeenKey,
+  recordEpisodesFirstSeen,
 } from '../../../utils/mediaIdentity.mjs';
 import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
 import {
@@ -339,7 +341,43 @@ async function processEpisodeSubtitles(seasonPath, episodeFiles, encodedShowName
  * @param {string[]} seasonFiles - Pre-read directory listing for the season
  * @returns {Promise<Object|null>} Episode data object or null if processing fails
  */
-async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null) {
+/**
+ * When this episode first entered the library, from the show sidecar's
+ * per-episode map. Episodes have no sidecar of their own, so the date lives
+ * beside the show's identity and is SEEDED ONCE: a coordinate already in the
+ * map keeps its date through remuxes, upgrades and renames.
+ *
+ * A new coordinate is dated `tracker.now` and queued in `tracker.added`; the
+ * caller persists the batch after every season has been walked. When the show
+ * has no durable sidecar the answer is null — the value is folded into the
+ * episode hash, so an unpersisted date would move that hash on every rebuild.
+ */
+function resolveEpisodeFirstSeen(tracker, seasonNumber, episodeNumber) {
+  if (!tracker) return null;
+  const key = episodeSeenKey(seasonNumber, episodeNumber);
+  if (tracker.known[key]) return tracker.known[key];
+  if (!tracker.durable) return null;
+  tracker.known[key] = tracker.now;
+  tracker.added[key] = tracker.now;
+  return tracker.now;
+}
+
+/**
+ * Null out the dates of episodes whose first-seen could not be persisted, so
+ * the payload never carries a date the next rebuild would contradict.
+ */
+function clearUndurableEpisodeDates(seasonsObj, added) {
+  for (const seasonData of Object.values(seasonsObj)) {
+    for (const episodeData of Object.values(seasonData?.episodes || {})) {
+      const identity = episodeData?.mediaIdentity;
+      if (!identity?.id) continue;
+      const key = identity.id.split(':').pop();
+      if (added[key]) identity.firstSeen = null;
+    }
+  }
+}
+
+async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null, episodeSeen = null) {
   // episodeFiles holds EVERY container for this one episode, already ordered by
   // container priority. The first is the primary — the one that publishes as
   // videoURL — and the rest ride along in sources[].
@@ -385,6 +423,7 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
       ? {
           id: episodeMediaId(showMediaId, seasonNumber, episodeNumber),
           scheme: 'mid',
+          firstSeen: resolveEpisodeFirstSeen(episodeSeen, seasonNumber, episodeNumber),
         }
       : null,
     filename: primary.filename,
@@ -484,7 +523,7 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
  * @param {Object} langMap - Language code mapping
  * @returns {Promise<Object|null>} Season data object or null if no episodes
  */
-async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null) {
+async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null, episodeSeen = null) {
   if (!season.isDirectory()) return null;
 
   const seasonName = season.name;
@@ -556,7 +595,8 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       basePath,
       langMap,
       episodes,
-      showMediaId
+      showMediaId,
+      episodeSeen
     );
 
     if (episodeResult) {
@@ -589,6 +629,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   const existingShowHashes = await getExistingTVShowHashes();
   const hashMap = new Map(existingShowHashes.map(s => [s.name, s.directory_hash]));
   const signatureMap = new Map(existingShowHashes.map(s => [s.name, s.payload_signature]));
+  // The published first-seen date per show, so a deleted sidecar self-heals to
+  // the date consumers already hold instead of re-dating the show to this scan.
+  const firstSeenMap = new Map(existingShowHashes.map(s => [s.name, s.first_seen ?? null]));
   const existingShowNames = new Set(existingShowHashes.map(s => s.name));
 
   // Bounded concurrency for season processing (moderate load — not unbounded)
@@ -633,6 +676,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       const showIdentity = await resolveMediaIdentity({
         dir: showPath,
         libraryRelativePath: `tv/${showName}`,
+        firstSeenHint: firstSeenMap.get(showName) ?? null,
       });
       let showMediaId = showIdentity.id;
       const showClaim = await recordMediaIdentity(db, identityClaims, {
@@ -943,6 +987,18 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         metadataResult = retryMetadataResult;
       }
 
+      // Per-episode first-seen tracker for this show. `known` starts as the
+      // sidecar's map; processEpisode dates unseen coordinates `now` and queues
+      // them in `added`, persisted in ONE sidecar write after the seasons below.
+      // The sidecar is excluded from the directory hash (HASH_EXCLUDED_FILES),
+      // so that write cannot make the next scan think the show changed.
+      const episodeSeen = {
+        known: { ...showIdentity.episodes },
+        added: {},
+        now: new Date().toISOString(),
+        durable: showIdentity.origin !== 'derived-unwritable',
+      };
+
       // Process seasons with bounded concurrency
       const seasonsObj = {};
       await Promise.all(
@@ -955,7 +1011,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
             prefixPath,
             basePath,
             langMap,
-            showMediaId
+            showMediaId,
+            episodeSeen
           );
           
           if (seasonResult) {
@@ -963,6 +1020,17 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           }
         }))
       );
+
+      // Persist newly observed episodes. If the write does not land, publish
+      // null for exactly those episodes: a date that is not on disk would be
+      // re-minted by the next rebuild and flap the episode hash.
+      if (Object.keys(episodeSeen.added).length > 0) {
+        const persisted = await recordEpisodesFirstSeen({ dir: showPath, added: episodeSeen.added });
+        if (!persisted) {
+          logger.warn(`episode first-seen dates not persisted for tv/${showName}; publishing null`);
+          clearUndurableEpisodeDates(seasonsObj, episodeSeen.added);
+        }
+      }
 
       // Sort seasons
       const sortedSeasons = Object.fromEntries(
@@ -1014,7 +1082,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         imageHashes,
         pristineMetadata,
         sourceUrls,
-        showMediaId
+        showMediaId,
+        // The DURABLE date only — see the matching note in movie-scanner.mjs.
+        showIdentity.durableFirstSeen
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

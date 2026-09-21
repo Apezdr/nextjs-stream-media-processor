@@ -488,3 +488,136 @@ describe('convergence and stability', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------- first seen
+
+describe('mediaIdentity.firstSeen — the library-add date', () => {
+  // Consumers rank "recently added" on this because file mtime lies in both
+  // directions: a quality upgrade bumps it, a download with a preserved mtime
+  // buries it. So the properties that matter are (1) it is on the wire at every
+  // level, and (2) NOTHING that happens to a file after it arrives moves it.
+  const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  const episodesOf = (payload, show, season) => payload[show].seasons[season].episodes;
+
+  it('emits firstSeen on movies, shows and episodes', async () => {
+    const movies = await moviePayload();
+    expect(movies['Solo Movie'].mediaIdentity.firstSeen).toMatch(ISO);
+
+    const tv = await tvPayload();
+    // The show-level identity was never published before payload version 6.
+    expect(tv['Mkv Show'].mediaIdentity.id).toMatch(/^mid:[0-9a-f]{16}$/);
+    expect(tv['Mkv Show'].mediaIdentity.scheme).toBe('mid');
+    expect(tv['Mkv Show'].mediaIdentity.firstSeen).toMatch(ISO);
+
+    const eps = episodesOf(tv, 'Mkv Show', 'Season 01');
+    expect(eps.S01E01.mediaIdentity.firstSeen).toMatch(ISO);
+    expect(eps.S01E02.mediaIdentity.firstSeen).toMatch(ISO);
+    // The episode id is prefixed by the published show id.
+    expect(eps.S01E01.mediaIdentity.id.startsWith(`${tv['Mkv Show'].mediaIdentity.id}:`)).toBe(true);
+  });
+
+  it('persists episode dates in the SHOW sidecar, keyed by coordinate', async () => {
+    const sidecar = JSON.parse(
+      await fs.readFile(join(MEDIA, 'tv', 'Mkv Show', '.mediaid.json'), 'utf8')
+    );
+    const eps = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01');
+    expect(sidecar.episodes.s01e01).toBe(eps.S01E01.mediaIdentity.firstSeen);
+    expect(sidecar.episodes.s01e02).toBe(eps.S01E02.mediaIdentity.firstSeen);
+  });
+
+  it('a REPLACED episode file keeps its date — an upgrade is not an addition', async () => {
+    const seasonDir = join(MEDIA, 'tv', 'Mkv Show', 'Season 01');
+    const before = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01').S01E02;
+
+    // What Sonarr does on a quality upgrade: the old file goes, a new file with
+    // a different name and a fresh mtime takes the same S/E coordinate.
+    await fs.rm(join(seasonDir, 'Mkv Show - S01E02.mkv'));
+    await fs.writeFile(join(seasonDir, 'Mkv Show - S01E02.REPACK.mkv'), 'y'.repeat(128));
+    await runScan();
+
+    const after = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01').S01E02;
+    expect(after.filename).toBe('Mkv Show - S01E02.REPACK.mkv');
+    expect(after.mediaIdentity.firstSeen).toBe(before.mediaIdentity.firstSeen);
+
+    // Restore the fixture for later tests.
+    await fs.rm(join(seasonDir, 'Mkv Show - S01E02.REPACK.mkv'));
+    await fs.writeFile(join(seasonDir, 'Mkv Show - S01E02.mkv'), 'x'.repeat(64));
+    await runScan();
+  });
+
+  it('a NEW episode is dated on arrival without moving its siblings', async () => {
+    const seasonDir = join(MEDIA, 'tv', 'Mkv Show', 'Season 01');
+    const before = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01');
+    const showBefore = (await tvPayload())['Mkv Show'].mediaIdentity.firstSeen;
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await fs.writeFile(join(seasonDir, 'Mkv Show - S01E03.mkv'), 'z'.repeat(64));
+    await runScan();
+
+    const tv = await tvPayload();
+    const after = episodesOf(tv, 'Mkv Show', 'Season 01');
+    expect(after.S01E03.mediaIdentity.firstSeen).toMatch(ISO);
+    expect(after.S01E03.mediaIdentity.firstSeen > before.S01E01.mediaIdentity.firstSeen).toBe(true);
+    expect(after.S01E01.mediaIdentity.firstSeen).toBe(before.S01E01.mediaIdentity.firstSeen);
+    expect(after.S01E02.mediaIdentity.firstSeen).toBe(before.S01E02.mediaIdentity.firstSeen);
+    // A new episode does not re-date the show.
+    expect(tv['Mkv Show'].mediaIdentity.firstSeen).toBe(showBefore);
+
+    await fs.rm(join(seasonDir, 'Mkv Show - S01E03.mkv'));
+    await runScan();
+  });
+
+  it('a REPLACED movie file keeps its date', async () => {
+    const dir = join(MEDIA, 'movies', 'Mkv Only');
+    const before = (await moviePayload())['Mkv Only'].mediaIdentity.firstSeen;
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await fs.writeFile(join(dir, 'Remux.2160p.mkv'), 'upgraded'.repeat(32));
+    await runScan();
+
+    expect((await moviePayload())['Mkv Only'].mediaIdentity.firstSeen).toBe(before);
+  });
+
+  it('a DELETED sidecar self-heals to the date already published', async () => {
+    // Without the SQLite-cached hint the re-established sidecar would say
+    // "now", and a consumer would see the title re-dated by a housekeeping
+    // accident. The directory hash ignores the sidecar, so force the rescan the
+    // way a real change would: touch a library file.
+    const dir = join(MEDIA, 'movies', 'Solo Movie');
+    const before = (await moviePayload())['Solo Movie'].mediaIdentity.firstSeen;
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await fs.rm(join(dir, '.mediaid.json'));
+    await fs.writeFile(join(dir, 'Solo.en.srt'), 'changed subtitle');
+    await runScan();
+
+    const sidecar = JSON.parse(await fs.readFile(join(dir, '.mediaid.json'), 'utf8'));
+    expect(sidecar.firstSeen).toBe(before);
+    expect((await moviePayload())['Solo Movie'].mediaIdentity.firstSeen).toBe(before);
+  });
+
+  it('folds identity into the MOVIE hash, which no field covered before', async () => {
+    // mediaIdentity sits outside `urls`, so it was the one published movie
+    // field a hash-gated consumer could never see change.
+    const readHash = async () =>
+      (
+        await db.get(
+          `SELECT hash FROM metadata_hashes
+           WHERE media_type = 'movies' AND title = ? AND season_number IS NULL`,
+          ['Avi Only']
+        )
+      )?.hash;
+
+    const before = await readHash();
+    expect(before).toBeTruthy();
+
+    const { generateMovieHashes } = await import('../../sqlite/metadataHashes.mjs');
+    const row = await sqliteDb.getMovieByName('Avi Only');
+    await generateMovieHashes(db, { ...row, first_seen: '2001-01-01T00:00:00.000Z' });
+    expect(await readHash()).not.toBe(before);
+
+    // Put the real hash back.
+    await generateMovieHashes(db, row);
+    expect(await readHash()).toBe(before);
+  });
+});

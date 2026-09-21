@@ -32,6 +32,24 @@
 //
 // The folder is the unit of content, so a Theatrical cut and a Director's cut
 // in separate folders correctly keep separate resume positions.
+//
+// The same sidecar is also the durable answer to "when did this enter the
+// library": `firstSeen` for the folder, plus an `episodes` map (s##e## ->
+// timestamp) for a show, because episodes have no sidecar of their own. Both are
+// published as mediaIdentity.firstSeen and both follow the primarySource rule —
+// SEEDED ONCE, NEVER RECOMPUTED. That is the entire point: a file's mtime moves
+// on a quality upgrade and is preserved-old on many downloads, so it cannot rank
+// "recently added". A date pinned at first sight, and immune to everything that
+// later happens to the file, can.
+//
+//   | Change                                   | firstSeen |
+//   |------------------------------------------|-----------|
+//   | File replaced / upgraded / re-encoded    | unchanged
+//   | Episode file renamed                     | unchanged — keyed by coordinate
+//   | New episode added to an existing show    | new key dated now; siblings and show unchanged
+//   | Episode deleted, later restored          | unchanged — keys are never removed
+//   | Sidecar deleted                          | restored from the SQLite-cached date (firstSeenHint)
+//   | Sidecar unwritable / unreadable          | published as null, never a per-pass "now"
 
 import { promises as fs } from 'fs';
 import { join } from 'path';
@@ -174,18 +192,31 @@ async function writeIdentitySidecar(dir, data) {
  *        Filename to record as the primary source when establishing identity.
  *        Seeded from the row's ALREADY-STORED url so existing titles keep
  *        publishing the same URL — see the note below.
+ * @param {string|null} [params.firstSeenHint]
+ *        A previously published first-seen timestamp (the SQLite cache of this
+ *        sidecar). Used ONLY when a sidecar has to be established or is missing
+ *        its firstSeen, so a deleted sidecar self-heals to the date consumers
+ *        already hold instead of re-dating the title to "now".
  * @param {string} [params.now] - ISO timestamp (injectable for tests)
- * @returns {Promise<{id: string, firstSeen: string, primarySource: string|null,
+ * @returns {Promise<{id: string, firstSeen: string, durableFirstSeen: string|null,
+ *                    primarySource: string|null, episodes: Object<string,string>,
  *                    origin: 'sidecar'|'established'|'derived-unwritable'}>}
+ *   `durableFirstSeen` is the first-seen timestamp ONLY when it is known to be
+ *   on disk. It is what gets PUBLISHED: the value is folded into the metadata
+ *   hash, so a per-pass `now` from a folder whose sidecar cannot be written
+ *   would move that hash on every rebuild. Stable null beats a flapping date.
+ *   `episodes` is the per-episode first-seen map (see episodeSeenKey).
  */
 export async function resolveMediaIdentity({
   dir,
   libraryRelativePath,
   primarySourceHint = null,
+  firstSeenHint = null,
   now = new Date().toISOString(),
 }) {
   const derivedId = deriveMediaId(libraryRelativePath);
   const { data, unreadable } = await readIdentitySidecar(dir);
+  const seededFirstSeen = isIsoTimestamp(firstSeenHint) ? firstSeenHint : now;
 
   if (data) {
     // Honour the stored id. This is what makes a rename survivable, and it is
@@ -194,22 +225,34 @@ export async function resolveMediaIdentity({
     // primarySource is only filled in when it is missing — the plan's rule is
     // "seeded once, never recomputed". Rewriting it whenever the priority order
     // would pick differently is exactly how a title's published URL, and with
-    // it the legacy watch-history key, would drift.
-    if (!data.primarySource && primarySourceHint) {
-      const updated = { ...data, primarySource: primarySourceHint };
-      await writeIdentitySidecar(dir, updated);
+    // it the legacy watch-history key, would drift. firstSeen follows the same
+    // rule: backfilled once when absent, never moved afterwards.
+    const needsPrimarySource = !data.primarySource && primarySourceHint;
+    const needsFirstSeen = !isIsoTimestamp(data.firstSeen);
+
+    if (needsPrimarySource || needsFirstSeen) {
+      const updated = {
+        ...data,
+        ...(needsPrimarySource ? { primarySource: primarySourceHint } : {}),
+        ...(needsFirstSeen ? { firstSeen: seededFirstSeen } : {}),
+      };
+      const wrote = await writeIdentitySidecar(dir, updated);
       return {
         id: updated.id,
-        firstSeen: updated.firstSeen ?? now,
-        primarySource: updated.primarySource,
+        firstSeen: updated.firstSeen,
+        durableFirstSeen: needsFirstSeen && !wrote ? null : updated.firstSeen,
+        primarySource: updated.primarySource ?? null,
+        episodes: episodeSeenMapOf(updated),
         origin: 'sidecar',
       };
     }
 
     return {
       id: data.id,
-      firstSeen: data.firstSeen ?? now,
+      firstSeen: data.firstSeen,
+      durableFirstSeen: data.firstSeen,
       primarySource: data.primarySource ?? null,
+      episodes: episodeSeenMapOf(data),
       origin: 'sidecar',
     };
   }
@@ -221,7 +264,9 @@ export async function resolveMediaIdentity({
     return {
       id: derivedId,
       firstSeen: now,
+      durableFirstSeen: null,
       primarySource: primarySourceHint,
+      episodes: {},
       origin: 'derived-unwritable',
     };
   }
@@ -231,7 +276,7 @@ export async function resolveMediaIdentity({
     id: derivedId,
     derivedFrom: String(libraryRelativePath).replace(/\\/g, '/'),
     primarySource: primarySourceHint,
-    firstSeen: now,
+    firstSeen: seededFirstSeen,
     previousIds: [],
   };
 
@@ -242,10 +287,70 @@ export async function resolveMediaIdentity({
 
   return {
     id: derivedId,
-    firstSeen: now,
+    firstSeen: seededFirstSeen,
+    durableFirstSeen: wrote ? seededFirstSeen : null,
     primarySource: primarySourceHint,
+    episodes: {},
     origin: wrote ? 'established' : 'derived-unwritable',
   };
+}
+
+function isIsoTimestamp(value) {
+  return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
+}
+
+function episodeSeenMapOf(data) {
+  const map = data?.episodes;
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return {};
+  return Object.fromEntries(Object.entries(map).filter(([, v]) => isIsoTimestamp(v)));
+}
+
+/**
+ * Key of one episode inside a show sidecar's `episodes` first-seen map.
+ *
+ * The same coordinate the episode id uses, so the map and the id can never
+ * disagree about which episode they describe.
+ *
+ * @returns {string} e.g. 's01e03'
+ */
+export function episodeSeenKey(season, episode) {
+  const ss = String(parseInt(season, 10)).padStart(2, '0');
+  const ee = String(parseInt(episode, 10)).padStart(2, '0');
+  return `s${ss}e${ee}`;
+}
+
+/**
+ * Persist newly observed episodes into a show sidecar's first-seen map.
+ *
+ * Episodes have no sidecar of their own, so "when did this episode enter the
+ * library" lives beside the show's identity. Same discipline as primarySource:
+ * SEEDED ONCE, NEVER RECOMPUTED — an existing key is never overwritten, and a
+ * key is never removed (a deleted-then-restored episode keeps its date).
+ *
+ * @param {Object} params
+ * @param {string} params.dir - Absolute show folder path
+ * @param {Object<string,string>} params.added - key (episodeSeenKey) -> ISO timestamp
+ * @returns {Promise<boolean>} whether every added key is now on disk
+ */
+export async function recordEpisodesFirstSeen({ dir, added }) {
+  const entries = Object.entries(added || {}).filter(([, v]) => isIsoTimestamp(v));
+  if (entries.length === 0) return true;
+
+  const { data } = await readIdentitySidecar(dir);
+  // No trustworthy sidecar to extend (unreadable, or the establish write
+  // failed). The caller must then publish null rather than an undurable date.
+  if (!data) return false;
+
+  const existing = episodeSeenMapOf(data);
+  const merged = { ...existing };
+  for (const [key, value] of entries) {
+    if (!merged[key]) merged[key] = value;
+  }
+  if (Object.keys(merged).length === Object.keys(existing).length) return true;
+
+  // Sorted so the file is diff-stable regardless of scan concurrency order.
+  const sorted = Object.fromEntries(Object.entries(merged).sort(([a], [b]) => a.localeCompare(b)));
+  return writeIdentitySidecar(dir, { ...data, episodes: sorted });
 }
 
 /**
@@ -274,6 +379,9 @@ export async function repointMediaIdentity({ dir, libraryRelativePath, now = new
     primarySource: data?.primarySource ?? null,
     firstSeen: data?.firstSeen ?? now,
     previousIds,
+    // A repoint changes WHICH id the folder answers to, not when its episodes
+    // entered the library — dropping the map here would re-date every episode.
+    ...(Object.keys(episodeSeenMapOf(data)).length > 0 ? { episodes: episodeSeenMapOf(data) } : {}),
   });
 
   return newId;
