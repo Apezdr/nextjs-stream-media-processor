@@ -112,9 +112,30 @@ describe('RadarrProvider', () => {
       externalIds: { imdb: 'tt5559796' },
       hasFile: true,
       providerPath: '/processed_movies/The Professor',
+      released: true,
+      arrStatus: 'released',
+      monitored: true,
     });
     expect(claims.find((c) => c.tmdbId === 999001).hasFile).toBe(false);
     expect(provider.lastFetch).toMatchObject({ items: 5, claims: 4, unmapped: 0, noId: 1 });
+  });
+
+  it('carries release availability: isAvailable → released, status verbatim, monitored', async () => {
+    const fetchImpl = fakeFetch({ '/api/v3/movie': await loadFixture('radarr-movies.json') });
+    const claims = await RadarrProvider.fromEnv(env, { fetchImpl }).fetchClaims();
+    // Announced, not yet obtainable, Radarr watching: the "not released yet" row.
+    expect(claims.find((c) => c.tmdbId === 999001)).toMatchObject({ hasFile: false, released: false, arrStatus: 'announced', monitored: true });
+    // Released but unmonitored.
+    expect(claims.find((c) => c.tmdbId === 999002)).toMatchObject({ released: true, arrStatus: 'released', monitored: false });
+  });
+
+  it('an item without the availability fields yields null, never false', () => {
+    const provider = RadarrProvider.fromEnv(env, {});
+    const claim = provider.claimFromItem({ tmdbId: 7, path: '/processed_movies/Old Radarr', hasFile: false });
+    expect(claim).toMatchObject({ released: null, arrStatus: null, monitored: null });
+    // Webhook subjects do not carry them either.
+    const [event] = provider.parseWebhook({ eventType: 'MovieAdded', movie: { tmdbId: 7, folderPath: '/processed_movies/Old Radarr' } });
+    expect(event.claim).toMatchObject({ released: null, arrStatus: null, monitored: null });
   });
 
   it('with a root map, items under unmapped roots are skipped and counted', async () => {
@@ -206,9 +227,21 @@ describe('SonarrProvider', () => {
       externalIds: { imdb: 'tt6611916', tvdb: 354167 },
       hasFile: true,
       providerPath: '/processed_tv/Kingdom (2019)',
+      released: true,
+      arrStatus: 'continuing',
+      monitored: true,
     });
-    expect(claims[1]).toMatchObject({ libraryRelativePath: 'tv/Kingdom (2014)', tmdbId: 61137, hasFile: false });
+    expect(claims[1]).toMatchObject({ libraryRelativePath: 'tv/Kingdom (2014)', tmdbId: 61137, hasFile: false, released: true, arrStatus: 'ended', monitored: false });
     expect(fetchImpl.calls[0].url).toBe('http://sonarr:8989/api/v3/series');
+  });
+
+  it('released follows status: upcoming → false, continuing/ended → true, absent → null', () => {
+    const provider = SonarrProvider.fromEnv(env, {});
+    const claim = (extra) => provider.claimFromItem({ tmdbId: 5, path: '/processed_tv/X', ...extra });
+    expect(claim({ status: 'upcoming' })).toMatchObject({ released: false, arrStatus: 'upcoming' });
+    expect(claim({ status: 'continuing' })).toMatchObject({ released: true });
+    expect(claim({ status: 'ended' })).toMatchObject({ released: true });
+    expect(claim({})).toMatchObject({ released: null, arrStatus: null, monitored: null });
   });
 
   it('two same-titled shows are two distinct claims — no name heuristic involved', async () => {

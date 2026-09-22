@@ -151,6 +151,26 @@ export class ArrProvider extends IdentityProvider {
     return ids;
   }
 
+  /**
+   * implement — whether the app considers the title obtainable now. Each app
+   * has its own verdict (Radarr: isAvailable; Sonarr: status !== upcoming);
+   * null when the item does not carry it.
+   */
+  // eslint-disable-next-line no-unused-vars
+  itemReleased(item) {
+    return null;
+  }
+
+  /** The app's own lifecycle word, verbatim. Shared shape across the family. */
+  itemArrStatus(item) {
+    return typeof item?.status === 'string' && item.status ? item.status : null;
+  }
+
+  /** Whether the app is actively looking for it. Shared shape across the family. */
+  itemMonitored(item) {
+    return typeof item?.monitored === 'boolean' ? item.monitored : null;
+  }
+
   // ---- HTTP ---------------------------------------------------------------
 
   /**
@@ -235,6 +255,9 @@ export class ArrProvider extends IdentityProvider {
       externalIds: this.itemExternalIds(item),
       hasFile: this.itemHasFile(item),
       providerPath,
+      released: this.itemReleased(item),
+      arrStatus: this.itemArrStatus(item),
+      monitored: this.itemMonitored(item),
     });
   }
 

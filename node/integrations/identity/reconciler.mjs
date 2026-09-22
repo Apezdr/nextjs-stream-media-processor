@@ -67,6 +67,24 @@ export function fingerprintFolders(foldersByType) {
   return createHash('sha1').update(lines.sort().join('\n')).digest('hex');
 }
 
+/**
+ * A provider-only row: the claim's provider-side facts, forwarded unchanged
+ * so the admin page can say why a title is expected but absent (queued,
+ * not released, not monitored, drift).
+ */
+function providerOnlyRow(claim) {
+  return {
+    libraryRelativePath: claim.libraryRelativePath,
+    tmdbId: claim.tmdbId,
+    source: claim.source,
+    hasFile: claim.hasFile,
+    providerPath: claim.providerPath,
+    released: claim.released ?? null,
+    arrStatus: claim.arrStatus ?? null,
+    monitored: claim.monitored ?? null,
+  };
+}
+
 function capped(list, cap) {
   return { items: list.slice(0, cap), total: list.length, truncated: Math.max(0, list.length - cap) };
 }
@@ -197,24 +215,11 @@ export async function reconcileIdentities({
             break;
           case 'missing-folder':
             totals.providerOnly++;
-            providerOnly.push({
-              libraryRelativePath: claim.libraryRelativePath,
-              tmdbId: claim.tmdbId,
-              source: claim.source,
-              hasFile: claim.hasFile,
-              providerPath: claim.providerPath,
-            });
+            providerOnly.push(providerOnlyRow(claim));
             break;
           case 'nested-path':
             totals.nested++;
-            providerOnly.push({
-              libraryRelativePath: claim.libraryRelativePath,
-              tmdbId: claim.tmdbId,
-              source: claim.source,
-              hasFile: claim.hasFile,
-              providerPath: claim.providerPath,
-              nested: true,
-            });
+            providerOnly.push({ ...providerOnlyRow(claim), nested: true });
             break;
           default:
             totals.errors++;

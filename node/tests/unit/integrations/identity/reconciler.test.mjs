@@ -24,13 +24,16 @@ class FakeProvider extends IdentityProvider {
 
   async fetchClaims() {
     if (this.fail) throw this.fail;
-    return this.claims.map(({ folder, tmdbId, hasFile = true }) =>
+    return this.claims.map(({ folder, tmdbId, hasFile = true, released, arrStatus, monitored }) =>
       this.makeClaim({
         mediaType: this.mediaType,
         libraryRelativePath: `${this.mediaType === 'movie' ? 'movies' : 'tv'}/${folder}`,
         tmdbId,
         hasFile,
         title: folder,
+        released,
+        arrStatus,
+        monitored,
       })
     );
   }
@@ -86,7 +89,7 @@ describe('reconcileIdentities', () => {
         { folder: 'Legacy Pin', tmdbId: 444 },
         { folder: 'Fresh (2024)', tmdbId: 555 },
         { folder: 'Frozen', tmdbId: 333 },
-        { folder: 'Queued Download (2026)', tmdbId: 666, hasFile: false }, // provider-only
+        { folder: 'Queued Download (2026)', tmdbId: 666, hasFile: false, released: false, arrStatus: 'announced', monitored: true }, // provider-only
       ]),
       new FakeProvider('sonarr', 'tv', [{ folder: 'Kingdom (2019)', tmdbId: 83097 }]),
     ]);
@@ -130,8 +133,13 @@ describe('reconcileIdentities', () => {
     expect(report.written.items.find((w) => w.libraryRelativePath === 'movies/The Professor')).toMatchObject({ replacedId: 9327, replacedSource: 'auto' });
     expect(report.conflicts.items.map((c) => c.libraryRelativePath).sort()).toEqual(['movies/Arrival (2016)', 'movies/Legacy Pin']);
     expect(report.conflicts.items.find((c) => c.libraryRelativePath === 'movies/Legacy Pin')).toMatchObject({ storedId: 222, storedSource: 'manual', providerId: 444, source: 'radarr' });
+    // The provider-only row forwards the provider's own availability verdict
+    // unchanged, so the page can say "not released yet" rather than a generic line.
     expect(report.providerOnly.items).toEqual([
-      expect.objectContaining({ libraryRelativePath: 'movies/Queued Download (2026)', tmdbId: 666, hasFile: false }),
+      expect.objectContaining({
+        libraryRelativePath: 'movies/Queued Download (2026)', tmdbId: 666, hasFile: false,
+        released: false, arrStatus: 'announced', monitored: true,
+      }),
     ]);
     expect(report.unmanaged.items).toEqual(['movies/Home Video']);
     expect(report.index.providers).toHaveLength(2);
@@ -170,6 +178,14 @@ describe('reconcileIdentities', () => {
       { basePath, unsourcedPinTreatment: 'manual' }
     );
     expect(result.outcome).toBe('nested-path');
+  });
+
+  it('a claim without availability fields yields null on the provider-only row, never false', async () => {
+    const index = await buildIdentityIndex([
+      new FakeProvider('radarr', 'movie', [{ folder: 'Ghost (2030)', tmdbId: 777, hasFile: false }]),
+    ]);
+    const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual' });
+    expect(report.providerOnly.items[0]).toMatchObject({ libraryRelativePath: 'movies/Ghost (2030)', released: null, arrStatus: null, monitored: null });
   });
 
   it('a claim for a folder that does not exist writes nothing', async () => {
