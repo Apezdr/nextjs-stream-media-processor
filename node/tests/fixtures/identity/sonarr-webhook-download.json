@@ -1,0 +1,30 @@
+{
+  "series": {
+    "id": 10,
+    "title": "Kingdom",
+    "titleSlug": "kingdom-2019",
+    "path": "/processed_tv/Kingdom (2019)",
+    "tvdbId": 354167,
+    "tvMazeId": 41045,
+    "tmdbId": 83097,
+    "imdbId": "tt6611916",
+    "type": "standard",
+    "year": 2019
+  },
+  "episodes": [
+    { "id": 500, "episodeNumber": 3, "seasonNumber": 2, "title": "Episode 3", "seriesId": 10, "tvdbId": 1 }
+  ],
+  "episodeFile": {
+    "id": 900,
+    "relativePath": "Season 02/Kingdom.S02E03.mkv",
+    "path": "/processed_tv/Kingdom (2019)/Season 02/Kingdom.S02E03.mkv",
+    "quality": "WEBDL-1080p"
+  },
+  "isUpgrade": true,
+  "deletedFiles": [
+    { "id": 899, "relativePath": "Season 02/Kingdom.S02E03.720p.mkv", "path": "/processed_tv/Kingdom (2019)/Season 02/Kingdom.S02E03.720p.mkv" }
+  ],
+  "downloadClient": "SABnzbd",
+  "eventType": "Download",
+  "instanceName": "Sonarr"
+}

@@ -6,7 +6,7 @@ import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
 import { fileExists, findVideoFile, stripVideoExtension, findSeasonFolder, safeJoin, PathTraversalError } from '../utils/utils.mjs';
 import { MetadataGenerator } from '../lib/metadataGenerator.mjs';
 import { searchMedia } from '../utils/tmdb.mjs';
-import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath } from '../utils/tmdbConfig.mjs';
+import { loadTmdbConfig, saveTmdbConfig, getTmdbConfigFilePath, stampProvenanceForOperatorWrite } from '../utils/tmdbConfig.mjs';
 import { sessionManager } from '../middleware/sessionCache.mjs';
 import { getLanguageCode } from '../utils/languageMap.mjs';
 
@@ -474,14 +474,20 @@ router.put('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
         
         logger.info(`Admin ${req.user.email} updating TMDB config for ${mediaType}: ${mediaName}`);
 
-        await saveTmdbConfig(configPath, config);
+        // Full replace (A-2) stays a full replace. Only the id's provenance is
+        // settled here: an id this operator added or changed becomes `manual`
+        // so no identity provider can put the old one back; an unchanged id
+        // keeps the source it had. See stampProvenanceForOperatorWrite.
+        const previousConfig = await loadTmdbConfig(configPath);
+        const stamped = stampProvenanceForOperatorWrite(previousConfig, config);
+        await saveTmdbConfig(configPath, stamped);
 
         return res.status(200).json({
             success: true,
             message: 'TMDB configuration updated successfully',
             mediaType,
             mediaName,
-            config,
+            config: stamped,
             configPath
         });
 

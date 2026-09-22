@@ -1,0 +1,33 @@
+[
+  {
+    "id": 10,
+    "title": "Kingdom",
+    "year": 2019,
+    "path": "/processed_tv/Kingdom (2019)",
+    "rootFolderPath": "/processed_tv",
+    "tvdbId": 354167,
+    "tmdbId": 83097,
+    "imdbId": "tt6611916",
+    "statistics": { "episodeFileCount": 12 }
+  },
+  {
+    "id": 11,
+    "title": "Kingdom",
+    "year": 2014,
+    "path": "/processed_tv/Kingdom (2014)",
+    "rootFolderPath": "/processed_tv",
+    "tvdbId": 280385,
+    "tmdbId": 61137,
+    "imdbId": "tt3411660",
+    "statistics": { "episodeFileCount": 0 }
+  },
+  {
+    "id": 12,
+    "title": "No Ids Yet",
+    "year": 2026,
+    "path": "/processed_tv/No Ids Yet",
+    "rootFolderPath": "/processed_tv",
+    "tvdbId": 1,
+    "statistics": { "episodeFileCount": 1 }
+  }
+]

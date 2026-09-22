@@ -45,6 +45,8 @@ import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
+import { createIdentityService } from "./integrations/identity/index.mjs";
+import { setupIdentityRoutes } from "./integrations/identity/routes.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
 import { langMap } from "./utils/languageMap.mjs";
 const logger = createCategoryLogger('main');
@@ -64,6 +66,28 @@ const BASE_PATH = process.env.BASE_PATH
   : "/var/www/html";
 // PREFIX_PATH is used to prefix the URL path for the server. Useful for reverse proxies.
 const PREFIX_PATH = process.env.PREFIX_PATH || "";
+
+// Identity providers (Radarr/Sonarr today): exact TMDB ids for managed
+// folders, reconciled into tmdb.config at the top of every scan tick and on
+// provider webhooks. Enabled purely by provider env; unset = no-op.
+// See integrations/identity/README.md.
+const identityService = createIdentityService({
+  basePath: BASE_PATH,
+  logger: createCategoryLogger('identity'),
+  requestScan: requestEarlyScan,
+});
+
+// A webhook asks for the normal tick to run now. Coalesce: one early run at a
+// time, and never a pile-up when a batch of imports lands together.
+let earlyScanInFlight = null;
+function requestEarlyScan(reason) {
+  if (earlyScanInFlight) return earlyScanInFlight;
+  logger.info(`Early media scan requested (${reason})`);
+  earlyScanInFlight = runGenerateList()
+    .catch((error) => logger.error(`Early media scan failed (${reason}): ${error.message ?? error}`))
+    .finally(() => { earlyScanInFlight = null; });
+  return earlyScanInFlight;
+}
 const scriptsDir = resolve(__dirname, "../scripts");
 // (RETRY_INTERVAL_HOURS used to live here but was dead code after the Python
 // scheduled job was removed; the canonical constant now lives in
@@ -1100,7 +1124,11 @@ async function runGenerateList() {
   // Use the MEDIA_SCAN task type for overall orchestration
   return enqueueTask(TaskType.MEDIA_SCAN, 'Media List Generation', async () => {
     logger.info('Generating media list - controlled by task manager');
-    
+
+    // Identity reconcile FIRST, so any tmdb.config it writes is already on
+    // disk when the scanners below read mtimes. Never throws; disabled = no-op.
+    await identityService.reconcileForTick();
+
     // Process movies using the specialized MOVIE_SCAN task type
     await enqueueTask(TaskType.MOVIE_SCAN, 'Movie List Generation', async () => {
       const movieDb = await initializeDatabase();
@@ -1330,6 +1358,9 @@ async function initialize() {
 }
 
 // Use the modular route system
+// Identity provider webhooks + status/report, next to /rescan/tmdb in spirit:
+// the service instance lives here, so the routes mount here.
+app.use('/api', setupIdentityRoutes(identityService));
 app.use(setupRoutes());
 
 //

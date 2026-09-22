@@ -1,0 +1,49 @@
+[
+  {
+    "id": 1,
+    "title": "The Professor",
+    "year": 2018,
+    "path": "/processed_movies/The Professor",
+    "rootFolderPath": "/processed_movies",
+    "tmdbId": 467956,
+    "imdbId": "tt5559796",
+    "hasFile": true
+  },
+  {
+    "id": 2,
+    "title": "Dune",
+    "year": 2021,
+    "path": "/processed_movies/Dune (2021)",
+    "rootFolderPath": "/processed_movies",
+    "tmdbId": 438631,
+    "imdbId": "tt1160419",
+    "hasFile": true
+  },
+  {
+    "id": 3,
+    "title": "Not Downloaded Yet",
+    "year": 2026,
+    "path": "/processed_movies/Not Downloaded Yet (2026)",
+    "rootFolderPath": "/processed_movies",
+    "tmdbId": 999001,
+    "hasFile": false
+  },
+  {
+    "id": 4,
+    "title": "Kids Film",
+    "year": 2020,
+    "path": "/kids_movies/Kids Film (2020)",
+    "rootFolderPath": "/kids_movies",
+    "tmdbId": 999002,
+    "hasFile": true
+  },
+  {
+    "id": 5,
+    "title": "Broken Entry",
+    "year": 2001,
+    "path": "/processed_movies/Broken Entry",
+    "rootFolderPath": "/processed_movies",
+    "tmdbId": 0,
+    "hasFile": true
+  }
+]

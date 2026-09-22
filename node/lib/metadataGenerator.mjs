@@ -5,6 +5,7 @@ import { createCategoryLogger } from './logger.mjs';
 import {
   loadTmdbConfig,
   updateTmdbConfigWithId,
+  IDENTITY_SOURCE_AUTO,
   isUpdateAllowed,
   applyMetadataOverrides,
   getMetadataOverrides
@@ -679,9 +680,10 @@ export class MetadataGenerator {
           // Search for TMDB ID
           tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, false);
 
-          // Update config with found TMDB ID
+          // Update config with found TMDB ID. Stamped `auto`: a search result
+          // is the one kind of pin an identity provider may later correct.
           if (tmdbData.id) {
-            await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
+            await updateTmdbConfigWithId(configPath, tmdbData.id, showName, { source: IDENTITY_SOURCE_AUTO });
           }
         }
 
@@ -760,14 +762,15 @@ export class MetadataGenerator {
             tmdbData = { id: existingId };
             // Persist through the add-only ratchet so the next pass takes the
             // cheap tmdbConfig.tmdb_id branch without re-reading the file.
-            await updateTmdbConfigWithId(configPath, existingId, showName);
+            // `auto`: the id was derived, not chosen by a human.
+            await updateTmdbConfigWithId(configPath, existingId, showName, { source: IDENTITY_SOURCE_AUTO });
             this.logger.info(`Show metadata up-to-date; adopted TMDB ID ${existingId} from metadata.json for ${showName}`);
           } else {
             // Need to get TMDB ID to process seasons
             this.logger.info(`Show metadata up-to-date but need TMDB ID for ${showName}, fetching...`);
             tmdbData = await fetchComprehensiveMediaDetails(showName, 'tv', null, false); // Don't generate blurhash for this lookup
             if (tmdbData.id) {
-              await updateTmdbConfigWithId(configPath, tmdbData.id, showName);
+              await updateTmdbConfigWithId(configPath, tmdbData.id, showName, { source: IDENTITY_SOURCE_AUTO });
             }
 
             // This corner path is a genuine full TMDB fetch too, so capture the
@@ -942,9 +945,10 @@ export class MetadataGenerator {
         // Search for TMDB ID
         tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', null, false);
 
-        // Update config with found TMDB ID
+        // Update config with found TMDB ID. Stamped `auto`: a search result
+        // is the one kind of pin an identity provider may later correct.
         if (tmdbData.id) {
-          await updateTmdbConfigWithId(configPath, tmdbData.id, movieName);
+          await updateTmdbConfigWithId(configPath, tmdbData.id, movieName, { source: IDENTITY_SOURCE_AUTO });
         }
       }
 
