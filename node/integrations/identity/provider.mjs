@@ -52,7 +52,9 @@ export const SCAN_TRIGGER_KINDS = Object.freeze(new Set([
  * @typedef {Object} IdentityClaim
  * @property {'movie'|'tv'} mediaType
  * @property {string} libraryRelativePath  e.g. 'movies/The Professor' — the join key
- * @property {number} tmdbId
+ * @property {number|null} tmdbId           null = the provider manages the folder but cannot name the TMDB entity
+ *                                           ("unidentified"); externalIds must then be non-empty
+ * @property {string|null} resolvedVia      'imdb' | 'tvdb' when the index builder filled tmdbId from externalIds
  * @property {string} source                the provider's `name`
  * @property {number|null} year
  * @property {string|null} title
@@ -62,6 +64,7 @@ export const SCAN_TRIGGER_KINDS = Object.freeze(new Set([
  * @property {boolean|null} released        the provider considers the title obtainable now; null = cannot say
  * @property {string|null} arrStatus        the provider's own lifecycle word, verbatim (announced, released, continuing, …)
  * @property {boolean|null} monitored       the provider is actively looking for it; null = cannot say
+ * @property {{poster: string|null, backdrop: string|null}} art  the provider's remote artwork URLs (never its own local paths); each null when absent
  */
 
 /**
@@ -94,6 +97,26 @@ export function libraryRelativePathFor(mediaType, folderName) {
   const root = LIBRARY_ROOTS[mediaType];
   if (!root) throw new Error(`Unknown media type: ${mediaType}`);
   return `${root}/${normalizeLibraryRelativePath(folderName)}`;
+}
+
+/**
+ * Only absolute http(s) URLs count as art the frontend can render; anything
+ * else (a provider's own /MediaCover path, an empty string) is null.
+ * @param {Object|undefined} art
+ * @returns {{poster: string|null, backdrop: string|null}}
+ */
+export function normalizeArt(art) {
+  const url = (value) => (typeof value === 'string' && /^https?:\/\//i.test(value.trim()) ? value.trim() : null);
+  return { poster: url(art?.poster), backdrop: url(art?.backdrop) };
+}
+
+/**
+ * Whether a claim names a TMDB entity (as opposed to only external ids).
+ * @param {IdentityClaim} claim
+ * @returns {boolean}
+ */
+export function isIdentified(claim) {
+  return Number.isInteger(claim?.tmdbId) && claim.tmdbId > 0;
 }
 
 /**
@@ -196,20 +219,27 @@ export class IdentityProvider {
    * @returns {IdentityClaim}
    */
   makeClaim(fields) {
+    const tmdbId = Number.isInteger(fields.tmdbId) && fields.tmdbId > 0 ? fields.tmdbId : null;
+    const externalIds = fields.externalIds ?? {};
+    if (tmdbId === null && Object.keys(externalIds).length === 0) {
+      throw new Error(`${this.name}: a claim needs a tmdbId or at least one external id (${fields.libraryRelativePath})`);
+    }
     return {
       mediaType: fields.mediaType,
       libraryRelativePath: normalizeLibraryRelativePath(fields.libraryRelativePath),
-      tmdbId: fields.tmdbId,
+      tmdbId,
+      resolvedVia: null,
       source: this.name,
       year: Number.isInteger(fields.year) ? fields.year : null,
       title: fields.title ?? null,
-      externalIds: fields.externalIds ?? {},
+      externalIds,
       hasFile: typeof fields.hasFile === 'boolean' ? fields.hasFile : null,
       providerPath: fields.providerPath ?? null,
       // Availability is never guessed: a provider that cannot say emits null.
       released: typeof fields.released === 'boolean' ? fields.released : null,
       arrStatus: typeof fields.arrStatus === 'string' && fields.arrStatus ? fields.arrStatus : null,
       monitored: typeof fields.monitored === 'boolean' ? fields.monitored : null,
+      art: normalizeArt(fields.art),
     };
   }
 

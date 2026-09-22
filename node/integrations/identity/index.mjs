@@ -30,6 +30,7 @@
 import { createIdentityProviders, parseUnsourcedPinTreatment } from './registry.mjs';
 import { buildIdentityIndex } from './index-builder.mjs';
 import { reconcileIdentities, reconcileClaim, listAllLibraryFolders, fingerprintFolders } from './reconciler.mjs';
+import { createExternalIdResolver } from './external-id-resolver.mjs';
 import { SCAN_TRIGGER_KINDS, EVENT_KINDS } from './provider.mjs';
 
 const DEFAULT_INTERVAL_SECONDS = 60;
@@ -76,6 +77,7 @@ export function parseReconcileIntervalMs(raw, logger = null) {
  * @param {Function} [options.build]          injectable buildIdentityIndex
  * @param {Function} [options.reconcile]      injectable reconcileIdentities
  * @param {Function} [options.reconcileOne]   injectable reconcileClaim
+ * @param {Function} [options.resolveExternalId]  injectable external-id resolver (default: TMDB /find)
  * @param {Function} [options.listFolders]    injectable listAllLibraryFolders
  * @param {() => Date} [options.now]          injectable clock
  * @param {Function} [options.setIntervalImpl]  injectable timer (tests)
@@ -91,6 +93,7 @@ export function createIdentityService({
   build = buildIdentityIndex,
   reconcile = reconcileIdentities,
   reconcileOne = reconcileClaim,
+  resolveExternalId = undefined,
   listFolders = listAllLibraryFolders,
   now = () => new Date(),
   setIntervalImpl = setInterval,
@@ -103,6 +106,7 @@ export function createIdentityService({
   const enabled = providers.length > 0;
   const reconcileIntervalMs = intervalMs ?? parseReconcileIntervalMs(env.IDENTITY_RECONCILE_INTERVAL_SECONDS, logger);
   const staleAfterMs = STALE_FACTOR * (reconcileIntervalMs || SCAN_TICK_MS);
+  const resolver = resolveExternalId === undefined ? createExternalIdResolver({ logger }) : resolveExternalId;
 
   let lastReport = null;
   let lastIndex = null;
@@ -141,7 +145,7 @@ export function createIdentityService({
     inFlight = (async () => {
       const checkedAt = now().toISOString();
       try {
-        const index = await build(providers, { logger });
+        const index = await build(providers, { logger, resolveExternalId: resolver });
         lastIndex = index;
 
         if (!index.hasData) {
@@ -271,6 +275,7 @@ export function createIdentityService({
         entry.outcome = result.outcome;
         if (result.decision) entry.decision = { action: result.decision.action, reason: result.decision.reason, tmdbId: result.decision.tmdbId ?? null };
         if (result.error) entry.error = result.error;
+        if (result.outcome === 'unidentified') entry.externalIds = event.claim.externalIds;
         touchedLibrary = true;
       }
       if (SCAN_TRIGGER_KINDS.has(event.kind) && requestScan) {

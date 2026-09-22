@@ -18,8 +18,8 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import pLimit from 'p-limit';
-import { pinTmdbIdentity, getTmdbConfigFilePath } from '../../utils/tmdbConfig.mjs';
-import { LIBRARY_ROOTS, MEDIA_TYPES, splitLibraryRelativePath } from './provider.mjs';
+import { pinTmdbIdentity, getTmdbConfigFilePath, loadTmdbConfig, getIdentityProvenance } from '../../utils/tmdbConfig.mjs';
+import { LIBRARY_ROOTS, MEDIA_TYPES, splitLibraryRelativePath, isIdentified } from './provider.mjs';
 
 const DEFAULT_LIST_CAP = 200;
 const DEFAULT_CONCURRENCY = 8;
@@ -75,14 +75,53 @@ export function fingerprintFolders(foldersByType) {
 function providerOnlyRow(claim) {
   return {
     libraryRelativePath: claim.libraryRelativePath,
-    tmdbId: claim.tmdbId,
+    tmdbId: claim.tmdbId ?? null,
     source: claim.source,
+    externalIds: claim.externalIds ?? {},
     hasFile: claim.hasFile,
     providerPath: claim.providerPath,
     released: claim.released ?? null,
     arrStatus: claim.arrStatus ?? null,
     monitored: claim.monitored ?? null,
+    art: claim.art ?? { poster: null, backdrop: null },
   };
+}
+
+/**
+ * A managed-but-unidentified row: the provider manages the folder but
+ * neither it nor TMDB can name the entity. Carries the folder's own pin (if
+ * any) so the page can say what the library is using meanwhile.
+ * @param {import('./provider.mjs').IdentityClaim} claim
+ * @param {{tmdbId: number|null, source: string|null}|null} localPin
+ */
+function managedUnidentifiedRow(claim, localPin) {
+  return {
+    libraryRelativePath: claim.libraryRelativePath,
+    source: claim.source,
+    externalIds: claim.externalIds ?? {},
+    title: claim.title ?? null,
+    year: claim.year ?? null,
+    hasFile: claim.hasFile,
+    providerPath: claim.providerPath,
+    released: claim.released ?? null,
+    arrStatus: claim.arrStatus ?? null,
+    monitored: claim.monitored ?? null,
+    art: claim.art ?? { poster: null, backdrop: null },
+    localPin: localPin && localPin.tmdbId ? { tmdbId: localPin.tmdbId, source: localPin.source } : null,
+  };
+}
+
+/**
+ * The folder's own pin, read through the config module (§4.6).
+ * @returns {Promise<{tmdbId: number|null, source: string|null}|null>} null when unreadable
+ */
+async function readLocalPin(mediaDir, unsourcedPinTreatment) {
+  try {
+    const config = await loadTmdbConfig(getTmdbConfigFilePath(mediaDir));
+    return getIdentityProvenance(config, { unsourcedPinTreatment });
+  } catch {
+    return null;
+  }
 }
 
 function capped(list, cap) {
@@ -116,6 +155,15 @@ export async function reconcileClaim(claim, { basePath, unsourcedPinTreatment, f
     return { libraryRelativePath: claim.libraryRelativePath, outcome: 'missing-folder' };
   }
   const mediaDir = path.join(basePath, LIBRARY_ROOTS[split.mediaType], split.folder);
+  if (!isIdentified(claim)) {
+    // Nothing to offer the precedence rule; the tick's full reconcile
+    // reports the folder as managed-but-unidentified.
+    return {
+      libraryRelativePath: claim.libraryRelativePath,
+      outcome: 'unidentified',
+      localPin: await readLocalPin(mediaDir, unsourcedPinTreatment),
+    };
+  }
   try {
     const { decision } = await pin(
       getTmdbConfigFilePath(mediaDir),
@@ -157,10 +205,11 @@ export async function reconcileIdentities({
   const started = Date.now();
   const limit = pLimit(concurrency);
 
-  const totals = { claimed: 0, write: 0, stamp: 0, keep: 0, conflict: 0, providerOnly: 0, unmanaged: 0, nested: 0, errors: 0 };
+  const totals = { claimed: 0, write: 0, stamp: 0, keep: 0, conflict: 0, providerOnly: 0, managedUnidentified: 0, unmanaged: 0, nested: 0, errors: 0 };
   const written = [];
   const conflicts = [];
   const providerOnly = [];
+  const managedUnidentified = [];
   const unmanaged = [];
   const errors = [];
   const perType = {};
@@ -228,6 +277,29 @@ export async function reconcileIdentities({
       }))
     );
 
+    // Managed by a provider that cannot name the entity, and TMDB could not
+    // either. Reported apart from unmanaged: the folder is known, just not
+    // identified, and the precedence rule has nothing to act on.
+    const unidentifiedClaims = index.unidentifiedFor ? index.unidentifiedFor(mediaType) : [];
+    for (const claim of unidentifiedClaims) {
+      const split = splitLibraryRelativePath(claim.libraryRelativePath);
+      if (!split) continue;
+      if (split.folder.includes('/')) {
+        totals.nested++;
+        providerOnly.push({ ...providerOnlyRow(claim), nested: true });
+        continue;
+      }
+      if (!foldersOnDisk.has(split.folder)) {
+        totals.providerOnly++;
+        providerOnly.push(providerOnlyRow(claim));
+        continue;
+      }
+      claimedFolders.add(split.folder);
+      totals.managedUnidentified++;
+      const mediaDir = path.join(basePath, LIBRARY_ROOTS[mediaType], split.folder);
+      managedUnidentified.push(managedUnidentifiedRow(claim, await readLocalPin(mediaDir, unsourcedPinTreatment)));
+    }
+
     for (const folder of foldersOnDisk) {
       if (covered && !claimedFolders.has(folder) && !index.has(`${LIBRARY_ROOTS[mediaType]}/${folder}`)) {
         totals.unmanaged++;
@@ -247,6 +319,7 @@ export async function reconcileIdentities({
     written: capped(written, listCap),
     conflicts: capped(conflicts, listCap),
     providerOnly: capped(providerOnly, listCap),
+    managedUnidentified: capped(managedUnidentified, listCap),
     unmanaged: capped(unmanaged.sort(), listCap),
     providerConflicts: capped(index.providerConflicts, listCap),
     errors: capped(errors, listCap),
@@ -262,6 +335,7 @@ export async function reconcileIdentities({
       'identity.kept': totals.keep,
       'identity.conflicts': totals.conflict,
       'identity.provider_only': totals.providerOnly,
+      'identity.managed_unidentified': totals.managedUnidentified,
       'identity.unmanaged': totals.unmanaged,
       'identity.errors': totals.errors,
     });

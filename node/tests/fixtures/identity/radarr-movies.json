@@ -11,7 +11,11 @@
     "status": "released",
     "isAvailable": true,
     "monitored": true,
-    "qualityProfileId": 4
+    "qualityProfileId": 4,
+    "images": [
+      { "coverType": "poster", "url": "/radarr/MediaCover/1/poster.jpg?lastWrite=1", "remoteUrl": "https://image.tmdb.org/t/p/original/professor-poster.jpg" },
+      { "coverType": "fanart", "url": "/radarr/MediaCover/1/fanart.jpg?lastWrite=1", "remoteUrl": "https://image.tmdb.org/t/p/original/professor-fanart.jpg" }
+    ]
   },
   {
     "id": 2,
@@ -36,7 +40,11 @@
     "hasFile": false,
     "status": "announced",
     "isAvailable": false,
-    "monitored": true
+    "monitored": true,
+    "images": [
+      { "coverType": "poster", "url": "/radarr/MediaCover/3/poster.jpg", "remoteUrl": "https://image.tmdb.org/t/p/original/ndy-poster.jpg" },
+      { "coverType": "fanart", "url": "/radarr/MediaCover/3/fanart.jpg" }
+    ]
   },
   {
     "id": 4,

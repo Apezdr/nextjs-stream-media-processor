@@ -394,6 +394,49 @@ describe('identity job and change detector', () => {
     expect(parseReconcileIntervalMs('soon')).toBe(60000);
   });
 
+  it('a Sonarr series with no TMDB id is resolved through TMDB by IMDb id and pinned as sonarr', async () => {
+    const showDir = join(basePath, 'tv', 'The Wayfinders');
+    await fs.mkdir(showDir, { recursive: true });
+    await saveTmdbConfig(join(showDir, 'tmdb.config'), { tmdb_id: 111, tmdb_id_source: 'auto' }); // the name search's guess
+    const sonarrItems = [
+      { id: 1, title: 'The Wayfinders', year: 2025, path: '/processed_tv/The Wayfinders', tvdbId: 470313, tmdbId: 0, imdbId: 'tt29712397', status: 'continuing', monitored: true, statistics: { episodeFileCount: 6 } },
+    ];
+    const resolveExternalId = jest.fn(async (claim) => (claim.externalIds.imdb === 'tt29712397' ? { tmdbId: 251234, via: 'imdb' } : null));
+    const svc = createIdentityService({
+      env: { SONARR_URL: 'http://sonarr:8989', SONARR_API_KEY: 'k' },
+      basePath,
+      fetchImpl: async (url) => (new URL(url).pathname === '/api/v3/series'
+        ? { ok: true, status: 200, json: async () => sonarrItems }
+        : { ok: false, status: 404, json: async () => ({}) }),
+      resolveExternalId,
+      intervalMs: 0,
+    });
+    const report = await svc.reconcileForTick({ reason: 'manual' });
+    expect(resolveExternalId).toHaveBeenCalledWith(expect.objectContaining({ mediaType: 'tv', externalIds: { tvdb: 470313, imdb: 'tt29712397' } }));
+    expect(report.totals).toMatchObject({ write: 1, managedUnidentified: 0, unmanaged: 0 });
+    expect(report.written.items[0]).toMatchObject({ libraryRelativePath: 'tv/The Wayfinders', tmdbId: 251234, source: 'sonarr', replacedId: 111 });
+    expect(await loadTmdbConfig(join(showDir, 'tmdb.config'))).toMatchObject({ tmdb_id: 251234, tmdb_id_source: 'sonarr' });
+    expect(svc.getStatus().providers[0].lastFetch).toMatchObject({ unidentified: 0, resolved: 1 });
+
+    // TMDB has no mapping either → managed-unidentified, local pin shown, nothing written.
+    const svcMiss = createIdentityService({
+      env: { SONARR_URL: 'http://sonarr:8989', SONARR_API_KEY: 'k' },
+      basePath,
+      fetchImpl: async (url) => (new URL(url).pathname === '/api/v3/series'
+        ? { ok: true, status: 200, json: async () => sonarrItems }
+        : { ok: false, status: 404, json: async () => ({}) }),
+      resolveExternalId: async () => null,
+      intervalMs: 0,
+    });
+    const missReport = await svcMiss.reconcileForTick({ reason: 'manual' });
+    expect(missReport.totals).toMatchObject({ write: 0, managedUnidentified: 1, unmanaged: 0 });
+    expect(missReport.managedUnidentified.items[0]).toMatchObject({
+      libraryRelativePath: 'tv/The Wayfinders', source: 'sonarr', externalIds: { tvdb: 470313, imdb: 'tt29712397' }, localPin: { tmdbId: 251234, source: 'sonarr' },
+    });
+    expect(svcMiss.getStatus().providers[0].lastFetch).toMatchObject({ unidentified: 1, resolved: 0 });
+    await fs.rm(showDir, { recursive: true, force: true });
+  });
+
   it('with the job off, staleAfterMs falls back to three scan ticks and start() is a no-op', () => {
     const off = createIdentityService({
       env: { RADARR_URL: 'http://radarr:7878', RADARR_API_KEY: 'k', IDENTITY_RECONCILE_INTERVAL_SECONDS: '0' },

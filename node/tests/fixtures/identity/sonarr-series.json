@@ -10,6 +10,11 @@
     "imdbId": "tt6611916",
     "status": "continuing",
     "monitored": true,
+    "images": [
+      { "coverType": "banner", "url": "/sonarr/MediaCover/10/banner.jpg", "remoteUrl": "https://artworks.thetvdb.com/banners/kingdom-banner.jpg" },
+      { "coverType": "poster", "url": "/sonarr/MediaCover/10/poster.jpg", "remoteUrl": "https://artworks.thetvdb.com/banners/kingdom-poster.jpg" },
+      { "coverType": "fanart", "url": "/sonarr/MediaCover/10/fanart.jpg", "remoteUrl": "https://artworks.thetvdb.com/banners/kingdom-fanart.jpg" }
+    ],
     "statistics": { "episodeFileCount": 12 }
   },
   {
