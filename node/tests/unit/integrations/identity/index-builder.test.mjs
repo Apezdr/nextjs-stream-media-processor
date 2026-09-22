@@ -86,6 +86,69 @@ describe('buildIdentityIndex', () => {
   });
 });
 
+describe('fingerprints (the change detector)', () => {
+  class ItemProvider extends IdentityProvider {
+    constructor(name, items, { fail = null } = {}) {
+      super({ name, mediaTypes: ['movie'] });
+      this.items = items;
+      this.fail = fail;
+    }
+
+    async fetchClaims() {
+      if (this.fail) throw this.fail;
+      return this.items.map((item) =>
+        this.makeClaim({ mediaType: 'movie', libraryRelativePath: `movies/${item.folder}`, tmdbId: item.tmdbId, hasFile: item.hasFile, providerPath: `/root/${item.folder}`, title: item.title })
+      );
+    }
+  }
+
+  const base = [
+    { folder: 'The End!', tmdbId: 464737, hasFile: false, title: 'The End?' },
+    { folder: 'Dune (2021)', tmdbId: 438631, hasFile: true, title: 'Dune' },
+  ];
+
+  it('is stable across order and fields outside (path, tmdbId, hasFile)', async () => {
+    const a = await buildIdentityIndex([new ItemProvider('radarr', base)]);
+    const reordered = await buildIdentityIndex([new ItemProvider('radarr', [...base].reverse())]);
+    const retitled = await buildIdentityIndex([new ItemProvider('radarr', base.map((i) => ({ ...i, title: i.title.toUpperCase(), monitored: false })))]);
+    expect(reordered.fingerprint).toBe(a.fingerprint);
+    expect(retitled.fingerprint).toBe(a.fingerprint);
+    expect(a.allOk).toBe(true);
+    expect(a.providers[0].fingerprint).toHaveLength(40);
+  });
+
+  it('moves when a path or hasFile changes (the production case: Radarr repointed and rescanned)', async () => {
+    const before = await buildIdentityIndex([new ItemProvider('radarr', base)]);
+    const repointed = base.map((i) => (i.tmdbId === 464737 ? { ...i, folder: 'The End?', hasFile: true } : i));
+    const after = await buildIdentityIndex([new ItemProvider('radarr', repointed)]);
+    expect(after.fingerprint).not.toBe(before.fingerprint);
+
+    const onlyHasFile = base.map((i) => (i.tmdbId === 464737 ? { ...i, hasFile: true } : i));
+    expect((await buildIdentityIndex([new ItemProvider('radarr', onlyHasFile)])).fingerprint).not.toBe(before.fingerprint);
+  });
+
+  it('a failed provider records the failure on lastFetch and never yields a stable fingerprint', async () => {
+    const provider = new ItemProvider('radarr', base, { fail: new Error('HTTP 503') });
+    const a = await buildIdentityIndex([provider]);
+    const b = await buildIdentityIndex([provider]);
+    expect(provider.lastFetch).toMatchObject({ ok: false, error: 'HTTP 503', claims: 0 });
+    expect(a.allOk).toBe(false);
+    expect(a.coveredTypes.has('movie')).toBe(false);
+    expect(a.providers[0].fingerprint).toBeNull();
+    expect(a.fingerprint).not.toBe(b.fingerprint);
+  });
+
+  it('a success after a failure replaces the failure record', async () => {
+    const provider = new ItemProvider('radarr', base, { fail: new Error('down') });
+    await buildIdentityIndex([provider]);
+    provider.fail = null;
+    const index = await buildIdentityIndex([provider]);
+    expect(provider.lastFetch).toMatchObject({ ok: true, claims: 2 });
+    expect(provider.lastFetch.error).toBeUndefined();
+    expect(index.coveredTypes.has('movie')).toBe(true);
+  });
+});
+
 describe('IdentityProvider contract guards', () => {
   it('rejects reserved and malformed names', () => {
     expect(() => new FakeProvider('manual', 'movie', [])).toThrow(/reserved/);

@@ -1318,6 +1318,9 @@ async function initialize() {
   const port = 3000;
   server = app.listen(port, async () => {
     scheduleTasks();
+    // The identity reconcile has its own cadence (IDENTITY_RECONCILE_INTERVAL_SECONDS,
+    // default 60s) so the report stays fresh while a long scan tick runs.
+    identityService.start();
     //runGenerateThumbnailJson().catch(logger.error);
     logger.info(`Server running on port ${port}`);
     const db = await initializeDatabase();
@@ -1584,6 +1587,9 @@ async function gracefulShutdown(signal, code = 0) {
         });
       });
     }
+
+    // Stop the identity reconcile job (a run in flight finishes on its own)
+    identityService.stop();
 
     // Close Discord client if it exists
     try {

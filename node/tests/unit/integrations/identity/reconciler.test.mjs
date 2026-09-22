@@ -11,17 +11,19 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { IdentityProvider } from '../../../../integrations/identity/provider.mjs';
 import { buildIdentityIndex } from '../../../../integrations/identity/index-builder.mjs';
-import { reconcileIdentities, reconcileClaim, listLibraryFolders } from '../../../../integrations/identity/reconciler.mjs';
+import { reconcileIdentities, reconcileClaim, listLibraryFolders, fingerprintFolders } from '../../../../integrations/identity/reconciler.mjs';
 import { loadTmdbConfig, saveTmdbConfig } from '../../../../utils/tmdbConfig.mjs';
 
 class FakeProvider extends IdentityProvider {
-  constructor(name, mediaType, claims) {
+  constructor(name, mediaType, claims, { fail = null } = {}) {
     super({ name, mediaTypes: [mediaType] });
     this.mediaType = mediaType;
     this.claims = claims;
+    this.fail = fail;
   }
 
   async fetchClaims() {
+    if (this.fail) throw this.fail;
     return this.claims.map(({ folder, tmdbId, hasFile = true }) =>
       this.makeClaim({
         mediaType: this.mediaType,
@@ -98,7 +100,7 @@ describe('reconcileIdentities', () => {
     expect(report.totals).toEqual({
       claimed: 8, write: 3, stamp: 1, keep: 1, conflict: 2, providerOnly: 1, unmanaged: 1, nested: 0, errors: 0,
     });
-    expect(report.perType).toEqual({ movie: { onDisk: 7, claimed: 7 }, tv: { onDisk: 1, claimed: 1 } });
+    expect(report.perType).toEqual({ movie: { onDisk: 7, claimed: 7, covered: true }, tv: { onDisk: 1, claimed: 1, covered: true } });
 
     // The repair: id replaced, source recorded, mtime moved past metadata.json.
     const professor = await loadTmdbConfig(join(movieDir('The Professor'), 'tmdb.config'));
@@ -193,6 +195,27 @@ describe('reconcileIdentities', () => {
     const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual', pin });
     expect(report.totals).toMatchObject({ errors: 1, keep: 1 });
     expect(report.errors.items).toEqual([{ libraryRelativePath: 'movies/Dune (2021)', error: 'EACCES' }]);
+  });
+
+  it('a media type whose only provider failed is unknown, not unmanaged', async () => {
+    const index = await buildIdentityIndex([
+      new FakeProvider('radarr', 'movie', [], { fail: new Error('ECONNREFUSED') }),
+      new FakeProvider('sonarr', 'tv', [{ folder: 'Kingdom (2019)', tmdbId: 83097 }]),
+    ]);
+    const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual' });
+    expect(report.perType.movie).toMatchObject({ covered: false, claimed: 0 });
+    expect(report.perType.tv).toMatchObject({ covered: true, claimed: 1 });
+    expect(report.totals.unmanaged).toBe(0); // seven movie folders, none listed
+    expect(report.unmanaged.items).toEqual([]);
+    expect(report.index.allOk).toBe(false);
+  });
+
+  it('fingerprintFolders moves on a folder rename and nothing else', () => {
+    const a = fingerprintFolders({ movie: new Set(['A', 'B']), tv: new Set(['S']) });
+    const same = fingerprintFolders({ movie: new Set(['B', 'A']), tv: new Set(['S']) });
+    const renamed = fingerprintFolders({ movie: new Set(['A', 'B2']), tv: new Set(['S']) });
+    expect(same).toBe(a);
+    expect(renamed).not.toBe(a);
   });
 
   it('listLibraryFolders: a missing root is an empty set, files are ignored', async () => {

@@ -27,6 +27,37 @@ The precedence rule itself lives in `utils/tmdbConfig.mjs`
 `tmdb_id` — a property of the file, not of any provider (§4.6 of
 `docs/BACKEND_ARCHITECTURE.md`).
 
+## When it runs
+
+Freshness is the service's own job, not the scan tick's. A scan tick can run
+for ten minutes after a batch of repairs, so the report would otherwise
+describe the tick's start for that long.
+
+| Trigger | Reason | Forced? |
+|---|---|---|
+| the service's own job, every `IDENTITY_RECONCILE_INTERVAL_SECONDS` (default 60, `0` = off, minimum 15) | `identity-tick` | no |
+| top of every scan tick (`runGenerateList`) | `scan-tick` | yes |
+| `POST /api/identity/reconcile` | `manual` | yes |
+| a provider webhook that names a folder | `<provider>-webhook` | yes |
+
+Unforced runs go through a change detector: every provider list is
+fingerprinted over `(path, tmdbId, hasFile)` as it arrives, the library's
+folder names are fingerprinted the same way, and if neither moved since the
+last real run the report keeps its `at` and gets a fresh `checkedAt` with
+`unchanged: true`. Nothing on disk is read or written on such a pass. One
+provider failing on an unforced run leaves the last good report untouched
+(the failure is on `status.providers[].lastFetch.error`); the next run after a
+failure never skips. Concurrent callers share one run.
+
+A repair found outside the scan tick (a write with `replacedId`) requests an
+early scan so the title regenerates now.
+
+The report publishes `checkedAt` (last time the providers were compared),
+`at` (last time the library was actually reconciled), `unchanged`,
+`checkedReason`, and `staleAfterMs` (3 × the job interval; 3 × the scan
+cadence when the job is off). A page should judge freshness on `checkedAt`
+against `staleAfterMs`, never on a threshold of its own.
+
 ## How a claim becomes a repair
 
 ```
@@ -79,6 +110,7 @@ SONARR_API_KEY=…
 # SONARR_ROOT_MAP=/processed_tv=tv
 # RADARR_TIMEOUT_MS=15000
 # IDENTITY_UNSOURCED_PINS=manual
+# IDENTITY_RECONCILE_INTERVAL_SECONDS=60
 ```
 
 ## Webhook (optional push)

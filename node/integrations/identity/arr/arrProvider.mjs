@@ -258,6 +258,7 @@ export class ArrProvider extends IdentityProvider {
       }
     }
     this.lastFetch = {
+      ok: true,
       at: new Date(started).toISOString(),
       durationMs: Date.now() - started,
       items: items.length,

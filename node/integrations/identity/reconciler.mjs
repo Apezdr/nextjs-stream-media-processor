@@ -16,6 +16,7 @@
 
 import { promises as fs } from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import pLimit from 'p-limit';
 import { pinTmdbIdentity, getTmdbConfigFilePath } from '../../utils/tmdbConfig.mjs';
 import { LIBRARY_ROOTS, MEDIA_TYPES, splitLibraryRelativePath } from './provider.mjs';
@@ -37,6 +38,33 @@ export async function listLibraryFolders(basePath, mediaType) {
   } catch {
     return new Set();
   }
+}
+
+/**
+ * Every library root at once.
+ * @param {string} basePath
+ * @returns {Promise<Object<string, Set<string>>>} keyed by media type
+ */
+export async function listAllLibraryFolders(basePath) {
+  const out = {};
+  for (const mediaType of MEDIA_TYPES) {
+    out[mediaType] = await listLibraryFolders(basePath, mediaType);
+  }
+  return out;
+}
+
+/**
+ * Stable hash of the library's folder names, the on-disk half of the change
+ * detector (the provider half is `fingerprintClaims` in index-builder.mjs).
+ * @param {Object<string, Set<string>>} foldersByType
+ * @returns {string}
+ */
+export function fingerprintFolders(foldersByType) {
+  const lines = [];
+  for (const mediaType of MEDIA_TYPES) {
+    for (const folder of foldersByType[mediaType] ?? []) lines.push(`${mediaType}\t${folder}`);
+  }
+  return createHash('sha1').update(lines.sort().join('\n')).digest('hex');
 }
 
 function capped(list, cap) {
@@ -123,7 +151,11 @@ export async function reconcileIdentities({
     const foldersOnDisk = await listFolders(basePath, mediaType);
     const claims = index.claimsFor(mediaType);
     const claimedFolders = new Set();
-    perType[mediaType] = { onDisk: foldersOnDisk.size, claimed: claims.length };
+    // A type with no successful provider this tick is unknown, not unmanaged:
+    // listing every one of its folders as unmanaged would be a lie born of an
+    // outage. Older/foreign indexes without coveredTypes count as covered.
+    const covered = index.coveredTypes ? index.coveredTypes.has(mediaType) : true;
+    perType[mediaType] = { onDisk: foldersOnDisk.size, claimed: claims.length, covered };
 
     await Promise.all(
       claims.map((claim) => limit(async () => {
@@ -192,7 +224,7 @@ export async function reconcileIdentities({
     );
 
     for (const folder of foldersOnDisk) {
-      if (!claimedFolders.has(folder) && !index.has(`${LIBRARY_ROOTS[mediaType]}/${folder}`)) {
+      if (covered && !claimedFolders.has(folder) && !index.has(`${LIBRARY_ROOTS[mediaType]}/${folder}`)) {
         totals.unmanaged++;
         unmanaged.push(`${LIBRARY_ROOTS[mediaType]}/${folder}`);
       }

@@ -174,6 +174,20 @@ describe('identity service + routes: enabled with Radarr', () => {
     expect(a).toBe(b);
   });
 
+  it('a webhook that touches a folder refreshes the report before answering', async () => {
+    const res = await fetch(`${base}/api/identity/webhook/radarr`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-webhook-id': 'hook-secret' },
+      body: JSON.stringify({ eventType: 'Rename', movie: { folderPath: '/processed_movies/The Professor', tmdbId: 467956 } }),
+    });
+    const body = await res.json();
+    expect(body).toMatchObject({ accepted: true, reportRefreshed: true, scanRequested: true });
+    const report = service.getLastReport();
+    expect(report.reason).toBe('radarr-webhook');
+    expect(report.checkedReason).toBe('radarr-webhook');
+    expect(report.unchanged).toBe(false);
+  });
+
   it('when the provider is down the library is left untouched and the report says why', async () => {
     const down = createIdentityService({
       env: { RADARR_URL: 'http://radarr:7878', RADARR_API_KEY: 'k' },
@@ -183,5 +197,211 @@ describe('identity service + routes: enabled with Radarr', () => {
     const report = await down.reconcileForTick();
     expect(report).toMatchObject({ skipped: 'no-provider-data' });
     expect(report.index.providers[0]).toMatchObject({ ok: false, error: expect.stringMatching(/HTTP 503/) });
+  });
+});
+
+/**
+ * Freshness on the processor's own initiative: the job path pulls the
+ * providers every interval, and the change detector makes a quiet pass cost
+ * nothing on disk. Measured against the production case of 2026-09-22: Radarr
+ * repointed and rescanned a movie during a ten-minute scan tick, and the
+ * report kept describing the tick's start for nine minutes.
+ */
+describe('identity job and change detector', () => {
+  const basePath = join(tmpdir(), `identity-job-${randomUUID()}`);
+  const endDir = join(basePath, 'movies', 'The End (2017)');
+  const duneDir = join(basePath, 'movies', 'Dune (2021)');
+
+  // Mutable provider state the fake fetch serves.
+  let radarrItems;
+  let radarrFails = false;
+  let sonarrFails = false;
+  const fetchImpl = async (url) => {
+    const pathname = new URL(url).pathname;
+    if (pathname === '/api/v3/movie') {
+      if (radarrFails) return { ok: false, status: 503, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => radarrItems };
+    }
+    if (pathname === '/api/v3/series') {
+      if (sonarrFails) return { ok: false, status: 503, json: async () => ({}) };
+      return { ok: true, status: 200, json: async () => [] };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+
+  // Deterministic clock: every call is one second later.
+  let tick = Date.parse('2026-09-22T05:21:00Z');
+  const now = () => new Date((tick += 1000));
+
+  const requestScan = jest.fn(async () => {});
+  const timers = [];
+  const setIntervalImpl = jest.fn((fn, ms) => { const t = { fn, ms, unref: jest.fn() }; timers.push(t); return t; });
+  const clearIntervalImpl = jest.fn();
+  let service;
+
+  const mtime = async (p) => (await fs.stat(p)).mtimeMs;
+
+  beforeAll(async () => {
+    await fs.mkdir(endDir, { recursive: true });
+    await fs.mkdir(duneDir, { recursive: true });
+    // Dune: correct auto pin. The End (2017): Radarr filed it under a different folder name with no file (the production case was ? vs !, which Windows cannot create here).
+    await saveTmdbConfig(join(duneDir, 'tmdb.config'), { tmdb_id: 438631, tmdb_id_source: 'auto' });
+    radarrItems = [
+      { id: 1, title: 'Dune', year: 2021, path: '/processed_movies/Dune (2021)', tmdbId: 438631, hasFile: true, monitored: true },
+      { id: 795, title: 'The End?', year: 2017, path: '/processed_movies/The End 2017', tmdbId: 464737, hasFile: false, monitored: true },
+    ];
+    service = createIdentityService({
+      env: { RADARR_URL: 'http://radarr:7878', RADARR_API_KEY: 'k', SONARR_URL: 'http://sonarr:8989', SONARR_API_KEY: 'k' },
+      basePath,
+      requestScan,
+      fetchImpl,
+      intervalMs: 60000,
+      now,
+      setIntervalImpl,
+      clearIntervalImpl,
+    });
+  });
+
+  afterAll(async () => {
+    service.stop();
+    await fs.rm(basePath, { recursive: true, force: true });
+  });
+
+  it('publishes its cadence: staleAfterMs is three times the job interval', () => {
+    expect(service.reconcileIntervalMs).toBe(60000);
+    expect(service.staleAfterMs).toBe(180000);
+    expect(service.getStatus()).toMatchObject({ reconcileIntervalMs: 60000, staleAfterMs: 180000, jobRunning: false });
+  });
+
+  it('start() schedules the job once and stop() clears it', () => {
+    expect(service.start()).toBe(true);
+    expect(service.start()).toBe(false);
+    expect(setIntervalImpl).toHaveBeenCalledTimes(1);
+    expect(timers[0].ms).toBe(60000);
+    expect(timers[0].unref).toHaveBeenCalled();
+    expect(service.getStatus().jobRunning).toBe(true);
+    service.stop();
+    expect(clearIntervalImpl).toHaveBeenCalledWith(timers[0]);
+    expect(service.getStatus().jobRunning).toBe(false);
+  });
+
+  it('first job run reconciles: the on-disk folder is unmanaged, the Radarr folder is provider-only with no file', async () => {
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report).toMatchObject({ reason: 'identity-tick', checkedReason: 'identity-tick', unchanged: false, staleAfterMs: 180000 });
+    expect(report.checkedAt).toBe(report.at);
+    expect(report.totals).toMatchObject({ stamp: 1, providerOnly: 1, unmanaged: 1, write: 0 });
+    expect(report.unmanaged.items).toEqual(['movies/The End (2017)']);
+    expect(report.providerOnly.items[0]).toMatchObject({ libraryRelativePath: 'movies/The End 2017', hasFile: false });
+  });
+
+  it('a quiet job run keeps `at`, advances `checkedAt`, says unchanged, and writes nothing', async () => {
+    const before = service.getLastReport();
+    const duneMtime = await mtime(join(duneDir, 'tmdb.config'));
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.unchanged).toBe(true);
+    expect(report.at).toBe(before.at);
+    expect(report.reason).toBe('identity-tick');
+    expect(Date.parse(report.checkedAt)).toBeGreaterThan(Date.parse(before.checkedAt));
+    expect(report.totals).toEqual(before.totals);
+    expect(await mtime(join(duneDir, 'tmdb.config'))).toBe(duneMtime);
+    expect(service.getStatus().lastReport).toMatchObject({ unchanged: true, checkedReason: 'identity-tick', at: before.at });
+  });
+
+  it('a change outside the fingerprint (monitored, quality profile) is still a quiet run', async () => {
+    const before = service.getLastReport();
+    radarrItems = radarrItems.map((i) => ({ ...i, monitored: false, qualityProfileId: 7 }));
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.unchanged).toBe(true);
+    expect(report.at).toBe(before.at);
+  });
+
+  it('the production case: Radarr repointed to the real folder, so the next job run pins and reports it', async () => {
+    const before = service.getLastReport();
+    radarrItems = radarrItems.map((i) => (i.id === 795 ? { ...i, path: '/processed_movies/The End (2017)', hasFile: true } : i));
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.unchanged).toBe(false);
+    expect(Date.parse(report.at)).toBeGreaterThan(Date.parse(before.at));
+    expect(report.totals).toMatchObject({ write: 1, providerOnly: 0, unmanaged: 0 });
+    expect(report.written.items[0]).toMatchObject({ libraryRelativePath: 'movies/The End (2017)', tmdbId: 464737, source: 'radarr', replacedId: null });
+    expect(await loadTmdbConfig(join(endDir, 'tmdb.config'))).toMatchObject({ tmdb_id: 464737, tmdb_id_source: 'radarr' });
+    // A new pin (not a repair) does not by itself request an early scan.
+    expect(requestScan).not.toHaveBeenCalled();
+  });
+
+  it('a repair found by the job requests an early scan so the title regenerates now', async () => {
+    // Radarr corrects Dune's id; the stored pin is auto, so this is a repair.
+    radarrItems = radarrItems.map((i) => (i.id === 1 ? { ...i, tmdbId: 438632 } : i));
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.written.items).toEqual([expect.objectContaining({ libraryRelativePath: 'movies/Dune (2021)', tmdbId: 438632, replacedId: 438631 })]);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(requestScan).toHaveBeenCalledWith('identity-repair');
+  });
+
+  it('a scan tick is forced: it reconciles even when nothing changed', async () => {
+    const before = service.getLastReport();
+    const report = await service.reconcileForTick({ reason: 'scan-tick' });
+    expect(report.unchanged).toBe(false);
+    expect(report.reason).toBe('scan-tick');
+    expect(Date.parse(report.at)).toBeGreaterThan(Date.parse(before.at));
+    expect(report.totals).toMatchObject({ keep: 2, write: 0 });
+  });
+
+  it('one provider failing on the job path leaves the last good report untouched', async () => {
+    const before = service.getLastReport();
+    sonarrFails = true;
+    const result = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(result).toMatchObject({ deferred: 'provider-failure', failedProviders: ['sonarr'] });
+    const after = service.getLastReport();
+    expect(after).toBe(before); // same object, not even checkedAt moved
+    const status = service.getStatus();
+    expect(status.providers.find((p) => p.name === 'sonarr').lastFetch).toMatchObject({ ok: false, error: expect.stringMatching(/HTTP 503/) });
+    expect(status.lastReport.skipped).toBeNull();
+    sonarrFails = false;
+  });
+
+  it('after the provider recovers, the next job run reconciles again rather than trusting the old fingerprint', async () => {
+    const before = service.getLastReport();
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.unchanged).toBe(false);
+    expect(Date.parse(report.at)).toBeGreaterThan(Date.parse(before.at));
+  });
+
+  it('every provider failing still yields the skipped report (the page shows a banner for that)', async () => {
+    radarrFails = true;
+    sonarrFails = true;
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report).toMatchObject({ skipped: 'no-provider-data', checkedReason: 'identity-tick' });
+    radarrFails = false;
+    sonarrFails = false;
+  });
+
+  it('a new folder on disk moves the library fingerprint', async () => {
+    await service.reconcileForTick({ reason: 'identity-tick' }); // recover from the skipped state
+    const before = service.getLastReport();
+    expect(before.skipped).toBeUndefined();
+    await fs.mkdir(join(basePath, 'movies', 'Home Video'), { recursive: true });
+    const report = await service.reconcileForTick({ reason: 'identity-tick' });
+    expect(report.unchanged).toBe(false);
+    expect(report.unmanaged.items).toEqual(['movies/Home Video']);
+  });
+
+  it('parseReconcileIntervalMs: default, off, floor, garbage', async () => {
+    const { parseReconcileIntervalMs } = await import('../../../../integrations/identity/index.mjs');
+    expect(parseReconcileIntervalMs(undefined)).toBe(60000);
+    expect(parseReconcileIntervalMs('0')).toBe(0);
+    expect(parseReconcileIntervalMs('5')).toBe(15000);
+    expect(parseReconcileIntervalMs('120')).toBe(120000);
+    expect(parseReconcileIntervalMs('soon')).toBe(60000);
+  });
+
+  it('with the job off, staleAfterMs falls back to three scan ticks and start() is a no-op', () => {
+    const off = createIdentityService({
+      env: { RADARR_URL: 'http://radarr:7878', RADARR_API_KEY: 'k', IDENTITY_RECONCILE_INTERVAL_SECONDS: '0' },
+      basePath,
+      fetchImpl,
+    });
+    expect(off.reconcileIntervalMs).toBe(0);
+    expect(off.staleAfterMs).toBe(540000);
+    expect(off.start()).toBe(false);
   });
 });
