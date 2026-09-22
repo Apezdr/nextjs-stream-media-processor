@@ -339,6 +339,59 @@ export const searchMedia = async (
   );
 };
 
+/** External id sources TMDB's /find endpoint accepts, keyed by our short names. */
+export const EXTERNAL_ID_SOURCES = Object.freeze({
+  imdb: "imdb_id",
+  tvdb: "tvdb_id",
+});
+
+/**
+ * Pick the TMDB id out of a /find response for the wanted media type.
+ * Exported for unit tests. Pure.
+ * @param {Object} data - /find response ({ movie_results, tv_results, ... })
+ * @param {string} type - 'movie' or 'tv'
+ * @returns {number|null}
+ */
+export function pickFindResult(data, type) {
+  const list = type === "tv" ? data?.tv_results : data?.movie_results;
+  const first = Array.isArray(list) ? list[0] : null;
+  return Number.isInteger(first?.id) && first.id > 0 ? first.id : null;
+}
+
+/**
+ * Map an IMDb or TVDB id to a TMDB id — an exact lookup, unlike the name
+ * search. Used by the identity providers when a manager (Sonarr, mostly)
+ * knows a title's external ids but carries no TMDB id for it.
+ *
+ * A miss (no mapping on TMDB's side yet) is a normal, cacheable answer, so
+ * the cache TTL is short: one request per unresolved title per day, and a
+ * mapping that appears upstream is seen within a day.
+ *
+ * @param {'imdb'|'tvdb'} source - Which external id `externalId` is
+ * @param {string|number} externalId
+ * @param {string} type - 'movie' or 'tv'
+ * @returns {Promise<number|null>} TMDB id, or null when TMDB has no mapping
+ */
+export const findTmdbIdByExternalId = async (source, externalId, type) => {
+  const externalSource = EXTERNAL_ID_SOURCES[source];
+  if (!externalSource) {
+    throw new Error(`Unknown external id source: ${source}`);
+  }
+  if (!["movie", "tv"].includes(type)) {
+    throw new Error('Type must be "movie" or "tv"');
+  }
+  const value = String(externalId ?? "").trim();
+  if (!value) return null;
+
+  const data = await makeTmdbRequest(
+    `/find/${encodeURIComponent(value)}`,
+    { external_source: externalSource },
+    3,
+    24,
+  );
+  return pickFindResult(data, type);
+};
+
 /**
  * Get detailed information for a movie or TV show
  * @param {string} type - 'movie' or 'tv'

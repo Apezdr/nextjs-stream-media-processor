@@ -171,6 +171,18 @@ export class ArrProvider extends IdentityProvider {
     return typeof item?.monitored === 'boolean' ? item.monitored : null;
   }
 
+  /**
+   * Remote artwork from the item's `images[]` (`coverType` poster / fanart,
+   * `remoteUrl`). The `url` field is the app's own /MediaCover path and is
+   * never forwarded: the frontend cannot reach it.
+   * @returns {{poster: string|null, backdrop: string|null}}
+   */
+  itemArt(item) {
+    const images = Array.isArray(item?.images) ? item.images : [];
+    const remote = (coverType) => images.find((img) => img?.coverType === coverType && typeof img.remoteUrl === 'string')?.remoteUrl ?? null;
+    return { poster: remote('poster'), backdrop: remote('fanart') };
+  }
+
   // ---- HTTP ---------------------------------------------------------------
 
   /**
@@ -235,21 +247,30 @@ export class ArrProvider extends IdentityProvider {
 
   // ---- claims -------------------------------------------------------------
 
+  /** Whether the item carries any id at all: a TMDB id, or an external id we can resolve. */
+  itemHasAnyId(item) {
+    const tmdbId = Number(item?.tmdbId);
+    if (Number.isInteger(tmdbId) && tmdbId > 0) return true;
+    return Object.keys(this.itemExternalIds(item)).length > 0;
+  }
+
   /**
-   * Turn one list item (or webhook subject) into a claim.
+   * Turn one list item (or webhook subject) into a claim. An item with no
+   * TMDB id but with external ids becomes an UNIDENTIFIED claim
+   * (`tmdbId: null`); the index builder tries to resolve it through TMDB.
    * @param {Object} item
    * @returns {IdentityClaim|null} null when the item has no usable id or path
    */
   claimFromItem(item) {
+    if (!this.itemHasAnyId(item)) return null;
     const tmdbId = Number(item?.tmdbId);
-    if (!Number.isInteger(tmdbId) || tmdbId <= 0) return null;
     const providerPath = this.itemPath(item);
     const libraryRelativePath = providerPath ? this.mapPath(providerPath) : null;
     if (!libraryRelativePath) return null;
     return this.makeClaim({
       mediaType: this.mediaType,
       libraryRelativePath,
-      tmdbId,
+      tmdbId: Number.isInteger(tmdbId) && tmdbId > 0 ? tmdbId : null,
       year: Number.isInteger(item?.year) ? item.year : null,
       title: item?.title ?? null,
       externalIds: this.itemExternalIds(item),
@@ -258,6 +279,7 @@ export class ArrProvider extends IdentityProvider {
       released: this.itemReleased(item),
       arrStatus: this.itemArrStatus(item),
       monitored: this.itemMonitored(item),
+      art: this.itemArt(item),
     });
   }
 
@@ -270,15 +292,19 @@ export class ArrProvider extends IdentityProvider {
     const claims = [];
     let unmapped = 0;
     let noId = 0;
+    let unidentified = 0;
     for (const item of items) {
-      const claim = this.claimFromItem(item);
-      if (claim) {
-        claims.push(claim);
-      } else if (Number.isInteger(Number(item?.tmdbId)) && Number(item?.tmdbId) > 0) {
-        unmapped++;
-      } else {
+      if (!this.itemHasAnyId(item)) {
         noId++;
+        continue;
       }
+      const claim = this.claimFromItem(item);
+      if (!claim) {
+        unmapped++;
+        continue;
+      }
+      claims.push(claim);
+      if (claim.tmdbId === null) unidentified++;
     }
     this.lastFetch = {
       ok: true,
@@ -288,6 +314,7 @@ export class ArrProvider extends IdentityProvider {
       claims: claims.length,
       unmapped,
       noId,
+      unidentified,
     };
     if (unmapped > 0 && this.logger) {
       this.logger.warn(`${this.name}: ${unmapped} item(s) under roots not in the root map were skipped`);

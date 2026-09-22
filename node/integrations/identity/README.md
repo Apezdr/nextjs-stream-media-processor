@@ -58,6 +58,37 @@ The report publishes `checkedAt` (last time the providers were compared),
 cadence when the job is off). A page should judge freshness on `checkedAt`
 against `staleAfterMs`, never on a threshold of its own.
 
+## Claims without a TMDB id
+
+A manager can know a folder without knowing its TMDB entity: Sonarr's
+metadata comes from TheTVDB and the TVDB-to-TMDB mapping is missing for some
+new shows (production 2026-09-22: *The Wayfinders*, tvdb 470313, imdb
+tt29712397, tmdbId 0). Such an item is still a claim, with `tmdbId: null` and
+its `externalIds`. The index builder offers it to `external-id-resolver.mjs`,
+which asks TMDB's `/find` endpoint (IMDb first, then TVDB for tv) — an exact
+lookup, cached for a day — and on a hit the claim becomes an ordinary one
+(`resolvedVia` says how). Radarr items and future providers get the same
+treatment.
+
+What TMDB cannot resolve either is kept apart in the index and reported
+under `managedUnidentified` — the folder, the provider, its external ids, the
+availability fields, and `localPin` (whatever the folder's own `tmdb.config`
+holds) — never under `unmanaged`. The precedence rule has nothing to act on,
+so nothing is written. An unidentified claim with no folder on disk is an
+ordinary provider-only row with `tmdbId: null` and `externalIds` attached.
+
+## Provider-side facts on report rows
+
+Provider-only and managed-unidentified rows forward what the provider says
+about the title, unchanged and never guessed: `hasFile`, `released`
+(Radarr `isAvailable`; Sonarr `status !== 'upcoming'`), `arrStatus` (the
+app's lifecycle word), `monitored`, `externalIds`, and `art`
+(`{ poster, backdrop }` — the app's *remote* image URLs from `images[]`,
+poster and fanart; its own `/MediaCover` paths are never forwarded, and a
+missing image is null). These titles are not in the library, so the admin
+page has no local art for them. Only `released` is in the change-detector
+fingerprint.
+
 ## How a claim becomes a repair
 
 ```

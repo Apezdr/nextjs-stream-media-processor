@@ -3,7 +3,7 @@
  * of them claim one folder with different ids the earlier one wins and the
  * disagreement is kept, not silently resolved.
  */
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest } from '@jest/globals';
 import { IdentityProvider } from '../../../../integrations/identity/provider.mjs';
 import { buildIdentityIndex, IdentityIndex } from '../../../../integrations/identity/index-builder.mjs';
 
@@ -137,6 +137,18 @@ describe('fingerprints (the change detector)', () => {
     expect((await buildIdentityIndex([new ItemProvider('radarr', onlyHasFile)])).fingerprint).not.toBe(before.fingerprint);
   });
 
+  it('art is not in the fingerprint', async () => {
+    const a = await buildIdentityIndex([new ItemProvider('radarr', base)]);
+    const withArt = base.map((i) => ({ ...i, art: { poster: 'https://image.tmdb.org/t/p/original/x.jpg', backdrop: null } }));
+    class ArtProvider extends ItemProvider {
+      async fetchClaims() {
+        const claims = await super.fetchClaims();
+        return claims.map((c, idx) => ({ ...c, art: withArt[idx].art }));
+      }
+    }
+    expect((await buildIdentityIndex([new ArtProvider('radarr', withArt)])).fingerprint).toBe(a.fingerprint);
+  });
+
   it('moves on release day (released flips) but not on monitored or arrStatus alone', async () => {
     const announced = base.map((i) => (i.tmdbId === 464737 ? { ...i, released: false, arrStatus: 'announced', monitored: true } : i));
     const before = await buildIdentityIndex([new ItemProvider('radarr', announced)]);
@@ -170,6 +182,78 @@ describe('fingerprints (the change detector)', () => {
     expect(provider.lastFetch).toMatchObject({ ok: true, claims: 2 });
     expect(provider.lastFetch.error).toBeUndefined();
     expect(index.coveredTypes.has('movie')).toBe(true);
+  });
+});
+
+describe('unidentified claims and the external-id resolver', () => {
+  class ExtProvider extends IdentityProvider {
+    constructor(name, mediaType, items) {
+      super({ name, mediaTypes: [mediaType] });
+      this.mediaType = mediaType;
+      this.items = items;
+    }
+
+    async fetchClaims() {
+      return this.items.map((item) =>
+        this.makeClaim({
+          mediaType: this.mediaType,
+          libraryRelativePath: `${this.mediaType === 'tv' ? 'tv' : 'movies'}/${item.folder}`,
+          tmdbId: item.tmdbId ?? null,
+          externalIds: item.externalIds ?? {},
+          providerPath: `/root/${item.folder}`,
+          hasFile: true,
+        })
+      );
+    }
+  }
+
+  const wayfinders = { folder: 'The Wayfinders', tmdbId: 0, externalIds: { tvdb: 470313, imdb: 'tt29712397' } };
+  const kingdom = { folder: 'Kingdom (2019)', tmdbId: 83097, externalIds: { tvdb: 354167 } };
+
+  it('makeClaim refuses a claim with neither a tmdbId nor an external id', () => {
+    const p = new ExtProvider('sonarr', 'tv', []);
+    expect(() => p.makeClaim({ mediaType: 'tv', libraryRelativePath: 'tv/X', tmdbId: 0 })).toThrow(/external id/);
+  });
+
+  it('without a resolver, the claim is kept apart as unidentified and the folder is known but not identified', async () => {
+    const index = await buildIdentityIndex([new ExtProvider('sonarr', 'tv', [wayfinders, kingdom])]);
+    expect(index.size).toBe(1);
+    expect(index.unidentifiedCount).toBe(1);
+    expect(index.has('tv/The Wayfinders')).toBe(false);
+    expect(index.knows('tv/The Wayfinders')).toBe(true);
+    expect(index.unidentifiedFor('tv')[0]).toMatchObject({ tmdbId: null, externalIds: { tvdb: 470313, imdb: 'tt29712397' } });
+    expect(index.providers[0]).toMatchObject({ claims: 2, unidentified: 1, resolved: 0 });
+    expect(index.summary().unidentified).toBe(1);
+  });
+
+  it('a resolver hit promotes the claim to an identified one and records how', async () => {
+    const resolveExternalId = jest.fn(async (claim) => (claim.externalIds.imdb === 'tt29712397' ? { tmdbId: 251234, via: 'imdb' } : null));
+    const index = await buildIdentityIndex([new ExtProvider('sonarr', 'tv', [wayfinders, kingdom])], { resolveExternalId });
+    expect(resolveExternalId).toHaveBeenCalledTimes(1); // only the unidentified claim is offered
+    expect(index.get('tv/The Wayfinders')).toMatchObject({ tmdbId: 251234, resolvedVia: 'imdb', source: 'sonarr' });
+    expect(index.unidentifiedCount).toBe(0);
+    expect(index.providers[0]).toMatchObject({ claims: 2, unidentified: 0, resolved: 1 });
+  });
+
+  it('a resolver miss leaves the claim unidentified; a resolution appearing later moves the fingerprint', async () => {
+    const miss = await buildIdentityIndex([new ExtProvider('sonarr', 'tv', [wayfinders])], { resolveExternalId: async () => null });
+    const hit = await buildIdentityIndex([new ExtProvider('sonarr', 'tv', [wayfinders])], { resolveExternalId: async () => ({ tmdbId: 251234, via: 'tvdb' }) });
+    expect(miss.unidentifiedCount).toBe(1);
+    expect(hit.unidentifiedCount).toBe(0);
+    expect(miss.fingerprint).not.toBe(hit.fingerprint);
+    // And the unidentified fingerprint itself is stable run to run.
+    const missAgain = await buildIdentityIndex([new ExtProvider('sonarr', 'tv', [wayfinders])], { resolveExternalId: async () => null });
+    expect(missAgain.fingerprint).toBe(miss.fingerprint);
+  });
+
+  it('an identified claim from another provider wins over an unidentified one for the same folder', async () => {
+    const index = await buildIdentityIndex([
+      new ExtProvider('sonarr', 'tv', [wayfinders]),
+      new ExtProvider('other', 'tv', [{ folder: 'The Wayfinders', tmdbId: 251234 }]),
+    ]);
+    expect(index.get('tv/The Wayfinders')).toMatchObject({ tmdbId: 251234, source: 'other' });
+    expect(index.unidentifiedCount).toBe(0);
+    expect(index.providerConflicts).toEqual([]);
   });
 });
 

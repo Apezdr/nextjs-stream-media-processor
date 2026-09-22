@@ -106,6 +106,7 @@ describe('RadarrProvider', () => {
       mediaType: 'movie',
       libraryRelativePath: 'movies/The Professor',
       tmdbId: 467956,
+      resolvedVia: null,
       source: 'radarr',
       year: 2018,
       title: 'The Professor',
@@ -115,9 +116,23 @@ describe('RadarrProvider', () => {
       released: true,
       arrStatus: 'released',
       monitored: true,
+      art: {
+        poster: 'https://image.tmdb.org/t/p/original/professor-poster.jpg',
+        backdrop: 'https://image.tmdb.org/t/p/original/professor-fanart.jpg',
+      },
     });
     expect(claims.find((c) => c.tmdbId === 999001).hasFile).toBe(false);
-    expect(provider.lastFetch).toMatchObject({ items: 5, claims: 4, unmapped: 0, noId: 1 });
+    // Broken Entry: tmdbId 0 and no imdbId → no id of any kind → dropped.
+    expect(provider.lastFetch).toMatchObject({ items: 5, claims: 4, unmapped: 0, noId: 1, unidentified: 0 });
+  });
+
+  it('a movie with only an IMDb id is an unidentified claim; a webhook subject too', () => {
+    const provider = RadarrProvider.fromEnv(env, {});
+    expect(provider.claimFromItem({ tmdbId: 0, imdbId: 'tt0000001', path: '/processed_movies/Obscure (1999)' })).toMatchObject({
+      tmdbId: null, externalIds: { imdb: 'tt0000001' }, libraryRelativePath: 'movies/Obscure (1999)',
+    });
+    const [event] = provider.parseWebhook({ eventType: 'MovieAdded', movie: { tmdbId: 0, imdbId: 'tt0000001', folderPath: '/processed_movies/Obscure (1999)' } });
+    expect(event.claim).toMatchObject({ tmdbId: null, externalIds: { imdb: 'tt0000001' } });
   });
 
   it('carries release availability: isAvailable → released, status verbatim, monitored', async () => {
@@ -127,6 +142,19 @@ describe('RadarrProvider', () => {
     expect(claims.find((c) => c.tmdbId === 999001)).toMatchObject({ hasFile: false, released: false, arrStatus: 'announced', monitored: true });
     // Released but unmonitored.
     expect(claims.find((c) => c.tmdbId === 999002)).toMatchObject({ released: true, arrStatus: 'released', monitored: false });
+  });
+
+  it('art: poster and fanart remote URLs are forwarded; the local /MediaCover path never is', async () => {
+    const fetchImpl = fakeFetch({ '/api/v3/movie': await loadFixture('radarr-movies.json') });
+    const claims = await RadarrProvider.fromEnv(env, { fetchImpl }).fetchClaims();
+    // fanart entry has no remoteUrl → backdrop null, poster still forwarded
+    expect(claims.find((c) => c.tmdbId === 999001).art).toEqual({ poster: 'https://image.tmdb.org/t/p/original/ndy-poster.jpg', backdrop: null });
+    // no images at all → both null, shape kept
+    expect(claims.find((c) => c.tmdbId === 438631).art).toEqual({ poster: null, backdrop: null });
+    // a relative or non-http remoteUrl is not art the frontend can render
+    const provider = RadarrProvider.fromEnv(env, {});
+    const claim = provider.claimFromItem({ tmdbId: 5, path: '/processed_movies/X', images: [{ coverType: 'poster', remoteUrl: '/MediaCover/5/poster.jpg' }, { coverType: 'fanart', remoteUrl: '' }] });
+    expect(claim.art).toEqual({ poster: null, backdrop: null });
   });
 
   it('an item without the availability fields yields null, never false', () => {
@@ -216,11 +244,12 @@ describe('SonarrProvider', () => {
     const fetchImpl = fakeFetch({ '/api/v3/series': await loadFixture('sonarr-series.json') });
     const provider = SonarrProvider.fromEnv(env, { fetchImpl });
     const claims = await provider.fetchClaims();
-    expect(claims).toHaveLength(2); // the third series has no tmdbId
+    expect(claims).toHaveLength(3); // the third series has no tmdbId but a tvdbId → unidentified claim
     expect(claims[0]).toEqual({
       mediaType: 'tv',
       libraryRelativePath: 'tv/Kingdom (2019)',
       tmdbId: 83097,
+      resolvedVia: null,
       source: 'sonarr',
       year: 2019,
       title: 'Kingdom',
@@ -230,9 +259,39 @@ describe('SonarrProvider', () => {
       released: true,
       arrStatus: 'continuing',
       monitored: true,
+      art: {
+        poster: 'https://artworks.thetvdb.com/banners/kingdom-poster.jpg',
+        backdrop: 'https://artworks.thetvdb.com/banners/kingdom-fanart.jpg',
+      },
     });
     expect(claims[1]).toMatchObject({ libraryRelativePath: 'tv/Kingdom (2014)', tmdbId: 61137, hasFile: false, released: true, arrStatus: 'ended', monitored: false });
     expect(fetchImpl.calls[0].url).toBe('http://sonarr:8989/api/v3/series');
+  });
+
+  it('a series Sonarr manages without a TMDB id is an unidentified claim, not a dropped one (The Wayfinders case)', async () => {
+    const fetchImpl = fakeFetch({ '/api/v3/series': await loadFixture('sonarr-series.json') });
+    const provider = SonarrProvider.fromEnv(env, { fetchImpl });
+    const claims = await provider.fetchClaims();
+    const unidentified = claims.find((c) => c.tmdbId === null);
+    expect(unidentified).toMatchObject({
+      libraryRelativePath: 'tv/No Ids Yet',
+      tmdbId: null,
+      resolvedVia: null,
+      externalIds: { tvdb: 1 },
+      released: false,
+      arrStatus: 'upcoming',
+    });
+    expect(provider.lastFetch).toMatchObject({ items: 3, claims: 3, unidentified: 1, noId: 0, unmapped: 0 });
+
+    // The production record verbatim: tvdb + imdb, tmdbId 0.
+    const wayfinders = provider.claimFromItem({
+      title: 'The Wayfinders', year: 2025, path: '/processed_tv/The Wayfinders',
+      tvdbId: 470313, tmdbId: 0, imdbId: 'tt29712397', status: 'continuing', monitored: true,
+    });
+    expect(wayfinders).toMatchObject({ tmdbId: null, externalIds: { tvdb: 470313, imdb: 'tt29712397' }, libraryRelativePath: 'tv/The Wayfinders' });
+
+    // No id of any kind is still dropped and counted as noId.
+    expect(provider.claimFromItem({ title: 'Nothing', path: '/processed_tv/Nothing', tmdbId: 0 })).toBeNull();
   });
 
   it('released follows status: upcoming → false, continuing/ended → true, absent → null', () => {

@@ -24,16 +24,18 @@ class FakeProvider extends IdentityProvider {
 
   async fetchClaims() {
     if (this.fail) throw this.fail;
-    return this.claims.map(({ folder, tmdbId, hasFile = true, released, arrStatus, monitored }) =>
+    return this.claims.map(({ folder, tmdbId, hasFile = true, released, arrStatus, monitored, externalIds, art }) =>
       this.makeClaim({
         mediaType: this.mediaType,
         libraryRelativePath: `${this.mediaType === 'movie' ? 'movies' : 'tv'}/${folder}`,
         tmdbId,
+        externalIds,
         hasFile,
         title: folder,
         released,
         arrStatus,
         monitored,
+        art,
       })
     );
   }
@@ -89,7 +91,7 @@ describe('reconcileIdentities', () => {
         { folder: 'Legacy Pin', tmdbId: 444 },
         { folder: 'Fresh (2024)', tmdbId: 555 },
         { folder: 'Frozen', tmdbId: 333 },
-        { folder: 'Queued Download (2026)', tmdbId: 666, hasFile: false, released: false, arrStatus: 'announced', monitored: true }, // provider-only
+        { folder: 'Queued Download (2026)', tmdbId: 666, hasFile: false, released: false, arrStatus: 'announced', monitored: true, art: { poster: 'https://image.tmdb.org/t/p/original/q.jpg', backdrop: 'https://image.tmdb.org/t/p/original/q-bg.jpg' } }, // provider-only
       ]),
       new FakeProvider('sonarr', 'tv', [{ folder: 'Kingdom (2019)', tmdbId: 83097 }]),
     ]);
@@ -101,7 +103,7 @@ describe('reconcileIdentities', () => {
     const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual', reason: 'test' });
 
     expect(report.totals).toEqual({
-      claimed: 8, write: 3, stamp: 1, keep: 1, conflict: 2, providerOnly: 1, unmanaged: 1, nested: 0, errors: 0,
+      claimed: 8, write: 3, stamp: 1, keep: 1, conflict: 2, providerOnly: 1, managedUnidentified: 0, unmanaged: 1, nested: 0, errors: 0,
     });
     expect(report.perType).toEqual({ movie: { onDisk: 7, claimed: 7, covered: true }, tv: { onDisk: 1, claimed: 1, covered: true } });
 
@@ -139,6 +141,7 @@ describe('reconcileIdentities', () => {
       expect.objectContaining({
         libraryRelativePath: 'movies/Queued Download (2026)', tmdbId: 666, hasFile: false,
         released: false, arrStatus: 'announced', monitored: true,
+        art: { poster: 'https://image.tmdb.org/t/p/original/q.jpg', backdrop: 'https://image.tmdb.org/t/p/original/q-bg.jpg' },
       }),
     ]);
     expect(report.unmanaged.items).toEqual(['movies/Home Video']);
@@ -178,6 +181,53 @@ describe('reconcileIdentities', () => {
       { basePath, unsourcedPinTreatment: 'manual' }
     );
     expect(result.outcome).toBe('nested-path');
+  });
+
+  it('a managed folder whose provider has no TMDB id is reported as managed-unidentified with its local pin, never as unmanaged', async () => {
+    // The Wayfinders: Sonarr manages it (tvdb + imdb, no tmdb); the folder exists and
+    // carries the name-search pin the scanner wrote when it first appeared.
+    await makeTitle(tvDir('The Wayfinders'), { tmdb_id: 123456, tmdb_id_source: 'auto' });
+    const index = await buildIdentityIndex([
+      new FakeProvider('sonarr', 'tv', [
+        { folder: 'The Wayfinders', tmdbId: null, externalIds: { tvdb: 470313, imdb: 'tt29712397' }, released: true, arrStatus: 'continuing', monitored: true, art: { poster: 'https://artworks.thetvdb.com/banners/wf.jpg', backdrop: null } },
+        { folder: 'Kingdom (2019)', tmdbId: 83097 },
+        { folder: 'Coming Soon (2027)', tmdbId: null, externalIds: { tvdb: 9 }, hasFile: false, released: false, arrStatus: 'upcoming' },
+      ]),
+    ]);
+    const pinBefore = await mtime(join(tvDir('The Wayfinders'), 'tmdb.config'));
+    const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual' });
+
+    expect(report.totals).toMatchObject({ managedUnidentified: 1, providerOnly: 1, keep: 1, write: 0, unmanaged: 0 });
+    expect(report.managedUnidentified.items).toEqual([
+      expect.objectContaining({
+        libraryRelativePath: 'tv/The Wayfinders',
+        source: 'sonarr',
+        externalIds: { tvdb: 470313, imdb: 'tt29712397' },
+        title: 'The Wayfinders',
+        released: true,
+        arrStatus: 'continuing',
+        monitored: true,
+        art: { poster: 'https://artworks.thetvdb.com/banners/wf.jpg', backdrop: null },
+        localPin: { tmdbId: 123456, source: 'auto' },
+      }),
+    ]);
+    expect(report.unmanaged.items).not.toContain('tv/The Wayfinders');
+    // Nothing was offered to the precedence rule, so nothing was written.
+    expect(await mtime(join(tvDir('The Wayfinders'), 'tmdb.config'))).toBe(pinBefore);
+    // An unidentified claim with no folder on disk is provider-only, tmdbId null, ids attached.
+    expect(report.providerOnly.items[0]).toMatchObject({ libraryRelativePath: 'tv/Coming Soon (2027)', tmdbId: null, externalIds: { tvdb: 9 }, hasFile: false, released: false });
+    expect(report.index.unidentified).toBe(2);
+  });
+
+  it('managed-unidentified with no pin on disk reports localPin null; reconcileClaim says unidentified', async () => {
+    await makeTitle(tvDir('Unpinned Show'));
+    const claim = {
+      mediaType: 'tv', libraryRelativePath: 'tv/Unpinned Show', tmdbId: null, source: 'sonarr', externalIds: { imdb: 'tt1' },
+    };
+    const result = await reconcileClaim(claim, { basePath, unsourcedPinTreatment: 'manual' });
+    expect(result).toMatchObject({ outcome: 'unidentified' });
+    expect(result.localPin?.tmdbId ?? null).toBeNull();
+    await expect(fs.access(join(tvDir('Unpinned Show'), 'tmdb.config'))).rejects.toBeDefined();
   });
 
   it('a claim without availability fields yields null on the provider-only row, never false', async () => {
@@ -221,8 +271,9 @@ describe('reconcileIdentities', () => {
     const report = await reconcileIdentities({ index, basePath, unsourcedPinTreatment: 'manual' });
     expect(report.perType.movie).toMatchObject({ covered: false, claimed: 0 });
     expect(report.perType.tv).toMatchObject({ covered: true, claimed: 1 });
-    expect(report.totals.unmanaged).toBe(0); // seven movie folders, none listed
-    expect(report.unmanaged.items).toEqual([]);
+    // Seven movie folders on disk, none listed; tv folders (covered) may be.
+    expect(report.unmanaged.items.filter((p) => p.startsWith('movies/'))).toEqual([]);
+    expect(report.totals.unmanaged).toBe(report.unmanaged.items.length);
     expect(report.index.allOk).toBe(false);
   });
 
