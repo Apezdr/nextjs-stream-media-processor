@@ -1,0 +1,25 @@
+{
+  "movie": {
+    "id": 1,
+    "title": "The Professor",
+    "year": 2018,
+    "releaseDate": "2018-05-17",
+    "folderPath": "/processed_movies/The Professor",
+    "tmdbId": 467956,
+    "imdbId": "tt5559796"
+  },
+  "remoteMovie": { "tmdbId": 467956, "imdbId": "tt5559796", "title": "The Professor", "year": 2018 },
+  "movieFile": {
+    "id": 77,
+    "relativePath": "The.Professor.2018.BluRay.Remux.mkv",
+    "path": "/processed_movies/The Professor/The.Professor.2018.BluRay.Remux.mkv",
+    "quality": "Remux-1080p",
+    "sceneName": "The.Professor.2018.BluRay.Remux"
+  },
+  "isUpgrade": false,
+  "downloadClient": "qBittorrent",
+  "downloadId": "abc",
+  "eventType": "Download",
+  "instanceName": "Radarr",
+  "applicationUrl": ""
+}

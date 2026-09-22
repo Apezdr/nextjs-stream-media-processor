@@ -68,6 +68,7 @@
       "utils/**/*.mjs",
       "routes/**/*.mjs",
       "lib/**/*.mjs",
+      "integrations/identity/**/*.mjs",
       "!**/*.test.mjs"
     ],
     "coveragePathIgnorePatterns": [
