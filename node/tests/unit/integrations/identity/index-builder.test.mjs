@@ -97,7 +97,17 @@ describe('fingerprints (the change detector)', () => {
     async fetchClaims() {
       if (this.fail) throw this.fail;
       return this.items.map((item) =>
-        this.makeClaim({ mediaType: 'movie', libraryRelativePath: `movies/${item.folder}`, tmdbId: item.tmdbId, hasFile: item.hasFile, providerPath: `/root/${item.folder}`, title: item.title })
+        this.makeClaim({
+          mediaType: 'movie',
+          libraryRelativePath: `movies/${item.folder}`,
+          tmdbId: item.tmdbId,
+          hasFile: item.hasFile,
+          providerPath: `/root/${item.folder}`,
+          title: item.title,
+          released: item.released,
+          arrStatus: item.arrStatus,
+          monitored: item.monitored,
+        })
       );
     }
   }
@@ -125,6 +135,20 @@ describe('fingerprints (the change detector)', () => {
 
     const onlyHasFile = base.map((i) => (i.tmdbId === 464737 ? { ...i, hasFile: true } : i));
     expect((await buildIdentityIndex([new ItemProvider('radarr', onlyHasFile)])).fingerprint).not.toBe(before.fingerprint);
+  });
+
+  it('moves on release day (released flips) but not on monitored or arrStatus alone', async () => {
+    const announced = base.map((i) => (i.tmdbId === 464737 ? { ...i, released: false, arrStatus: 'announced', monitored: true } : i));
+    const before = await buildIdentityIndex([new ItemProvider('radarr', announced)]);
+
+    const unmonitored = announced.map((i) => (i.tmdbId === 464737 ? { ...i, monitored: false } : i));
+    expect((await buildIdentityIndex([new ItemProvider('radarr', unmonitored)])).fingerprint).toBe(before.fingerprint);
+
+    const inCinemas = announced.map((i) => (i.tmdbId === 464737 ? { ...i, arrStatus: 'inCinemas' } : i));
+    expect((await buildIdentityIndex([new ItemProvider('radarr', inCinemas)])).fingerprint).toBe(before.fingerprint);
+
+    const released = announced.map((i) => (i.tmdbId === 464737 ? { ...i, released: true, arrStatus: 'released' } : i));
+    expect((await buildIdentityIndex([new ItemProvider('radarr', released)])).fingerprint).not.toBe(before.fingerprint);
   });
 
   it('a failed provider records the failure on lastFetch and never yields a stable fingerprint', async () => {

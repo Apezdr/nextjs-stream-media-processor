@@ -50,6 +50,11 @@ export class RadarrProvider extends ArrProvider {
     return typeof item?.hasFile === 'boolean' ? item.hasFile : null;
   }
 
+  /** Radarr's own "minimum availability met" verdict. */
+  itemReleased(item) {
+    return typeof item?.isAvailable === 'boolean' ? item.isAvailable : null;
+  }
+
   webhookSubjectPath(subject) {
     return subject?.folderPath ?? subject?.path ?? null;
   }

@@ -60,4 +60,10 @@ export class SonarrProvider extends ArrProvider {
     if (item?.tvdbId) ids.tvdb = item.tvdbId;
     return ids;
   }
+
+  /** A series is obtainable once it is no longer `upcoming` (continuing or ended). */
+  itemReleased(item) {
+    const status = this.itemArrStatus(item);
+    return status ? status !== 'upcoming' : null;
+  }
 }

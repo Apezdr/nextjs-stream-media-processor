@@ -59,6 +59,9 @@ export const SCAN_TRIGGER_KINDS = Object.freeze(new Set([
  * @property {Object<string,string|number>} externalIds  e.g. { imdb: 'tt…', tvdb: 123 }
  * @property {boolean|null} hasFile         whether the provider believes a file exists; null = unknown
  * @property {string|null} providerPath     the path as the provider sees it (diagnostics only)
+ * @property {boolean|null} released        the provider considers the title obtainable now; null = cannot say
+ * @property {string|null} arrStatus        the provider's own lifecycle word, verbatim (announced, released, continuing, …)
+ * @property {boolean|null} monitored       the provider is actively looking for it; null = cannot say
  */
 
 /**
@@ -203,6 +206,10 @@ export class IdentityProvider {
       externalIds: fields.externalIds ?? {},
       hasFile: typeof fields.hasFile === 'boolean' ? fields.hasFile : null,
       providerPath: fields.providerPath ?? null,
+      // Availability is never guessed: a provider that cannot say emits null.
+      released: typeof fields.released === 'boolean' ? fields.released : null,
+      arrStatus: typeof fields.arrStatus === 'string' && fields.arrStatus ? fields.arrStatus : null,
+      monitored: typeof fields.monitored === 'boolean' ? fields.monitored : null,
     };
   }
 

@@ -8,6 +8,8 @@
     "tvdbId": 354167,
     "tmdbId": 83097,
     "imdbId": "tt6611916",
+    "status": "continuing",
+    "monitored": true,
     "statistics": { "episodeFileCount": 12 }
   },
   {
@@ -19,6 +21,8 @@
     "tvdbId": 280385,
     "tmdbId": 61137,
     "imdbId": "tt3411660",
+    "status": "ended",
+    "monitored": false,
     "statistics": { "episodeFileCount": 0 }
   },
   {
@@ -28,6 +32,8 @@
     "path": "/processed_tv/No Ids Yet",
     "rootFolderPath": "/processed_tv",
     "tvdbId": 1,
+    "status": "upcoming",
+    "monitored": true,
     "statistics": { "episodeFileCount": 1 }
   }
 ]

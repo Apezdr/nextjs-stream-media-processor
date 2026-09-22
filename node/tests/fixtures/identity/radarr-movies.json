@@ -7,7 +7,11 @@
     "rootFolderPath": "/processed_movies",
     "tmdbId": 467956,
     "imdbId": "tt5559796",
-    "hasFile": true
+    "hasFile": true,
+    "status": "released",
+    "isAvailable": true,
+    "monitored": true,
+    "qualityProfileId": 4
   },
   {
     "id": 2,
@@ -17,7 +21,10 @@
     "rootFolderPath": "/processed_movies",
     "tmdbId": 438631,
     "imdbId": "tt1160419",
-    "hasFile": true
+    "hasFile": true,
+    "status": "released",
+    "isAvailable": true,
+    "monitored": true
   },
   {
     "id": 3,
@@ -26,7 +33,10 @@
     "path": "/processed_movies/Not Downloaded Yet (2026)",
     "rootFolderPath": "/processed_movies",
     "tmdbId": 999001,
-    "hasFile": false
+    "hasFile": false,
+    "status": "announced",
+    "isAvailable": false,
+    "monitored": true
   },
   {
     "id": 4,
@@ -35,7 +45,10 @@
     "path": "/kids_movies/Kids Film (2020)",
     "rootFolderPath": "/kids_movies",
     "tmdbId": 999002,
-    "hasFile": true
+    "hasFile": true,
+    "status": "released",
+    "isAvailable": true,
+    "monitored": false
   },
   {
     "id": 5,

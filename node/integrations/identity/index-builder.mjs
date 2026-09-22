@@ -17,14 +17,16 @@
 import { createHash } from 'crypto';
 
 /**
- * Stable hash of what a reconcile would see. Fields outside the tuple
- * (monitored, quality profile, title casing, …) deliberately do not move it.
+ * Stable hash of what a reconcile would see, plus `released`, which flips
+ * once per title on release day and changes what a provider-only row means.
+ * Fields outside the tuple (monitored, arrStatus, quality profile, title
+ * casing, …) deliberately do not move it.
  * @param {import('./provider.mjs').IdentityClaim[]} claims
  * @returns {string}
  */
 export function fingerprintClaims(claims) {
   const lines = claims
-    .map((c) => `${c.providerPath ?? c.libraryRelativePath}\t${c.tmdbId}\t${c.hasFile}`)
+    .map((c) => `${c.providerPath ?? c.libraryRelativePath}\t${c.tmdbId}\t${c.hasFile}\t${c.released ?? null}`)
     .sort();
   return createHash('sha1').update(lines.join('\n')).digest('hex');
 }
