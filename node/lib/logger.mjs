@@ -5,11 +5,11 @@ import { isOpenTelemetryEnabled } from './telemetry.mjs';
 import path from 'path';
 import fs from 'fs';
 
-// Ensure base log directory exists
+// Ensure base log directory exists. `recursive: true` makes this idempotent so
+// concurrent importers (e.g. parallel Jest workers) can't race an existsSync
+// check and lose with EEXIST.
 const logDirectory = path.resolve('logs');
-if (!fs.existsSync(logDirectory)) {
-  fs.mkdirSync(logDirectory);
-}
+fs.mkdirSync(logDirectory, { recursive: true });
 
 const isProduction = process.env.NODE_ENV === 'production';
 
