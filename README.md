@@ -5,6 +5,8 @@
 - FRONT_END_1=<your_frontend_url>
 - WEBHOOK_ID_1=<your_webhook_id>
 - MONGODB_URI=<mongodb_uri>
+- WIKIDATA_RATING_ENRICHMENT=scanner  # Optional; off when absent
+- WIKIDATA_USER_AGENT=<descriptive_user_agent_with_contact>  # Optional override
 - TZ=America/New_York
 # Node.js
 - BASE_PATH=<your_base_path>
@@ -39,6 +41,15 @@ WEBHOOK_ID_2=o4jsi82ksjLowQ910PXosEas5S0eopqS
 ```
 
 See [.env.example](.env.example) for a complete configuration example.
+
+### Optional Wikidata rating enrichment
+
+`WIKIDATA_RATING_ENRICHMENT=scanner` lets movie metadata refreshes augment
+compatible TMDB ratings with cached Wikidata descriptors, certificate IDs and
+field-level source evidence. It uses exact TMDB movie IDs, never title search,
+and needs no API key. User-facing comprehensive requests read this cache but do
+not trigger live Wikidata traffic. Missing, conflicting or unavailable data is
+omitted without changing the TMDB response.
 
 ## Development Setup
 

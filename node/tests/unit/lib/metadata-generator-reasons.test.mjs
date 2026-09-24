@@ -228,7 +228,13 @@ describe('B-1: scanner-triggered fetches never request embedded blurhash', () =>
     const result = await generator.generateForMovie('Blurhash Movie (2020)');
 
     expect(result.success).toBe(true);
-    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledWith('Blurhash Movie (2020)', 'movie', null, false);
+    expect(fetchComprehensiveMediaDetails).toHaveBeenCalledWith(
+      'Blurhash Movie (2020)',
+      'movie',
+      null,
+      false,
+      { allowWikidataNetwork: true },
+    );
     // The consumed pipeline — sidecar .blurhash files via downloadMediaImages —
     // stays governed by the config flag.
     expect(downloadMediaImages).toHaveBeenCalledWith(
@@ -238,6 +244,41 @@ describe('B-1: scanner-triggered fetches never request embedded blurhash', () =>
       'movie',
       expect.objectContaining({ generateBlurhash: true })
     );
+  });
+
+  it('preserves the trusted provider envelope over a metadata override', async () => {
+    const dir = join(baseDir, 'movies', 'Provider Envelope Movie (2026)');
+    const trustedEnrichments = {
+      wikidata: {
+        schema: 1,
+        entityId: 'Q136163067',
+        tmdbMovieId: '1339713',
+        contentRating: 'R',
+        ratingEntityId: 'Q18665344',
+        descriptors: [],
+      },
+    };
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      join(dir, 'tmdb.config'),
+      JSON.stringify({
+        metadata: {
+          contentRatingEnrichments: { wikidata: { entityId: 'Qspoofed' } },
+        },
+      }),
+    );
+    fetchComprehensiveMediaDetails.mockResolvedValue({
+      id: 1339713,
+      title: 'Provider Envelope Movie',
+      contentRatingEnrichments: trustedEnrichments,
+    });
+
+    const generator = await makeGenerator();
+    const result = await generator.generateForMovie('Provider Envelope Movie (2026)');
+
+    expect(result.success).toBe(true);
+    const written = JSON.parse(await fs.readFile(join(dir, 'metadata.json'), 'utf8'));
+    expect(written.contentRatingEnrichments).toEqual(trustedEnrichments);
   });
 
   it('generateForShow fetches with includeBlurhash=false on the pinned-id path', async () => {

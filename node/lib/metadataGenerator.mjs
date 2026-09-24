@@ -940,10 +940,22 @@ export class MetadataGenerator {
       let tmdbData;
       if (tmdbConfig.tmdb_id) {
         // Use existing TMDB ID
-        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', tmdbConfig.tmdb_id, false);
+        tmdbData = await fetchComprehensiveMediaDetails(
+          movieName,
+          'movie',
+          tmdbConfig.tmdb_id,
+          false,
+          { allowWikidataNetwork: true },
+        );
       } else {
         // Search for TMDB ID
-        tmdbData = await fetchComprehensiveMediaDetails(movieName, 'movie', null, false);
+        tmdbData = await fetchComprehensiveMediaDetails(
+          movieName,
+          'movie',
+          null,
+          false,
+          { allowWikidataNetwork: true },
+        );
 
         // Update config with found TMDB ID. Stamped `auto`: a search result
         // is the one kind of pin an identity provider may later correct.
@@ -952,7 +964,7 @@ export class MetadataGenerator {
         }
       }
 
-      // G-5: capture the raw pre-override TMDB payload for the scanner to
+      // G-5: capture the raw pre-override provider payload for the scanner to
       // persist into movies.pristine_metadata. This point is reachable ONLY
       // after a genuine fetch (the frozen and up-to-date paths returned
       // earlier), so the success return below always carries it. Serialized
@@ -962,7 +974,18 @@ export class MetadataGenerator {
       const pristineMetadata = JSON.stringify(tmdbData);
 
       // Apply any metadata overrides from config
-      const enhancedMetadata = applyMetadataOverrides(tmdbData, tmdbConfig);
+      const overriddenMetadata = applyMetadataOverrides(tmdbData, tmdbConfig);
+      const trustedContentRatingEnrichments = tmdbData.contentRatingEnrichments;
+      const {
+        contentRatingEnrichments: _ignoredContentRatingEnrichmentOverride,
+        ...metadataWithoutProviderOverride
+      } = overriddenMetadata;
+      const enhancedMetadata = trustedContentRatingEnrichments
+        ? {
+            ...metadataWithoutProviderOverride,
+            contentRatingEnrichments: trustedContentRatingEnrichments,
+          }
+        : metadataWithoutProviderOverride;
 
       // Reconcile BEFORE downloading on the fresh-fetch path too. Mirrors
       // the show flow; catches URL-change orphans plus stale-by-tmdb.config

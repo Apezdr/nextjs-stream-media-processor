@@ -278,23 +278,76 @@ GET /api/tmdb/images/movie/27205
 
 Get content rating for a movie or TV show.
 
-**Endpoint**: `GET /api/tmdb/rating/:type/:id`
+**Endpoint**: `GET /api/tmdb/rating/:type?tmdb_id=:id`
 
 **Parameters**:
 - `type` (path): `movie` or `tv`
-- `id` (path): TMDB ID
+- `tmdb_id` (query): TMDB ID
 
 **Example**:
 ```http
-GET /api/tmdb/rating/movie/27205
+GET /api/tmdb/rating/movie?tmdb_id=27205
 ```
 
 **Response**:
 ```json
 {
-  "rating": "PG-13"
+  "rating": "PG-13",
+  "descriptors": ["Violence", "Strong Language"],
+  "release_dates": {
+    "results": []
+  }
 }
 ```
+
+Movie responses include a bounded US-only subset of TMDB `release_dates`; TV
+responses use a bounded US-only `content_ratings` subset instead. Foreign rows,
+release notes, unknown fields and internal cache bookkeeping are omitted. The
+legacy `rating` string remains for existing clients, while `descriptors`
+contains only sanitized values attached to that same US classification. TMDB
+may return an empty descriptor array even when a certification is present.
+
+The comprehensive movie/TV endpoints expose the same additive bounded fields so
+clients can apply deterministic selection and normalization without a second
+TMDB request.
+
+When optional Wikidata movie enrichment is enabled and a compatible cached
+record exists, comprehensive movie responses may also include:
+
+```json
+{
+  "contentRatingEnrichments": {
+    "wikidata": {
+      "schema": 1,
+      "entityId": "Q136163067",
+      "tmdbMovieId": "1339713",
+      "imdbId": "tt37287335",
+      "contentRating": "R",
+      "ratingEntityId": "Q18665344",
+      "descriptors": [],
+      "certificateId": "55720",
+      "certificateProperty": "P2676",
+      "statementId": "Q136163067$statement-guid",
+      "retrievedAt": "2026-08-16T00:00:00.000Z"
+    }
+  }
+}
+```
+
+The envelope is additive and movie-only. It is evidence for the frontend's
+field-level compatibility check, not a replacement for `rating`,
+`release_dates` or manual overrides. The authenticated comprehensive route is
+cache-only for Wikidata; a cache miss returns the normal TMDB payload with no
+extra upstream request.
+
+When TMDB already supplies a supported MPA code, scanner-authorized cold
+lookups use the Wikidata Action API: one exact
+`haswbstatement:P4947=<TMDB movie ID>` search, one claims request and, only when
+P7367 descriptor qualifiers exist, one bounded English-label request. Positive
+results use the existing SQLite cache for 60 days; terminal misses and identity
+conflicts use a 7-day negative cache. Transient errors are not durable misses.
+Live lookups are process-limited to one and same-key misses share one in-flight
+request.
 
 ### 8. Get TV Episode Details
 
