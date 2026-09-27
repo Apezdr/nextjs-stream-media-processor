@@ -8,9 +8,11 @@
  *  - T-5: 5xx and connection-level errors (ECONNRESET) retry with backoff;
  *    non-retryable HTTP errors still fail fast
  *  - cache hits return without touching the network or the revalidation path
+ *  - failures keep TMDB's status (and Retry-After) on the thrown error
+ *  - a TMDB 404 is remembered for a day and answered without a network call
  */
 
-import { describe, it, expect, jest, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
 
 process.env.TMDB_API_KEY = process.env.TMDB_API_KEY || 'test-key';
 
@@ -40,14 +42,21 @@ jest.unstable_mockModule('../../../utils/tmdbBlurhash.mjs', () => ({
   enhanceTmdbResponseWithBlurhash: jest.fn(async (d) => d),
 }));
 
-const { makeTmdbRequest } = await import('../../../utils/tmdb.mjs');
+const { makeTmdbRequest, TmdbRequestError } = await import('../../../utils/tmdb.mjs');
+const { withWriteTx } = await import('../../../sqliteDatabase.mjs');
 
 beforeEach(() => {
   axiosGet.mockReset();
   getTmdbCache.mockReset().mockResolvedValue(null);
   getTmdbCacheEntryAnyAge.mockReset().mockResolvedValue(null);
   setTmdbCache.mockReset().mockResolvedValue(true);
+  withWriteTx.mockClear();
 });
+
+const httpError = (status, headers = {}) =>
+  Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, headers } });
+
+const NOT_FOUND_KEY = '/tv/275188_{}_notfound';
 
 describe('T-1 conditional revalidation', () => {
   it('sends the expired row\'s ETag as If-None-Match and re-ups the row on 304', async () => {
@@ -119,6 +128,114 @@ describe('T-5 transient-error retry', () => {
 
     await expect(makeTmdbRequest('/movie/404', {})).rejects.toThrow(/TMDB API request failed/);
     expect(axiosGet).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TMDB status on thrown errors', () => {
+  it('keeps TMDB\'s status on a non-retryable failure', async () => {
+    axiosGet.mockRejectedValue(httpError(401));
+
+    const err = await makeTmdbRequest('/movie/1', {}).catch((e) => e);
+
+    expect(err).toBeInstanceOf(TmdbRequestError);
+    expect(err.status).toBe(401);
+    expect(err.endpoint).toBe('/movie/1');
+    expect(err.message).toBe('TMDB API request failed: Request failed with status code 401');
+  });
+
+  it('keeps the last 5xx status when retries run out, and caches nothing', async () => {
+    axiosGet.mockRejectedValue(httpError(503));
+
+    const err = await makeTmdbRequest('/movie/1', {}, 1).catch((e) => e);
+
+    expect(err).toBeInstanceOf(TmdbRequestError);
+    expect(err.status).toBe(503);
+    expect(err.message).toMatch(/TMDB API request failed after 1 retries/);
+    expect(setTmdbCache).not.toHaveBeenCalled();
+  });
+
+  it('reports a null status when TMDB never answered', async () => {
+    axiosGet.mockRejectedValue(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
+
+    const err = await makeTmdbRequest('/movie/1', {}, 1).catch((e) => e);
+
+    expect(err.status).toBeNull();
+    expect(setTmdbCache).not.toHaveBeenCalled();
+  });
+
+  it('carries TMDB\'s Retry-After on a 429 that outlasts the retries', async () => {
+    axiosGet.mockRejectedValue(httpError(429, { 'retry-after': '1' }));
+
+    const err = await makeTmdbRequest('/movie/1', {}, 1).catch((e) => e);
+
+    expect(err.status).toBe(429);
+    expect(err.retryAfter).toBe(1);
+    expect(setTmdbCache).not.toHaveBeenCalled();
+  });
+});
+
+describe('not-found cache', () => {
+  // Pin the 10% expired-row cleanup off: it also goes through withWriteTx.
+  let randomSpy;
+  beforeEach(() => {
+    randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.99);
+  });
+  afterEach(() => {
+    randomSpy.mockRestore();
+  });
+
+  it('remembers a TMDB 404 for a day under its own key', async () => {
+    axiosGet.mockRejectedValue(httpError(404));
+
+    const err = await makeTmdbRequest('/tv/275188', {}).catch((e) => e);
+
+    expect(err.status).toBe(404);
+    expect(err.cached).toBe(false);
+    expect(setTmdbCache).toHaveBeenCalledTimes(1);
+    const [endpoint, , data, ttlHours, cacheKey] = setTmdbCache.mock.calls[0];
+    expect(endpoint).toBe('/tv/275188');
+    expect(data).toMatchObject({ notFound: true, status: 404 });
+    expect(ttlHours).toBe(24);
+    expect(cacheKey).toBe(NOT_FOUND_KEY);
+  });
+
+  it('answers a remembered 404 without calling TMDB', async () => {
+    getTmdbCache.mockImplementation(async (endpoint, params, key) =>
+      key === NOT_FOUND_KEY
+        ? { data: { notFound: true, status: 404, message: 'Request failed with status code 404' } }
+        : null,
+    );
+
+    const err = await makeTmdbRequest('/tv/275188', {}).catch((e) => e);
+
+    expect(axiosGet).not.toHaveBeenCalled();
+    expect(err).toBeInstanceOf(TmdbRequestError);
+    expect(err.status).toBe(404);
+    expect(err.cached).toBe(true);
+    expect(err.message).toBe('TMDB API request failed: Request failed with status code 404');
+  });
+
+  it('lets forceRefresh past the marker and clears it on success', async () => {
+    getTmdbCache.mockImplementation(async (endpoint, params, key) =>
+      key === NOT_FOUND_KEY ? { data: { notFound: true, status: 404, message: 'gone' } } : null,
+    );
+    axiosGet.mockResolvedValue({ status: 200, data: { id: 275188 }, headers: {} });
+    const dbRun = jest.fn(async () => ({ changes: 1 }));
+    withWriteTx.mockImplementationOnce(async (name, fn) => fn({ run: dbRun }));
+
+    const result = await makeTmdbRequest('/tv/275188', {}, 3, 1440, /* forceRefresh */ true);
+
+    expect(result).toMatchObject({ id: 275188 });
+    expect(axiosGet).toHaveBeenCalledTimes(1);
+    expect(dbRun).toHaveBeenCalledWith('DELETE FROM tmdb_cache WHERE cache_key = ?', [NOT_FOUND_KEY]);
+  });
+
+  it('skips the marker delete on a forced refetch that has no marker', async () => {
+    axiosGet.mockResolvedValue({ status: 200, data: { id: 3 }, headers: {} });
+
+    await makeTmdbRequest('/tv/3', {}, 3, 1440, /* forceRefresh */ true);
+
+    expect(withWriteTx).not.toHaveBeenCalled();
   });
 });
 

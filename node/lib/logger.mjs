@@ -85,16 +85,35 @@ export function getCategories() {
 }
 
 /**
+ * Turn a log call's second argument into record fields. Spreading it raw lost
+ * an Error's message and stack (not enumerable) and split a string into one
+ * field per character ("0": "R", "1": "e", …) in SigNoz.
+ */
+export function normalizeLogMeta(meta) {
+  if (meta instanceof Error) {
+    const status = meta.status ?? meta.response?.status;
+    return {
+      error: meta.message,
+      stack: meta.stack,
+      ...(status != null ? { status } : {}),
+    };
+  }
+  if (meta === null || meta === undefined) return {};
+  if (typeof meta !== 'object' || Array.isArray(meta)) return { detail: meta };
+  return meta;
+}
+
+/**
  * Create a category-specific logger that tags each message with `category`.
  * All logs go to the base transports; Python logs also get routed to python-%DATE%.log
  */
 function makeLogger(category) {
   categories.add(category);
   return {
-    info:  (message, meta = {}) => baseLogger.info(message,  { ...meta, category }),
-    warn:  (message, meta = {}) => baseLogger.warn(message,  { ...meta, category }),
-    error: (message, meta = {}) => baseLogger.error(message, { ...meta, category }),
-    debug: (message, meta = {}) => baseLogger.debug(message, { ...meta, category }),
+    info:  (message, meta) => baseLogger.info(message,  { ...normalizeLogMeta(meta), category }),
+    warn:  (message, meta) => baseLogger.warn(message,  { ...normalizeLogMeta(meta), category }),
+    error: (message, meta) => baseLogger.error(message, { ...normalizeLogMeta(meta), category }),
+    debug: (message, meta) => baseLogger.debug(message, { ...normalizeLogMeta(meta), category }),
   };
 }
 
