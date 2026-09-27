@@ -7,6 +7,14 @@ import {
   enhanceTmdbResponseWithBlurhash,
   generateBlurhashCacheKey,
 } from "./tmdbBlurhash.mjs";
+import {
+  TmdbInvalidRequestError,
+  TmdbNoMatchError,
+  TmdbRequestError,
+} from "./tmdbErrors.mjs";
+
+// Re-exported so existing importers (MetadataGenerator, tests) keep one path.
+export { TmdbInvalidRequestError, TmdbNoMatchError, TmdbRequestError };
 
 const logger = createCategoryLogger("tmdb-utils");
 
@@ -37,20 +45,49 @@ if (!TMDB_API_KEY) {
   logger.error("TMDB_API_KEY environment variable is not set");
 }
 
-/**
- * A TMDB name search legitimately returned zero results — the title has no
- * match, as opposed to a network/HTTP/rate-limit failure (those stay generic
- * Errors). Lets MetadataGenerator classify the failure in its return contract
- * (`reason: 'no-match'` vs `'transient-error'`). Note the scanners currently
- * apply the same 24h cooldown to both reasons — the type exists so the two
- * cases stop being indistinguishable at the contract/log layer, not because
- * they are paced differently today.
- */
-export class TmdbNoMatchError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "TmdbNoMatchError";
-    this.code = "no-match";
+// Not-found cache: a TMDB 404 is remembered for a day so a title TMDB has
+// deleted stops costing a network call on every request. TMDB rarely restores
+// a deleted id, and a forceRefresh bypasses (and on success clears) the marker.
+// Only 404s are cached — a 429, 5xx or timeout can clear on the next request.
+// The marker lives in tmdb_cache under its own key, shared by the plain and
+// blurhash variants of the same endpoint + params.
+const NOT_FOUND_TTL_HOURS = 24;
+
+const notFoundCacheKey = (endpoint, params) => {
+  const sortedParams = Object.keys(params)
+    .sort()
+    .reduce((result, key) => {
+      result[key] = params[key];
+      return result;
+    }, {});
+  return `${endpoint}_${JSON.stringify(sortedParams)}_notfound`;
+};
+
+// Best effort: a failed marker write must never mask the 404 being thrown.
+async function rememberTmdbNotFound(endpoint, params, message) {
+  const cacheKey = notFoundCacheKey(endpoint, params);
+  try {
+    await withApiCacheSpan(
+      { service: "tmdb", operation: "SET", cacheKey, ttl: NOT_FOUND_TTL_HOURS, endpoint },
+      async () =>
+        setTmdbCache(endpoint, params, { notFound: true, status: 404, message }, NOT_FOUND_TTL_HOURS, cacheKey),
+    );
+  } catch (err) {
+    logger.warn(`Failed to cache TMDB 404 for ${endpoint}: ${err.message}`);
+  }
+}
+
+// Read before deleting: forced refetches (the episode backfill) are frequent
+// and almost never have a marker, so most never take the write lock.
+async function forgetTmdbNotFound(endpoint, params) {
+  const cacheKey = notFoundCacheKey(endpoint, params);
+  try {
+    if (!(await getTmdbCache(endpoint, params, cacheKey))) return;
+    await withWriteTx("tmdbCache", (db) =>
+      db.run("DELETE FROM tmdb_cache WHERE cache_key = ?", [cacheKey]),
+    );
+  } catch (err) {
+    logger.warn(`Failed to clear TMDB not-found marker for ${endpoint}: ${err.message}`);
   }
 }
 
@@ -120,6 +157,20 @@ export const makeTmdbRequest = async (
         _expiresAt: cached.expiresAt,
       };
     }
+
+    // A remembered 404 answers without a network call (see NOT_FOUND_TTL_HOURS).
+    // Deliberately not a withApiCacheSpan GET: it would log a second cache
+    // miss for every real one and skew the hit-ratio metrics.
+    const notFound = await getTmdbCache(endpoint, params, notFoundCacheKey(endpoint, params));
+
+    if (notFound?.data?.notFound) {
+      logger.debug(`TMDB not-found cache hit for ${endpoint}`);
+      throw new TmdbRequestError(`TMDB API request failed: ${notFound.data.message}`, {
+        endpoint,
+        status: 404,
+        cached: true,
+      });
+    }
   }
 
   // Conditional revalidation (T-1): we're about to refetch — either the row
@@ -139,6 +190,8 @@ export const makeTmdbRequest = async (
   let backoffFactor = 1;
   let responseData;
   let responseETag = null;
+  // The last retryable failure, so a give-up can still report TMDB's status.
+  let lastError = null;
 
   while (retries < maxRetries) {
     try {
@@ -226,6 +279,7 @@ export const makeTmdbRequest = async (
     } catch (error) {
       if (error.response?.status === 429) {
         // Rate limited by TMDB
+        lastError = error;
         const retryAfter =
           parseInt(error.response.headers["retry-after"]) || backoffFactor;
         logger.warn(
@@ -243,6 +297,7 @@ export const makeTmdbRequest = async (
       ) {
         // Transient network/server error (T-5): connection-level failures and
         // TMDB 5xx responses back off and retry like timeouts always did.
+        lastError = error;
         logger.warn(
           `Transient TMDB error for ${endpoint} (${error.response?.status || error.code}), retry ${retries + 1}/${maxRetries}: ${error.message}`,
         );
@@ -252,14 +307,47 @@ export const makeTmdbRequest = async (
         );
         backoffFactor *= 2;
       } else {
-        logger.error(`TMDB API error for ${endpoint}:`, error.message);
-        throw new Error(`TMDB API request failed: ${error.message}`);
+        const status = error.response?.status ?? null;
+        // A 404 is TMDB's answer (a deleted title), not a fault: warn.
+        (status === 404 ? logger.warn : logger.error)(`TMDB API error for ${endpoint}`, {
+          endpoint,
+          status,
+          error: error.message,
+        });
+        if (status === 404) {
+          await rememberTmdbNotFound(endpoint, params, error.message);
+        }
+        throw new TmdbRequestError(`TMDB API request failed: ${error.message}`, {
+          endpoint,
+          status,
+          cause: error,
+        });
       }
     }
   }
 
   if (!responseData) {
-    throw new Error(`TMDB API request failed after ${maxRetries} retries`);
+    const status = lastError?.response?.status ?? null;
+    logger.error(`TMDB API request for ${endpoint} gave up after ${maxRetries} retries`, {
+      endpoint,
+      status,
+      error: lastError?.message,
+    });
+    throw new TmdbRequestError(`TMDB API request failed after ${maxRetries} retries`, {
+      endpoint,
+      status,
+      retryAfter:
+        status === 429
+          ? parseInt(lastError.response.headers?.["retry-after"]) || null
+          : null,
+      cause: lastError ?? undefined,
+    });
+  }
+
+  // A forced refetch that succeeds retires any not-found marker, so the
+  // blurhash variant (which shares the marker) stops answering 404 too.
+  if (forceRefresh) {
+    await forgetTmdbNotFound(endpoint, params);
   }
 
   // If blurhash is requested, enhance the response with blurhash data
@@ -322,11 +410,11 @@ export const searchMedia = async (
   includeBlurhash = false,
 ) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   if (!query) {
-    throw new Error("Query parameter is required");
+    throw new TmdbInvalidRequestError("Query parameter is required");
   }
 
   return await makeTmdbRequest(
@@ -375,10 +463,10 @@ export function pickFindResult(data, type) {
 export const findTmdbIdByExternalId = async (source, externalId, type) => {
   const externalSource = EXTERNAL_ID_SOURCES[source];
   if (!externalSource) {
-    throw new Error(`Unknown external id source: ${source}`);
+    throw new TmdbInvalidRequestError(`Unknown external id source: ${source}`);
   }
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
   const value = String(externalId ?? "").trim();
   if (!value) return null;
@@ -401,7 +489,7 @@ export const findTmdbIdByExternalId = async (source, externalId, type) => {
  */
 export const getMediaDetails = async (type, id, includeBlurhash = false) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   const data = await makeTmdbRequest(
@@ -427,7 +515,7 @@ export const getMediaDetails = async (type, id, includeBlurhash = false) => {
  */
 export const getMediaCast = async (type, id) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   const data = await makeTmdbRequest(`/${type}/${id}/credits`);
@@ -455,7 +543,7 @@ export const getMediaCast = async (type, id) => {
  */
 export const getEnhancedMediaCast = async (type, id) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   if (type === "tv") {
@@ -598,7 +686,7 @@ export const getStructuredMediaCast = async (
   includeGuestCast = false,
 ) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   if (type === "movie") {
@@ -644,7 +732,7 @@ export const getStructuredMediaCast = async (
  */
 export const getMediaVideos = async (type, id) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   const data = await makeTmdbRequest(`/${type}/${id}/videos`);
@@ -673,7 +761,7 @@ export const getMediaVideos = async (type, id) => {
  */
 export const getMediaImages = async (type, id, includeBlurhash = false) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   const data = await makeTmdbRequest(
@@ -709,7 +797,7 @@ export const getMediaImages = async (type, id, includeBlurhash = false) => {
  */
 export const getMediaRating = async (type, id) => {
   if (!["movie", "tv"].includes(type)) {
-    throw new Error('Type must be "movie" or "tv"');
+    throw new TmdbInvalidRequestError('Type must be "movie" or "tv"');
   }
 
   const endpoint = type === "movie" ? "release_dates" : "content_ratings";
@@ -934,7 +1022,7 @@ export const searchCollections = async (
   includeBlurhash = false,
 ) => {
   if (!query) {
-    throw new Error("Query parameter is required");
+    throw new TmdbInvalidRequestError("Query parameter is required");
   }
 
   return await makeTmdbRequest(

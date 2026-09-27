@@ -19,6 +19,7 @@ import {
   fetchEnhancedCollectionData,
   makeTmdbRequest
 } from '../utils/tmdb.mjs';
+import { classifyTmdbError } from '../utils/tmdbErrors.mjs';
 import {
   initializeDatabase,
   releaseDatabase,
@@ -91,6 +92,28 @@ function sendJsonWithETag(req, res, data) {
 }
 
 /**
+ * Answer a failed TMDB route with TMDB's own verdict (see classifyTmdbError):
+ * a title TMDB doesn't have is a 404 the caller should give up on, an outage
+ * a 502 or 429 it should retry. Callers read `code` to label the item.
+ *
+ * Logs at the answer's level: a 4xx (a dead title, bad parameters, TMDB rate
+ * limiting) is an expected outcome and logs a warning without a stack; only
+ * a 5xx is an error here.
+ */
+function sendTmdbError(res, error, label) {
+  const { status, code, retryAfter } = classifyTmdbError(error);
+  if (status < 500) {
+    logger.warn(label, { status, code, endpoint: error.endpoint, error: error.message });
+  } else {
+    logger.error(label, error);
+  }
+  if (retryAfter != null) {
+    res.set('Retry-After', String(retryAfter));
+  }
+  return res.status(status).json(code ? { error: error.message, code } : { error: error.message });
+}
+
+/**
  * Initialize and configure TMDB API routes
  * @returns {object} Configured Express router
  */
@@ -111,8 +134,7 @@ export function setupTmdbRoutes() {
     logger.info(`User ${req.user.email} searched for ${type}: "${query}"${includeBlurhash ? ' with blurhash' : ''} returned ${data.results.length} results`);
     res.json(data);
   } catch (error) {
-    logger.error('Search error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Search error:');
   }
 });
 
@@ -132,8 +154,7 @@ router.get('/comprehensive/:type', authenticateUser, rateLimiter, async (req, re
     logger.info(`User ${req.user.email} requested comprehensive ${type} details for: ${name || `ID ${tmdb_id}`}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, data);
   } catch (error) {
-    logger.error('Comprehensive details error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Comprehensive details error:');
   }
 });
 
@@ -153,8 +174,7 @@ router.get('/details/:type', authenticateUser, rateLimiter, async (req, res) => 
     logger.info(`User ${req.user.email} requested ${type} details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, data);
   } catch (error) {
-    logger.error('Details error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Details error:');
   }
 });
 
@@ -173,8 +193,7 @@ router.get('/cast/:type', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested cast for ${type} ID: ${tmdb_id}`);
     return sendJsonWithETag(req, res, cast);
   } catch (error) {
-    logger.error('Cast error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Cast error:');
   }
 });
 
@@ -194,8 +213,7 @@ router.get('/structured-cast/:type', authenticateUser, rateLimiter, async (req, 
     logger.info(`User ${req.user.email} requested structured cast for ${type} ID: ${tmdb_id}${includeGuestCast ? ' with guest cast' : ''}`);
     res.json(castData);
   } catch (error) {
-    logger.error('Structured cast error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Structured cast error:');
   }
 });
 
@@ -214,8 +232,7 @@ router.get('/videos/:type', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested videos for ${type} ID: ${tmdb_id}`);
     return sendJsonWithETag(req, res, videos);
   } catch (error) {
-    logger.error('Videos error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Videos error:');
   }
 });
 
@@ -235,8 +252,7 @@ router.get('/images/:type', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested images for ${type} ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, images);
   } catch (error) {
-    logger.error('Images error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Images error:');
   }
 });
 
@@ -255,8 +271,7 @@ router.get('/rating/:type', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested rating for ${type} ID: ${tmdb_id}`);
     return sendJsonWithETag(req, res, rating);
   } catch (error) {
-    logger.error('Rating error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Rating error:');
   }
 });
 
@@ -274,8 +289,7 @@ router.get('/episode', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested episode details: ${tmdb_id} S${season}E${episode}`);
     return sendJsonWithETag(req, res, data);
   } catch (error) {
-    logger.error('Episode error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Episode error:');
   }
 });
 
@@ -294,8 +308,7 @@ router.get('/episode/images', authenticateUser, rateLimiter, async (req, res) =>
     logger.info(`User ${req.user.email} requested episode images: ${tmdb_id} S${season}E${episode}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, images);
   } catch (error) {
-    logger.error('Episode images error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Episode images error:');
   }
 });
 
@@ -310,8 +323,7 @@ router.get('/search/collection', authenticateUser, rateLimiter, async (req, res)
     logger.info(`User ${req.user.email} searched for collections: "${query}"${includeBlurhash ? ' with blurhash' : ''}`);
     res.json(data);
   } catch (error) {
-    logger.error('Collection search error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Collection search error:');
   }
 });
 
@@ -336,8 +348,7 @@ router.get('/collection', authenticateUser, rateLimiter, async (req, res) => {
     logger.info(`User ${req.user.email} requested ${enhanced === 'true' ? 'enhanced ' : ''}collection details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     res.json(data);
   } catch (error) {
-    logger.error('Collection details error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Collection details error:');
   }
 });
 
@@ -356,8 +367,7 @@ router.get('/collection/images', authenticateUser, rateLimiter, async (req, res)
     logger.info(`User ${req.user.email} requested collection images for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     res.json(images);
   } catch (error) {
-    logger.error('Collection images error:', error);
-    res.status(400).json({ error: error.message });
+    sendTmdbError(res, error, 'Collection images error:');
   }
 });
 
