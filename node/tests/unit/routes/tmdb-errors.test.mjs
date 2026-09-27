@@ -209,6 +209,7 @@ describe('every TMDB GET route maps failures the same way', () => {
     ['/rating/tv?tmdb_id=275188', 'getMediaRating'],
     ['/episode?tmdb_id=275188&season=1&episode=1', 'getEpisodeDetails'],
     ['/episode/images?tmdb_id=275188&season=1&episode=1', 'getEpisodeImages'],
+    ['/search/collection?query=x', 'searchCollections'],
     ['/collection?tmdb_id=10', 'getCollectionDetails'],
     ['/collection?tmdb_id=10&enhanced=true', 'fetchEnhancedCollectionData'],
     ['/collection/images?tmdb_id=10', 'getCollectionImages'],

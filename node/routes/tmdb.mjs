@@ -122,6 +122,22 @@ export function setupTmdbRoutes() {
 
   // STANDARDIZED ENDPOINTS - All use query parameters consistently
 
+  // Search movie collections. Must stay registered before /search/:type,
+  // which would otherwise capture /search/collection as type "collection".
+  router.get('/search/collection', authenticateUser, rateLimiter, async (req, res) => {
+    try {
+      const { query, page = 1, blurhash } = req.query;
+
+      const includeBlurhash = blurhash === 'true';
+      const data = await searchCollections(query, page, includeBlurhash);
+
+      logger.info(`User ${req.user.email} searched for collections: "${query}"${includeBlurhash ? ' with blurhash' : ''}`);
+      res.json(data);
+    } catch (error) {
+      sendTmdbError(res, error, 'Collection search error:');
+    }
+  });
+
   // Search movies or TV shows
   router.get('/search/:type', authenticateUser, rateLimiter, async (req, res) => {
   try {
@@ -309,21 +325,6 @@ router.get('/episode/images', authenticateUser, rateLimiter, async (req, res) =>
     return sendJsonWithETag(req, res, images);
   } catch (error) {
     sendTmdbError(res, error, 'Episode images error:');
-  }
-});
-
-// Search movie collections
-router.get('/search/collection', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { query, page = 1, blurhash } = req.query;
-    
-    const includeBlurhash = blurhash === 'true';
-    const data = await searchCollections(query, page, includeBlurhash);
-    
-    logger.info(`User ${req.user.email} searched for collections: "${query}"${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(data);
-  } catch (error) {
-    sendTmdbError(res, error, 'Collection search error:');
   }
 });
 
