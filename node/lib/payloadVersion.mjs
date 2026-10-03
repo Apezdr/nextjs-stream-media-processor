@@ -35,7 +35,10 @@
 //     would keep the old labels.
 // 8 — hdr and mediaQuality recomputed by the HDR10+ fix (sidecar v1.0013),
 //     for the same reason as 7.
-export const MEDIA_PAYLOAD_VERSION = 8;
+// 9 — a title with several video files publishes the one Radarr/Sonarr tracks
+//     (else the best) as its primary. Nothing on disk changes for a title whose
+//     leftover copy is still there, so only this bump moves it.
+export const MEDIA_PAYLOAD_VERSION = 9;
 
 /**
  * Whether this host advertises JIT transcoder capability.

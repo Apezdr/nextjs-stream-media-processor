@@ -22,6 +22,7 @@ import { getInfo } from '../../../infoManager.mjs';
 import { isJitEligibilityEnabled } from '../../../lib/payloadVersion.mjs';
 import { jitPathKey, jitMasterUrl, isJitUrlConfigured } from '../../../utils/jitUrl.mjs';
 import { evaluateJitEligibility, isJitAddressableContainer } from './jit-eligibility.mjs';
+import { compareSourceQuality } from '../../../utils/sourceQuality.mjs';
 
 const logger = createCategoryLogger('video-sources');
 
@@ -51,13 +52,17 @@ export function audioLanguagesOf(additionalMetadata) {
  * @param {(filename: string) => string} params.urlFor - Builds the published URL
  * @param {string|null} [params.primaryFilename]
  *        The identity sidecar's pinned primary. Honoured when present in the
- *        folder; otherwise the first file in priority order wins.
+ *        folder and no managed file is; see pickPrimarySource.
+ * @param {Set<string>|null} [params.managedFilenames]
+ *        Basenames the library manager (Radarr/Sonarr) tracks for this title.
+ *        null when there is no manager or it could not answer.
  * @param {string|null} [params.libraryRelativeDir]
  *        Directory path relative to BASE_PATH, e.g. 'movies/Dune (2021)'. Used
  *        to build the transcoder's path key. Omit to skip JIT emission.
  * @returns {Promise<{
  *   sources: Array<object>,
  *   primary: object|null,
+ *   primaryReason: 'only'|'managed'|'pinned'|'quality'|null,
  *   fileLengths: Record<string, number>,
  *   fileDimensions: Record<string, string>
  * }>}
@@ -67,6 +72,7 @@ export async function buildVideoSources({
   dir,
   urlFor,
   primaryFilename = null,
+  managedFilenames = null,
   libraryRelativeDir = null,
 }) {
   const sources = [];
@@ -166,14 +172,47 @@ export async function buildVideoSources({
   }
 
   if (sources.length === 0) {
-    return { sources: [], primary: null, fileLengths, fileDimensions };
+    return { sources: [], primary: null, primaryReason: null, fileLengths, fileDimensions };
   }
 
-  const primary =
-    (primaryFilename && sources.find(s => s.filename === primaryFilename)) || sources[0];
+  const { source: primary, reason: primaryReason } =
+    pickPrimarySource(sources, { primaryFilename, managedFilenames });
   primary.isPrimary = true;
 
-  return { sources, primary, fileLengths, fileDimensions };
+  return { sources, primary, primaryReason, fileLengths, fileDimensions };
+}
+
+/**
+ * Which source publishes as the title's primary (urls.mp4 / videoURL).
+ *
+ * 1. The file the library manager tracks. When Radarr or Sonarr upgrades a
+ *    title and the old file stays on disk, the old file is a leftover; serving
+ *    it is how Nobody kept playing a 1080p SDR copy beside a 4K remux.
+ * 2. The identity sidecar's pin, so a title without a manager keeps its URL
+ *    (watch history is keyed on it).
+ * 3. The best file: HDR first, then resolution class. Ties keep the priority
+ *    order (container, then name), so equal duplicates never flip.
+ *
+ * @param {Array<object>} sources  in priority order
+ * @param {Object} options
+ * @param {string|null} [options.primaryFilename]
+ * @param {Set<string>|null} [options.managedFilenames]
+ * @returns {{source: object, reason: 'only'|'managed'|'pinned'|'quality'}}
+ */
+export function pickPrimarySource(sources, { primaryFilename = null, managedFilenames = null } = {}) {
+  if (sources.length === 1) return { source: sources[0], reason: 'only' };
+
+  const managed = managedFilenames ? sources.find(s => managedFilenames.has(s.filename)) : null;
+  if (managed) return { source: managed, reason: 'managed' };
+
+  const pinned = primaryFilename ? sources.find(s => s.filename === primaryFilename) : null;
+  if (pinned) return { source: pinned, reason: 'pinned' };
+
+  let best = sources[0];
+  for (const candidate of sources.slice(1)) {
+    if (compareSourceQuality(candidate, best) > 0) best = candidate;
+  }
+  return { source: best, reason: 'quality' };
 }
 
 /**

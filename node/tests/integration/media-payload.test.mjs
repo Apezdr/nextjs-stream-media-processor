@@ -234,14 +234,15 @@ describe('/media/movies payload', () => {
     expect(m.urls.mediaLastModified).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('builds sources[] with mp4 first and exactly one primary', async () => {
+  it('builds sources[] in priority order with exactly one primary, the better file', async () => {
     const m = (await moviePayload())['Mixed Containers'];
     expect(m.urls.sources).toHaveLength(2);
     expect(m.urls.sources.map((s) => s.container)).toEqual(['mp4', 'mkv']);
 
     const primaries = m.urls.sources.filter((s) => s.isPrimary);
     expect(primaries).toHaveLength(1);
-    expect(primaries[0].container).toBe('mp4');
+    // No pin and no library manager: the 4K HDR10 mkv beats the 1080p mp4.
+    expect(primaries[0].container).toBe('mkv');
     // The stated invariant: the primary's url IS urls.mp4.
     expect(primaries[0].url).toBe(m.urls.mp4);
   });
@@ -652,5 +653,24 @@ describe('scan progress for the admin process list', () => {
     expect(summary.error).toBeNull();
     expect(summary.reprocessed).toBeGreaterThanOrEqual(0);
     expect(summary.reprocessed).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('primary source with a library manager', () => {
+  it('publishes the managed file over the pin, and moves the pin so an outage keeps it', async () => {
+    const folder = join(MEDIA, 'movies', 'Mixed Containers');
+    const managedFilesFor = async (path) =>
+      path === 'movies/Mixed Containers' ? new Set(['Solo.1080p.mp4']) : null;
+
+    await scanMovies(db, join(MEDIA, 'movies'), PREFIX, MEDIA, {}, 1.0011, false, async () => {}, { managedFilesFor });
+    let m = (await moviePayload())['Mixed Containers'];
+    expect(m.urls.mp4).toMatch(/\/Solo\.1080p\.mp4$/);
+    const sidecar = JSON.parse(await fs.readFile(join(folder, '.mediaid.json'), 'utf8'));
+    expect(sidecar.primarySource).toBe('Solo.1080p.mp4');
+
+    // The manager is unreachable on the next scan: the moved pin holds.
+    await scanMovies(db, join(MEDIA, 'movies'), PREFIX, MEDIA, {}, 1.0011, false, async () => {});
+    m = (await moviePayload())['Mixed Containers'];
+    expect(m.urls.mp4).toMatch(/\/Solo\.1080p\.mp4$/);
   });
 });

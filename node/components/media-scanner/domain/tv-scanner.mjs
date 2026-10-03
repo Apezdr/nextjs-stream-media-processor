@@ -377,10 +377,10 @@ function clearUndurableEpisodeDates(seasonsObj, added) {
   }
 }
 
-async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null, episodeSeen = null) {
-  // episodeFiles holds EVERY container for this one episode, already ordered by
-  // container priority. The first is the primary — the one that publishes as
-  // videoURL — and the rest ride along in sources[].
+async function processEpisode(episodeFiles, seasonPath, showName, encodedShowName, encodedSeasonName, seasonNumber, prefixPath, basePath, langMap, seasonFiles, showMediaId = null, episodeSeen = null, managedFilenamesForShow = null) {
+  // episodeFiles holds EVERY file for this one episode, ordered by container
+  // priority. pickPrimarySource chooses which publishes as videoURL (the one
+  // Sonarr tracks, else the best); the rest ride along in sources[].
   const episode = episodeFiles[0];
 
   let derivedEpisodeName = deriveEpisodeTitle(episode);
@@ -397,9 +397,13 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
   const paddedEpisodeNumber = episodeNumber.padStart(2, '0');
   const episodeKey = `S${seasonNumber}E${paddedEpisodeNumber}`;
 
+  const managedFilenames =
+    episodeFiles.length > 1 && managedFilenamesForShow ? await managedFilenamesForShow() : null;
+
   const { sources, primary, fileLengths, fileDimensions } = await buildVideoSources({
     videoFiles: episodeFiles,
     dir: seasonPath,
+    managedFilenames,
     urlFor: (filename) =>
       `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(filename)}`,
     // basename(seasonPath) is the real folder name on disk, which is what the
@@ -523,7 +527,7 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
  * @param {Object} langMap - Language code mapping
  * @returns {Promise<Object|null>} Season data object or null if no episodes
  */
-async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null, episodeSeen = null) {
+async function processSeason(season, showPath, showName, encodedShowName, prefixPath, basePath, langMap, showMediaId = null, episodeSeen = null, managedFilenamesForShow = null) {
   if (!season.isDirectory()) return null;
 
   const seasonName = season.name;
@@ -550,7 +554,7 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
   // two results that write to the same seasonData.episodes key, so the last one
   // by iteration order wins — and which one that is flips with readdir order,
   // making the episode's published URL and identity flap on every scan. The
-  // list is already in container-priority order, so group[0] is the primary.
+  // list is in container-priority order; processEpisode picks the primary.
   const episodeGroups = new Map();
   for (const filename of validEpisodes) {
     const match = filename.match(/S\d+E(\d+)/i);
@@ -596,7 +600,8 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
       langMap,
       episodes,
       showMediaId,
-      episodeSeen
+      episodeSeen,
+      managedFilenamesForShow
     );
 
     if (episodeResult) {
@@ -621,12 +626,14 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
  * @param {Object} [options]
  * @param {Function} [options.onProgress] - Called as each show starts with
  *   { position, total, name }; position is 1-based. Must not throw.
+ * @param {(libraryRelativePath: string) => Promise<Set<string>|null>} [options.managedFilesFor]
+ *   Basenames the library manager tracks for a show, or null when unknown.
  * @returns {Promise<{titles: number, reprocessed: number, error: Error|null}>} -
  *   show folders seen, how many were processed rather than fast-skipped, and
  *   the error that stopped the pass, if any. The scan logs that error instead
  *   of throwing it, so this is the only place a caller can see it.
  */
-export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, isDebugMode, downloadTMDBImages, { onProgress = () => {} } = {}) {
+export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, isDebugMode, downloadTMDBImages, { onProgress = () => {}, managedFilesFor = null } = {}) {
   const shows = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMedia = await getMissingMediaData();
   const now = new Date();
@@ -666,6 +673,13 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
       const showName = show.name;
       existingShowNames.delete(showName);
+
+      // The files Sonarr tracks for this show, asked for only when an episode
+      // has more than one file to choose between, and at most once per scan.
+      let managedForShow = null;
+      const managedFilenamesForShow = managedFilesFor
+        ? () => (managedForShow ??= Promise.resolve(managedFilesFor(`tv/${showName}`)).catch(() => null))
+        : null;
       const encodedShowName = encodeURIComponent(showName);
       const showPath = normalize(join(dirPath, showName));
 
@@ -1026,7 +1040,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
             basePath,
             langMap,
             showMediaId,
-            episodeSeen
+            episodeSeen,
+            managedFilenamesForShow
           );
           
           if (seasonResult) {

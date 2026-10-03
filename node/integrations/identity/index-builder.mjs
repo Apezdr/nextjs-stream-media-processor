@@ -125,6 +125,11 @@ export class IdentityIndex {
     return this.byPath.has(libraryRelativePath) || this.unidentifiedByPath.has(libraryRelativePath);
   }
 
+  /** The claim for the path, identified or not; null when no provider manages it. */
+  claimFor(libraryRelativePath) {
+    return this.byPath.get(libraryRelativePath) ?? this.unidentifiedByPath.get(libraryRelativePath) ?? null;
+  }
+
   /** @param {'movie'|'tv'} mediaType */
   claimsFor(mediaType) {
     return [...this.byPath.values()].filter((claim) => claim.mediaType === mediaType);

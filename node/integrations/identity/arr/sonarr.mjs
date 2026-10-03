@@ -66,4 +66,18 @@ export class SonarrProvider extends ArrProvider {
     const status = this.itemArrStatus(item);
     return status ? status !== 'upcoming' : null;
   }
+
+  /**
+   * The series list does not carry episode files, so they are fetched here,
+   * one request per series. Callers ask only for shows that have an episode
+   * with more than one file.
+   * @param {import('../provider.mjs').IdentityClaim} claim
+   * @returns {Promise<string[]|null>} e.g. ['Season 1/Show - S01E01.mkv']
+   */
+  async managedFiles(claim) {
+    if (!Number.isInteger(claim?.providerItemId)) return null;
+    const files = await this.request(`/api/v3/episodefile?seriesId=${claim.providerItemId}`);
+    if (!Array.isArray(files)) return null;
+    return files.map((f) => f?.relativePath).filter((p) => typeof p === 'string' && p);
+  }
 }

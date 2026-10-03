@@ -47,11 +47,11 @@ of truth:
 export const VIDEO_EXTENSIONS = ['.mp4', '.m4v', '.mov', '.mkv', '.webm', '.avi'];
 ```
 
-**The order is load-bearing.** It is the priority order used to choose "the" video file when
-a folder holds more than one, so it decides which URL a title publishes. `.mp4` stays first
-because that is what the scanner has always chosen, and today's watch-history identity is
-derived from the published URL — reordering would repoint existing titles. New containers are
-appended or inserted *after* `.mp4`, never in front of it.
+**The order is load-bearing.** It orders `sources[]` (which the movie hash folds in) and breaks
+ties when choosing "the" video file of a folder that holds more than one (see "Which source is
+primary" below). `.mp4` stays first because that is what the scanner has always chosen, and
+today's watch-history identity is derived from the published URL — reordering would repoint
+existing titles. New containers are appended or inserted *after* `.mp4`, never in front of it.
 
 Matching is case-insensitive (`Movie.MKV` works). Files containing `-TdarrCacheFile-` are
 excluded: they are valid containers written mid-transcode, so an extension filter alone would
@@ -245,17 +245,20 @@ force a permanent resync loop. Sorted by `VIDEO_EXTENSIONS` index, then by filen
 **Invariants:** exactly one `isPrimary: true` when the array is non-empty; that entry's `url`
 equals `urls.mp4` (movies) or `videoURL` (episodes); an empty array means neither is emitted.
 
-**Which source is primary** — the identity sidecar's pinned `primarySource` when that file is
-still present, otherwise the first entry in `VIDEO_EXTENSIONS` priority order. The pin is what
-keeps an existing title publishing the same URL it published before this shipped.
+**Which source is primary** (`pickPrimarySource`, payload v9) — the file Radarr/Sonarr tracks
+when the folder has a choice; otherwise the identity sidecar's pinned `primarySource` when that
+file is still present (movies); otherwise the best file, HDR first and then resolution class,
+with ties going to `VIDEO_EXTENSIONS` priority order. The pin is what keeps an existing title
+publishing the same URL it published before this shipped; it moves only to follow the
+manager's file, so an upgrade that leaves the old file behind no longer keeps serving it.
 
 **An unprobeable file is still a source.** If ffprobe cannot read it, the entry is published
 with null facts rather than dropped — a file that exists and can be served should not vanish
 from the catalog because a probe failed.
 
 **Multiple containers of the same episode collapse to one entry.** A season holding both
-`S01E01.mp4` and `S01E01.mkv` yields a single episode whose primary is the `.mp4`, with the
-`.mkv` alongside in `sources[]`. Previously the two would have written to the same episode key
+`S01E01.mp4` and `S01E01.mkv` yields a single episode with both in `sources[]`; its primary is
+the one Sonarr tracks, else the better one, else the `.mp4`. Previously the two would have written to the same episode key
 and the winner would have flipped with readdir order, moving that episode's URL on every scan.
 
 **`directPlayLikely` is deliberately not emitted.** Whether the transcoder can remux rather
@@ -428,8 +431,10 @@ what made rule 4 removable.
   discarding the rest, and multi-language sources are `jitEligible: true`.
 - **DASH is a 501 stub** in the transcoder. HLS only.
 - **A title with several containers publishes ONE playable URL** (`urls.mp4` /
-  `videoURL`) — the primary. The others are described in `sources[]` but the backend does not
-  choose between them; that is the client's call. There is no per-source playback endpoint.
+  `videoURL`) — the primary. The primary is the file Radarr/Sonarr tracks; without one, a
+  movie's identity pin, else the best file (HDR, then resolution); see `pickPrimarySource` in
+  `video-sources.mjs`. The others are described in `sources[]`; choosing among them for
+  playback is the client's call. There is no per-source playback endpoint.
 - **`fileNames` / `lengths` / `dimensions` are informational.** They are keyed by filename and
   now cover every container. `sources[].length` and `sources[].dimensions` are authoritative.
 
@@ -438,7 +443,7 @@ what made rule 4 removable.
 ## 11. Payload versioning
 
 Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``,
-at **v8** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+at **v9** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 
 | Version | Change |
 |---|---|
@@ -449,6 +454,7 @@ at **v8** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 | 6 | `mediaIdentity.firstSeen` added on movies and episodes; the show-level `mediaIdentity` published for the first time |
 | 7 | `hdr` and `mediaQuality` recomputed by the HDR detection fix (`.info` sidecar v1.0012). Shows regenerate their sidecars only because this bump reprocesses them. |
 | 8 | `hdr` and `mediaQuality` recomputed by the HDR10+ fix (`.info` sidecar v1.0013), for the same reason. |
+| 9 | A title with several video files publishes the one Radarr/Sonarr tracks (else the best: HDR, then resolution) as its primary, instead of the first by container and name. Titles whose leftover copy is still on disk change nothing the directory hash sees, so only this bump moves them. |
 
 It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
 i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT
