@@ -438,7 +438,7 @@ what made rule 4 removable.
 ## 11. Payload versioning
 
 Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``,
-at **v7** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+at **v8** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 
 | Version | Change |
 |---|---|
@@ -448,6 +448,7 @@ at **v7** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 | 5 | `multi-audio-language` rule dropped (§9): multi-language titles flip to `jitEligible: true` and lose their `jitReason`. Again nothing on disk changes. |
 | 6 | `mediaIdentity.firstSeen` added on movies and episodes; the show-level `mediaIdentity` published for the first time |
 | 7 | `hdr` and `mediaQuality` recomputed by the HDR detection fix (`.info` sidecar v1.0012). Shows regenerate their sidecars only because this bump reprocesses them. |
+| 8 | `hdr` and `mediaQuality` recomputed by the HDR10+ fix (`.info` sidecar v1.0013), for the same reason. |
 
 It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
 i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT

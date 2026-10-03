@@ -33,7 +33,9 @@
 //     v1.0012). Movies would converge through needsInfoRegeneration alone.
 //     Shows have no sidecar-version check, so without this bump their rows
 //     would keep the old labels.
-export const MEDIA_PAYLOAD_VERSION = 7;
+// 8 — hdr and mediaQuality recomputed by the HDR10+ fix (sidecar v1.0013),
+//     for the same reason as 7.
+export const MEDIA_PAYLOAD_VERSION = 8;
 
 /**
  * Whether this host advertises JIT transcoder capability.

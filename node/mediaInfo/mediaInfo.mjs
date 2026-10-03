@@ -120,21 +120,15 @@ export function analyzeVideoTracks(videoTracks) {
     const colourPrimaries = videoTrack["colour_primaries"] || videoTrack["ColorPrimaries"] || "";
     const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
     const contentLightLevel = videoTrack["MaxCLL"] || "";
+    const hdrFormat = videoTrack["HDR_Format"] || "";
+    const isPQ =
+      includesIgnoreCase(transferCharacteristics, "PQ") ||
+      includesIgnoreCase(transferCharacteristics, "SMPTE 2084");
 
-    // Check for various HDR formats through HDR_Format field
-    if (videoTrack["HDR_Format"]) {
-      if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
-        detectedHDR.add("HDR10+");
-        continue; // HDR10+ takes precedence
-      } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
-        detectedHDR.add("HDR10");
-      } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
-        detectedHDR.add("Dolby Vision");
-      }
-    }
-
-    // Check for Dolby Vision through other fields
+    // HDR_Format lists every format a track carries, e.g. "Dolby Vision /
+    // SMPTE ST 2094 App 4", so each one is checked on its own.
     if (
+      includesIgnoreCase(hdrFormat, "Dolby Vision") ||
       videoTrack["Format_Profile"]?.includes("Dolby Vision") ||
       videoTrack["Format_Commercial"]?.includes("Dolby Vision") ||
       videoTrack["CodecID"]?.startsWith("dva")
@@ -142,13 +136,24 @@ export function analyzeVideoTracks(videoTracks) {
       detectedHDR.add("Dolby Vision");
     }
 
+    // HDR10+ is SMPTE ST 2094-40 dynamic metadata on a PQ stream. MediaInfo
+    // calls it "SMPTE ST 2094 App 4", sometimes with an "HDR10+ Profile A/B"
+    // compatibility. On an HLG stream the metadata is not HDR10+.
+    if (
+      isPQ &&
+      (includesIgnoreCase(hdrFormat, "2094 App 4") ||
+       includesIgnoreCase(hdrFormat, "2094-40") ||
+       includesIgnoreCase(videoTrack["HDR_Format_Compatibility"], "HDR10+"))
+    ) {
+      detectedHDR.add("HDR10+");
+    }
+
     // PQ over BT.2020 is HDR10. Mastering-display data and MaxCLL are optional
     // static metadata that many UHD remuxes omit, so they don't gate the label.
     // Dolby Vision profile 5 reports the same PQ and BT.2020, but its base layer
     // is IPTPQc2 rather than HDR10, so a player without Dolby Vision can't show it.
     if (
-      (includesIgnoreCase(transferCharacteristics, "PQ") ||
-       includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
+      isPQ &&
       includesIgnoreCase(colourPrimaries, "BT.2020") &&
       !includesIgnoreCase(videoTrack["HDR_Format_Profile"], "dvhe.05")
     ) {
@@ -202,6 +207,9 @@ export function analyzeVideoTracks(videoTracks) {
     });
   }
 
+  // HDR10+ carries an HDR10 base layer, so "HDR10+" alone says both.
+  if (detectedHDR.has("HDR10+")) detectedHDR.delete("HDR10");
+
   const primary = tracks[0];
   const bitDepth = parseBitDepth(primary);
 
@@ -221,7 +229,8 @@ export function analyzeVideoTracks(videoTracks) {
       highDynamicRange: isHDR,
       dolbyVision: detectedHDR.has("Dolby Vision"),
       hdr10Plus: detectedHDR.has("HDR10+"),
-      standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HLG")
+      // A display without HDR10+ plays an HDR10+ stream as HDR10.
+      standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HDR10+") || detectedHDR.has("HLG")
     }
   };
 }
