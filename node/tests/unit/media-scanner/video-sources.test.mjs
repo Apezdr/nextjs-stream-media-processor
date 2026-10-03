@@ -22,7 +22,7 @@ const getInfo = jest.fn(async (filePath) => {
 });
 jest.unstable_mockModule('../../../infoManager.mjs', () => ({ getInfo }));
 
-const { buildVideoSources, publishableSources, audioLanguagesOf } = await import(
+const { buildVideoSources, publishableSources, audioLanguagesOf, pickPrimarySource } = await import(
   '../../../components/media-scanner/domain/video-sources.mjs'
 );
 
@@ -82,6 +82,8 @@ afterAll(async () => {
   await fs.rm(dir, { recursive: true, force: true });
 });
 
+const { resolutionClass } = await import('../../../utils/sourceQuality.mjs');
+
 const urlFor = (f) => `/media/movies/Test/${encodeURIComponent(f)}`;
 
 describe('audioLanguagesOf', () => {
@@ -132,34 +134,62 @@ describe('buildVideoSources', () => {
     expect(mkv.mediaLastModified).toMatch(/^\d{4}-/);
   });
 
-  it('marks exactly one primary', async () => {
-    const { sources, primary } = await buildVideoSources({
+  it('marks exactly one primary: the better file when nothing is pinned or managed', async () => {
+    const { sources, primary, primaryReason } = await buildVideoSources({
       videoFiles: ['Movie.mp4', 'Movie.mkv'],
       dir,
       urlFor,
     });
     expect(sources.filter(s => s.isPrimary)).toHaveLength(1);
-    expect(primary.filename).toBe('Movie.mp4');
+    // The mkv is 4K HDR10, the mp4 1080p SDR.
+    expect(primary.filename).toBe('Movie.mkv');
+    expect(primaryReason).toBe('quality');
   });
 
-  it('honours a pinned primary over list order', async () => {
-    const { primary } = await buildVideoSources({
+  it('honours a pinned primary over a better file', async () => {
+    const { primary, primaryReason } = await buildVideoSources({
       videoFiles: ['Movie.mp4', 'Movie.mkv'],
       dir,
       urlFor,
-      primaryFilename: 'Movie.mkv',
+      primaryFilename: 'Movie.mp4',
     });
-    expect(primary.filename).toBe('Movie.mkv');
+    expect(primary.filename).toBe('Movie.mp4');
+    expect(primaryReason).toBe('pinned');
   });
 
-  it('falls back to the first entry when the pinned primary is gone', async () => {
+  it('publishes the file the library manager tracks over the pin', async () => {
+    // Nobody in production: the pin named a leftover 1080p copy, Radarr tracked the remux.
+    const { primary, primaryReason } = await buildVideoSources({
+      videoFiles: ['Movie.mp4', 'Movie.mkv'],
+      dir,
+      urlFor,
+      primaryFilename: 'Movie.mp4',
+      managedFilenames: new Set(['Movie.mkv']),
+    });
+    expect(primary.filename).toBe('Movie.mkv');
+    expect(primaryReason).toBe('managed');
+  });
+
+  it('falls back to the pin when the manager tracks none of the files', async () => {
+    const { primary, primaryReason } = await buildVideoSources({
+      videoFiles: ['Movie.mp4', 'Movie.mkv'],
+      dir,
+      urlFor,
+      primaryFilename: 'Movie.mp4',
+      managedFilenames: new Set(['Elsewhere.mkv']),
+    });
+    expect(primary.filename).toBe('Movie.mp4');
+    expect(primaryReason).toBe('pinned');
+  });
+
+  it('falls back to the better file when the pinned primary is gone', async () => {
     const { primary } = await buildVideoSources({
       videoFiles: ['Movie.mp4', 'Movie.mkv'],
       dir,
       urlFor,
       primaryFilename: 'Deleted.mp4',
     });
-    expect(primary.filename).toBe('Movie.mp4');
+    expect(primary.filename).toBe('Movie.mkv');
   });
 
   it('PRESERVES CALLER ORDER — the hash-stability contract', async () => {
@@ -334,5 +364,42 @@ describe('publishableSources', () => {
     const twice = JSON.stringify(publishableSources(sources));
     expect(once).toBe(twice);
     expect(once).not.toContain('_info');
+  });
+});
+
+describe('pickPrimarySource', () => {
+  const src = (filename, dimensions, hdr = null) => ({ filename, dimensions, hdr });
+
+  it('keeps priority order between equal files, so duplicates never flip', () => {
+    const sources = [src('A.mp4', '1920x1080'), src('B.mp4', '1920x1080')];
+    expect(pickPrimarySource(sources).source.filename).toBe('A.mp4');
+  });
+
+  it('ranks HDR above resolution', () => {
+    const sources = [src('UHD.SDR.mp4', '3840x2160', '10-bit SDR (BT.709)'), src('HD.HDR.mp4', '1920x1080', 'HDR10')];
+    expect(pickPrimarySource(sources).source.filename).toBe('HD.HDR.mp4');
+  });
+
+  it('prefers the higher resolution class between SDR files', () => {
+    // Alien: Earth S01E01 in production: a 1080p leftover sorted ahead of the 2160p file.
+    const sources = [src('S01E01 WEBDL-1080p.mp4', '1920x1080'), src('S01E01 WEBDL-2160p Proper.mp4', '3840x2160')];
+    expect(pickPrimarySource(sources)).toEqual({ source: sources[1], reason: 'quality' });
+  });
+
+  it('calls a single file the primary without weighing anything', () => {
+    const only = [src('Only.mkv', null)];
+    expect(pickPrimarySource(only, { primaryFilename: 'Gone.mp4' })).toEqual({ source: only[0], reason: 'only' });
+  });
+});
+
+describe('resolutionClass', () => {
+  it('reads letterboxed and anamorphic video by its effective width', () => {
+    expect(resolutionClass('3840x2160')).toBe(4);
+    expect(resolutionClass('3840x1608')).toBe(4); // letterboxed 2160p
+    expect(resolutionClass('1920x804')).toBe(3);  // letterboxed 1080p
+    expect(resolutionClass('1440x1080')).toBe(3); // anamorphic 1080p
+    expect(resolutionClass('1280x720')).toBe(2);
+    expect(resolutionClass('720x480')).toBe(1);
+    expect(resolutionClass(null)).toBe(0);
   });
 });

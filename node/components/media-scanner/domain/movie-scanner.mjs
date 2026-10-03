@@ -19,6 +19,7 @@ import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
   resolveMediaIdentity,
   repointMediaIdentity,
+  setPrimarySource,
   filenameFromUrl,
 } from '../../../utils/mediaIdentity.mjs';
 import { currentPayloadSignature } from '../../../lib/payloadVersion.mjs';
@@ -315,16 +316,17 @@ async function processSubtitles(fileNames, dirPath, dirName, prefixPath, langMap
  * @param {string|null} primaryFilename - Identity's pinned primary source
  * @returns {Promise<Object>}
  */
-async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, primaryFilename = null) {
+async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, primaryFilename = null, managedFilenames = null) {
   const encodedDirName = encodeURIComponent(dirName);
   const dir = join(dirPath, dirName);
 
-  const { sources, primary, fileLengths, fileDimensions } = await buildVideoSources({
+  const { sources, primary, primaryReason, fileLengths, fileDimensions } = await buildVideoSources({
     videoFiles,
     dir,
     urlFor: (filename) =>
       `${prefixPath}/movies/${encodedDirName}/${encodeURIComponent(filename)}`,
     primaryFilename,
+    managedFilenames,
     libraryRelativeDir: `movies/${dirName}`,
   });
 
@@ -367,6 +369,7 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
     additionalMetadata: primaryInfo?.additionalMetadata,
     _id: primaryInfo?.uuid,
     primaryFilename: primary?.filename ?? null,
+    primaryReason,
   };
 }
 
@@ -445,10 +448,12 @@ async function extractTMDBId(tmdbConfigPath) {
  * @param {Object} [options]
  * @param {Function} [options.onProgress] - Called as each movie starts with
  *   { position, total, name }; position is 1-based. Must not throw.
+ * @param {(libraryRelativePath: string) => Promise<Set<string>|null>} [options.managedFilesFor]
+ *   Basenames the library manager tracks in a folder, or null when unknown.
  * @returns {Promise<{titles: number, reprocessed: number}>} - movie folders
  *   seen, and how many of them were processed rather than skipped as unchanged.
  */
-export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, currentVersion, isDebugMode, downloadTMDBImages, { onProgress = () => {} } = {}) {
+export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, currentVersion, isDebugMode, downloadTMDBImages, { onProgress = () => {}, managedFilesFor = null } = {}) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMovies = await getMissingMediaData();
   const now = new Date();
@@ -636,16 +641,25 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         logger.warn(`identity repointed for ${libraryRelativePath}: ${identity.id} -> ${mediaId}`);
       }
 
-      // Process video files — every supported container becomes a source, and
-      // the identity's pinned primary is the one that publishes as urls.mp4.
+      // Process video files — every supported container becomes a source. The
+      // file the library manager tracks publishes as urls.mp4, else the
+      // identity's pin (pickPrimarySource). The manager is only asked when
+      // there is a choice to make.
+      const managedFilenames = managedFilesFor && videoFiles.length > 1
+        ? await Promise.resolve(managedFilesFor(libraryRelativePath)).catch(() => null)
+        : null;
       const videoData = await processVideoFiles(
         videoFiles,
         dirPath,
         dirName,
         prefixPath,
-        identity.primarySource
+        identity.primarySource,
+        managedFilenames
       );
       if (videoData._id) _id = videoData._id;
+      if (videoData.primaryReason === 'managed' && videoData.primaryFilename !== identity.primarySource) {
+        await setPrimarySource({ dir: fullDirPath, primarySource: videoData.primaryFilename });
+      }
 
       // Build URLs. The resolution map (file path + mtime + hash per kind) comes
       // from the same pass that builds the URLs, so the DB row below stores the

@@ -120,8 +120,13 @@ describe('RadarrProvider', () => {
         poster: 'https://image.tmdb.org/t/p/original/professor-poster.jpg',
         backdrop: 'https://image.tmdb.org/t/p/original/professor-fanart.jpg',
       },
+      providerItemId: 1,
+      managedFiles: ['The.Professor.2018.1080p.BluRay.mkv'],
     });
-    expect(claims.find((c) => c.tmdbId === 999001).hasFile).toBe(false);
+    expect(claims.find((c) => c.tmdbId === 999001)).toMatchObject({ hasFile: false, managedFiles: [] });
+    // hasFile but no movieFile on the item: Radarr cannot say which, so neither do we.
+    expect(claims.find((c) => c.tmdbId === 438631).managedFiles).toBeNull();
+    expect(await provider.managedFiles(professor)).toEqual(['The.Professor.2018.1080p.BluRay.mkv']);
     // Broken Entry: tmdbId 0 and no imdbId → no id of any kind → dropped.
     expect(provider.lastFetch).toMatchObject({ items: 5, claims: 4, unmapped: 0, noId: 1, unidentified: 0 });
   });
@@ -263,9 +268,35 @@ describe('SonarrProvider', () => {
         poster: 'https://artworks.thetvdb.com/banners/kingdom-poster.jpg',
         backdrop: 'https://artworks.thetvdb.com/banners/kingdom-fanart.jpg',
       },
+      providerItemId: 10,
+      // The series list carries no episode files; managedFiles fetches them.
+      managedFiles: null,
     });
     expect(claims[1]).toMatchObject({ libraryRelativePath: 'tv/Kingdom (2014)', tmdbId: 61137, hasFile: false, released: true, arrStatus: 'ended', monitored: false });
     expect(fetchImpl.calls[0].url).toBe('http://sonarr:8989/api/v3/series');
+  });
+
+  it('fetches the episode files Sonarr tracks for one series, on request', async () => {
+    const fetchImpl = fakeFetch({
+      '/api/v3/series': await loadFixture('sonarr-series.json'),
+      '/api/v3/episodefile': [
+        { id: 1, seasonNumber: 1, relativePath: 'Season 1/Kingdom - S01E01 - Episode 1 WEBDL-2160p.mkv' },
+        { id: 2, seasonNumber: 1, relativePath: 'Season 1/Kingdom - S01E02 - Episode 2 WEBDL-2160p.mkv' },
+        { id: 3, seasonNumber: 1 },
+      ],
+    });
+    const provider = SonarrProvider.fromEnv(env, { fetchImpl });
+    const [kingdom] = await provider.fetchClaims();
+
+    expect(await provider.managedFiles(kingdom)).toEqual([
+      'Season 1/Kingdom - S01E01 - Episode 1 WEBDL-2160p.mkv',
+      'Season 1/Kingdom - S01E02 - Episode 2 WEBDL-2160p.mkv',
+    ]);
+    const request = fetchImpl.calls.at(-1);
+    expect(request.url).toBe('http://sonarr:8989/api/v3/episodefile?seriesId=10');
+    expect(request.init.headers['X-Api-Key']).toBe('k');
+    // A claim without Sonarr's own id cannot be asked about.
+    expect(await provider.managedFiles({ ...kingdom, providerItemId: null })).toBeNull();
   });
 
   it('a series Sonarr manages without a TMDB id is an unidentified claim, not a dropped one (The Wayfinders case)', async () => {

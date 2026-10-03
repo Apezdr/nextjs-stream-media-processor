@@ -65,6 +65,9 @@ export const SCAN_TRIGGER_KINDS = Object.freeze(new Set([
  * @property {string|null} arrStatus        the provider's own lifecycle word, verbatim (announced, released, continuing, …)
  * @property {boolean|null} monitored       the provider is actively looking for it; null = cannot say
  * @property {{poster: string|null, backdrop: string|null}} art  the provider's remote artwork URLs (never its own local paths); each null when absent
+ * @property {number|null} providerItemId   the provider's own id for the item (Radarr movie id, Sonarr series id)
+ * @property {string[]|null} managedFiles   files the provider tracks, relative to the folder; null = not in the list
+ *                                           (see IdentityProvider#managedFiles, which may fetch them)
  */
 
 /**
@@ -240,7 +243,22 @@ export class IdentityProvider {
       arrStatus: typeof fields.arrStatus === 'string' && fields.arrStatus ? fields.arrStatus : null,
       monitored: typeof fields.monitored === 'boolean' ? fields.monitored : null,
       art: normalizeArt(fields.art),
+      providerItemId: Number.isInteger(fields.providerItemId) ? fields.providerItemId : null,
+      managedFiles: Array.isArray(fields.managedFiles)
+        ? fields.managedFiles.filter((f) => typeof f === 'string' && f)
+        : null,
     };
+  }
+
+  /**
+   * The files this provider tracks for a claim's folder, relative to it. The
+   * default reads them off the claim; a provider whose list endpoint does not
+   * carry them (Sonarr) fetches them here.
+   * @param {IdentityClaim} claim
+   * @returns {Promise<string[]|null>} null = cannot say
+   */
+  async managedFiles(claim) {
+    return claim?.managedFiles ?? null;
   }
 
   /**

@@ -448,3 +448,151 @@ describe('identity job and change detector', () => {
     expect(off.start()).toBe(false);
   });
 });
+
+describe('managed files and leftovers', () => {
+  const basePath = join(tmpdir(), `identity-leftovers-${randomUUID()}`);
+  const episodeFileRequests = [];
+  let service;
+  let server;
+  let base;
+
+  // Production's cases: Radarr tracks Nobody's remux, Sonarr the 2160p episode;
+  // the 1080p copies are what each upgrade left behind.
+  const fetchImpl = async (url) => {
+    const { pathname, search } = new URL(url);
+    const json = (body) => ({ ok: true, status: 200, json: async () => body });
+    if (pathname === '/api/v3/movie') {
+      return json([
+        {
+          id: 7, title: 'Nobody', year: 2021, path: '/processed_movies/Nobody', tmdbId: 615457, hasFile: true,
+          movieFile: { relativePath: 'Nobody.2021.2160p.Remux.mkv' },
+        },
+        {
+          // Radarr swapped the Dolby Vision release for an SDR one.
+          id: 8, title: 'Elio', year: 2025, path: '/processed_movies/Elio', tmdbId: 1022787, hasFile: true,
+          movieFile: { relativePath: 'Elio.2025.2160p.SDR.mp4' },
+        },
+      ]);
+    }
+    if (pathname === '/api/v3/series') {
+      return json([{
+        id: 188, title: 'Alien: Earth', year: 2025, path: '/processed_tv/Alien - Earth', tmdbId: 157239,
+        statistics: { episodeFileCount: 1 }, status: 'continuing',
+      }]);
+    }
+    if (pathname === '/api/v3/episodefile') {
+      episodeFileRequests.push(search);
+      return json([{ relativePath: 'Season 1/Alien - Earth - S01E01 - Neverland WEBDL-2160p Proper.mp4' }]);
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+
+  const listMultiSourceTitles = async () => [
+    {
+      mediaType: 'movie', libraryRelativePath: 'movies/Nobody', title: 'Nobody', episode: null,
+      sources: [
+        { filename: 'Nobody.2021.1080p.iVy.mp4', size: 4322151904, dimensions: '1920x804', hdr: '10-bit SDR (BT.709)', isPrimary: true },
+        { filename: 'Nobody.2021.2160p.Remux.mkv', size: 45069992695, dimensions: '3840x2160', hdr: 'Dolby Vision, HDR10+', isPrimary: false },
+      ],
+    },
+    {
+      mediaType: 'tv', libraryRelativePath: 'tv/Alien - Earth', title: 'Alien - Earth', episode: 'S01E01',
+      sources: [
+        { filename: 'Alien - Earth - S01E01 - Neverland WEBDL-1080p.mp4', size: 2605644608, dimensions: '1920x1080', hdr: null, isPrimary: true },
+        { filename: 'Alien - Earth - S01E01 - Neverland WEBDL-2160p Proper.mp4', size: 5815704082, dimensions: '3840x2160', hdr: null, isPrimary: false },
+      ],
+    },
+    {
+      mediaType: 'movie', libraryRelativePath: 'movies/Elio', title: 'Elio', episode: null,
+      sources: [
+        { filename: 'Elio.2025.2160p.DV.mp4', size: 18606230244, dimensions: '3840x1608', hdr: 'Dolby Vision, HDR10+', isPrimary: false },
+        { filename: 'Elio.2025.2160p.SDR.mp4', size: 21428937961, dimensions: '3840x2160', hdr: '10-bit SDR (BT.709)', isPrimary: true },
+      ],
+    },
+    {
+      // Nobody manages this folder: two files, and no one to say which is the leftover.
+      mediaType: 'movie', libraryRelativePath: 'movies/Home Videos', title: 'Home Videos', episode: null,
+      sources: [
+        { filename: 'a.mp4', size: 1, dimensions: '1920x1080', hdr: null, isPrimary: true },
+        { filename: 'b.mp4', size: 1, dimensions: '1920x1080', hdr: null, isPrimary: false },
+      ],
+    },
+  ];
+
+  beforeAll(async () => {
+    await fs.mkdir(join(basePath, 'movies'), { recursive: true });
+    await fs.mkdir(join(basePath, 'tv'), { recursive: true });
+    service = createIdentityService({
+      env: {
+        RADARR_URL: 'http://radarr:7878', RADARR_API_KEY: 'k',
+        SONARR_URL: 'http://sonarr:8989', SONARR_API_KEY: 'k',
+      },
+      basePath,
+      fetchImpl,
+      resolveExternalId: null,
+      listMultiSourceTitles,
+    });
+    const app = express();
+    app.use('/api', setupIdentityRoutes(service));
+    ({ server, base } = await listen(app));
+  });
+
+  afterAll(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(basePath, { recursive: true, force: true });
+  });
+
+  it('knows nothing before the first pull', async () => {
+    expect(await service.managedFilesFor('movies/Nobody')).toBeNull();
+    expect(await service.listLeftovers()).toEqual({ enabled: true, pending: true, leftovers: [] });
+  });
+
+  it('answers from the Radarr list for movies and fetches a Sonarr show once per pull', async () => {
+    await service.reconcileForTick({ reason: 'manual' });
+
+    expect(await service.managedFilesFor('movies/Nobody')).toEqual(new Set(['Nobody.2021.2160p.Remux.mkv']));
+    expect(await service.managedFilesFor('tv/Alien - Earth'))
+      .toEqual(new Set(['Alien - Earth - S01E01 - Neverland WEBDL-2160p Proper.mp4']));
+    await service.managedFilesFor('tv/Alien - Earth');
+    expect(episodeFileRequests).toEqual(['?seriesId=188']);
+    expect(await service.managedFilesFor('movies/Home Videos')).toBeNull();
+  });
+
+  it('GET /identity/leftovers lists what each upgrade left behind, and only that', async () => {
+    const res = await fetch(`${base}/api/identity/leftovers`, { headers: { 'x-webhook-id': 'hook-secret' } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.leftovers).toEqual([
+      {
+        mediaType: 'tv', libraryRelativePath: 'tv/Alien - Earth', title: 'Alien - Earth', episode: 'S01E01',
+        file: 'Alien - Earth - S01E01 - Neverland WEBDL-1080p.mp4', size: 2605644608, dimensions: '1920x1080',
+        hdr: null, isPrimary: true, keep: 'Alien - Earth - S01E01 - Neverland WEBDL-2160p Proper.mp4',
+        betterThanKept: false,
+      },
+      {
+        // The leftover is the better copy: the page must warn, not invite a delete.
+        mediaType: 'movie', libraryRelativePath: 'movies/Elio', title: 'Elio', episode: null,
+        file: 'Elio.2025.2160p.DV.mp4', size: 18606230244, dimensions: '3840x1608',
+        hdr: 'Dolby Vision, HDR10+', isPrimary: false, keep: 'Elio.2025.2160p.SDR.mp4',
+        betterThanKept: true,
+      },
+      {
+        mediaType: 'movie', libraryRelativePath: 'movies/Nobody', title: 'Nobody', episode: null,
+        file: 'Nobody.2021.1080p.iVy.mp4', size: 4322151904, dimensions: '1920x804',
+        hdr: '10-bit SDR (BT.709)', isPrimary: true, keep: 'Nobody.2021.2160p.Remux.mkv',
+        betterThanKept: false,
+      },
+    ]);
+    // Elio's better copy is not counted as space to reclaim.
+    expect(body.reclaimableBytes).toBe(4322151904 + 2605644608);
+    expect(body.unverified).toBe(1);
+    // Sonarr was not asked again: the answer is cached for this pull.
+    expect(episodeFileRequests).toHaveLength(1);
+  });
+
+  it('refuses unauthenticated requests', async () => {
+    const res = await fetch(`${base}/api/identity/leftovers`);
+    expect(res.status).toBe(401);
+  });
+});

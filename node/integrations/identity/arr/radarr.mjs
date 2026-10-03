@@ -2,7 +2,7 @@
  * Radarr identity provider. Env: RADARR_URL, RADARR_API_KEY, optional
  * RADARR_ROOT_MAP and RADARR_TIMEOUT_MS (see arrProvider.mjs).
  *
- * List: GET /api/v3/movie → [{ id, title, year, path, tmdbId, imdbId, hasFile, … }]
+ * List: GET /api/v3/movie → [{ id, title, year, path, tmdbId, imdbId, hasFile, movieFile: { relativePath }, … }]
  * Webhook subject: body.movie → { id, title, year, folderPath, tmdbId, imdbId }
  */
 
@@ -48,6 +48,13 @@ export class RadarrProvider extends ArrProvider {
 
   itemHasFile(item) {
     return typeof item?.hasFile === 'boolean' ? item.hasFile : null;
+  }
+
+  /** Radarr tracks one file per movie; the list item carries it as movieFile. */
+  itemManagedFiles(item) {
+    const relativePath = item?.movieFile?.relativePath;
+    if (typeof relativePath === 'string' && relativePath) return [relativePath];
+    return item?.hasFile === false ? [] : null;
   }
 
   /** Radarr's own "minimum availability met" verdict. */

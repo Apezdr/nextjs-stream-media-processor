@@ -8,6 +8,8 @@
  *   start() / stop()               the service's own reconcile job
  *   handleWebhook(name, body)      a provider pushed an event
  *   getStatus() / getLastReport()  for the admin endpoints
+ *   managedFilesFor(path)          the files a provider tracks in a folder (the scanner's primary pick)
+ *   listLeftovers()                files on disk a provider replaced but never deleted
  *
  * Freshness is the service's own responsibility, not the scan tick's. A scan
  * tick can run for ten minutes after a batch of repairs; the job below keeps
@@ -32,6 +34,7 @@ import { buildIdentityIndex } from './index-builder.mjs';
 import { reconcileIdentities, reconcileClaim, listAllLibraryFolders, fingerprintFolders } from './reconciler.mjs';
 import { createExternalIdResolver } from './external-id-resolver.mjs';
 import { SCAN_TRIGGER_KINDS, EVENT_KINDS } from './provider.mjs';
+import { compareSourceQuality } from '../../utils/sourceQuality.mjs';
 
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 15;
@@ -82,6 +85,10 @@ export function parseReconcileIntervalMs(raw, logger = null) {
  * @param {() => Date} [options.now]          injectable clock
  * @param {Function} [options.setIntervalImpl]  injectable timer (tests)
  * @param {Function} [options.clearIntervalImpl]
+ * @param {() => Promise<Array<{mediaType: string, libraryRelativePath: string, title: string,
+ *   episode: string|null, sources: Array<{filename: string, size: number|null, dimensions: string|null,
+ *   hdr: string|null, isPrimary: boolean}>}>>} [options.listMultiSourceTitles]
+ *   the library's movies and episodes with more than one video file, for listLeftovers
  */
 export function createIdentityService({
   env = process.env,
@@ -98,6 +105,7 @@ export function createIdentityService({
   now = () => new Date(),
   setIntervalImpl = setInterval,
   clearIntervalImpl = clearInterval,
+  listMultiSourceTitles = null,
 } = {}) {
   if (!basePath) throw new Error('identity service needs basePath');
 
@@ -308,6 +316,100 @@ export function createIdentityService({
     return { accepted: true, status: 200, provider: provider.name, events: results, scanRequested, reportRefreshed };
   }
 
+  // Managed-file answers per index build: a show costs Sonarr at most one
+  // request per provider pull, and a failure is not retried until the next.
+  const managedFilesCache = new WeakMap();
+
+  /**
+   * Basenames of the files the library manager tracks for a folder.
+   * @param {string} libraryRelativePath  e.g. 'movies/Nobody', 'tv/Alien - Earth'
+   * @returns {Promise<Set<string>|null>} null when no provider manages the
+   *   folder, none has been pulled yet, or it could not answer. Never throws.
+   */
+  async function managedFilesFor(libraryRelativePath) {
+    const index = lastIndex;
+    if (!enabled || !index) return null;
+    const claim = index.claimFor(libraryRelativePath);
+    if (!claim) return null;
+
+    let perIndex = managedFilesCache.get(index);
+    if (!perIndex) {
+      perIndex = new Map();
+      managedFilesCache.set(index, perIndex);
+    }
+    if (!perIndex.has(libraryRelativePath)) {
+      const provider = providers.find((p) => p.name === claim.source);
+      perIndex.set(libraryRelativePath, (async () => {
+        try {
+          const files = await provider?.managedFiles(claim);
+          return Array.isArray(files) ? new Set(files.map((f) => f.split(/[\\/]/).pop())) : null;
+        } catch (error) {
+          logger?.warn(`identity: ${claim.source} could not list the files it tracks for ${libraryRelativePath}: ${error.message}`);
+          return null;
+        }
+      })());
+    }
+    return perIndex.get(libraryRelativePath);
+  }
+
+  /**
+   * Files the library manager no longer tracks, in titles where it tracks
+   * another file for the same movie or episode: what an upgrade leaves behind
+   * when the old file stays on disk. Built from the titles the library already
+   * knows have more than one file, so its cost follows the duplicates.
+   * @returns {Promise<Object>}
+   */
+  async function listLeftovers() {
+    if (!enabled) return { enabled: false };
+    if (!listMultiSourceTitles) return { enabled: true, leftovers: [], error: 'no library reader configured' };
+    if (!lastIndex) return { enabled: true, pending: true, leftovers: [] };
+
+    const titles = await listMultiSourceTitles();
+    const leftovers = [];
+    // Titles with several files where the manager vouches for none of them.
+    let unverified = 0;
+    for (const title of titles) {
+      const managed = await managedFilesFor(title.libraryRelativePath);
+      const kept = managed ? title.sources.find((s) => managed.has(s.filename)) : null;
+      if (!kept) {
+        unverified++;
+        continue;
+      }
+      for (const source of title.sources) {
+        if (managed.has(source.filename)) continue;
+        leftovers.push({
+          mediaType: title.mediaType,
+          libraryRelativePath: title.libraryRelativePath,
+          title: title.title,
+          episode: title.episode ?? null,
+          file: source.filename,
+          size: source.size ?? null,
+          dimensions: source.dimensions ?? null,
+          hdr: source.hdr ?? null,
+          // Still the one playing until the next scan applies the managed file.
+          isPrimary: source.isPrimary === true,
+          keep: kept.filename,
+          // The manager kept the worse copy (Elio: an SDR release replaced the
+          // Dolby Vision one). Deleting this would lose the better file.
+          betterThanKept: compareSourceQuality(source, kept) > 0,
+        });
+      }
+    }
+    leftovers.sort((a, b) =>
+      a.title.localeCompare(b.title) || String(a.episode ?? '').localeCompare(String(b.episode ?? '')));
+    return {
+      enabled: true,
+      at: now().toISOString(),
+      indexBuiltAt: lastIndex.builtAt ?? null,
+      leftovers,
+      // What deleting the leftovers frees, leaving out any that are the better copy.
+      reclaimableBytes: leftovers
+        .filter((l) => !l.betterThanKept)
+        .reduce((sum, l) => sum + (l.size ?? 0), 0),
+      unverified,
+    };
+  }
+
   function getStatus() {
     return {
       enabled,
@@ -348,5 +450,7 @@ export function createIdentityService({
     handleWebhook,
     getStatus,
     getLastReport: () => lastReport,
+    managedFilesFor,
+    listLeftovers,
   };
 }

@@ -8,6 +8,10 @@
     "tmdbId": 467956,
     "imdbId": "tt5559796",
     "hasFile": true,
+    "movieFile": {
+      "relativePath": "The.Professor.2018.1080p.BluRay.mkv",
+      "path": "/processed_movies/The Professor/The.Professor.2018.1080p.BluRay.mkv"
+    },
     "status": "released",
     "isAvailable": true,
     "monitored": true,

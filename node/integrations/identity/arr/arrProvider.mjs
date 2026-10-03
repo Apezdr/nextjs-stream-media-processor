@@ -172,6 +172,15 @@ export class ArrProvider extends IdentityProvider {
   }
 
   /**
+   * implement — the files the list item says the app tracks, relative to the
+   * item's folder; null when the list item does not carry them.
+   */
+  // eslint-disable-next-line no-unused-vars
+  itemManagedFiles(item) {
+    return null;
+  }
+
+  /**
    * Remote artwork from the item's `images[]` (`coverType` poster / fanart,
    * `remoteUrl`). The `url` field is the app's own /MediaCover path and is
    * never forwarded: the frontend cannot reach it.
@@ -280,6 +289,8 @@ export class ArrProvider extends IdentityProvider {
       arrStatus: this.itemArrStatus(item),
       monitored: this.itemMonitored(item),
       art: this.itemArt(item),
+      providerItemId: Number.isInteger(item?.id) ? item.id : null,
+      managedFiles: this.itemManagedFiles(item),
     });
   }
 

@@ -104,6 +104,38 @@ The scanner and generator have no identity-specific branches. A write looks to
 them exactly like an operator editing the id by hand, which is the path that
 already wipes the old id's art and repulls.
 
+## Managed files: which copy plays
+
+When an upgrade imports a new file but the old one stays on disk, the folder
+holds two copies and only one is the app's. Before this, the scanner published
+whichever came first by container and name and pinned it, so production served
+Nobody's leftover 1080p SDR file beside the 4K remux Radarr tracked.
+
+`managedFilesFor(libraryRelativePath)` answers which files the provider
+tracks. Radarr's movie list carries `movieFile`, so movies cost nothing extra;
+Sonarr's series list carries no files, so `SonarrProvider#managedFiles`
+fetches `/api/v3/episodefile?seriesId=` for one series. Answers are cached per
+index build, and the scanner asks only for a folder (or show) that has a
+choice to make, so Sonarr sees a request only for shows with a doubled
+episode. The scanner gets the function as a plain option and never learns
+which provider answered.
+
+`pickPrimarySource` (`components/media-scanner/domain/video-sources.mjs`)
+then publishes, in order: the managed file; the movie's identity pin; the best
+file (HDR, then resolution). When the managed file wins, the movie's pin moves
+to it, so a provider outage cannot hand the title back to the leftover.
+
+`GET /api/identity/leftovers` lists the files a provider no longer tracks in
+titles where it tracks another one (`keep`), with sizes and whether each is
+still the playing copy until the next scan. `betterThanKept` marks a leftover
+that beats the kept file (HDR, then resolution): production's Elio, where
+Radarr swapped a Dolby Vision release for an SDR one. That is a provider
+setting to fix, not a file to delete, and `reclaimableBytes` leaves it out.
+It reads the titles the library already knows have several files, so its
+cost follows the duplicates.
+Titles with several files where the provider vouches for none are counted as
+`unverified`, never guessed. Deleting a leftover is left to a person.
+
 ## Precedence
 
 | stored `tmdb_id_source` | provider says | result | write-back |
@@ -163,6 +195,7 @@ reaches the frontend in seconds rather than up to three minutes.
 | `POST /api/identity/webhook/:provider` | webhook id (header or Basic password) or admin | provider push |
 | `GET /api/identity/status` | webhook id or admin | providers, last index, recent events |
 | `GET /api/identity/report` | webhook id or admin | last reconcile report (written, conflicts, provider-only, unmanaged) |
+| `GET /api/identity/leftovers` | webhook id or admin | files a provider replaced but never deleted |
 | `POST /api/identity/reconcile` | webhook id or admin | run a reconcile now |
 
 ## Adding a provider
@@ -175,6 +208,9 @@ reaches the frontend in seconds rather than up to three minutes.
 4. Implement `fetchClaims()` → `IdentityClaim[]` via `this.makeClaim(...)`.
    Claims are keyed by library-relative path (`movies/<folder>`, `tv/<folder>`).
 5. Optionally implement `parseWebhook(body, headers)` → `IdentityEvent[]`.
+   If the list carries the files the provider tracks, pass them to
+   `makeClaim` as `managedFiles` (relative to the folder); otherwise override
+   `managedFiles(claim)` to fetch them, or leave it returning null.
 6. Add the class to `PROVIDER_CLASSES` in `registry.mjs`.
 7. Tests: a fixture of the provider's list response, `fetchClaims` against an
    injected `fetchImpl`, and (if applicable) one webhook payload per event kind.

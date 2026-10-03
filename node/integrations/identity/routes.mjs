@@ -4,6 +4,7 @@
  *   POST /api/identity/webhook/:provider   a provider's Webhook connection
  *   GET  /api/identity/status              providers, last index, recent events
  *   GET  /api/identity/report              the last full reconcile report
+ *   GET  /api/identity/leftovers           files a provider replaced but never deleted
  *   POST /api/identity/reconcile           run a reconcile now (returns the report)
  *
  * Auth: every route accepts the processor's webhook id or an admin session
@@ -75,6 +76,15 @@ export function setupIdentityRoutes(service, { authenticate = authenticateWebhoo
     if (!service.enabled) return res.status(200).json({ enabled: false });
     if (!report) return res.status(202).json({ enabled: true, pending: true, message: 'no reconcile has run yet' });
     res.json(report);
+  });
+
+  router.get('/identity/leftovers', authenticate, async (_req, res) => {
+    try {
+      res.json(await service.listLeftovers());
+    } catch (error) {
+      logger.error(`identity leftovers failed: ${error.message}`);
+      res.status(500).json({ error: 'leftovers failed' });
+    }
   });
 
   router.post('/identity/reconcile', authenticate, async (_req, res) => {

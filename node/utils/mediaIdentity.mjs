@@ -299,6 +299,34 @@ function isIsoTimestamp(value) {
   return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value));
 }
 
+/**
+ * Move a folder's pinned primary source.
+ *
+ * The one exception to "seeded once, never recomputed": when the library
+ * manager tracks a different file than the pin, the pin follows it. Otherwise a
+ * manager outage would hand the title back to the leftover the pin still names,
+ * and its URL would flip between the two files.
+ *
+ * @param {Object} params
+ * @param {string} params.dir           absolute folder path
+ * @param {string} params.primarySource filename the sidecar should name
+ * @returns {Promise<boolean>} whether the sidecar now names primarySource
+ */
+export async function setPrimarySource({ dir, primarySource }) {
+  if (!primarySource) return false;
+  const { data } = await readIdentitySidecar(dir);
+  if (!data) return false;
+  if (data.primarySource === primarySource) return true;
+  const wrote = await writeIdentitySidecar(dir, { ...data, primarySource });
+  if (wrote) {
+    logger.info(
+      `identity primary source moved for ${data.derivedFrom ?? dir}: ` +
+      `${data.primarySource ?? 'none'} -> ${primarySource}`
+    );
+  }
+  return wrote;
+}
+
 function episodeSeenMapOf(data) {
   const map = data?.episodes;
   if (!map || typeof map !== 'object' || Array.isArray(map)) return {};

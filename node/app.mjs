@@ -47,6 +47,7 @@ import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
 import { createIdentityService } from "./integrations/identity/index.mjs";
+import { listMultiSourceTitles } from "./sqlite/multiSourceTitles.mjs";
 import { setupIdentityRoutes } from "./integrations/identity/routes.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
 import { langMap } from "./utils/languageMap.mjs";
@@ -76,6 +77,7 @@ const identityService = createIdentityService({
   basePath: BASE_PATH,
   logger: createCategoryLogger('identity'),
   requestScan: requestEarlyScan,
+  listMultiSourceTitles: () => listMultiSourceTitles(),
 });
 
 // A webhook asks for the normal tick to run now. Coalesce: one early run at a
@@ -792,7 +794,7 @@ async function generateListTV(db, dirPath) {
       langMap,
       isDebugMode,
       runDownloadTmdbImages,
-      { onProgress: progress.onProgress }
+      { onProgress: progress.onProgress, managedFilesFor: identityService.managedFilesFor }
     );
     await progress.complete(summary);
   } catch (error) {
@@ -843,7 +845,7 @@ async function generateListMovies(db, dirPath) {
       CURRENT_VERSION,
       isDebugMode,
       runDownloadTmdbImages,
-      { onProgress: progress.onProgress }
+      { onProgress: progress.onProgress, managedFilesFor: identityService.managedFilesFor }
     );
     await progress.complete(summary);
   } catch (error) {
