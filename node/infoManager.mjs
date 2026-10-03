@@ -12,7 +12,10 @@ const exec = promisify(execCallback);
 // 1.0011 adds container/codec detail (additionalMetadata.format, video pix_fmt
 // and field_order, audio languageTag/disposition) used to decide whether the
 // JIT transcoder can serve a file without losing anything.
-export const CURRENT_VERSION = 1.0011;
+// 1.0012 changes no field. It recomputes mediaQuality and hdr after the HDR
+// detection fix: PQ sources without MaxCLL are now labelled HDR10, and MP4
+// cover art no longer overwrites the transfer and bit depth.
+export const CURRENT_VERSION = 1.0012;
 
 /**
  * The shape extractAdditionalMetadata returns when probing fails.

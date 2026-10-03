@@ -83,6 +83,150 @@ export async function getHeaderData(filePath) {
 }
 
 /**
+ * MediaInfo lists an MP4's embedded cover art as an extra Video track: one JPEG
+ * or PNG frame. It describes no part of the picture.
+ */
+const STILL_IMAGE_FORMATS = new Set(["JPEG", "PNG", "BMP", "GIF", "TIFF", "WebP"]);
+
+const parseBitDepth = (track) => track["BitDepth"] ? parseInt(track["BitDepth"]) : null;
+
+const transferOf = (track) =>
+  track["transfer_characteristics"] || track["TransferCharacteristics"] || "";
+
+/**
+ * Derives the mediaQuality object from a file's MediaInfo Video tracks.
+ *
+ * HDR labels are collected across every picture track, since a Dolby Vision
+ * enhancement layer can carry its own signalling. bitDepth, colorSpace and
+ * transferCharacteristics describe the main picture, so they come from the
+ * first picture track only. They used to come from the last track, which let
+ * an MP4's cover-art JPEG blank the transfer and report the file as 8-bit.
+ *
+ * @param {object[]} videoTracks - MediaInfo tracks with @type "Video"; at least one.
+ * @returns {object} mediaQuality
+ */
+export function analyzeVideoTracks(videoTracks) {
+  const pictureTracks = videoTracks.filter(t => !STILL_IMAGE_FORMATS.has(t["Format"]));
+  // A file whose only video track uses an image codec (Motion JPEG) is still video.
+  const tracks = pictureTracks.length > 0 ? pictureTracks : videoTracks;
+
+  const detectedHDR = new Set();
+
+  for (const videoTrack of tracks) {
+    const bitDepth = parseBitDepth(videoTrack);
+    const encodingSettings = videoTrack["Encoded_Library_Settings"] || "";
+    const transferCharacteristics = transferOf(videoTrack);
+    const colorSpace = videoTrack["ColorSpace"] || "";
+    const colourPrimaries = videoTrack["colour_primaries"] || videoTrack["ColorPrimaries"] || "";
+    const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
+    const contentLightLevel = videoTrack["MaxCLL"] || "";
+
+    // Check for various HDR formats through HDR_Format field
+    if (videoTrack["HDR_Format"]) {
+      if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
+        detectedHDR.add("HDR10+");
+        continue; // HDR10+ takes precedence
+      } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
+        detectedHDR.add("HDR10");
+      } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
+        detectedHDR.add("Dolby Vision");
+      }
+    }
+
+    // Check for Dolby Vision through other fields
+    if (
+      videoTrack["Format_Profile"]?.includes("Dolby Vision") ||
+      videoTrack["Format_Commercial"]?.includes("Dolby Vision") ||
+      videoTrack["CodecID"]?.startsWith("dva")
+    ) {
+      detectedHDR.add("Dolby Vision");
+    }
+
+    // PQ over BT.2020 is HDR10. Mastering-display data and MaxCLL are optional
+    // static metadata that many UHD remuxes omit, so they don't gate the label.
+    // Dolby Vision profile 5 reports the same PQ and BT.2020, but its base layer
+    // is IPTPQc2 rather than HDR10, so a player without Dolby Vision can't show it.
+    if (
+      (includesIgnoreCase(transferCharacteristics, "PQ") ||
+       includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
+      includesIgnoreCase(colourPrimaries, "BT.2020") &&
+      !includesIgnoreCase(videoTrack["HDR_Format_Profile"], "dvhe.05")
+    ) {
+      detectedHDR.add("HDR10");
+    }
+
+    // Check for HLG
+    if (includesIgnoreCase(transferCharacteristics, "HLG")) {
+      detectedHDR.add("HLG");
+    }
+
+    // Explicitly detect 10-bit SDR
+    if (
+      bitDepth === 10 &&
+      (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
+      (includesIgnoreCase(transferCharacteristics, "BT.709") || transferCharacteristics === "2") &&
+      detectedHDR.size === 0 &&
+      !encodingSettings.includes("no-hdr")
+    ) {
+      detectedHDR.add("10-bit SDR (BT.709)");
+    }
+
+    // Standard 8-bit SDR detection
+    if (
+      (bitDepth === 8 || bitDepth === null) &&
+      (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
+      detectedHDR.size === 0
+    ) {
+      detectedHDR.add("8-bit SDR (BT.709)");
+    }
+
+    // Check if HDR is explicitly disabled in encoding settings
+    if (encodingSettings.includes("no-hdr") && detectedHDR.size === 0) {
+      if (bitDepth === 10) {
+        detectedHDR.add("10-bit SDR (BT.709)");
+      } else {
+        detectedHDR.add("8-bit SDR (BT.709)");
+      }
+    }
+
+    // Add debug logging
+    logger.debug('Video Track Analysis:', {
+      HDR_Format: videoTrack["HDR_Format"],
+      transfer_characteristics: transferCharacteristics,
+      ColorSpace: colorSpace,
+      colour_primaries: colourPrimaries,
+      BitDepth: bitDepth,
+      MasteringDisplay_ColorPrimaries: masteringDisplayColorPrimaries,
+      MaxCLL: contentLightLevel,
+      EncodingSettings: encodingSettings ? "Present" : "Not present"
+    });
+  }
+
+  const primary = tracks[0];
+  const bitDepth = parseBitDepth(primary);
+
+  const formatString = detectedHDR.size > 0 ? Array.from(detectedHDR).join(', ') : null;
+  const isHDR = detectedHDR.size > 0 &&
+               !Array.from(detectedHDR).some(format =>
+                  format.includes("SDR") || format.includes("8-bit") || format.includes("10-bit SDR"));
+
+  return {
+    format: formatString,
+    bitDepth: bitDepth,
+    colorSpace: primary["ColorSpace"] || "",
+    transferCharacteristics: transferOf(primary),
+    isHDR: isHDR,
+    viewingExperience: {
+      enhancedColor: bitDepth === 10 || isHDR,
+      highDynamicRange: isHDR,
+      dolbyVision: detectedHDR.has("Dolby Vision"),
+      hdr10Plus: detectedHDR.has("HDR10+"),
+      standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HLG")
+    }
+  };
+}
+
+/**
  * Extracts media quality information using MediaInfo.
  * @param {string} filePath - Path to the media file.
  * @returns {Promise<object|null>} - Returns an object with format and quality information or null if not found.
@@ -98,138 +242,7 @@ export async function extractMediaQuality(filePath) {
       return null;
     }
 
-    const detectedHDR = new Set();
-    let bitDepth = null;
-    let colorSpace = null;
-    let transferCharacteristics = null;
-    let encodingSettings = null;
-
-    for (const videoTrack of videoTracks) {
-      // Store bit depth
-      bitDepth = videoTrack["BitDepth"] ? parseInt(videoTrack["BitDepth"]) : null;
-      
-      // Get encoding settings
-      encodingSettings = videoTrack["Encoded_Library_Settings"] || "";
-      
-      // Get all relevant fields with correct names
-      transferCharacteristics = videoTrack["transfer_characteristics"] || videoTrack["TransferCharacteristics"] || "";
-      colorSpace = videoTrack["ColorSpace"] || "";
-      const colourPrimaries = videoTrack["colour_primaries"] || videoTrack["ColorPrimaries"] || "";
-      const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
-      const contentLightLevel = videoTrack["MaxCLL"] || "";
-
-      // Check for various HDR formats through HDR_Format field
-      if (videoTrack["HDR_Format"]) {
-        if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
-          detectedHDR.add("HDR10+");
-          continue; // HDR10+ takes precedence
-        } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
-          detectedHDR.add("HDR10");
-        } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
-          detectedHDR.add("Dolby Vision");
-        }
-      }
-
-      // Check for Dolby Vision through other fields
-      if (
-        videoTrack["Format_Profile"]?.includes("Dolby Vision") ||
-        videoTrack["Format_Commercial"]?.includes("Dolby Vision") ||
-        videoTrack["CodecID"]?.startsWith("dva")
-      ) {
-        detectedHDR.add("Dolby Vision");
-      }
-
-      // Detect HDR10 through PQ/SMPTE 2084 transfer characteristics
-      if (
-        (includesIgnoreCase(transferCharacteristics, "PQ") || 
-         includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
-        includesIgnoreCase(colourPrimaries, "BT.2020")
-      ) {
-        if (masteringDisplayColorPrimaries && contentLightLevel) {
-          detectedHDR.add("HDR10");
-        }
-      }
-
-      // Check for HLG
-      if (includesIgnoreCase(transferCharacteristics, "HLG")) {
-        detectedHDR.add("HLG");
-      }
-
-      // Detect potential HDR based on BT.2020 color space and primaries
-      if (
-        (includesIgnoreCase(colorSpace, "BT.2020") || 
-         includesIgnoreCase(colorSpace, "bt2020")) &&
-        (includesIgnoreCase(colourPrimaries, "BT.2020") || 
-         includesIgnoreCase(colourPrimaries, "bt2020"))
-      ) {
-        // Only add if no other HDR type detected
-        if (detectedHDR.size === 0) {
-          detectedHDR.add("Potential HDR (BT.2020)");
-        }
-      }
-
-      // Explicitly detect 10-bit SDR
-      if (
-        bitDepth === 10 &&
-        (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
-        (includesIgnoreCase(transferCharacteristics, "BT.709") || transferCharacteristics === "2") &&
-        detectedHDR.size === 0 &&
-        !encodingSettings.includes("no-hdr")
-      ) {
-        detectedHDR.add("10-bit SDR (BT.709)");
-      }
-
-      // Standard 8-bit SDR detection
-      if (
-        (bitDepth === 8 || bitDepth === null) &&
-        (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
-        detectedHDR.size === 0
-      ) {
-        detectedHDR.add("8-bit SDR (BT.709)");
-      }
-
-      // Check if HDR is explicitly disabled in encoding settings
-      if (encodingSettings.includes("no-hdr") && detectedHDR.size === 0) {
-        if (bitDepth === 10) {
-          detectedHDR.add("10-bit SDR (BT.709)");
-        } else {
-          detectedHDR.add("8-bit SDR (BT.709)");
-        }
-      }
-
-      // Add debug logging
-      logger.debug('Video Track Analysis:', {
-        HDR_Format: videoTrack["HDR_Format"],
-        transfer_characteristics: transferCharacteristics,
-        ColorSpace: colorSpace,
-        colour_primaries: colourPrimaries,
-        BitDepth: bitDepth,
-        MasteringDisplay_ColorPrimaries: masteringDisplayColorPrimaries,
-        MaxCLL: contentLightLevel,
-        EncodingSettings: encodingSettings ? "Present" : "Not present"
-      });
-    }
-
-    // Create the result object
-    const formatString = detectedHDR.size > 0 ? Array.from(detectedHDR).join(', ') : null;
-    const isHDR = detectedHDR.size > 0 && 
-                 !Array.from(detectedHDR).some(format => 
-                    format.includes("SDR") || format.includes("8-bit") || format.includes("10-bit SDR"));
-
-    return {
-      format: formatString,
-      bitDepth: bitDepth,
-      colorSpace: colorSpace,
-      transferCharacteristics: transferCharacteristics,
-      isHDR: isHDR,
-      viewingExperience: {
-        enhancedColor: bitDepth === 10 || isHDR,
-        highDynamicRange: isHDR,
-        dolbyVision: detectedHDR.has("Dolby Vision"),
-        hdr10Plus: detectedHDR.has("HDR10+"),
-        standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HLG")
-      }
-    };
+    return analyzeVideoTracks(videoTracks);
   } catch (error) {
     logger.error(`Error extracting media quality info with MediaInfo for ${filePath}:` + error);
     return null;
@@ -314,80 +327,8 @@ export async function getMediaInfoCombined(filePath) {
       headerData = [...generalFields, ...videoFields].filter(Boolean).join('|');
     }
 
-    // --- Media quality extraction (from extractMediaQuality logic) ---
-    let mediaQuality = null;
-    if (videoTracks.length > 0) {
-      const detectedHDR = new Set();
-      let bitDepth = null;
-      let colorSpace = null;
-      let transferCharacteristics = null;
-      let encodingSettings = null;
-
-      for (const videoTrack of videoTracks) {
-        bitDepth = videoTrack["BitDepth"] ? parseInt(videoTrack["BitDepth"]) : null;
-        encodingSettings = videoTrack["Encoded_Library_Settings"] || "";
-        transferCharacteristics = videoTrack["transfer_characteristics"] || videoTrack["TransferCharacteristics"] || "";
-        colorSpace = videoTrack["ColorSpace"] || "";
-        const colourPrimaries = videoTrack["colour_primaries"] || videoTrack["ColorPrimaries"] || "";
-        const masteringDisplayColorPrimaries = videoTrack["MasteringDisplay_ColorPrimaries"] || "";
-        const contentLightLevel = videoTrack["MaxCLL"] || "";
-
-        if (videoTrack["HDR_Format"]) {
-          if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094-40")) {
-            detectedHDR.add("HDR10+"); continue;
-          } else if (includesIgnoreCase(videoTrack["HDR_Format"], "SMPTE ST 2094")) {
-            detectedHDR.add("HDR10");
-          } else if (includesIgnoreCase(videoTrack["HDR_Format"], "Dolby Vision")) {
-            detectedHDR.add("Dolby Vision");
-          }
-        }
-        if (videoTrack["Format_Profile"]?.includes("Dolby Vision") ||
-            videoTrack["Format_Commercial"]?.includes("Dolby Vision") ||
-            videoTrack["CodecID"]?.startsWith("dva")) {
-          detectedHDR.add("Dolby Vision");
-        }
-        if ((includesIgnoreCase(transferCharacteristics, "PQ") ||
-             includesIgnoreCase(transferCharacteristics, "SMPTE 2084")) &&
-            includesIgnoreCase(colourPrimaries, "BT.2020")) {
-          if (masteringDisplayColorPrimaries && contentLightLevel) detectedHDR.add("HDR10");
-        }
-        if (includesIgnoreCase(transferCharacteristics, "HLG")) detectedHDR.add("HLG");
-        if ((includesIgnoreCase(colorSpace, "BT.2020") || includesIgnoreCase(colorSpace, "bt2020")) &&
-            (includesIgnoreCase(colourPrimaries, "BT.2020") || includesIgnoreCase(colourPrimaries, "bt2020"))) {
-          if (detectedHDR.size === 0) detectedHDR.add("Potential HDR (BT.2020)");
-        }
-        if (bitDepth === 10 &&
-            (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
-            (includesIgnoreCase(transferCharacteristics, "BT.709") || transferCharacteristics === "2") &&
-            detectedHDR.size === 0 && !encodingSettings.includes("no-hdr")) {
-          detectedHDR.add("10-bit SDR (BT.709)");
-        }
-        if ((bitDepth === 8 || bitDepth === null) &&
-            (includesIgnoreCase(colorSpace, "BT.709") || includesIgnoreCase(colourPrimaries, "BT.709")) &&
-            detectedHDR.size === 0) {
-          detectedHDR.add("8-bit SDR (BT.709)");
-        }
-        if (encodingSettings.includes("no-hdr") && detectedHDR.size === 0) {
-          detectedHDR.add(bitDepth === 10 ? "10-bit SDR (BT.709)" : "8-bit SDR (BT.709)");
-        }
-      }
-
-      const formatString = detectedHDR.size > 0 ? Array.from(detectedHDR).join(', ') : null;
-      const isHDR = detectedHDR.size > 0 &&
-                   !Array.from(detectedHDR).some(f => f.includes("SDR") || f.includes("8-bit") || f.includes("10-bit SDR"));
-
-      mediaQuality = {
-        format: formatString,
-        bitDepth, colorSpace, transferCharacteristics, isHDR,
-        viewingExperience: {
-          enhancedColor: bitDepth === 10 || isHDR,
-          highDynamicRange: isHDR,
-          dolbyVision: detectedHDR.has("Dolby Vision"),
-          hdr10Plus: detectedHDR.has("HDR10+"),
-          standardHDR: detectedHDR.has("HDR10") || detectedHDR.has("HLG")
-        }
-      };
-    }
+    // --- Media quality extraction ---
+    const mediaQuality = videoTracks.length > 0 ? analyzeVideoTracks(videoTracks) : null;
 
     const hdr = deriveHDRFromQuality(mediaQuality);
 

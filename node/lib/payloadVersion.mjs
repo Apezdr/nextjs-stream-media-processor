@@ -29,7 +29,11 @@
 //     mediaIdentity published for the first time. The dates come from the
 //     identity sidecar (already on disk for folders; the per-episode map is
 //     seeded on this pass), so nothing the directory hash sees changes.
-export const MEDIA_PAYLOAD_VERSION = 6;
+// 7 — hdr and mediaQuality recomputed by the HDR detection fix (sidecar
+//     v1.0012). Movies would converge through needsInfoRegeneration alone.
+//     Shows have no sidecar-version check, so without this bump their rows
+//     would keep the old labels.
+export const MEDIA_PAYLOAD_VERSION = 7;
 
 /**
  * Whether this host advertises JIT transcoder capability.
