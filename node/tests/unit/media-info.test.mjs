@@ -142,6 +142,63 @@ describe('PQ sources are HDR10', () => {
   });
 });
 
+describe('HDR10+ is detected', () => {
+  it('labels SMPTE ST 2094 App 4 on a PQ stream HDR10+', () => {
+    // 28 Years Later: MediaInfo's name for ST 2094-40 is "App 4".
+    const q = analyzeVideoTracks([
+      uhdPQ({
+        Width: '3832',
+        Height: '1384',
+        HDR_Format: 'SMPTE ST 2094 App 4',
+        HDR_Format_Compatibility: 'HDR10+ Profile B',
+        MaxCLL: '308',
+      }),
+    ]);
+
+    expect(q.format).toBe('HDR10+');
+    expect(q.isHDR).toBe(true);
+    expect(q.viewingExperience.hdr10Plus).toBe(true);
+    expect(q.viewingExperience.standardHDR).toBe(true);
+  });
+
+  it('labels App 4 HDR10+ when no compatibility is reported', () => {
+    // Upload S01E09.
+    const q = analyzeVideoTracks([uhdPQ({ HDR_Format: 'SMPTE ST 2094 App 4' })]);
+
+    expect(q.format).toBe('HDR10+');
+  });
+
+  it('keeps Dolby Vision alongside HDR10+', () => {
+    // Lanterns S01E07: both formats in one HDR_Format field. The old else-if
+    // matched "SMPTE ST 2094" first and never saw the Dolby Vision.
+    const q = analyzeVideoTracks([
+      uhdPQ({
+        Height: '1920',
+        HDR_Format: 'Dolby Vision / SMPTE ST 2094 App 4',
+        HDR_Format_Profile: 'dvhe.08 / ',
+        HDR_Format_Compatibility: 'HDR10 / HDR10+ Profile B',
+        MaxCLL: '298',
+      }),
+    ]);
+
+    expect(q.format).toBe('Dolby Vision, HDR10+');
+    expect(q.viewingExperience.dolbyVision).toBe(true);
+    expect(q.viewingExperience.hdr10Plus).toBe(true);
+  });
+
+  it('does not call App 4 metadata on an HLG stream HDR10+ or HDR10', () => {
+    // The Old Man S1, previously "HDR10, HLG".
+    const q = analyzeVideoTracks([
+      uhdPQ({ transfer_characteristics: 'HLG', HDR_Format: 'SMPTE ST 2094 App 4' }),
+      coverArt({ Width: '1000', Height: '1500' }),
+    ]);
+
+    expect(q.format).toBe('HLG');
+    expect(q.viewingExperience.hdr10Plus).toBe(false);
+    expect(q.viewingExperience.standardHDR).toBe(true);
+  });
+});
+
 describe('cover art does not describe the picture', () => {
   it('keeps the main track transfer and bit depth when a JPEG track follows', () => {
     // Flight Risk: two HEVC tracks, then a JPEG with no colour fields.

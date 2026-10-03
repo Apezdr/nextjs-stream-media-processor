@@ -15,7 +15,10 @@ const exec = promisify(execCallback);
 // 1.0012 changes no field. It recomputes mediaQuality and hdr after the HDR
 // detection fix: PQ sources without MaxCLL are now labelled HDR10, and MP4
 // cover art no longer overwrites the transfer and bit depth.
-export const CURRENT_VERSION = 1.0012;
+// 1.0013 changes no field either. It recomputes the labels after the HDR10+
+// fix: "SMPTE ST 2094 App 4" on PQ is HDR10+, Dolby Vision is no longer missed
+// beside it, and the same metadata on HLG no longer adds HDR10.
+export const CURRENT_VERSION = 1.0013;
 
 /**
  * The shape extractAdditionalMetadata returns when probing fails.
