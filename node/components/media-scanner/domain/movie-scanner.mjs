@@ -442,9 +442,13 @@ async function extractTMDBId(tmdbConfigPath) {
  * @param {number} currentVersion - Current info file version
  * @param {boolean} isDebugMode - Debug mode flag
  * @param {Function} downloadTMDBImages - Function to download TMDB images
- * @returns {Promise<void>}
+ * @param {Object} [options]
+ * @param {Function} [options.onProgress] - Called as each movie starts with
+ *   { position, total, name }; position is 1-based. Must not throw.
+ * @returns {Promise<{titles: number, reprocessed: number}>} - movie folders
+ *   seen, and how many of them were processed rather than skipped as unchanged.
  */
-export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, currentVersion, isDebugMode, downloadTMDBImages) {
+export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, currentVersion, isDebugMode, downloadTMDBImages, { onProgress = () => {} } = {}) {
   const dirs = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMovies = await getMissingMediaData();
   const now = new Date();
@@ -464,13 +468,20 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
   // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
   const identityClaims = createIdentityClaims();
 
+  // Progress for the admin process list (lib/scanProgress.mjs). Positions are
+  // handed out as movies start, which p-limit does in order.
+  const total = dirs.filter(dir => dir.isDirectory()).length;
+  let started = 0;
+  let reprocessed = 0;
+
   await Promise.all(
     dirs.map((dir, index) => movieLimit(async () => {
       if (isDebugMode) {
         logger.info(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
       }
-      
+
       if (!dir.isDirectory()) return;
+      onProgress({ position: ++started, total, name: dir.name });
 
       const dirName = dir.name;
       const fullDirPath = join(dirPath, dirName);
@@ -523,6 +534,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       }
 
       logger.info(`Directory Hash invalidated for, ${dirName}`);
+      reprocessed++;
 
       const fileSet = new Set(files);
       // Video files, ordered by container priority then name. This is the
@@ -910,4 +922,6 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
     await clearMissingMediaData(movieName);
     await deleteHashesForMedia(db, 'movies', movieName);
   }
+
+  return { titles: total, reprocessed };
 }

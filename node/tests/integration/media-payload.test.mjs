@@ -621,3 +621,36 @@ describe('mediaIdentity.firstSeen — the library-add date', () => {
     expect(await readHash()).toBe(before);
   });
 });
+
+describe('scan progress for the admin process list', () => {
+  it('reports each movie folder as it starts, and returns a summary', async () => {
+    const events = [];
+    const summary = await scanMovies(db, join(MEDIA, 'movies'), PREFIX, MEDIA, {}, 1.0011, false, async () => {}, {
+      onProgress: (event) => events.push(event),
+    });
+
+    expect(events.map((e) => e.position)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(events.every((e) => e.total === 6)).toBe(true);
+    expect(events.map((e) => e.name).sort()).toEqual([
+      'Avi Only', 'Mixed Containers', 'Mkv Only', 'Multi Lang', 'Probe Gap', 'Solo Movie',
+    ]);
+    // getInfo is mocked, so no fixture video has a .info sidecar and
+    // needsInfoRegeneration sends every movie through processing.
+    expect(summary).toEqual({ titles: 6, reprocessed: 6 });
+  });
+
+  it('reports each show as it starts, with no error on a clean pass', async () => {
+    const events = [];
+    const summary = await scanTVShows(db, join(MEDIA, 'tv'), PREFIX, MEDIA, {}, false, async () => {}, {
+      onProgress: (event) => events.push(event),
+    });
+
+    expect(events.map((e) => e.position)).toEqual([1, 2]);
+    expect(events.every((e) => e.total === 2)).toBe(true);
+    expect(events.map((e) => e.name).sort()).toEqual(['Dual Show', 'Mkv Show']);
+    expect(summary.titles).toBe(2);
+    expect(summary.error).toBeNull();
+    expect(summary.reprocessed).toBeGreaterThanOrEqual(0);
+    expect(summary.reprocessed).toBeLessThanOrEqual(2);
+  });
+});
