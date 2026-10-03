@@ -575,13 +575,15 @@ Eviction was verified directly, since it had never been checked: **no eviction p
 
 Two genuinely separate mechanisms share the "what is the backend doing right now" role:
 
-**1. SQLite `process_queue`** (`node/sqlite/processTracking.mjs`, its own DB file). One row per `file_key` (UNIQUE), tracking `process_type` (`spritesheet`, `vtt`, `caption`), step counters, `status`, and a message.
+**1. SQLite `process_queue`** (`node/sqlite/processTracking.mjs`, its own DB file). One row per `file_key` (UNIQUE), tracking `process_type` (`spritesheet`, `vtt`, `caption`, `library-scan`), step counters, `status`, and a message.
 
 *Absent* → *created/upserted* (`createOrUpdateProcessQueue()`, called from `node/sprite-route.mjs` for spritesheet/VTT jobs and `node/components/caption-generator/entry-points/caption-controller.mjs` `trackProcess()` for caption jobs) → *stepped* (`updateProcessQueue()`) → *finalized* (`finalizeProcessQueue()` → `completed` or `error`) → *interrupted* (startup: `node/app.mjs` calls `markInProgressAsInterrupted()`, flipping any `in-progress` row to `interrupted`).
 
+Library scans write through `node/lib/scanProgress.mjs`, called from the `generateListMovies`/`generateListTV` wrappers in `node/app.mjs`: one row per library under a fixed key (`library_scan_movies`, `library_scan_tv`), upserted by every tick. The step counters count titles; the message names the current title while running ("Futurama (65 of 230 shows)") and summarizes the pass when done ("230 shows, 65 reprocessed, 17m 3s"). Progress writes are throttled to one per 2 s and chained, so the final write always lands last, and a failed write never fails the scan. `scanTVShows` logs its own errors instead of throwing, so it returns `{ titles, reprocessed, error }` and the row records a stopped pass as `error`.
+
 There is **no deletion in any production path**: `resetProcessQueue()` and `removeInProgressProcesses()` exist (the latter is even imported by `app.mjs`) but are never called. Terminal rows persist indefinitely; growth is bounded because `file_key` upserts in place — one row per media item × process type, ever. Note the startup log line says "Process queue has been reset", which overstates what `markInProgressAsInterrupted()` does (it marks, it does not delete).
 
-Read surface: `GET /processes` and `GET /processes/:fileKey` in `node/app.mjs`, both behind `authenticateWebhookOrUser`, with optional `processType`/`status` filters.
+Read surface: `GET /processes` and `GET /processes/:fileKey` in `node/app.mjs`, both behind `authenticateWebhookOrUser`, with optional `processType`/`status` filters. `GET /processes?active=true` returns only `in-progress` and `queued` rows (`getActiveProcesses()`); `interrupted` and `error` rows are history, so the admin panel's always-on Active Processes card polls this instead of the whole table.
 
 **Tier, honestly:** this is *operational telemetry*, not durable state and not a real queue — nothing dequeues from it, and losing the file costs nothing but progress display history. It is the most disposable table in the system; it does not merit the non-derivable durability posture of the cooldown or intro tables.
 

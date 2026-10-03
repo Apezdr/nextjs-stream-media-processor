@@ -618,9 +618,15 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
  * @param {Object} langMap - Language code mapping
  * @param {boolean} isDebugMode - Debug mode flag
  * @param {Function} downloadTMDBImages - Function to download TMDB images
- * @returns {Promise<void>}
+ * @param {Object} [options]
+ * @param {Function} [options.onProgress] - Called as each show starts with
+ *   { position, total, name }; position is 1-based. Must not throw.
+ * @returns {Promise<{titles: number, reprocessed: number, error: Error|null}>} -
+ *   show folders seen, how many were processed rather than fast-skipped, and
+ *   the error that stopped the pass, if any. The scan logs that error instead
+ *   of throwing it, so this is the only place a caller can see it.
  */
-export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, isDebugMode, downloadTMDBImages) {
+export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, isDebugMode, downloadTMDBImages, { onProgress = () => {} } = {}) {
   const shows = await fs.readdir(dirPath, { withFileTypes: true });
   const missingDataMedia = await getMissingMediaData();
   const now = new Date();
@@ -641,15 +647,22 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // earlier pass (i.e. a rename) is not mistaken for a duplicate folder.
   const identityClaims = createIdentityClaims();
 
+  // Progress for the admin process list (lib/scanProgress.mjs).
+  const total = shows.filter(show => show.isDirectory()).length;
+  let started = 0;
+  let reprocessed = 0;
+  let failure = null;
+
   try {
     for (let index = 0; index < shows.length; index++) {
       const show = shows[index];
-      
+
       if (isDebugMode) {
         logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
       }
-      
+
       if (!show.isDirectory()) continue;
+      onProgress({ position: ++started, total, name: show.name });
 
       const showName = show.name;
       existingShowNames.delete(showName);
@@ -857,6 +870,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           'media.name': showName, 'media.type': 'tv', 'episodes.written': backfillWrote,
         });
       }
+      reprocessed++;
 
       // Raw pre-override TMDB payload (G-5), carried opaquely from the
       // generator's result to saveTVShow. Stays null when no download ran or
@@ -1129,7 +1143,10 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
     }
   } catch (error) {
     logger.error('Error during database update: ' + error);
+    failure = error;
   }
+
+  return { titles: total, reprocessed, error: failure };
 }
 
 // ── Air-date-aware episode-metadata backfill ──────────────────────────────────

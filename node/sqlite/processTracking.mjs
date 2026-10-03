@@ -230,13 +230,22 @@ export async function finalizeProcessQueue(
 }
 
 /**
- * Retrieve all active (non-completed) processes from the queue.
- * You might also want to filter by process_type if needed.
+ * Retrieve the processes that are running or waiting to run, newest first.
+ * 'interrupted' (cut off by a restart) and 'error' rows are history, not
+ * activity, so only 'in-progress' and 'queued' count.
+ * @param {object} db - The database instance. If not provided, will get a new connection.
  */
-export async function getActiveProcesses(db) {
+export async function getActiveProcesses(db = null) {
+  if (!db) {
+    db = await getProcessTrackingDb();
+  }
   try {
-    return await withRetry(() => 
-      db.all(`SELECT * FROM process_queue WHERE status NOT IN ('completed', 'error')`)
+    return await withRetry(() =>
+      db.all(
+        `SELECT * FROM process_queue
+         WHERE status IN ('in-progress', 'queued')
+         ORDER BY last_updated DESC`
+      )
     );
   } catch (error) {
     logger.error(`Error retrieving active processes: ${error.message}`);

@@ -38,7 +38,8 @@ import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
-import { createOrUpdateProcessQueue, finalizeProcessQueue, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
@@ -580,7 +581,8 @@ async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietM
  * Retrieves the current process queue information in JSON format.
  * Requires either webhook authentication or admin user access.
  * Optional query parameters:
- * - processType: Filter by process_type (e.g., "spritesheet", "vtt")
+ * - active: "true" returns only running or queued processes; the other filters are ignored
+ * - processType: Filter by process_type (e.g., "spritesheet", "vtt", "library-scan")
  * - status: Filter by status (e.g., "in-progress", "queued", "completed", "error")
  */
 app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
@@ -588,10 +590,12 @@ app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
     const db = await getProcessTrackingDb();
 
     // Extract query parameters for filtering
-    const { processType, status } = req.query;
+    const { processType, status, active } = req.query;
 
     let processes;
-    if (processType || status) {
+    if (active === 'true') {
+      processes = await getActiveProcesses(db);
+    } else if (processType || status) {
       // Use the filtered retrieval function
       processes = await getProcessesWithFilters(db, { processType, status });
     } else {
@@ -775,18 +779,26 @@ scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hou
 
 /**
  * Wrapper function for backward compatibility
- * Calls the new media-scanner component
+ * Calls the new media-scanner component, and shows the scan in /processes
  */
 async function generateListTV(db, dirPath) {
-  await scanTVShows(
-    db,
-    dirPath,
-    PREFIX_PATH,
-    BASE_PATH,
-    langMap,
-    isDebugMode,
-    runDownloadTmdbImages
-  );
+  const progress = createLibraryScanProgress('tv');
+  try {
+    const summary = await scanTVShows(
+      db,
+      dirPath,
+      PREFIX_PATH,
+      BASE_PATH,
+      langMap,
+      isDebugMode,
+      runDownloadTmdbImages,
+      { onProgress: progress.onProgress }
+    );
+    await progress.complete(summary);
+  } catch (error) {
+    await progress.fail(error);
+    throw error;
+  }
 }
 
 /**
@@ -817,19 +829,27 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
 
 /**
  * Wrapper function for backward compatibility
- * Calls the new media-scanner component
+ * Calls the new media-scanner component, and shows the scan in /processes
  */
 async function generateListMovies(db, dirPath) {
-  await scanMovies(
-    db,
-    dirPath,
-    PREFIX_PATH,
-    BASE_PATH,
-    langMap,
-    CURRENT_VERSION,
-    isDebugMode,
-    runDownloadTmdbImages
-  );
+  const progress = createLibraryScanProgress('movies');
+  try {
+    const summary = await scanMovies(
+      db,
+      dirPath,
+      PREFIX_PATH,
+      BASE_PATH,
+      langMap,
+      CURRENT_VERSION,
+      isDebugMode,
+      runDownloadTmdbImages,
+      { onProgress: progress.onProgress }
+    );
+    await progress.complete(summary);
+  } catch (error) {
+    await progress.fail(error);
+    throw error;
+  }
 }
 
 /**
