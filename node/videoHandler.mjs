@@ -13,9 +13,12 @@ import { createCategoryLogger } from "./lib/logger.mjs";
 //import { extractHDRInfo } from "./mediaInfo/mediaInfo.mjs";
 import { generateAndCacheClip } from "./ffmpeg/transcode.mjs";
 import { doviReshapeRequired, libplaceboAvailable } from "./ffmpeg/dolbyVision.mjs";
+import { resolveClipCodec, CLIP_CODEC_VALUES } from "./utils/clipCodec.mjs";
 import { getInfo } from "./infoManager.mjs";
 
 const logger = createCategoryLogger('videoHandler');
+// Encoder configs a ?codec= request can name (utils/clipCodec.mjs maps codec -> encoder).
+const CLIP_ENCODER_CONFIGS = { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc };
 // Video Clip Generation Version Control (for cache invalidation)
 const VIDEO_CLIP_VERSION = 1.0002;
 
@@ -375,6 +378,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
       return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
     }
 
+    // Optional output codec (?codec=h264 for a clip that plays on any device);
+    // see utils/clipCodec.mjs. Not echoed back: res.send answers text/html.
+    const requestedCodec = resolveClipCodec(req.query.codec);
+    if (!requestedCodec.ok) {
+      return res.status(400).send(`Unsupported codec. Supported values: ${CLIP_CODEC_VALUES.join(', ')}.`);
+    }
+
     // Check if video file exists
     if (!await fileExists(videoPath)) {
       return res.status(404).send('Video not found.');
@@ -419,7 +429,11 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     const hardwareInfo = await initHardwareInfo();
     let selectedEncoder = null;
 
-    if (!hardwareInfo || !hardwareInfo.encoder) {
+    if (requestedCodec.encoder) {
+      selectedEncoderConfig = CLIP_ENCODER_CONFIGS[requestedCodec.encoder];
+      selectedEncoder = requestedCodec.encoder;
+      logger.info(`Using ${selectedEncoder} as requested by ?codec=`);
+    } else if (!hardwareInfo || !hardwareInfo.encoder) {
       logger.info('No suitable hardware encoder found. Falling back to software encoding.');
       selectedEncoderConfig = libx264;
       selectedEncoder = 'libx264';

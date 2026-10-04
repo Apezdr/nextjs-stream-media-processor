@@ -810,7 +810,7 @@ A JSON body parser (`express.json({ limit: '30mb' })`) is applied globally in `n
 | GET | `/chapters/movie/:movieName` | none | Serve (generating if absent) the chapter VTT for a movie. | |
 | GET | `/chapters/tv/:showName` | none | Bulk-generate chapter VTTs for **every** episode of a show; returns a status string, not a file. | |
 | GET | `/chapters/tv/:showName/:season/:episode` | none | Serve (generating if absent) the chapter VTT for one episode. | |
-| GET | `/videoClip/movie/:movieName` | none | Generate and serve a bounded video clip of a movie. | |
+| GET | `/videoClip/movie/:movieName` | none | Generate and serve a bounded video clip of a movie (`?start=&end=`; optional `codec=h264` for a universally playable H.264 MP4, default `auto` = hardware encoder). | |
 | GET | `/videoClip/tv/:showName/:season/:episode` | none | Same, for a TV episode. | |
 | GET | `/rescan/tmdb` | webhook-or-admin | Full-library TMDB force-refresh: runs `runDownloadTmdbImages({ fullScan: true })`, which wipes and re-downloads managed images library-wide. | The single most privileged mutation in the surface; auth added by A-1 (Branch 9). **Not** in the decided S-2 task-manager gating scope (that covers only the write-heavy `/api/admin/metadata/*` routes); if S-2 gating is ever extended here, it must wrap — not replace or revert — the A-1 auth middleware. |
 | GET | `/media/movies` | webhook-or-admin | List all movies from SQLite (scanning first only if the table is empty); injects auto-caption stubs at read time. | |

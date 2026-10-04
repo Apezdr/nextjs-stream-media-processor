@@ -111,6 +111,6 @@ The application periodically clears old cache files to free up disk space. Adjus
 
 ## Video Clips
 
-`/videoClip/...` encodes a bounded preview clip (at most 10 minutes) with the detected hardware encoder and caches it. Full-length playback and transcoding are not served from here: the JIT transcoder (`jit-transcoder` repo) owns them.
+`/videoClip/...?start=<s>&end=<s>` encodes a bounded preview clip (at most 10 minutes) with the detected hardware encoder and caches it. Add `&codec=h264` for H.264 + AAC in MP4, which plays on practically any device (the hardware default on an Intel Arc host is VP9/WebM, which older iPhones and many chat apps do not play); `codec=auto` or no parameter keeps the default, and any other value is a 400. Each codec is cached separately. `&useOriginalVideo=true` serves the source bytes instead, and ignores `codec`. Full-length playback and transcoding are not served from here: the JIT transcoder (`jit-transcoder` repo) owns them.
 
 For more detailed information about the implementation, refer to the source code in the repository.
