@@ -64,6 +64,24 @@ export function canonicalizeLangCode(rawCode) {
   return nameToTwoLetter[name.toLowerCase()] || rawCode;
 }
 
+const intlLanguageNames = new Intl.DisplayNames(['en'], { type: 'language' });
+
+/**
+ * Display name for a code: "en" and "eng" are "English". A code langMap lacks
+ * falls back to the runtime's own names ("pt-BR" is "Brazilian Portuguese");
+ * one neither knows passes through unchanged.
+ */
+export function getLanguageName(code) {
+  if (!code) return code;
+  const known = langMap[String(code).toLowerCase()];
+  if (known) return known;
+  try {
+    return intlLanguageNames.of(code) || code;
+  } catch {
+    return code;
+  }
+}
+
 /**
  * Resolve a display name (optionally suffixed with " Hearing Impaired" or
  * " - Auto Generated") to its 2-letter code, or null if unknown.
