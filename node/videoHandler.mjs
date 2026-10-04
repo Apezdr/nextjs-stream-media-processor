@@ -13,6 +13,7 @@ import { createCategoryLogger } from "./lib/logger.mjs";
 //import { extractHDRInfo } from "./mediaInfo/mediaInfo.mjs";
 import { generateAndCacheClip, generateFullTranscode } from "./ffmpeg/transcode.mjs";
 import { getAudioTracks, getVideoCodec } from "./ffmpeg/ffprobe.mjs";
+import { doviReshapeRequired, libplaceboAvailable } from "./ffmpeg/dolbyVision.mjs";
 import { getInfo } from "./infoManager.mjs";
 
 const logger = createCategoryLogger('videoHandler');
@@ -657,9 +658,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     const inputPixFmt = videoStream.pix_fmt;
     const isHDR = videoStream.color_transfer?.includes('smpte2084') || 
                   videoStream.color_space?.includes('bt2020');
+    // Dolby Vision whose RPU must be applied (Profile 5) reads as neither, and
+    // every filter chain renders its base layer green; libplacebo reshapes it
+    // (see ffmpeg/dolbyVision.mjs). -show_streams carries the side data.
+    const dovi = doviReshapeRequired(videoStream) && await libplaceboAvailable();
 
     logger.info(`Video analysis: Codec=${sourceCodec}, PixFmt=${inputPixFmt}, HDR=${isHDR}, ` +
-               `Profile=${videoStream.profile}, ColorSpace=${videoStream.color_space}`);
+               `Profile=${videoStream.profile}, ColorSpace=${videoStream.color_space}, DolbyVisionReshape=${dovi}`);
     
     // Determine best encoder based on source and capabilities
     let selectedEncoderConfig;
@@ -762,7 +767,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     try {
       // Generate the clip
       logger.info(`Generating new clip for caching: ${cacheKey}`);
-      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR, 'clip');
+      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR, 'clip', {}, { dovi });
       
       // Serve the newly cached clip
       return serveCachedClip(res, cachedClipPath, type, req);

@@ -10,6 +10,7 @@ import {
   hevc_nvenc,
 } from "./encoderConfig.mjs";
 import { isVideoHDR } from "./ffprobe.mjs";
+import { DOVI_RESHAPE_INPUT_ARGS } from "./dolbyVision.mjs";
 import { createCategoryLogger } from "../lib/logger.mjs";
 import { executeFFmpeg } from "./ffmpeg.mjs";
 import {
@@ -20,6 +21,36 @@ import {
 import { fileInfo, stringArrayContainsArg } from "../utils/utils.mjs";
 
 const logger = createCategoryLogger("transcode");
+
+/**
+ * The -vf for a Dolby Vision source whose RPU must be applied (Profile 5). The
+ * encoder's dovi_vf scales inside libplacebo, so it replaces vf/hdr_vf AND the
+ * profile scale override: that override would otherwise put a swscale pass of
+ * the raw base layer in front of it.
+ * @param {Object} encoderConfig - Legacy encoder object (has dovi_vf).
+ * @param {Object} profile - Selected transcode profile.
+ * @returns {string}
+ */
+function doviVideoFilter(encoderConfig, profile) {
+  const videoFilter = encoderConfig.dovi_vf(profile.scale);
+  logger.info(`Dolby Vision RPU reshape (libplacebo): ${videoFilter}`);
+  return videoFilter;
+}
+
+/**
+ * Options placed before -i so libplacebo has a Vulkan device, for a Dolby
+ * Vision reshape encode. Empty for a VAAPI encoder, on purpose: -vaapi_device
+ * already binds the filter device that hwupload needs, and a second
+ * -init_hw_device after it takes that binding over, so hwupload hands Vulkan
+ * frames to the VAAPI encoder and the graph fails ("src: vulkan"; Arc A380,
+ * vp9_vaapi, 2026-10-04). With VAAPI bound, libplacebo creates its own Vulkan
+ * instance, verified on the same box to reshape correctly.
+ * @param {Object} encoderConfig - Legacy encoder object.
+ * @returns {string[]}
+ */
+function doviInputArgs(encoderConfig) {
+  return encoderConfig.vaapi_device ? [] : [...DOVI_RESHAPE_INPUT_ARGS];
+}
 
 /**
  * Merges encoder settings with transcode profiles and user overrides.
@@ -138,6 +169,7 @@ function buildSinglePassArgs(
  * @param {number} params.audioTrackIndex - Audio track index.
  * @param {string} params.videoFilter - Video filter string.
  * @param {string} params.containerExtension - Output container extension.
+ * @param {string[]} [params.inputArgs] - Options placed before -i (e.g. the Vulkan device).
  * @returns {Promise<void>}
  */
 async function runTwoPassTranscode({
@@ -149,6 +181,7 @@ async function runTwoPassTranscode({
   audioTrackIndex,
   videoFilter,
   containerExtension,
+  inputArgs = [],
 }) {
   const passLogFile = join(tmpdir(), `ffmpeg2pass-${Date.now()}`);
 
@@ -182,7 +215,7 @@ async function runTwoPassTranscode({
     }
 
     // Input
-    ffmpegArgs.push("-i", inputPath);
+    ffmpegArgs.push(...inputArgs, "-i", inputPath);
 
     // Map video only
     ffmpegArgs.push("-map", "0:v:0");
@@ -224,7 +257,7 @@ async function runTwoPassTranscode({
     }
 
     // Input
-    ffmpegArgs.push("-i", inputPath);
+    ffmpegArgs.push(...inputArgs, "-i", inputPath);
 
     // Map video and audio
     ffmpegArgs.push("-map", "0:v:0", "-map", `0:a:${audioTrackIndex}?`);
@@ -457,6 +490,11 @@ export async function generateFullTranscode(
  * @param {boolean} isHDR - Flag indicating whether the video is HDR.
  * @param {string} profileName - Name of the transcode profile (e.g., 'clip').
  * @param {Object} userOverrides - User-specified overrides (optional).
+ * @param {Object} [options]
+ * @param {boolean} [options.dovi] - Dolby Vision whose RPU must be applied
+ *   (Profile 5): libplacebo replaces the tone-map and scale. The stream-copied
+ *   segment keeps the RPU NAL units, and the encode decodes in software, so the
+ *   frames reach libplacebo with it attached.
  * @returns {Promise<void>}
  */
 export async function generateAndCacheClip(
@@ -468,6 +506,7 @@ export async function generateAndCacheClip(
   isHDR,
   profileName = "clip",
   userOverrides = {},
+  { dovi = false } = {},
 ) {
   return withClipGenerationSpan(
     {
@@ -533,11 +572,12 @@ export async function generateAndCacheClip(
         );
 
         // Step 4: Handle video filter scaling
-        let videoFilter =
-          isHDR && selectedEncoderConfig.hdr_vf
+        let videoFilter = dovi
+          ? doviVideoFilter(selectedEncoderConfig, profile)
+          : isHDR && selectedEncoderConfig.hdr_vf
             ? selectedEncoderConfig.hdr_vf(isHDR)
             : selectedEncoderConfig.vf(isHDR);
-        if (profile.scale) {
+        if (profile.scale && !dovi) {
           const { width, height } = profile.scale;
           if (videoFilter) {
             const scaleRegex = /scale=\d+:-?\d+/;
@@ -572,6 +612,7 @@ export async function generateAndCacheClip(
             audioTrackIndex: 0, // Since we extracted with '-map 0:a:0?'
             videoFilter,
             containerExtension,
+            inputArgs: dovi ? doviInputArgs(selectedEncoderConfig) : [],
           });
         } else {
           // Single-pass encode for clip
@@ -586,6 +627,9 @@ export async function generateAndCacheClip(
           }
 
           // Input raw video segment
+          if (dovi) {
+            ffmpegArgs.push(...doviInputArgs(selectedEncoderConfig));
+          }
           ffmpegArgs.push("-i", rawVideoFile);
 
           // Map video and audio tracks
