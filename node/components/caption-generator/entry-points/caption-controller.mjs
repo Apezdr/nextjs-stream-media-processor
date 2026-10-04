@@ -81,6 +81,15 @@ function buildProcessFileKey(req, langCode) {
   return `movie_${safeTitle}_${langCode}_caption`;
 }
 
+/** Who a caption job is for, in words, for the admin process list. */
+function buildProcessSubject(req, langCode) {
+  if (req.mediaType === 'tv') {
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${req.mediaTitle} S${pad(req.season)}E${pad(req.episode)} (${langCode})`;
+  }
+  return `${req.mediaTitle} (${langCode})`;
+}
+
 const CAPTION_PROCESS_TYPE = 'caption';
 const CAPTION_TOTAL_STEPS = 5;
 
@@ -93,7 +102,7 @@ async function trackProcess(action, fileKey, ...args) {
   try {
     db = await getProcessTrackingDb();
     if (action === 'create') {
-      await createOrUpdateProcessQueue(db, fileKey, CAPTION_PROCESS_TYPE, CAPTION_TOTAL_STEPS, args[0], args[1], args[2]);
+      await createOrUpdateProcessQueue(db, fileKey, CAPTION_PROCESS_TYPE, CAPTION_TOTAL_STEPS, args[0], args[1], args[2], args[3]);
     } else if (action === 'update') {
       await updateProcessQueue(db, fileKey, args[0], args[1], args[2]);
     } else if (action === 'finalize') {
@@ -214,7 +223,7 @@ export async function enqueueCaptionJob(req) {
   pruneJobsIfNeeded();
 
   // Surface the job in /processes immediately as 'queued'
-  trackProcess('create', processFileKey, 0, 'queued', `Caption job queued for ${langCode}`);
+  trackProcess('create', processFileKey, 0, 'queued', `Caption job queued for ${langCode}`, buildProcessSubject(req, langCode));
 
   // Fire-and-forget — caller gets queued state immediately.
   enqueueTask(TaskType.CAPTION_GENERATE, taskName, () => runJob({ jobId, target, langCode, config, processFileKey }))

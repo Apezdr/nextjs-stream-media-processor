@@ -90,6 +90,9 @@ export async function markInProgressAsInterrupted(db = null) {
  * @param {number} currentStep - The step we are currently on (1-based index).
  * @param {string} status - e.g. "in-progress", "queued", "completed", "error".
  * @param {string} message - Optional message or description of the current step.
+ * @param {string|null} subject - Who the process is for, in words ("For All
+ *   Mankind S01E01", "Logan (en)", "Movies"). An update without one keeps the
+ *   row's existing subject.
  */
 export async function createOrUpdateProcessQueue(
   db = null,
@@ -98,7 +101,8 @@ export async function createOrUpdateProcessQueue(
   totalSteps,
   currentStep,
   status,
-  message = ""
+  message = "",
+  subject = null
 ) {
   // Get a database connection if not provided
   if (!db) {
@@ -115,26 +119,27 @@ export async function createOrUpdateProcessQueue(
     if (!existing) {
       // Create new
       logger.debug(`Creating new process queue entry for ${fileKey}`);
-      await withRetry(() => 
+      await withRetry(() =>
         db.run(
           `
-              INSERT INTO process_queue (file_key, process_type, total_steps, current_step, status, message)
-              VALUES (?, ?, ?, ?, ?, ?)
+              INSERT INTO process_queue (file_key, process_type, total_steps, current_step, status, message, subject)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
             `,
-          [fileKey, processType, totalSteps, currentStep, status, message]
+          [fileKey, processType, totalSteps, currentStep, status, message, subject]
         )
       );
     } else {
       // Update existing
       logger.debug(`Updating existing process queue entry for ${fileKey}`);
-      await withRetry(() => 
+      await withRetry(() =>
         db.run(
           `
               UPDATE process_queue
-              SET process_type = ?, total_steps = ?, current_step = ?, status = ?, message = ?, last_updated = ?
+              SET process_type = ?, total_steps = ?, current_step = ?, status = ?, message = ?,
+                  subject = COALESCE(?, subject), last_updated = ?
               WHERE file_key = ?
             `,
-          [processType, totalSteps, currentStep, status, message, last_updated, fileKey]
+          [processType, totalSteps, currentStep, status, message, subject, last_updated, fileKey]
         )
       );
     }
