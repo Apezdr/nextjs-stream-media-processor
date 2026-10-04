@@ -17,6 +17,7 @@ import {
 } from '../../../sqlite/processTracking.mjs';
 import { releaseDatabase } from '../../../sqliteDatabase.mjs';
 import { mainCacheDir } from '../../../utils/utils.mjs';
+import { getLanguageName } from '../../../utils/languageMap.mjs';
 
 const logger = createCategoryLogger('caption-controller');
 
@@ -81,13 +82,14 @@ function buildProcessFileKey(req, langCode) {
   return `movie_${safeTitle}_${langCode}_caption`;
 }
 
-/** Who a caption job is for, in words, for the admin process list. */
+/** Who a caption job is for, in words, for the admin process list: "Logan (English)". */
 function buildProcessSubject(req, langCode) {
+  const language = getLanguageName(langCode);
   if (req.mediaType === 'tv') {
     const pad = (value) => String(value).padStart(2, '0');
-    return `${req.mediaTitle} S${pad(req.season)}E${pad(req.episode)} (${langCode})`;
+    return `${req.mediaTitle} S${pad(req.season)}E${pad(req.episode)} (${language})`;
   }
-  return `${req.mediaTitle} (${langCode})`;
+  return `${req.mediaTitle} (${language})`;
 }
 
 const CAPTION_PROCESS_TYPE = 'caption';
@@ -223,7 +225,8 @@ export async function enqueueCaptionJob(req) {
   pruneJobsIfNeeded();
 
   // Surface the job in /processes immediately as 'queued'
-  trackProcess('create', processFileKey, 0, 'queued', `Caption job queued for ${langCode}`, buildProcessSubject(req, langCode));
+  // The subject names the title and language; the status already says queued.
+  trackProcess('create', processFileKey, 0, 'queued', 'Waiting to start', buildProcessSubject(req, langCode));
 
   // Fire-and-forget — caller gets queued state immediately.
   enqueueTask(TaskType.CAPTION_GENERATE, taskName, () => runJob({ jobId, target, langCode, config, processFileKey }))
@@ -299,7 +302,8 @@ async function runJob({ jobId, target, langCode, config, processFileKey }) {
     }
 
     logger.info(`[${jobId}] running whisper: model=${config.model} lang=${langCode} duration=${audioDurationSec || '?'}s`);
-    await trackProcess('update', processFileKey, 3, 'in-progress', `Transcribing (${config.model})`);
+    // "base.en" is a Whisper model name, not a language; say so.
+    await trackProcess('update', processFileKey, 3, 'in-progress', `Transcribing (Whisper ${config.model})`);
 
     // Throttle process_queue writes during transcription — whisper progress updates
     // can fire many times per second; we only need a coarse view in /processes.

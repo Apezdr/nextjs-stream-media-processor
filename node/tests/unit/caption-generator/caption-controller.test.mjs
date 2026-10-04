@@ -188,8 +188,9 @@ describe('enqueueCaptionJob', () => {
     expect(callArgs[2]).toBe('caption');
     expect(callArgs[3]).toBe(5);
     expect(callArgs[5]).toBe('queued');
-    // The title as written, not the key's underscored form.
-    expect(callArgs[7]).toBe('Test Movie (en)');
+    expect(callArgs[6]).toBe('Waiting to start');
+    // The title as written, not the key's underscored form, and the language by name.
+    expect(callArgs[7]).toBe('Test Movie (English)');
   });
 
   it('exposes the in-flight job via findInflightJob', async () => {
