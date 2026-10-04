@@ -143,6 +143,10 @@ describe('GET /vtt/movie/:movieName', () => {
       message: 'Starting VTT generation',
     });
     await untilGenerationStarted();
+    // The admin process list names the title each job is for.
+    const { createOrUpdateProcessQueue } = await import('../../../sqlite/processTracking.mjs');
+    const subjects = createOrUpdateProcessQueue.mock.calls.map((call) => call[7]);
+    expect(subjects).toEqual(expect.arrayContaining(['Fresh Movie']));
     generation.resolve({});
   });
 

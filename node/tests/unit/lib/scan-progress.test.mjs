@@ -80,9 +80,9 @@ describe('createLibraryScanProgress', () => {
     await progress.complete({ titles: 3, reprocessed: 1 });
 
     expect(rows).toEqual([
-      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 0, status: 'in-progress', message: 'Alien (1 of 3 movies)' },
-      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 2, status: 'in-progress', message: 'Casablanca (3 of 3 movies)' },
-      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 3, status: 'completed', message: '3 movies, 1 reprocessed, 3s' },
+      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 0, status: 'in-progress', message: 'Alien (1 of 3 movies)', subject: 'Movies' },
+      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 2, status: 'in-progress', message: 'Casablanca (3 of 3 movies)', subject: 'Movies' },
+      { fileKey: 'library_scan_movies', totalSteps: 3, currentStep: 3, status: 'completed', message: '3 movies, 1 reprocessed, 3s', subject: 'Movies' },
     ]);
   });
 
@@ -117,6 +117,7 @@ describe('createLibraryScanProgress', () => {
       currentStep: 64,
       status: 'error',
       message: 'Stopped at Futurama (65 of 230 shows): database is locked',
+      subject: 'TV shows',
     });
   });
 
@@ -132,6 +133,7 @@ describe('createLibraryScanProgress', () => {
       currentStep: 0,
       status: 'error',
       message: 'Failed at the start: ENOENT: no such file or directory',
+      subject: 'Movies',
     }]);
   });
 
@@ -180,6 +182,7 @@ describe('library scan rows in process_queue', () => {
       total_steps: 2,
     });
     expect(done.message).toMatch(/^2 movies, 0 reprocessed, \d+s$/);
+    expect(done.subject).toBe('Movies');
     expect(await activeKeys()).not.toContain('library_scan_movies');
 
     // The next tick overwrites the same row.
@@ -196,5 +199,23 @@ describe('library scan rows in process_queue', () => {
     const active = await activeKeys();
     expect(active).toContain('movie_y_caption');
     expect(active).not.toContain('movie_x_spritesheet');
+  });
+
+  it('keeps a row\'s subject through updates that do not repeat it', async () => {
+    const db = await processTracking.getProcessTrackingDb();
+    const key = 'tv_For All Mankind_1_1_spritesheet';
+    await processTracking.createOrUpdateProcessQueue(db, key, 'spritesheet', 3, 0, 'in-progress', 'Starting', 'For All Mankind S01E01');
+    await processTracking.updateProcessQueue(db, key, 2, 'in-progress', 'Extracting frames 33%');
+    await processTracking.createOrUpdateProcessQueue(db, key, 'spritesheet', 3, 0, 'in-progress', 'Starting again');
+    await processTracking.finalizeProcessQueue(db, key, 'completed', 'done');
+
+    const row = await processTracking.getProcessByFileKey(db, key);
+    expect(row).toMatchObject({ status: 'completed', subject: 'For All Mankind S01E01' });
+  });
+
+  it('adds the subject column to a table created before it existed', async () => {
+    const db = await processTracking.getProcessTrackingDb();
+    const columns = await db.all('PRAGMA table_info(process_queue)');
+    expect(columns.map((c) => c.name)).toContain('subject');
   });
 });

@@ -76,6 +76,13 @@ export function classifyVttFailure(error) {
   return { status: 500, body: { status: 'failed', message } };
 }
 
+/** Who a sprite/VTT job is for, in words, for the admin process list. */
+function processSubject(type, name, season, episode) {
+  if (type === 'movies') return name;
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${name} S${pad(season)}E${pad(episode)}`;
+}
+
 function vttFileNameFor(type, { movieName, showName, season, episode }, videoUUID) {
   const sanitize = (value) => value.replace(/[^a-zA-Z0-9\-_]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
   const sanitizedName = sanitize(movieName || showName);
@@ -286,7 +293,8 @@ async function handleSpriteSheetRequest(req, res, type, BASE_PATH) {
       3,        // total steps
       0,        // current step
       "in-progress",
-      "Starting sprite sheet creation"
+      "Starting sprite sheet creation",
+      processSubject(type, movieName || showName, season, episode)
     );
 
     try {
@@ -456,8 +464,9 @@ async function runVttGeneration({ job, vttFileName, vttFilePath, videoPath, type
   const spriteKey = fileKey + "_spritesheet";
   try {
     const processDB = await getProcessTrackingDb();
-    await createOrUpdateProcessQueue(processDB, vttKey, "vtt", VTT_TOTAL_STEPS, 1, "in-progress", job.message);
-    await createOrUpdateProcessQueue(processDB, spriteKey, "spritesheet", VTT_TOTAL_STEPS, 0, "in-progress", "Starting sprite sheet creation");
+    const subject = processSubject(type, name, season, episode);
+    await createOrUpdateProcessQueue(processDB, vttKey, "vtt", VTT_TOTAL_STEPS, 1, "in-progress", job.message, subject);
+    await createOrUpdateProcessQueue(processDB, spriteKey, "spritesheet", VTT_TOTAL_STEPS, 0, "in-progress", "Starting sprite sheet creation", subject);
     await releaseDatabase(processDB);
 
     await generateSpriteSheet({

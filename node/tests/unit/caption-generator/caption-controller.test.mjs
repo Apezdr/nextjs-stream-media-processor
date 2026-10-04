@@ -183,11 +183,13 @@ describe('enqueueCaptionJob', () => {
     });
     expect(processTracking.createOrUpdateProcessQueue).toHaveBeenCalled();
     const callArgs = processTracking.createOrUpdateProcessQueue.mock.calls[0];
-    // (db, fileKey, processType, totalSteps, currentStep, status, message)
+    // (db, fileKey, processType, totalSteps, currentStep, status, message, subject)
     expect(callArgs[1]).toBe('movie_Test_Movie_en_caption');
     expect(callArgs[2]).toBe('caption');
     expect(callArgs[3]).toBe(5);
     expect(callArgs[5]).toBe('queued');
+    // The title as written, not the key's underscored form.
+    expect(callArgs[7]).toBe('Test Movie (en)');
   });
 
   it('exposes the in-flight job via findInflightJob', async () => {

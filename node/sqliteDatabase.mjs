@@ -272,9 +272,16 @@ export async function initializeSchema(dbType, db) {
         current_step INTEGER,
         status TEXT,
         message TEXT,
-        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+        last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
+        subject TEXT
       );
     `);
+    // subject (who the process is for, e.g. "For All Mankind S01E01") came
+    // after the table shipped; existing files gain it here. Older rows keep NULL.
+    const columns = await db.all(`PRAGMA table_info(process_queue)`);
+    if (!columns.some((column) => column.name === 'subject')) {
+      await db.exec(`ALTER TABLE process_queue ADD COLUMN subject TEXT`);
+    }
     return;
   }
 

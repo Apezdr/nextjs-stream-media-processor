@@ -575,7 +575,7 @@ Eviction was verified directly, since it had never been checked: **no eviction p
 
 Two genuinely separate mechanisms share the "what is the backend doing right now" role:
 
-**1. SQLite `process_queue`** (`node/sqlite/processTracking.mjs`, its own DB file). One row per `file_key` (UNIQUE), tracking `process_type` (`spritesheet`, `vtt`, `caption`, `library-scan`), step counters, `status`, and a message.
+**1. SQLite `process_queue`** (`node/sqlite/processTracking.mjs`, its own DB file). One row per `file_key` (UNIQUE), tracking `process_type` (`spritesheet`, `vtt`, `caption`, `library-scan`), step counters, `status`, a message, and `subject`: who the process is for, in words ("For All Mankind S01E01", "Logan (en)", "Movies"), written when the job is created and kept by later updates. Rows from before the column existed have a NULL subject.
 
 *Absent* → *created/upserted* (`createOrUpdateProcessQueue()`, called from `node/sprite-route.mjs` for spritesheet/VTT jobs and `node/components/caption-generator/entry-points/caption-controller.mjs` `trackProcess()` for caption jobs) → *stepped* (`updateProcessQueue()`) → *finalized* (`finalizeProcessQueue()` → `completed` or `error`) → *interrupted* (startup: `node/app.mjs` calls `markInProgressAsInterrupted()`, flipping any `in-progress` row to `interrupted`).
 

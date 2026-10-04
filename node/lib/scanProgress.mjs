@@ -23,11 +23,12 @@ export const LIBRARY_SCAN_PROCESS_TYPE = 'library-scan';
 export const SCAN_PROGRESS_INTERVAL_MS = 2000;
 
 const UNITS = { movies: 'movies', tv: 'shows' };
+const SUBJECTS = { movies: 'Movies', tv: 'TV shows' };
 
-async function writeProcessRow(fileKey, { totalSteps, currentStep, status, message }) {
+async function writeProcessRow(fileKey, { totalSteps, currentStep, status, message, subject }) {
   const db = await getProcessTrackingDb();
   await createOrUpdateProcessQueue(
-    db, fileKey, LIBRARY_SCAN_PROCESS_TYPE, totalSteps, currentStep, status, message
+    db, fileKey, LIBRARY_SCAN_PROCESS_TYPE, totalSteps, currentStep, status, message, subject
   );
 }
 
@@ -64,6 +65,7 @@ export function createLibraryScanProgress(library, {
 } = {}) {
   const fileKey = `library_scan_${library}`;
   const unit = UNITS[library] ?? library;
+  const subject = SUBJECTS[library] ?? library;
   const startedAt = now();
   let lastWriteAt = null;
   let current = null; // the last title reported: { position, total, name }
@@ -71,7 +73,7 @@ export function createLibraryScanProgress(library, {
 
   const enqueue = (row) => {
     writes = writes
-      .then(() => write(fileKey, row))
+      .then(() => write(fileKey, { ...row, subject }))
       .catch((error) => {
         logger.warn(`Could not record ${library} scan progress: ${error.message}`);
       });
