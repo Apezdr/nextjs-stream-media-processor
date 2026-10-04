@@ -1,6 +1,6 @@
 # nextjs-stream-media-processor
 
-This application serves as a dynamic backend service for generating and serving video frames, sprite sheets, WebVTT (Video Text Tracks) files, and chapter information. It's designed to handle requests for individual frames from videos stored in specific directories, generate sprite sheets for efficient video preview, and provide audio track selection for video playback.
+This application serves as a dynamic backend service for generating and serving video frames, sprite sheets, WebVTT (Video Text Tracks) files, and chapter information. It's designed to handle requests for individual frames from videos stored in specific directories, generate sprite sheets for efficient video preview, and encode short preview clips.
 
 ## Features
 
@@ -8,7 +8,6 @@ This application serves as a dynamic backend service for generating and serving 
 - **Sprite Sheet Generation:** Creates sprite sheets from video frames for efficient loading and previewing.
 - **WebVTT File Creation:** Generates WebVTT files for video previews, allowing for timestamp-based navigation.
 - **Cache Management:** Implements caching for generated frames and sprite sheets to enhance performance and reduce processing time.
-- **Audio Track Handling:** Supports requests for video files with specific audio tracks, optimizing for different playback scenarios.
 - **Chapter Information:** Extracts and serves chapter information from video files.
 - **Concurrent Processing:** Utilizes worker processes for efficient frame generation.
 
@@ -16,14 +15,14 @@ This application serves as a dynamic backend service for generating and serving 
 
 - **app.mjs:** Main application logic, route handling, and orchestration of various services.
 - **chapter-generator.js:** Handles extraction of chapter information and generation of chapter WebVTT files.
-- **videoHandler.js:** Manages video serving with custom audio track selection.
+- **videoHandler.mjs:** Serves `/videoClip` preview clips.
 - **utils.js:** Utility functions for file operations, frame generation, and other common tasks.
 
 ## Prerequisites
 
 - Docker
 - Node.js
-- FFmpeg: For processing video files, extracting frames, and handling audio tracks.
+- FFmpeg: For processing video files, extracting frames, and encoding preview clips.
 - PM2: Recommended for process management.
 
 ## Installation and Usage
@@ -77,9 +76,6 @@ The application exposes the following API endpoints:
 - **Chapter Information Request:**
   - Movie: `GET /chapters/movie/:movieName`
   - TV: `GET /chapters/tv/:showName/:season/:episode`
-- **Video Request with Audio Track Selection:**
-  - Movie: `GET /video/movie/:movieName?audio=<track>`
-  - TV: `GET /video/tv/:showName/:season/:episode?audio=<track>`
 
 ## API Endpoint Placeholders
 
@@ -108,49 +104,13 @@ The application periodically clears old cache files to free up disk space. Adjus
 
 ## Implementation Details
 
-- The application uses FFmpeg for processing video files, extracting frames, and handling audio tracks.
+- The application uses FFmpeg for processing video files, extracting frames, and encoding preview clips.
 - It implements robust error handling and retries for API requests.
 - The caching mechanism improves performance for frequently requested content.
 - Worker processes are utilized for concurrent frame generation to enhance efficiency.
 
-## Video Handling
+## Video Clips
 
-The `handleVideoRequest` function in the Node application dynamically serves video content with the ability to adjust audio tracks based on user requests. It supports serving both movie and TV show video files, optionally modifying them for audio track preferences.
-
-### Key Features
-
-- **Dynamic Video Path Resolution:** Locates video files based on parameters such as movie name, show name, season, and episode.
-- **Audio Track Selection:** Allows clients to request specific audio tracks (e.g., stereo or maximum available channels) for a personalized viewing experience.
-- **Efficient Content Delivery:** Supports HTTP range requests for efficient video streaming, enabling functionalities like seeking within the video.
-- **Error Handling:** Implements robust error handling to gracefully manage cases where video files or audio tracks are unavailable.
-
-### Implementation Details
-
-1. **Video and Audio Track Processing:**
-   - Utilizes `ffprobe` to list available audio tracks within the video file, selecting either a specified track or the track with the maximum number of channels.
-   - Generates a modified version of the video file with the selected audio track when necessary.
-
-2. **Serving Video Content:**
-   - Determines if a request specifies a range for partial content delivery, facilitating efficient video streaming.
-   - Serves video content directly from the filesystem, leveraging Node's asynchronous file handling capabilities.
-
-3. **Caching and Performance:**
-   - Optionally integrates with server-side caching mechanisms to improve performance for frequently requested content.
-
-### Setup and Configuration
-
-Ensure FFmpeg is installed on your server for audio track manipulation and video file processing. Modify the `directoryPath` variables within the script to match the locations where your video content is stored.
-
-### Integration
-
-This script can be integrated into your existing Node.js web server application or used as a standalone service. Ensure the necessary routes are configured in your Express app to handle requests directed at video content.
-
-### Usage Example
-
-Requesting a video with a specific audio track:
-
-```http
-GET /video/movie/TheMatrix?audio=max
-```
+`/videoClip/...` encodes a bounded preview clip (at most 10 minutes) with the detected hardware encoder and caches it. Full-length playback and transcoding are not served from here: the JIT transcoder (`jit-transcoder` repo) owns them.
 
 For more detailed information about the implementation, refer to the source code in the repository.

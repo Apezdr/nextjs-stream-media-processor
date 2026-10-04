@@ -155,44 +155,6 @@ export async function withClipGenerationSpan(options, fn) {
 }
 
 /**
- * Creates a span for full video transcoding
- * 
- * @param {Object} options Transcoding options
- * @param {Function} fn Function to execute within the span
- * @returns {Promise<any>} Result of the function execution
- */
-export async function withTranscodeSpan(options, fn) {
-  const attributes = {
-    'video.operation': 'transcode',
-    'video.input_path': sanitizePath(options.inputPath || 'unknown'),
-    'video.output_path': sanitizePath(options.outputPath || 'unknown'),
-    'video.codec': options.codec || 'unknown',
-    'video.hardware_acceleration': options.hardwareAcceleration || 'none'
-  };
-  
-  const startTime = Date.now();
-  try {
-    const result = await withSpan(tracer, 'video.transcode', fn, attributes);
-    
-    // Record metrics
-    const duration = Date.now() - startTime;
-    videoTranscodeDuration.record(duration, {
-      'video.codec': options.codec || 'unknown',
-      'video.hardware_acceleration': options.hardwareAcceleration || 'none'
-    });
-    
-    return result;
-  } catch (error) {
-    // Record error metrics
-    videoProcessingErrors.record(1, {
-      'video.operation': 'transcode',
-      'error.type': error.name || 'Error'
-    });
-    throw error;
-  }
-}
-
-/**
  * Sanitize file paths for telemetry (remove sensitive user paths)
  * 
  * @param {string} path File path to sanitize

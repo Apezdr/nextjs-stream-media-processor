@@ -39,7 +39,6 @@ export const generalCacheDir = join(mainCacheDir, 'general');
 export const spritesheetCacheDir = join(mainCacheDir, 'spritesheet');
 export const framesCacheDir = join(mainCacheDir, 'frames');
 export const videoClipsCacheDir = join(mainCacheDir, 'video_clips');
-export const videoTranscodeCacheDir = join(mainCacheDir, 'video_transcode');
 
 // Map to track ongoing conversions: key = pngPath, value = Promise
 const conversionQueue = new Map();
@@ -219,7 +218,6 @@ export async function ensureCacheDirs() {
     await fs.mkdir(spritesheetCacheDir, { recursive: true });
     await fs.mkdir(framesCacheDir, { recursive: true });
     await fs.mkdir(videoClipsCacheDir, { recursive: true });
-    await fs.mkdir(videoTranscodeCacheDir, { recursive: true });
     //logger.info(`Cache directories are ready.`);
   } catch (error) {
     logger.error(`Error creating cache directories: ${error.message}`);
@@ -232,16 +230,6 @@ export function generateCacheKey(...args) {
   const hash = createHash('sha1');
   hash.update(args.join('-'));
   return hash.digest('hex');
-}
-
-/**
- * Generates the cached transcoded file based on the cache key and desired extension.
- * @param {string} cacheKey - Unique key for the cached clip.
- * @param {string} [extension='.mp4'] - Desired file extension (e.g., '.webm', '.mp4').
- * @returns {string} - Full path to the cached clip.
- */
-export function getCachedTranscodedPath(cacheKey, extension = '.mp4') {
-  return join(videoTranscodeCacheDir, `${cacheKey}${extension}`);
 }
 
 /**
@@ -297,40 +285,6 @@ export async function clearVideoClipsCache() {
   const cacheType = 'video_clips';
   const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
   const dir = videoClipsCacheDir;
-
-  try {
-    const files = await fs.readdir(dir);
-    for (const file of files) {
-      const filePath = join(dir, file);
-      try {
-        const stats = await fs.stat(filePath);
-        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
-        if (age > maxAge) {
-          await fs.unlink(filePath);
-          logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
-        }
-      } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
-      }
-    }
-  } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:` + err);
-  }
-}
-
-/**
- * Clears expired files from the Video Transcode Cache (V-2).
- * Previously the only cache directory with no eviction at all, despite
- * holding the largest artifacts the subsystem produces. Also the mechanism
- * that reclaims entries stranded under pre-V-3 cache keys (the key gained
- * the file-identity uuid, so old entries can never be addressed again).
- * Max Age: 1 month
- */
-export async function clearVideoTranscodeCache() {
-  const now = Date.now();
-  const cacheType = 'video_transcode';
-  const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
-  const dir = videoTranscodeCacheDir;
 
   try {
     const files = await fs.readdir(dir);

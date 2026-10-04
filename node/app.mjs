@@ -28,12 +28,12 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, clearVideoTranscodeCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } from "./lib/mediaPayload.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
-import { handleVideoRequest, handleVideoClipRequest } from "./videoHandler.mjs";
+import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
@@ -57,7 +57,6 @@ const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
 const app = express();
-//const { handleVideoRequest } = require("./videoHandler");
 const logDirectory = resolve('logs');
 const LOG_FILE = process.env.LOG_PATH
   ? join(process.env.LOG_PATH, "cron.log")
@@ -639,15 +638,6 @@ app.get('/processes/:fileKey', authenticateWebhookOrUser, async (req, res) => {
   }
 });
 
-//
-// Handle MP4 video requests
-// Enhanced to allow transcoding with video codec desired as well as audio channels exposed
-app.get("/video/movie/:movieName", async (req, res) => {
-  const db = await initializeDatabase();
-  await handleVideoRequest(req, res, "movies", BASE_PATH, db);
-  await releaseDatabase(db);
-});
-
 app.get("/rescan/tmdb", authenticateWebhookOrUser, async (req, res) => {
   try {
     await runDownloadTmdbImages({ fullScan: true });
@@ -656,12 +646,6 @@ app.get("/rescan/tmdb", authenticateWebhookOrUser, async (req, res) => {
     logger.error(error);
     res.status(500).send("Rescan Failed: Internal server error");
   }
-});
-
-app.get("/video/tv/:showName/:season/:episode", async (req, res) => {
-  const db = await initializeDatabase();
-  await handleVideoRequest(req, res, "tv", BASE_PATH, db);
-  await releaseDatabase(db);
 });
 
 // Instead of using setInterval for cache cleanup, use node-schedule with the task manager
@@ -712,21 +696,6 @@ scheduleJob("15 3 * * *", () => {
     return 'Frames cache cleanup completed successfully';
   }).catch(error => {
     logger.error(`Failed to enqueue frames cache cleanup task: ${error.message}`);
-  });
-});
-
-// Clear Video Transcode Cache at 4:15 AM daily (V-2) — transcodes are the
-// largest artifacts the subsystem produces and previously had no eviction at
-// all; this sweep is also what reclaims entries stranded under pre-V-3
-// cache keys.
-scheduleJob("15 4 * * *", () => {
-  enqueueTask(TaskType.CACHE_CLEANUP, 'Video Transcode Cache Cleanup', async () => {
-    logger.info("Running Video Transcode Cache Cleanup...");
-    await clearVideoTranscodeCache();
-    logger.info("Video Transcode Cache Cleanup Completed.");
-    return 'Video transcode cache cleanup completed successfully';
-  }).catch(error => {
-    logger.error(`Failed to enqueue video transcode cache cleanup task: ${error.message}`);
   });
 });
 
@@ -1404,10 +1373,6 @@ app.get('/', (req, res) => {
         description: 'Media library endpoints',
         routes: ['/media/movies', '/media/tv', '/media/scan']
       },
-      video: {
-        description: 'Video streaming',
-        routes: ['/video/movie/:movieName', '/video/tv/:showName/:season/:episode']
-      },
       api: {
         description: 'API operations',
         routes: ['/api/tmdb/*', '/api/admin/*', '/api/system-status', '/api/logs']
@@ -1467,13 +1432,6 @@ app.use((req, res, next) => {
         '/media/movies - List all movies',
         '/media/tv - List all TV shows',
         '/media/scan - Trigger library scan'
-      ]
-    },
-    '/video': {
-      description: 'Video streaming endpoints',
-      endpoints: [
-        '/video/movie/:movieName - Stream movie',
-        '/video/tv/:showName/:season/:episode - Stream TV episode'
       ]
     },
     '/frame': {
