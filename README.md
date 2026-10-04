@@ -27,6 +27,12 @@ Almost all of this backend's state is derived and rebuildable (SQLite mirrors th
 
 **Note for low-resource servers:** Set `ENABLE_AVIF_CONVERSION=false` to disable resource-intensive AVIF conversion. The system will automatically fall back to optimized PNG sprite sheets, which provide excellent quality with significantly lower CPU and memory usage. But higher frontend/browser memory requirements for spritesheets.
 
+### Video Clip Configuration
+
+- VIDEO_CLIP_CONCURRENCY=2  # How many `/videoClip` preview clips are encoded at once (default: one per eight logical CPUs, between 2 and 4)
+
+Requests beyond the limit wait their turn, and a waiting clip is dropped if the viewer who asked for it has gone. Lower it on a server where clip encodes compete with the scanner; raise it on one with cores to spare.
+
 ### Multi-Frontend Support
 
 For setups with multiple frontends, you can use numbered environment variables:

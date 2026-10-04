@@ -1,0 +1,301 @@
+/**
+ * The pure half of ffmpeg/clipEncode.mjs: reading a probe, choosing a filter
+ * chain, and the exact ffmpeg command lines. These strings are what was run
+ * against production titles, so a change here is a change in what every clip
+ * is made of — bump VIDEO_CLIP_VERSION in videoHandler.mjs when one is meant.
+ *
+ * Running ffmpeg for real is tests/integration/video-clip-real-binary.test.mjs.
+ */
+
+import { describe, it, expect } from '@jest/globals';
+import {
+  describeClipSource,
+  selectColorPipeline,
+  buildClipVideoFilter,
+  buildTranscodeArgs,
+  buildOriginalArgs,
+  canCopyOriginal,
+  planOriginalCopy,
+} from '../../../ffmpeg/clipEncode.mjs';
+
+const videoStream = (overrides = {}) => ({
+  codec_type: 'video',
+  codec_name: 'h264',
+  pix_fmt: 'yuv420p',
+  disposition: { attached_pic: 0 },
+  ...overrides,
+});
+const audioStream = { codec_type: 'audio', codec_name: 'aac' };
+const probe = (streams, format = { duration: '5400.000000', start_time: '0.000000' }) => ({ streams, format });
+
+const SDR = describeClipSource(probe([videoStream(), audioStream]));
+const HDR10 = describeClipSource(probe([
+  videoStream({ codec_name: 'hevc', pix_fmt: 'yuv420p10le', color_transfer: 'smpte2084', color_primaries: 'bt2020', color_space: 'bt2020nc' }),
+]));
+const HLG = describeClipSource(probe([
+  videoStream({ codec_name: 'hevc', pix_fmt: 'yuv420p10le', color_transfer: 'arib-std-b67', color_primaries: 'bt2020', color_space: 'bt2020nc' }),
+]));
+const DOVI_P5 = describeClipSource(probe([
+  videoStream({
+    codec_name: 'hevc', pix_fmt: 'yuv420p10le', color_transfer: 'unknown', color_space: 'unknown',
+    side_data_list: [{ side_data_type: 'DOVI configuration record', dv_profile: 5, dv_bl_signal_compatibility_id: 0 }],
+  }),
+]));
+
+const FIT = "w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+const LIBPLACEBO =
+  `libplacebo=${FIT}:apply_dolbyvision=1:tonemapping=bt.2390:` +
+  'colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p';
+
+describe('describeClipSource', () => {
+  it('reads an ordinary SDR source', () => {
+    expect(SDR).toEqual({
+      codec: 'h264',
+      pixFmt: 'yuv420p',
+      transfer: 'sdr',
+      assumedPq: false,
+      wideGamut: false,
+      dovi: false,
+      duration: 5400,
+      startTime: 0,
+    });
+  });
+
+  it('recognises PQ and HLG by their transfer', () => {
+    expect(HDR10).toMatchObject({ codec: 'hevc', pixFmt: 'yuv420p10le', transfer: 'pq', assumedPq: false });
+    expect(HLG).toMatchObject({ transfer: 'hlg', assumedPq: false });
+  });
+
+  it('reads BT.2020 with no transfer tag as PQ, and says it assumed so', () => {
+    for (const untagged of [undefined, 'unknown', 'unspecified']) {
+      const source = describeClipSource(probe([videoStream({ color_space: 'bt2020nc', color_transfer: untagged })]));
+      expect(source).toMatchObject({ transfer: 'pq', assumedPq: true, wideGamut: false });
+    }
+  });
+
+  it('believes a transfer that is tagged: BT.2020 primaries with an SDR transfer is wide-gamut SDR', () => {
+    const source = describeClipSource(probe([videoStream({ color_primaries: 'bt2020', color_transfer: 'bt709' })]));
+    expect(source).toMatchObject({ transfer: 'sdr', assumedPq: false, wideGamut: true });
+  });
+
+  it('flags Dolby Vision that needs its RPU, which reads as SDR by its tags', () => {
+    expect(DOVI_P5).toMatchObject({ transfer: 'sdr', assumedPq: false, dovi: true });
+  });
+
+  it('describes the stream -map 0:V:0 selects: cover art is skipped even when it comes first', () => {
+    const source = describeClipSource(probe([
+      videoStream({ codec_name: 'mjpeg', pix_fmt: 'yuvj444p', disposition: { attached_pic: 1 } }),
+      videoStream({ codec_name: 'hevc', pix_fmt: 'yuv420p10le' }),
+      audioStream,
+    ]));
+    expect(source).toMatchObject({ codec: 'hevc', pixFmt: 'yuv420p10le' });
+  });
+
+  it('returns null when there is no video to clip', () => {
+    expect(describeClipSource(probe([audioStream]))).toBeNull();
+    expect(describeClipSource(probe([videoStream({ disposition: { attached_pic: 1 } })]))).toBeNull();
+    expect(describeClipSource({})).toBeNull();
+  });
+
+  it('keeps the container start time, and has no duration rather than a made-up one', () => {
+    expect(describeClipSource(probe([videoStream()], { duration: '12.001000', start_time: '-0.006000' })))
+      .toMatchObject({ duration: 12.001, startTime: -0.006 });
+    expect(describeClipSource(probe([videoStream()], {}))).toMatchObject({ duration: null, startTime: 0 });
+    expect(describeClipSource(probe([videoStream()], { duration: 'N/A' }))).toMatchObject({ duration: null });
+  });
+});
+
+describe('selectColorPipeline', () => {
+  it('leaves an SDR source alone, with or without libplacebo', () => {
+    expect(selectColorPipeline(SDR, { libplacebo: true })).toBe('none');
+    expect(selectColorPipeline(SDR, { libplacebo: false })).toBe('none');
+  });
+
+  it('sends every kind of HDR through libplacebo when the host has it', () => {
+    const wideGamut = describeClipSource(probe([videoStream({ color_primaries: 'bt2020', color_transfer: 'bt709' })]));
+    for (const source of [HDR10, HLG, DOVI_P5, wideGamut]) {
+      expect(selectColorPipeline(source, { libplacebo: true })).toBe('libplacebo');
+    }
+  });
+
+  it('falls back to the CPU tone-map for PQ and HLG without it', () => {
+    expect(selectColorPipeline(HDR10, { libplacebo: false })).toBe('zscale');
+    expect(selectColorPipeline(HLG, { libplacebo: false })).toBe('zscale');
+  });
+
+  it('has nothing that can apply an RPU without it, so Profile 5 is only scaled', () => {
+    expect(selectColorPipeline(DOVI_P5, { libplacebo: false })).toBe('none');
+  });
+});
+
+describe('buildClipVideoFilter', () => {
+  it('fits an SDR source inside 1280x720, never enlarging it, as 8-bit 4:2:0', () => {
+    expect(buildClipVideoFilter(SDR, 'none')).toBe(`scale=${FIT},format=yuv420p`);
+  });
+
+  it('tone-maps and scales in one libplacebo pass', () => {
+    expect(buildClipVideoFilter(HDR10, 'libplacebo')).toBe(LIBPLACEBO);
+    expect(buildClipVideoFilter(DOVI_P5, 'libplacebo')).toBe(LIBPLACEBO);
+  });
+
+  it('tells libplacebo what an untagged BT.2020 source is', () => {
+    const untagged = describeClipSource(probe([videoStream({ color_space: 'bt2020nc' })]));
+    expect(buildClipVideoFilter(untagged, 'libplacebo')).toBe(
+      `setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,${LIBPLACEBO}`
+    );
+  });
+
+  it('builds the CPU tone-map: tags first, then scale, then the float chain', () => {
+    expect(buildClipVideoFilter(HDR10, 'zscale')).toBe(
+      'setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,' +
+      `scale=${FIT},` +
+      'zscale=tin=smpte2084:min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=100,' +
+      'format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0:peak=100,' +
+      'zscale=t=bt709:m=bt709:r=tv,format=yuv420p'
+    );
+  });
+
+  it('reads an HLG source as HLG in the CPU tone-map', () => {
+    const filter = buildClipVideoFilter(HLG, 'zscale');
+    expect(filter).toContain('setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc,');
+    expect(filter).toContain('zscale=tin=arib-std-b67:');
+    expect(filter).not.toContain('smpte2084');
+  });
+});
+
+describe('buildTranscodeArgs', () => {
+  const base = { videoPath: '/media/movies/A Film/A Film.mkv', start: 3200, duration: 50, outputPath: '/cache/x.part' };
+
+  it('is one pass: seek before the input, H.264 + AAC, faststart MP4', () => {
+    expect(buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none' })).toEqual([
+      '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+      '-ss', '3200',
+      '-i', '/media/movies/A Film/A Film.mkv',
+      '-t', '50',
+      '-map', '0:V:0', '-map', '0:a:0?', '-sn', '-dn', '-map_chapters', '-1', '-map_metadata', '-1',
+      '-vf', `scale=${FIT},format=yuv420p`,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-x264-params', 'subme=1',
+      '-crf', '23', '-maxrate', '2M', '-bufsize', '4M',
+      '-profile:v', 'high', '-pix_fmt', 'yuv420p', '-g', '48',
+      '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+      '-max_muxing_queue_size', '9999', '-movflags', '+faststart', '-f', 'mp4',
+      '/cache/x.part',
+    ]);
+  });
+
+  it('gives libplacebo its Vulkan device, and tags the tone-mapped result BT.709', () => {
+    const args = buildTranscodeArgs({ ...base, source: HDR10, pipeline: 'libplacebo' });
+    // The device has to be created before the input it filters.
+    expect(args.indexOf('-init_hw_device')).toBeLessThan(args.indexOf('-i'));
+    expect(args.slice(args.indexOf('-init_hw_device'), args.indexOf('-init_hw_device') + 2)).toEqual(['-init_hw_device', 'vulkan']);
+    expect(args[args.indexOf('-vf') + 1]).toBe(LIBPLACEBO);
+    expect(args.join(' ')).toContain('-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv');
+  });
+
+  it('tags the CPU tone-map BT.709 too, without asking for a Vulkan device', () => {
+    const args = buildTranscodeArgs({ ...base, source: HDR10, pipeline: 'zscale' });
+    expect(args).not.toContain('-init_hw_device');
+    expect(args.join(' ')).toContain('-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv');
+  });
+
+  it('does not stamp BT.709 on an SDR source, whose own tags may say BT.601', () => {
+    const args = buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none' });
+    expect(args).not.toContain('-colorspace');
+    expect(args).not.toContain('-color_trc');
+  });
+
+  it('writes fractional times without float noise', () => {
+    const args = buildTranscodeArgs({ ...base, start: 0.1 + 0.2, duration: 12.5, source: SDR, pipeline: 'none' });
+    expect(args[args.indexOf('-ss') + 1]).toBe('0.3');
+    expect(args[args.indexOf('-t') + 1]).toBe('12.5');
+  });
+});
+
+describe('canCopyOriginal', () => {
+  const source = (codec, pixFmt, extra = {}) => ({ ...SDR, codec, pixFmt, ...extra });
+
+  it('copies 8-bit H.264 and 8/10-bit HEVC, which a TV or phone decodes in hardware', () => {
+    expect(canCopyOriginal(source('h264', 'yuv420p'))).toBe(true);
+    expect(canCopyOriginal(source('hevc', 'yuv420p'))).toBe(true);
+    expect(canCopyOriginal(source('hevc', 'yuv420p10le'))).toBe(true);
+    expect(canCopyOriginal(HDR10)).toBe(true);
+  });
+
+  it('transcodes everything else', () => {
+    expect(canCopyOriginal(source('h264', 'yuv420p10le'))).toBe(false); // Hi10P
+    expect(canCopyOriginal(source('hevc', 'yuv422p10le'))).toBe(false);
+    expect(canCopyOriginal(source('av1', 'yuv420p10le'))).toBe(false);
+    expect(canCopyOriginal(source('vp9', 'yuv420p'))).toBe(false);
+    expect(canCopyOriginal(source('mpeg2video', 'yuv420p'))).toBe(false);
+  });
+
+  it('transcodes Dolby Vision that needs its RPU: a copy is green on any non-DV screen', () => {
+    expect(canCopyOriginal(DOVI_P5)).toBe(false);
+  });
+});
+
+describe('planOriginalCopy', () => {
+  it('seeks a quarter second past the keyframe and runs to the requested end', () => {
+    // Mutiny on production: keyframe at 3199.196 for a 3200-3250 clip.
+    const plan = planOriginalCopy({ start: 3200, duration: 50, startTime: 0, keyframeTime: 3199.196 });
+    expect(plan.seekTo).toBeCloseTo(3199.446, 6);
+    expect(plan.seekTo + plan.length).toBeCloseTo(3250, 6);
+  });
+
+  it('works on the container timeline when the file does not start at zero', () => {
+    // start=3 in a file whose timestamps begin at 4.977: the request is for t=7.977.
+    const plan = planOriginalCopy({ start: 3, duration: 4, startTime: 4.977, keyframeTime: 7 });
+    expect(plan.seekTo).toBeCloseTo(7.25, 6);
+    expect(plan.seekTo + plan.length).toBeCloseTo(11.977, 6);
+  });
+
+  it('accepts a first keyframe that sits a moment after the start of the file', () => {
+    const plan = planOriginalCopy({ start: 0, duration: 10, startTime: 0, keyframeTime: 0.083 });
+    expect(plan.seekTo).toBeCloseTo(0.333, 6);
+    expect(plan.seekTo + plan.length).toBeCloseTo(10, 6);
+  });
+
+  it('refuses when there is no keyframe, or none near the start', () => {
+    expect(planOriginalCopy({ start: 100, duration: 50, startTime: 0, keyframeTime: null })).toBeNull();
+    expect(planOriginalCopy({ start: 100, duration: 50, startTime: 0, keyframeTime: NaN })).toBeNull();
+    expect(planOriginalCopy({ start: 100, duration: 50, startTime: 0, keyframeTime: 69.9 })).toBeNull(); // 30.1 s GOP
+    expect(planOriginalCopy({ start: 100, duration: 50, startTime: 0, keyframeTime: 101.5 })).toBeNull(); // after the start
+  });
+
+  it('refuses a clip that would end before the copy could begin', () => {
+    expect(planOriginalCopy({ start: 10, duration: 0.1, startTime: 0, keyframeTime: 10 })).toBeNull();
+  });
+});
+
+describe('buildOriginalArgs', () => {
+  const plan = { seekTo: 3199.446, length: 50.554 };
+  const base = { videoPath: '/media/movies/A Film/A Film.mkv', plan, outputPath: '/cache/x.part' };
+
+  it('copies HEVC as hvc1 with AAC stereo, from the keyframe, into faststart MP4', () => {
+    expect(buildOriginalArgs({ ...base, source: HDR10 })).toEqual([
+      '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+      '-seek_timestamp', '1',
+      '-noaccurate_seek',
+      '-ss', '3199.446',
+      '-t', '50.554',
+      '-i', '/media/movies/A Film/A Film.mkv',
+      '-map', '0:V:0', '-map', '0:a:0?', '-sn', '-dn', '-map_chapters', '-1', '-map_metadata', '-1',
+      '-c:v', 'copy', '-tag:v', 'hvc1',
+      '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000',
+      '-avoid_negative_ts', 'make_zero',
+      '-max_muxing_queue_size', '9999', '-movflags', '+faststart', '-f', 'mp4',
+      '/cache/x.part',
+    ]);
+  });
+
+  it('leaves the tag alone for H.264', () => {
+    const args = buildOriginalArgs({ ...base, source: SDR });
+    expect(args).not.toContain('-tag:v');
+    expect(args.slice(args.indexOf('-c:v'), args.indexOf('-c:v') + 2)).toEqual(['-c:v', 'copy']);
+  });
+
+  it('limits the input, not the output: -t comes before -i', () => {
+    const args = buildOriginalArgs({ ...base, source: SDR });
+    expect(args.indexOf('-t')).toBeLessThan(args.indexOf('-i'));
+  });
+});

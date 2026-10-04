@@ -21,10 +21,14 @@ export async function executeFFmpeg(args, options = {}) {
       reject(error);
     });
 
-    ffmpeg.on('close', (code) => {
+    ffmpeg.on('close', (code, signal) => {
       if (code === 0) {
         logger.info(`FFmpeg process completed successfully.`);
         resolve();
+      } else if (signal) {
+        // No exit code: the process was killed, e.g. by the spawn `timeout` option.
+        logger.error(`FFmpeg was killed by ${signal}.`);
+        reject(new Error(`FFmpeg was killed by ${signal}: ${stderrData}`));
       } else {
         logger.error(`FFmpeg exited with code ${code}.`);
         reject(new Error(`FFmpeg exited with code ${code}: ${stderrData}`));

@@ -242,9 +242,6 @@ export function getCachedClipPath(cacheKey, extension = '.mp4') {
   return join(videoClipsCacheDir, `${cacheKey}${extension}`);
 }
 
-// Set to track ongoing cache generations
-export const ongoingCacheGenerations = new Set();
-
 // Cleanup cache files based on their cache type
 /**
  * Clears expired files from the General Cache.
@@ -324,12 +321,11 @@ export async function clearOriginalSegmentsCache() {
     let totalSize = 0;
     
     for (const file of files) {
-      // Only process files that match the original segment naming pattern.
-      // The extension is whatever container the SOURCE used (see
-      // serveOriginalVideoWithRanges in videoHandler.mjs) — matching a literal
-      // '-original.mp4' would silently stop evicting the moment a non-mp4
-      // source produced a segment, and this cache has an 8-minute TTL for a
-      // reason. These two must always change together.
+      // Only process files that match the original segment naming pattern
+      // (serveOriginalClip in videoHandler.mjs names them; the two must always
+      // change together). They are all .mp4 now, but the extension stays a
+      // wildcard: segments written before that kept the SOURCE's container,
+      // and a literal '-original.mp4' would leave those on disk for a month.
       if (/-original\.[a-z0-9]+$/i.test(file)) {
         const filePath = join(dir, file);
         try {
@@ -448,7 +444,7 @@ export function safeJoin(base, ...segments) {
   return resolvedPath;
 }
 
-// Containers the video pipeline can serve (getOutputFormat in videoHandler.mjs).
+// Containers the video pipeline can read as a source.
 //
 // ORDER IS LOAD-BEARING. It is the priority order used to pick "the" video file
 // when a folder holds more than one, so it decides which URL a title publishes.
@@ -804,12 +800,3 @@ export const generateFrame = async (videoPath, timestamp, framePath) => {
   await loadPLimit();
   return _generateFrame(videoPath, timestamp, framePath);
 };
-
-/**
- * Helper to see if an array of arguments includes a certain argument key (e.g. "-vf").
- * Simple utility so we don’t double-add the same flag.
- */
-export function stringArrayContainsArg(argsArray, argKey) {
-  // e.g. argKey = "-vf" or "-ac"
-  return argsArray.some((item) => item.trim().toLowerCase() === argKey);
-}
