@@ -11,6 +11,7 @@ import { createCategoryLogger } from '../lib/logger.mjs';
 import PQueue from 'p-queue';
 import { generateBlurhash } from './blurhashNative.mjs';
 import { sidecarBlurhashSizeForFilename } from './blurhashSizePolicy.mjs';
+import { needsDoviReshape, libplaceboAvailable, doviReshapeFilter, DOVI_RESHAPE_INPUT_ARGS } from '../ffmpeg/dolbyVision.mjs';
 const logger = createCategoryLogger('utility');
 //const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
 
@@ -38,7 +39,6 @@ export const generalCacheDir = join(mainCacheDir, 'general');
 export const spritesheetCacheDir = join(mainCacheDir, 'spritesheet');
 export const framesCacheDir = join(mainCacheDir, 'frames');
 export const videoClipsCacheDir = join(mainCacheDir, 'video_clips');
-export const videoTranscodeCacheDir = join(mainCacheDir, 'video_transcode');
 
 // Map to track ongoing conversions: key = pngPath, value = Promise
 const conversionQueue = new Map();
@@ -74,100 +74,130 @@ async function _generateFrame(videoPath, timestamp, framePath) {
     await loadPLimit();
   }
 
-  return limit(() => new Promise((resolve, reject) => {
-    // Replace colons in timestamp to make it Windows-friendly
-    const sanitizedTimestamp = timestamp.replace(/:/g, '-');
+  return limit(async () => {
+    // Dolby Vision Profile 5 reads as SDR by its transfer, and either branch
+    // below renders its base layer green/magenta. libplacebo applies the RPU
+    // and writes HDR10, which then takes the HDR path like any HDR10 source.
+    // Without a usable libplacebo the old branches still run (see
+    // ffmpeg/dolbyVision.mjs; the probe has warned once).
+    const dovi = (await needsDoviReshape(videoPath)) && (await libplaceboAvailable());
+    return new Promise((resolve, reject) => {
+      // Replace colons in timestamp to make it Windows-friendly
+      const sanitizedTimestamp = timestamp.replace(/:/g, '-');
 
-    // Update framePath with sanitized timestamp and .avif extension
-    const avifPath = framePath.replace(/\.[^/.]+$/, `.avif`);
+      // Update framePath with sanitized timestamp and .avif extension
+      const avifPath = framePath.replace(/\.[^/.]+$/, `.avif`);
 
-    // Determine if the video is HDR by probing color_transfer
-    const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
+      // Determine if the video is HDR by probing color_transfer
+      const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
 
-    exec(ffprobeCommand, (error, stdout, stderr) => {
-      if (error) {
-        logger.error(`Worker ${process.pid} error detecting HDR: ${error.message}`);
-        return reject(error);
-      }
-
-      const colorTransfer = stdout.trim();
-      logger.info(`Worker ${process.pid} color_transfer: ${colorTransfer}`);
-      const isHDR = (colorTransfer === 'smpte2084' || colorTransfer === 'arib-std-b67');
-
-      // Build the FFmpeg command for AVIF encoding
-      let ffmpegCommand;
-      if (isHDR) {
-        logger.info(`Worker ${process.pid} detected HDR video, preserving HDR in AVIF`);
-
-        // For HDR:
-        // - Ensure even width with scale=-2:140
-        // - Use yuv420p10le pixel format
-        // - Set HDR metadata: BT.2020 primaries, SMPTE2084 transfer, BT.2020 non-constant colorspace
-        // - Use libaom-av1 encoder with high quality settings
-        ffmpegCommand = [
-          'ffmpeg',
-          `-ss ${timestamp}`,
-          `-i "${videoPath}"`,
-          '-frames:v 1',
-          '-vf "scale=-2:140:flags=lanczos,format=yuv420p10le"',
-          '-color_primaries bt2020',
-          '-color_trc smpte2084',
-          '-colorspace bt2020nc',
-          '-c:v libaom-av1',
-          '-crf 10',
-          '-b:v 0',
-          '-preset slower',
-          `"${avifPath}"`,
-          '-y'
-        ].join(' ');
-      } else {
-        logger.info(`Worker ${process.pid} detected SDR video, encoding AVIF in SDR`);
-
-        // For SDR:
-        // - Ensure even width with scale=-2:140
-        // - Use yuv420p pixel format
-        // - No HDR metadata needed
-        ffmpegCommand = [
-          'ffmpeg',
-          `-ss ${timestamp}`,
-          `-i "${videoPath}"`,
-          '-frames:v 1',
-          '-vf "scale=-2:140:flags=lanczos,format=yuv420p"',
-          '-c:v libaom-av1',
-          '-crf 10',
-          '-b:v 0',
-          '-preset slower',
-          `"${avifPath}"`,
-          '-y'
-        ].join(' ');
-      }
-
-      // Execute the FFmpeg command to produce the AVIF
-      exec(ffmpegCommand, (error, stdout, stderr) => {
+      exec(ffprobeCommand, (error, stdout, stderr) => {
         if (error) {
-          logger.error(`Worker ${process.pid} error generating AVIF at ${timestamp}: ${error.message}`);
-          logger.debug(`FFmpeg stderr: ${stderr}`);
+          logger.error(`Worker ${process.pid} error detecting HDR: ${error.message}`);
           return reject(error);
         }
 
-        logger.info(`Worker ${process.pid} AVIF frame generated successfully: ${avifPath}`);
+        const colorTransfer = stdout.trim();
+        logger.info(`Worker ${process.pid} color_transfer: ${colorTransfer}`);
+        const isHDR = (colorTransfer === 'smpte2084' || colorTransfer === 'arib-std-b67');
 
-        // Get the dimensions of the generated AVIF using ffprobe
-        const ffprobeDimCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${avifPath}"`;
+        // Build the FFmpeg command for AVIF encoding
+        let ffmpegCommand;
+        if (dovi) {
+          logger.info(`Worker ${process.pid} detected Dolby Vision needing RPU reshape, writing HDR10 AVIF via libplacebo`);
 
-        exec(ffprobeDimCommand, (error, stdout, stderr) => {
+          // Same AVIF output as the HDR branch below; libplacebo replaces the
+          // scale (software decode — it is the only decoder that keeps the RPU).
+          ffmpegCommand = [
+            'ffmpeg',
+            ...DOVI_RESHAPE_INPUT_ARGS,
+            `-ss ${timestamp}`,
+            `-i "${videoPath}"`,
+            '-frames:v 1',
+            `-vf "${doviReshapeFilter({ width: -2, height: 140, output: 'pq' })}"`,
+            '-color_primaries bt2020',
+            '-color_trc smpte2084',
+            '-colorspace bt2020nc',
+            '-c:v libaom-av1',
+            '-crf 10',
+            '-b:v 0',
+            '-preset slower',
+            `"${avifPath}"`,
+            '-y'
+          ].join(' ');
+        } else if (isHDR) {
+          logger.info(`Worker ${process.pid} detected HDR video, preserving HDR in AVIF`);
+
+          // For HDR:
+          // - Ensure even width with scale=-2:140
+          // - Use yuv420p10le pixel format
+          // - Set HDR metadata: BT.2020 primaries, SMPTE2084 transfer, BT.2020 non-constant colorspace
+          // - Use libaom-av1 encoder with high quality settings
+          ffmpegCommand = [
+            'ffmpeg',
+            `-ss ${timestamp}`,
+            `-i "${videoPath}"`,
+            '-frames:v 1',
+            '-vf "scale=-2:140:flags=lanczos,format=yuv420p10le"',
+            '-color_primaries bt2020',
+            '-color_trc smpte2084',
+            '-colorspace bt2020nc',
+            '-c:v libaom-av1',
+            '-crf 10',
+            '-b:v 0',
+            '-preset slower',
+            `"${avifPath}"`,
+            '-y'
+          ].join(' ');
+        } else {
+          logger.info(`Worker ${process.pid} detected SDR video, encoding AVIF in SDR`);
+
+          // For SDR:
+          // - Ensure even width with scale=-2:140
+          // - Use yuv420p pixel format
+          // - No HDR metadata needed
+          ffmpegCommand = [
+            'ffmpeg',
+            `-ss ${timestamp}`,
+            `-i "${videoPath}"`,
+            '-frames:v 1',
+            '-vf "scale=-2:140:flags=lanczos,format=yuv420p"',
+            '-c:v libaom-av1',
+            '-crf 10',
+            '-b:v 0',
+            '-preset slower',
+            `"${avifPath}"`,
+            '-y'
+          ].join(' ');
+        }
+
+        // Execute the FFmpeg command to produce the AVIF
+        exec(ffmpegCommand, (error, stdout, stderr) => {
           if (error) {
-            logger.error(`Worker ${process.pid} error getting AVIF frame dimensions: ${error.message}`);
-            logger.debug(`FFprobe stderr: ${stderr}`);
+            logger.error(`Worker ${process.pid} error generating AVIF at ${timestamp}: ${error.message}`);
+            logger.debug(`FFmpeg stderr: ${stderr}`);
             return reject(error);
           }
 
-          const [width, height] = stdout.trim().split('x');
-          resolve({ framePath: avifPath, width: parseInt(width), height: parseInt(height) });
+          logger.info(`Worker ${process.pid} AVIF frame generated successfully: ${avifPath}`);
+
+          // Get the dimensions of the generated AVIF using ffprobe
+          const ffprobeDimCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${avifPath}"`;
+
+          exec(ffprobeDimCommand, (error, stdout, stderr) => {
+            if (error) {
+              logger.error(`Worker ${process.pid} error getting AVIF frame dimensions: ${error.message}`);
+              logger.debug(`FFprobe stderr: ${stderr}`);
+              return reject(error);
+            }
+
+            const [width, height] = stdout.trim().split('x');
+            resolve({ framePath: avifPath, width: parseInt(width), height: parseInt(height) });
+          });
         });
       });
     });
-  }));
+  });
 }
 
 // Function to check file existence asynchronously
@@ -188,7 +218,6 @@ export async function ensureCacheDirs() {
     await fs.mkdir(spritesheetCacheDir, { recursive: true });
     await fs.mkdir(framesCacheDir, { recursive: true });
     await fs.mkdir(videoClipsCacheDir, { recursive: true });
-    await fs.mkdir(videoTranscodeCacheDir, { recursive: true });
     //logger.info(`Cache directories are ready.`);
   } catch (error) {
     logger.error(`Error creating cache directories: ${error.message}`);
@@ -201,16 +230,6 @@ export function generateCacheKey(...args) {
   const hash = createHash('sha1');
   hash.update(args.join('-'));
   return hash.digest('hex');
-}
-
-/**
- * Generates the cached transcoded file based on the cache key and desired extension.
- * @param {string} cacheKey - Unique key for the cached clip.
- * @param {string} [extension='.mp4'] - Desired file extension (e.g., '.webm', '.mp4').
- * @returns {string} - Full path to the cached clip.
- */
-export function getCachedTranscodedPath(cacheKey, extension = '.mp4') {
-  return join(videoTranscodeCacheDir, `${cacheKey}${extension}`);
 }
 
 /**
@@ -266,40 +285,6 @@ export async function clearVideoClipsCache() {
   const cacheType = 'video_clips';
   const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
   const dir = videoClipsCacheDir;
-
-  try {
-    const files = await fs.readdir(dir);
-    for (const file of files) {
-      const filePath = join(dir, file);
-      try {
-        const stats = await fs.stat(filePath);
-        const age = (now - stats.mtimeMs) / 1000; // Age in seconds
-        if (age > maxAge) {
-          await fs.unlink(filePath);
-          logger.info(`Deleted expired cache file (${cacheType}): ${file}`);
-        }
-      } catch (err) {
-        logger.error(`Error processing file ${file} in ${cacheType} cache:` + err);
-      }
-    }
-  } catch (err) {
-    logger.error(`Error reading ${cacheType} cache directory:` + err);
-  }
-}
-
-/**
- * Clears expired files from the Video Transcode Cache (V-2).
- * Previously the only cache directory with no eviction at all, despite
- * holding the largest artifacts the subsystem produces. Also the mechanism
- * that reclaims entries stranded under pre-V-3 cache keys (the key gained
- * the file-identity uuid, so old entries can never be addressed again).
- * Max Age: 1 month
- */
-export async function clearVideoTranscodeCache() {
-  const now = Date.now();
-  const cacheType = 'video_transcode';
-  const maxAge = 30 * 24 * 60 * 60; // 1 month in seconds
-  const dir = videoTranscodeCacheDir;
 
   try {
     const files = await fs.readdir(dir);

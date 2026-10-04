@@ -14,6 +14,8 @@
  * - Easy extensibility for new encoders and profiles
  */
 
+import { doviReshapeFilter } from './dolbyVision.mjs';
+
 // ==================== CONFIGURATION CONSTANTS ====================
 
 /**
@@ -173,10 +175,28 @@ class VideoFilterStrategy {
    * @param {boolean} isHDR - Whether input is HDR
    * @param {string} inputPixFmt - Input pixel format
    * @param {Object} scalingParams - Scaling parameters {width, height}
+   * @param {Object} [options]
+   * @param {boolean} [options.dovi] - Dolby Vision whose RPU must be applied
+   *   (Profile 5): libplacebo replaces the tone-map AND the scale, then the
+   *   encoder's own tail follows. See ffmpeg/dolbyVision.mjs.
    * @returns {string} Comma-separated filter string
    */
-  generateFilters(isHDR, inputPixFmt, scalingParams = null) {
+  generateFilters(isHDR, inputPixFmt, scalingParams = null, options = {}) {
     throw new EncoderConfigError('generateFilters must be implemented by subclasses');
+  }
+
+  /**
+   * The libplacebo reshape that stands in for the tone-map and scale of a
+   * Dolby Vision source: BT.709 SDR at the scaling size, or the source size.
+   * @param {Object|null} scalingParams - {width, height}
+   * @returns {string} Filter string
+   */
+  _getDoviReshapeFilter(scalingParams) {
+    return doviReshapeFilter({
+      width: scalingParams?.width ?? 'iw',
+      height: scalingParams?.height ?? 'ih',
+      output: 'sdr',
+    });
   }
 
   /**
@@ -208,12 +228,14 @@ class VideoFilterStrategy {
  * Software encoding filter strategy (libx264)
  */
 class SoftwareFilterStrategy extends VideoFilterStrategy {
-  generateFilters(isHDR, inputPixFmt, scalingParams = null) {
+  generateFilters(isHDR, inputPixFmt, scalingParams = null, { dovi = false } = {}) {
     EncoderValidator.validateInputs(isHDR, inputPixFmt, null, scalingParams);
 
     const filters = [];
 
-    if (isHDR) {
+    if (dovi) {
+      filters.push(this._getDoviReshapeFilter(scalingParams), 'format=yuv420p');
+    } else if (isHDR) {
       // HDR to SDR tone mapping pipeline
       filters.push(
         `zscale=tin=smpte2084:min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=${CONFIG.HDR.LINEAR_NPL}`,
@@ -249,25 +271,29 @@ class SoftwareFilterStrategy extends VideoFilterStrategy {
  * VAAPI hardware encoding filter strategy
  */
 class VaapiFilterStrategy extends VideoFilterStrategy {
-  generateFilters(isHDR, inputPixFmt, scalingParams = null) {
+  generateFilters(isHDR, inputPixFmt, scalingParams = null, { dovi = false } = {}) {
     EncoderValidator.validateInputs(isHDR, inputPixFmt, null, scalingParams);
 
     const filters = [];
 
-    if (isHDR) {
-      // HDR tone mapping for VAAPI
-      filters.push(
-        `zscale=t=linear:npl=${CONFIG.HDR.LINEAR_NPL}`,
-        'format=gbrp16le',
-        'zscale=p=bt709',
-        `tonemap=tonemap=${CONFIG.HDR.TONEMAP_ALGORITHM}:peak=${CONFIG.HDR.NITS_PEAK}`,
-        'zscale=t=bt709:m=bt709:r=tv'
-      );
-    }
+    if (dovi) {
+      filters.push(this._getDoviReshapeFilter(scalingParams));
+    } else {
+      if (isHDR) {
+        // HDR tone mapping for VAAPI
+        filters.push(
+          `zscale=t=linear:npl=${CONFIG.HDR.LINEAR_NPL}`,
+          'format=gbrp16le',
+          'zscale=p=bt709',
+          `tonemap=tonemap=${CONFIG.HDR.TONEMAP_ALGORITHM}:peak=${CONFIG.HDR.NITS_PEAK}`,
+          'zscale=t=bt709:m=bt709:r=tv'
+        );
+      }
 
-    // Add scaling if specified
-    if (scalingParams) {
-      filters.push(this._getScalingFilter(scalingParams, 'zscale'));
+      // Add scaling if specified
+      if (scalingParams) {
+        filters.push(this._getScalingFilter(scalingParams, 'zscale'));
+      }
     }
 
     // VAAPI format conversion and upload
@@ -281,25 +307,29 @@ class VaapiFilterStrategy extends VideoFilterStrategy {
  * NVENC hardware encoding filter strategy
  */
 class NvencFilterStrategy extends VideoFilterStrategy {
-  generateFilters(isHDR, inputPixFmt, scalingParams = null) {
+  generateFilters(isHDR, inputPixFmt, scalingParams = null, { dovi = false } = {}) {
     EncoderValidator.validateInputs(isHDR, inputPixFmt, null, scalingParams);
 
     const filters = [];
 
-    if (isHDR) {
-      // HDR tone mapping for NVENC
-      filters.push(
-        `zscale=t=linear:npl=${CONFIG.HDR.LINEAR_NPL}`,
-        'format=gbrp16le',
-        'zscale=p=bt709',
-        `tonemap=tonemap=${CONFIG.HDR.TONEMAP_ALGORITHM}:peak=${CONFIG.HDR.NITS_PEAK}`,
-        'zscale=t=bt709:m=bt709:r=tv'
-      );
-    }
+    if (dovi) {
+      filters.push(this._getDoviReshapeFilter(scalingParams));
+    } else {
+      if (isHDR) {
+        // HDR tone mapping for NVENC
+        filters.push(
+          `zscale=t=linear:npl=${CONFIG.HDR.LINEAR_NPL}`,
+          'format=gbrp16le',
+          'zscale=p=bt709',
+          `tonemap=tonemap=${CONFIG.HDR.TONEMAP_ALGORITHM}:peak=${CONFIG.HDR.NITS_PEAK}`,
+          'zscale=t=bt709:m=bt709:r=tv'
+        );
+      }
 
-    // Add scaling if specified
-    if (scalingParams) {
-      filters.push(this._getScalingFilter(scalingParams, 'zscale'));
+      // Add scaling if specified
+      if (scalingParams) {
+        filters.push(this._getScalingFilter(scalingParams, 'zscale'));
+      }
     }
 
     // NVENC format and padding
@@ -543,11 +573,12 @@ class Encoder {
    * @param {boolean} isHDR - Whether input is HDR
    * @param {string} inputPixFmt - Input pixel format
    * @param {Object} scalingParams - Scaling parameters
+   * @param {Object} [options] - `{ dovi }`, see VideoFilterStrategy.generateFilters
    * @returns {string} Filter string
    */
-  generateVideoFilters(isHDR = false, inputPixFmt = null, scalingParams = null) {
+  generateVideoFilters(isHDR = false, inputPixFmt = null, scalingParams = null, options = {}) {
     try {
-      return this.filterStrategy.generateFilters(isHDR, inputPixFmt, scalingParams);
+      return this.filterStrategy.generateFilters(isHDR, inputPixFmt, scalingParams, options);
     } catch (error) {
       throw new EncoderConfigError(`Failed to generate video filters: ${error.message}`, {
         encoder: this.config.codec,
@@ -710,6 +741,11 @@ function createLegacyEncoder(encoderType) {
       const scaling = encoder.getScalingForProfile('clip');
       return encoder.generateVideoFilters(isHDR, inputPixFmt, scaling);
     },
+    // Dolby Vision whose RPU must be applied (Profile 5). The filter already
+    // scales, so callers use it INSTEAD of vf/hdr_vf plus the profile scale
+    // override. Defaults to the same size vf uses.
+    dovi_vf: (scaling) =>
+      encoder.generateVideoFilters(false, null, scaling ?? encoder.getScalingForProfile('clip'), { dovi: true }),
     profiles: {
       full: {
         encoderFlags: {}, // Legacy compatibility

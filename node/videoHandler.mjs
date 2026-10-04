@@ -1,24 +1,26 @@
 import { exec, spawn } from "child_process";
-import { join, extname, basename } from "path";
+import { join, extname } from "path";
 import { promises as fs } from "fs";
 import { readFileSync, createReadStream } from "fs";
 import { fileExists, ongoingCacheGenerations, fileInfo } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { getTVShowByName, getMovieByName } from "./sqliteDatabase.mjs";
 //const execAsync = promisify(exec);
-import { generateCacheKey, getCachedClipPath, getCachedTranscodedPath } from "./utils/utils.mjs";
+import { getCachedClipPath } from "./utils/utils.mjs";
 import { getHardwareAccelerationInfo } from './hardwareAcceleration.mjs';
 import { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc } from "./ffmpeg/encoderConfig.mjs";
 import { createCategoryLogger } from "./lib/logger.mjs";
 //import { extractHDRInfo } from "./mediaInfo/mediaInfo.mjs";
-import { generateAndCacheClip, generateFullTranscode } from "./ffmpeg/transcode.mjs";
-import { getAudioTracks, getVideoCodec } from "./ffmpeg/ffprobe.mjs";
+import { generateAndCacheClip } from "./ffmpeg/transcode.mjs";
+import { doviReshapeRequired, libplaceboAvailable } from "./ffmpeg/dolbyVision.mjs";
+import { resolveClipCodec, CLIP_CODEC_VALUES } from "./utils/clipCodec.mjs";
 import { getInfo } from "./infoManager.mjs";
 
 const logger = createCategoryLogger('videoHandler');
+// Encoder configs a ?codec= request can name (utils/clipCodec.mjs maps codec -> encoder).
+const CLIP_ENCODER_CONFIGS = { libx264, vp9_vaapi, hevc_vaapi, hevc_nvenc };
 // Video Clip Generation Version Control (for cache invalidation)
 const VIDEO_CLIP_VERSION = 1.0002;
-const FULL_TRANSCODE_VERSION = 1.0001; // Increment if encoder settings change
 
 let hardwareInfo;
 async function initHardwareInfo() {
@@ -26,257 +28,6 @@ async function initHardwareInfo() {
     hardwareInfo = await getHardwareAccelerationInfo();
   }
   return hardwareInfo;
-}
-
-/**
- * Determines the file extension based on the provided video codec.
- * @param {string} codec - The video codec to map to a file extension.
- * @returns {string} The file extension corresponding to the input codec, or '.mp4' if the codec is not found in the mapping.
- */
-function getExtensionFromCodec(codec) {
-  // Map codecs to file extensions
-  const codecToExtension = {
-    'libx264': '.mp4',
-    'vp9_vaapi': '.webm',
-    'hevc_vaapi': '.mp4',
-    'hevc_nvenc': '.mp4',
-    // Add more mappings as needed
-  };
-
-  return codecToExtension[codec] || '.mp4'; // Default to .mp4
-}
-
-/**
- * Handles video clip requests by streaming a specific segment of the video.
- * This function is responsible for determining the appropriate audio track, video codec, and whether transcoding is required. It also manages the caching of transcoded video files.
- * @param {Object} req - Express request object.
- * @param {Object} res - Express response object.
- * @param {string} type - Type of media ('movies' or 'tv').
- * @param {string} BASE_PATH - Base path to media files.
- * @param {Object} db - Database connection.
- * @returns {Promise<void>} - Resolves when the video has been served.
- */
-export async function handleVideoRequest(req, res, type, BASE_PATH, db) {
-  const { movieName, showName, season, episode } = req.params;
-  const audioTrackParam = req.query.audio || "stereo"; // Default to "stereo" if no audio track specified
-  const videoCodecParam = req.query.video || false; // No default, use original codec if not specified
-
-  try {
-    let videoPath;
-    if (type === "movies") {
-      const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
-      videoPath = videoRef?.path;
-    } else if (type === "tv") {
-      // Get TV show data from SQLite database
-      const showData = await getTVShowByName(showName);
-
-      if (!showData) {
-        throw new Error(`Show not found: ${showName}`);
-      }
-
-      const entry = findEpisodeEntry(showData, season, episode);
-      if (!entry) {
-        throw new Error(`Episode not found: ${showName} - Season ${season} Episode ${episode}`);
-      }
-
-      const videoRef = await resolveEpisodeVideo({
-        basePath: BASE_PATH,
-        showName,
-        season,
-        episode,
-        preferFilename: entry.episode.filename,
-      });
-      videoPath = videoRef?.path;
-    }
-
-    // If no video path found:
-    if (!videoPath) {
-      throw new Error("Video file not found");
-    }
-
-    // 1) Collect audio track data
-    const audioTracks = await getAudioTracks(videoPath);
-    // 2) Figure out which track to use
-    const { selectedAudioTrack, channelCount } = determineSelectedAudioTrack(audioTracks, audioTrackParam);
-
-    // 3) Determine the original video codec using ffprobe
-    const originalCodec = await getVideoCodec(videoPath);
-
-    // 4) Decide if we need to transcode based on videoCodecParam and audio parameters
-    let needsTranscode = false;
-    let targetCodec = originalCodec; // Default to original codec
-
-    if (videoCodecParam) {
-      if (videoCodecParam !== originalCodec) {
-        needsTranscode = true;
-        targetCodec = videoCodecParam;
-      }
-    }
-
-    if (audioTrackParam !== "max" && channelCount !== 2) {
-      needsTranscode = true;
-      // Note: If targetCodec is already set by videoCodecParam, retain it
-    }
-
-    // 5) Generate cache key based on video parameters and target codec
-    const videoBaseName = basename(videoPath, extname(videoPath)); // Extracts only the filename without extension
-    // File-identity component (V-3): the video-clips key already carries
-    // info.uuid; without it here, replacing a file in place kept serving the
-    // stale transcode forever (filename + params + version never moved).
-    const { uuid: videoIdentity } = await getInfo(videoPath);
-    const cacheKeyComponents = [
-      videoBaseName,
-      `key_${videoIdentity}`,
-      selectedAudioTrack,
-      channelCount,
-      targetCodec,
-      `v${FULL_TRANSCODE_VERSION}`
-    ];
-    const cacheKey = cacheKeyComponents.join('-'); // e.g., "videoName-key_ab12…-0-2-libx264-v1.0001"
-
-    // Generate a hashed cache key to ensure it's directory-safe
-    const hashedCacheKey = generateCacheKey(cacheKey); // Assuming this hashes the string without adding slashes
-
-    // Define cache path
-    const transcodedFilePath = getCachedTranscodedPath(hashedCacheKey, getExtensionFromCodec(targetCodec))
-
-    let finalVideoPath;
-
-    if (!needsTranscode) {
-      // No transcoding needed, serve original file
-      finalVideoPath = videoPath;
-      logger.info("No transcoding needed, serving original video file.");
-    } else {
-      // Check if transcoded file already exists
-      if (await fileExists(transcodedFilePath) && !ongoingCacheGenerations.has(cacheKey)) {
-        logger.info(`Serving existing transcoded video: ${transcodedFilePath}`);
-        finalVideoPath = transcodedFilePath;
-      } else {
-        // Check if another request is already transcoding this file
-        if (ongoingCacheGenerations.has(cacheKey)) {
-          logger.info(`Waiting for ongoing transcoding of cache key: ${cacheKey}`);
-          try {
-            await waitForCache(transcodedFilePath, 500, 120000); // Wait up to 2 minutes
-            if (await fileExists(transcodedFilePath)) {
-              finalVideoPath = transcodedFilePath;
-            } else {
-              ongoingCacheGenerations.delete(cacheKey);
-              throw new Error('Transcoding failed or timed out.');
-            }
-          } catch (error) {
-            ongoingCacheGenerations.delete(cacheKey);
-            throw new Error('Transcoding timed out.');
-          }
-        } else {
-          // Initiate transcoding
-          ongoingCacheGenerations.add(cacheKey);
-          try {
-            logger.info(`Initiating transcoding for cache key: ${cacheKey}`);
-            await generateFullTranscode(videoPath, selectedAudioTrack, channelCount, transcodedFilePath, targetCodec, 'full');
-            finalVideoPath = transcodedFilePath;
-          } finally {
-            ongoingCacheGenerations.delete(cacheKey);
-          }
-        }
-      }
-    }
-
-    // Serve the final video file with range support
-    //return serveCachedClip(res, finalVideoPath, type, req);
-    return serveVideoWithRange(req, res, finalVideoPath);
-  } catch (error) {
-    logger.error(`Error in handleVideoRequest: ${error.message}`);
-    
-    // Provide helpful error responses based on error type
-    // Use 4xx status codes to avoid Apache error page interception
-    let statusCode = 422; // Unprocessable Entity - for processing failures
-    let errorMessage = "Failed to process video request";
-    let details = {};
-    
-    if (error.message.includes("not found")) {
-      statusCode = 404;
-      errorMessage = error.message;
-      details = {
-        suggestion: "Verify the media exists in the library and the path is correct"
-      };
-    } else if (error.message.includes("Stereo track not found")) {
-      statusCode = 400;
-      errorMessage = "No stereo audio track available";
-      details = {
-        suggestion: "Try using ?audio=max to select the highest quality track, or specify a track index",
-        availableOptions: ["audio=max", "audio=stereo", "audio=0", "audio=1"]
-      };
-    } else if (error.message.includes("Invalid audio track")) {
-      statusCode = 400;
-      errorMessage = "Invalid audio track specified";
-      details = {
-        suggestion: "Use ?audio=max, ?audio=stereo, or ?audio=N where N is a valid track index"
-      };
-    } else if (error.message.includes("Transcoding")) {
-      statusCode = 429; // Too Many Requests - indicates server is busy
-      errorMessage = "Video transcoding failed or timed out";
-      details = {
-        suggestion: "The server may be under heavy load. Try again in a few moments",
-        hint: "If this persists, the video file may have compatibility issues",
-        retryAfter: "30 seconds"
-      };
-    }
-    
-    // Ensure proper Content-Type to prevent Apache interception
-    res.setHeader('Content-Type', 'application/json');
-    if (statusCode === 429) {
-      res.setHeader('Retry-After', '30');
-    }
-    res.status(statusCode).json({
-      error: errorMessage,
-      statusCode,
-      timestamp: new Date().toISOString(),
-      type: type,
-      ...(Object.keys(details).length > 0 && { details })
-    });
-  }
-}
-
-/**
- * Determines the selected audio track based on the provided audio track parameter.
- * @param {Object[]} audioTracks - An array of audio track objects, each with a 'channels' property.
- * @param {string|number} audioTrackParam - The parameter specifying the desired audio track. Can be 'max', 'stereo', or a numeric index.
- * @returns {Object} An object containing the selected audio track index and the channel count of the selected track.
- * @throws {Error} If the 'stereo' track is not found or the specified audio track index is invalid.
- */
-function determineSelectedAudioTrack(audioTracks, audioTrackParam) {
-  let selectedAudioTrack;
-  if (audioTrackParam === "max") {
-    selectedAudioTrack = getHighestChannelTrack(audioTracks);
-  } else if (audioTrackParam === "stereo") {
-    selectedAudioTrack = audioTracks.findIndex(track => track.channels === 2);
-    if (selectedAudioTrack === -1) {
-      throw new Error("Stereo track not found");
-    }
-  } else {
-    selectedAudioTrack = parseInt(audioTrackParam);
-    if (isNaN(selectedAudioTrack) || selectedAudioTrack < 0 || selectedAudioTrack >= audioTracks.length) {
-      throw new Error("Invalid audio track specified");
-    }
-  }
-
-  const channelCount = audioTracks[selectedAudioTrack]?.channels || 2;
-  return { selectedAudioTrack, channelCount };
-}
-
-/**
- * Finds the audio track with the highest number of channels from the provided list of audio tracks.
- * @param {Object[]} audioTracks - An array of audio track objects, each with a 'channels' property.
- * @returns {number} The index of the audio track with the highest number of channels.
- */
-function getHighestChannelTrack(audioTracks) {
-  let highestChannelTrack = audioTracks[0];
-  for (const track of audioTracks) {
-    if (track.channels > highestChannelTrack.channels) {
-      highestChannelTrack = track;
-    }
-  }
-  return highestChannelTrack.index;
 }
 
 /**
@@ -627,6 +378,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
       return res.status(400).send(`Clip duration exceeds maximum allowed duration of ${MAX_CLIP_DURATION} seconds.`);
     }
 
+    // Optional output codec (?codec=h264 for a clip that plays on any device);
+    // see utils/clipCodec.mjs. Not echoed back: res.send answers text/html.
+    const requestedCodec = resolveClipCodec(req.query.codec);
+    if (!requestedCodec.ok) {
+      return res.status(400).send(`Unsupported codec. Supported values: ${CLIP_CODEC_VALUES.join(', ')}.`);
+    }
+
     // Check if video file exists
     if (!await fileExists(videoPath)) {
       return res.status(404).send('Video not found.');
@@ -657,9 +415,13 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     const inputPixFmt = videoStream.pix_fmt;
     const isHDR = videoStream.color_transfer?.includes('smpte2084') || 
                   videoStream.color_space?.includes('bt2020');
+    // Dolby Vision whose RPU must be applied (Profile 5) reads as neither, and
+    // every filter chain renders its base layer green; libplacebo reshapes it
+    // (see ffmpeg/dolbyVision.mjs). -show_streams carries the side data.
+    const dovi = doviReshapeRequired(videoStream) && await libplaceboAvailable();
 
     logger.info(`Video analysis: Codec=${sourceCodec}, PixFmt=${inputPixFmt}, HDR=${isHDR}, ` +
-               `Profile=${videoStream.profile}, ColorSpace=${videoStream.color_space}`);
+               `Profile=${videoStream.profile}, ColorSpace=${videoStream.color_space}, DolbyVisionReshape=${dovi}`);
     
     // Determine best encoder based on source and capabilities
     let selectedEncoderConfig;
@@ -667,7 +429,11 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     const hardwareInfo = await initHardwareInfo();
     let selectedEncoder = null;
 
-    if (!hardwareInfo || !hardwareInfo.encoder) {
+    if (requestedCodec.encoder) {
+      selectedEncoderConfig = CLIP_ENCODER_CONFIGS[requestedCodec.encoder];
+      selectedEncoder = requestedCodec.encoder;
+      logger.info(`Using ${selectedEncoder} as requested by ?codec=`);
+    } else if (!hardwareInfo || !hardwareInfo.encoder) {
       logger.info('No suitable hardware encoder found. Falling back to software encoding.');
       selectedEncoderConfig = libx264;
       selectedEncoder = 'libx264';
@@ -762,7 +528,7 @@ export async function handleVideoClipRequest(req, res, type, basePath, db) {
     try {
       // Generate the clip
       logger.info(`Generating new clip for caching: ${cacheKey}`);
-      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR, 'clip');
+      await generateAndCacheClip(videoPath, start, end, cachedClipPath, selectedEncoderConfig, isHDR, 'clip', {}, { dovi });
       
       // Serve the newly cached clip
       return serveCachedClip(res, cachedClipPath, type, req);

@@ -6,6 +6,7 @@ import sharp from 'sharp';
 import { createCategoryLogger } from './lib/logger.mjs';
 import PQueue from 'p-queue';
 import { getVideoDuration, isVideoHDR, estimateKeyframeInterval } from './ffmpeg/ffprobe.mjs';
+import { needsDoviReshape, libplaceboAvailable, doviReshapeFilter, DOVI_RESHAPE_INPUT_ARGS } from './ffmpeg/dolbyVision.mjs';
 import { getInfo } from './infoManager.mjs';
 
 const logger = createCategoryLogger('sprite');
@@ -534,9 +535,15 @@ export function planFrameTimestamps(duration, interval) {
  * Builds the per-frame video filter chain (no fps/tile — each ffmpeg call
  * extracts exactly one frame and tiling happens in sharp).
  * @param {boolean} hdr - Whether the source is HDR (adds tone mapping).
+ * @param {boolean} [dovi] - Dolby Vision whose RPU must be applied (Profile 5):
+ *   libplacebo reshapes and tone-maps it. Checked first — such a source is not
+ *   `hdr` by transfer, and neither branch below can show its base layer.
  * @returns {string} - ffmpeg -vf filter string.
  */
-function buildFrameFilters(hdr) {
+export function buildFrameFilters(hdr, dovi = false) {
+  if (dovi) {
+    return doviReshapeFilter({ width: 320, height: -2, output: 'sdr' });
+  }
   if (hdr) {
     return (
       `zscale=transfer=smpte2084:primaries=bt2020:matrix=bt2020nc:rangein=limited,` +
@@ -597,10 +604,17 @@ function runFfmpeg(args, { onProgressBlock } = {}) {
  * @param {string|null} hwaccel - Hardware decode method or null for software.
  * @param {boolean} fastSeek - Snap to nearest keyframe (-noaccurate_seek) instead of the exact frame.
  * @param {boolean} hdr - Whether the source is HDR (drives the qsv download pixel format).
+ * @param {boolean} [dovi] - The filters reshape Dolby Vision (see buildFrameFilters):
+ *   adds the Vulkan device libplacebo runs on and forces software decode, the
+ *   only decoder here that keeps the RPU (hevc_qsv drops it).
  * @returns {string[]} - ffmpeg arguments.
  */
-export function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr) {
+export function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr, dovi = false) {
   const args = ['-y', '-loglevel', 'error'];
+  if (dovi) {
+    args.push(...DOVI_RESHAPE_INPUT_ARGS);
+    hwaccel = null;
+  }
   if (fastSeek) {
     args.push('-noaccurate_seek');
   }
@@ -639,11 +653,12 @@ export function buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hw
  * @param {string} framesDir - Directory to write frame PNGs into.
  * @param {boolean} fastSeek - Snap to nearest keyframe instead of decoding to the exact frame.
  * @param {boolean} hdr - Whether the source is HDR.
+ * @param {boolean} dovi - The filters reshape Dolby Vision (software decode only).
  * @returns {Promise<(string|null)[]>} - Frame paths by index; null where extraction failed.
  */
-async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek, hdr, { onProgress = () => {} } = {}) {
+async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, fastSeek, hdr, dovi, { onProgress = () => {} } = {}) {
   const frameQueue = new PQueue({ concurrency: SPRITE_FRAME_CONCURRENCY });
-  let hwaccel = SPRITE_HWACCEL && SPRITE_HWACCEL !== 'none' ? SPRITE_HWACCEL : null;
+  let hwaccel = !dovi && SPRITE_HWACCEL && SPRITE_HWACCEL !== 'none' ? SPRITE_HWACCEL : null;
   let hwaccelWarned = false;
   const framePaths = new Array(timestamps.length).fill(null);
   let completed = 0;
@@ -653,7 +668,7 @@ async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, frame
     const outputPath = join(framesDir, `frame_${String(index).padStart(6, '0')}.png`);
     try {
       try {
-        await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr));
+        await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, hwaccel, fastSeek, hdr, dovi));
       } catch (error) {
         if (hwaccel) {
           if (!hwaccelWarned) {
@@ -661,7 +676,7 @@ async function extractFramesAtTimestamps(videoPath, timestamps, vfFilters, frame
             logger.warn(`Hardware decode (${hwaccel}) failed, falling back to software for remaining frames: ${error.message}`);
           }
           hwaccel = null;
-          await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, null, fastSeek, hdr));
+          await runFfmpeg(buildExtractArgs(videoPath, timestamp, vfFilters, outputPath, null, fastSeek, hdr, dovi));
         } else {
           throw error;
         }
@@ -777,10 +792,11 @@ async function composeSpriteSheet(framePaths, columns, rows, outputPath) {
  * silent for the whole decode; per-frame output makes it count up.
  * @returns {Promise<(string|null)[]>} - Frame PNGs by grid index (null = missing).
  */
-async function runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, totalFrames, { onProgress = () => {} } = {}) {
+async function runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, totalFrames, dovi, { onProgress = () => {} } = {}) {
   const ffmpegArgs = [
     '-y',
     '-loglevel', 'error',
+    ...(dovi ? DOVI_RESHAPE_INPUT_ARGS : []),
     '-i', videoPath,
     '-an', '-sn', '-dn',
     '-vf', `fps=1/${interval},${vfFilters}`,
@@ -872,13 +888,19 @@ export async function generateSpriteSheetWithFFmpeg(
 
     let hdr;
     let duration;
+    let doviSource;
     try {
       hdr = await isVideoHDR(videoPath);
       duration = await getVideoDuration(videoPath);
+      doviSource = await needsDoviReshape(videoPath);
     } catch (error) {
       throw tagFailure(error, FAILURE_KIND.PROBE);
     }
-    logger.info(`Video HDR: ${hdr}`);
+    // Without a usable libplacebo the old chain still runs: the frames come out
+    // green, but the sheet exists and lines up with the timeline. The probe has
+    // already warned once for the whole process.
+    const dovi = doviSource && await libplaceboAvailable();
+    logger.info(`Video HDR: ${hdr}${doviSource ? `, Dolby Vision needs RPU reshape (${dovi ? 'libplacebo' : 'unavailable — old filters'})` : ''}`);
 
     const strategy = await resolveExtractionStrategy(videoPath, interval, duration);
     const tempSpriteSheetPath = spriteSheetPath.replace(/\.[^/.]+$/, '.png');
@@ -894,12 +916,12 @@ export async function generateSpriteSheetWithFFmpeg(
     // also what makes linear progress observable, since ffmpeg's tile filter
     // emits nothing until the whole file is decoded.
     await ffmpegQueue.add(async () => {
-      const vfFilters = buildFrameFilters(hdr);
+      const vfFilters = buildFrameFilters(hdr, dovi);
       const framesDir = await fs.mkdtemp(join(dirname(spriteSheetPath), 'sprite_frames_'));
       try {
         const framePaths = strategy.seek
-          ? await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek, hdr, { onProgress: report })
-          : await runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, timestamps.length, { onProgress: report });
+          ? await extractFramesAtTimestamps(videoPath, timestamps, vfFilters, framesDir, strategy.fastSeek, hdr, dovi, { onProgress: report })
+          : await runLinearSpriteExtraction(videoPath, framesDir, interval, vfFilters, timestamps.length, dovi, { onProgress: report });
         await composeSpriteSheet(framePaths, columns, rows, tempSpriteSheetPath);
       } finally {
         await fs.rm(framesDir, { recursive: true, force: true }).catch((error) => {
