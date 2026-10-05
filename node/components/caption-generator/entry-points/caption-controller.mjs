@@ -6,8 +6,9 @@ import { enqueueTask, TaskType, getTaskStatus } from '../../../lib/taskManager.m
 import { getAutoCaptionsConfig, isLanguageEnabled } from '../data-access/caption-config.mjs';
 import { resolveTarget } from '../domain/target-resolver.mjs';
 import { extractAudio } from '../domain/audio-extractor.mjs';
+import { selectCaptionAudioTrack, NoCaptionAudioError } from '../domain/audio-track.mjs';
 import { postProcessSrt } from '../domain/srt-postprocess.mjs';
-import { getVideoDuration } from '../../../ffmpeg/ffprobe.mjs';
+import { getVideoDuration, getAudioTracks } from '../../../ffmpeg/ffprobe.mjs';
 import * as whisper from '../../../lib/whisper.mjs';
 import {
   createOrUpdateProcessQueue,
@@ -59,6 +60,8 @@ export class TargetExistsError extends Error {
     this.path = path;
   }
 }
+
+export { NoCaptionAudioError };
 
 async function fileExists(p) {
   try { await fs.access(p); return true; } catch { return false; }
@@ -115,6 +118,15 @@ async function trackProcess(action, fileKey, ...args) {
   } finally {
     if (db) await releaseDatabase(db).catch(() => {});
   }
+}
+
+/**
+ * The audio track a caption in `langCode` is transcribed from.
+ *
+ * @throws {NoCaptionAudioError} when the file's audio is all in other languages
+ */
+async function chooseAudioTrack(videoPath, langCode) {
+  return selectCaptionAudioTrack(await getAudioTracks(videoPath), langCode);
 }
 
 /**
@@ -202,6 +214,10 @@ export async function enqueueCaptionJob(req) {
     return enrichJobState(inflight);
   }
 
+  // Refuse now, not minutes later from the queue: a file with no audio in this
+  // language gets no caption, and the caller should hear that from its request.
+  await chooseAudioTrack(target.videoPath, langCode);
+
   const jobId = `cap-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const taskName = `Caption: ${req.mediaType}/${req.mediaTitle}${req.season ? `/S${req.season}E${req.episode}` : ''} [${langCode}]`;
   const processFileKey = buildProcessFileKey(req, langCode);
@@ -250,8 +266,11 @@ export async function enqueueCaptionJob(req) {
         s.completedAt = new Date().toISOString();
       }
       dedupeIndex.delete(state.dedupeKey);
-      health.lastFailureAt = new Date().toISOString();
-      health.lastFailureReason = err.message;
+      // A file with nothing to caption is not the caption engine failing.
+      if (!(err instanceof NoCaptionAudioError)) {
+        health.lastFailureAt = new Date().toISOString();
+        health.lastFailureReason = err.message;
+      }
       trackProcess('finalize', processFileKey, 'error', err.message);
       logger.error(`Caption job ${jobId} failed: ${err.message}`);
     });
@@ -289,9 +308,13 @@ async function runJob({ jobId, target, langCode, config, processFileKey }) {
   await fs.mkdir(CAPTIONS_TMP_DIR, { recursive: true });
 
   try {
-    logger.info(`[${jobId}] extracting audio: ${target.videoPath}`);
+    // Chosen again here, from the file as it is now: the job may have waited
+    // in the queue behind others, and the file can be replaced in that time.
+    const { track, matchedLanguage } = await chooseAudioTrack(target.videoPath, langCode);
+    const trackLanguage = matchedLanguage ? `tagged ${track.language}` : 'no language tag';
+    logger.info(`[${jobId}] extracting audio: ${target.videoPath} (stream ${track.index}, ${trackLanguage})`);
     await trackProcess('update', processFileKey, 1, 'in-progress', 'Extracting audio');
-    await extractAudio(target.videoPath, wavPath);
+    await extractAudio(target.videoPath, wavPath, track.index);
 
     await trackProcess('update', processFileKey, 2, 'in-progress', 'Probing audio duration');
     let audioDurationSec;

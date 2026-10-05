@@ -17,7 +17,8 @@ import {
   getHealthSnapshot,
   FeatureDisabledError,
   LanguageNotAllowedError,
-  TargetExistsError
+  TargetExistsError,
+  NoCaptionAudioError
 } from '../components/caption-generator/index.mjs';
 
 const logger = createCategoryLogger('captions-routes');
@@ -230,6 +231,10 @@ function mapEnqueueError(res, err) {
   }
   if (err instanceof TargetExistsError) {
     return res.status(409).json({ error: err.message, code: err.code, path: err.path });
+  }
+  // The file has no audio in the caption's language: nothing to retry.
+  if (err instanceof NoCaptionAudioError) {
+    return res.status(422).json({ error: err.message, code: err.code, audioLanguages: err.audioLanguages });
   }
   // resolveTarget throws plain Errors for missing files — surface as 404
   if (err && /not found/i.test(err.message)) {

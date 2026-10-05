@@ -255,13 +255,13 @@ One entry per subsystem. Each entry states what the subsystem owns (its exclusiv
 
 ### 2.10 Subtitles, chapters, and captions
 
-**Owns:** Subtitle filename parsing at scan time, chapter VTT generation, and just-in-time Whisper-based caption generation. Chapter generation is `generateChapters` in `node/chapter-generator.mjs`, served by the `/chapters/movie/...` and `/chapters/tv/...` routes in `node/app.mjs`. Auto-captions are the `caption-generator` component: config comes from MongoDB (`getAutoCaptionsConfig` in `node/components/caption-generator/data-access/caption-config.mjs`, reading the `app_config` database), stubs are injected at scan time (`domain/caption-stubs.mjs`), and generation runs through `entry-points/caption-controller.mjs` with Whisper plumbing in `node/lib/whisper.mjs`. Caption jobs enqueue under `TaskType.CAPTION_GENERATE` (limit 1).
+**Owns:** Subtitle filename parsing at scan time, chapter VTT generation, and just-in-time Whisper-based caption generation. Chapter generation is `generateChapters` in `node/chapter-generator.mjs`, served by the `/chapters/movie/...` and `/chapters/tv/...` routes in `node/app.mjs`. Auto-captions are the `caption-generator` component: config comes from MongoDB (`getAutoCaptionsConfig` in `node/components/caption-generator/data-access/caption-config.mjs`, reading the `app_config` database), stubs are injected at scan time (`domain/caption-stubs.mjs`), and generation runs through `entry-points/caption-controller.mjs` with Whisper plumbing in `node/lib/whisper.mjs`. Caption jobs enqueue under `TaskType.CAPTION_GENERATE` (limit 1). The audio a caption is transcribed from is chosen by language tag (`domain/audio-track.mjs`): a track tagged with the caption's language, else a track with no language tag, else none, in which case no caption is made (`NoCaptionAudioError`, a 422 from the routes, and not counted as an engine failure in the health snapshot). Commentary and audio-description tracks are passed over while the file has an ordinary track. ffmpeg is never left to pick: it takes the track with the most channels, which on a foreign film with an English dub is the original.
 
 **Does not own:** Video/audio transcoding (2.11) or subtitle file placement decisions during scans (scanner domain, `subtitle-filename.mjs`).
 
 **Key files:**
 - `node/chapter-generator.mjs`
-- `node/components/caption-generator/` — `index.mjs`, `data-access/caption-config.mjs`, `domain/` (audio-extractor, caption-stubs, srt-postprocess, target-resolver), `entry-points/caption-controller.mjs`
+- `node/components/caption-generator/` — `index.mjs`, `data-access/caption-config.mjs`, `domain/` (audio-extractor, audio-track, caption-stubs, srt-postprocess, target-resolver), `entry-points/caption-controller.mjs`
 - `node/lib/whisper.mjs`
 - `node/routes/captions.mjs` — caption track/job/health routes
 - `node/components/media-scanner/domain/subtitle-filename.mjs`
@@ -890,11 +890,11 @@ Every route in this module is `admin`. The title/name path segments in this modu
 
 | Method | Path | Auth | Purpose | Notes |
 |---|---|---|---|---|
-| GET | `/api/captions/track/movie/:title/:lang` | none to read; user to trigger | 302-redirect to an existing caption file, or report an in-flight job; if neither exists, requires an authenticated user (rate-limited) to enqueue generation. | Split-auth by design: reads are public, generation is not. |
+| GET | `/api/captions/track/movie/:title/:lang` | none to read; user to trigger | 302-redirect to an existing caption file, or report an in-flight job; if neither exists, requires an authenticated user (rate-limited) to enqueue generation. | Split-auth by design: reads are public, generation is not. 422 `NO_AUDIO_FOR_LANGUAGE` (with `audioLanguages`) when the file's audio is all tagged with other languages. |
 | GET | `/api/captions/track/tv/:show/:lang/:season/:episode` | none to read; user to trigger | Same, for a TV episode. | |
 | GET | `/api/captions/jobs/:jobId` | none | Poll a caption job's status. | Job IDs are `cap-<ms timestamp>-<8 random hex chars>` (~32 bits of entropy) — hard to enumerate over HTTP but not full UUIDs; the unauthenticated poll relies on that plus the jobs map being small and short-lived. |
 | GET | `/api/captions/health` | webhook-or-admin | Caption subsystem health/queue snapshot. | |
-| POST | `/api/admin/captions/generate` | admin (+ rate limit) | Manually enqueue a caption-generation job (optional `force`). | |
+| POST | `/api/admin/captions/generate` | admin (+ rate limit) | Manually enqueue a caption-generation job (optional `force`). | Same 422 as the track route. |
 
 ### A.6 Discord integration (`node/integrations/discord/routes.mjs`)
 

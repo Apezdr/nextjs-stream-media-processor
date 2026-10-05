@@ -1,7 +1,7 @@
 /**
  * Unit tests for the caption-controller orchestration logic:
  * dedupe by (videoPath, lang), skip-if-human-sub, file-already-exists,
- * and feature-disabled gating.
+ * feature-disabled gating, and which audio track is transcribed.
  *
  * The pipeline body itself (ffmpeg + whisper + write) is mocked — we're
  * testing decision logic, not the actual transcription.
@@ -59,8 +59,10 @@ jest.unstable_mockModule('../../../lib/whisper.mjs', () => ({
   inspect: jest.fn(async () => ({ binaryPresent: true, modelPresent: true })),
   getBinaryPath: () => '/mock/whisper-cli'
 }));
+const mockGetAudioTracks = jest.fn();
 jest.unstable_mockModule('../../../ffmpeg/ffprobe.mjs', () => ({
-  getVideoDuration: jest.fn(async () => 60)
+  getVideoDuration: jest.fn(async () => 60),
+  getAudioTracks: mockGetAudioTracks
 }));
 
 // process_queue + sqlite stubs — we don't want tests touching real SQLite.
@@ -85,16 +87,34 @@ process.env.CAPTIONS_TMP_DIR = join(tmpRoot, 'caption-tmp');
 
 // Pull refs to the mocked process-tracking functions so we can assert calls.
 const processTracking = await import('../../../sqlite/processTracking.mjs');
+const { extractAudio } = await import('../../../components/caption-generator/domain/audio-extractor.mjs');
+const whisper = await import('../../../lib/whisper.mjs');
 
 // Now import the controller (after mocks are registered).
 const {
   enqueueCaptionJob,
   findInflightJob,
   getJob,
+  getHealthSnapshot,
   _resetStateForTests,
   FeatureDisabledError,
-  TargetExistsError
+  TargetExistsError,
+  NoCaptionAudioError
 } = await import('../../../components/caption-generator/entry-points/caption-controller.mjs');
+
+function audioTrack(index, language, overrides = {}) {
+  return {
+    index,
+    codec: 'ac3',
+    channels: 2,
+    language,
+    title: null,
+    isDefault: false,
+    commentary: false,
+    described: false,
+    ...overrides
+  };
+}
 
 // ---- Tests ----------------------------------------------------------------
 
@@ -113,6 +133,9 @@ describe('enqueueCaptionJob', () => {
       threads: 4
     });
     mockIsLangEnabled.mockResolvedValue(true);
+    mockGetAudioTracks.mockReset();
+    mockGetAudioTracks.mockResolvedValue([audioTrack(1, 'eng', { isDefault: true })]);
+    extractAudio.mockClear();
   });
 
   it('rejects when feature is disabled', async () => {
@@ -227,5 +250,73 @@ describe('enqueueCaptionJob', () => {
     ).rejects.toBeInstanceOf(TargetExistsError);
 
     await fs.unlink(expectedPath);
+  });
+
+  it('refuses a file whose audio is all in other languages, without queueing anything', async () => {
+    mockGetAudioTracks.mockResolvedValue([
+      audioTrack(1, 'jpn', { channels: 6, isDefault: true }),
+      audioTrack(2, 'fre')
+    ]);
+    processTracking.createOrUpdateProcessQueue.mockClear();
+
+    await expect(
+      enqueueCaptionJob({ mediaType: 'movie', mediaTitle: 'Test Movie', language: 'en' })
+    ).rejects.toMatchObject({
+      code: 'NO_AUDIO_FOR_LANGUAGE',
+      audioLanguages: ['Japanese', 'French']
+    });
+
+    expect(queuedFn).toBeNull();
+    expect(findInflightJob(join(moviesDir, 'Test Movie.mp4'), 'en')).toBeNull();
+    expect(processTracking.createOrUpdateProcessQueue).not.toHaveBeenCalled();
+  });
+
+  it('transcribes the English track, not the default foreign one with more channels', async () => {
+    mockGetAudioTracks.mockResolvedValue([
+      audioTrack(1, 'jpn', { channels: 6, isDefault: true }),
+      audioTrack(2, 'eng')
+    ]);
+    whisper.transcribe.mockImplementationOnce(async ({ outputBase }) => {
+      await fs.writeFile(`${outputBase}.srt`, ['1', '00:00:00,000 --> 00:00:01,000', 'Hello.', ''].join('\n'));
+    });
+
+    const job = await enqueueCaptionJob({ mediaType: 'movie', mediaTitle: 'Test Movie', language: 'en' });
+    await queuedFn();
+
+    expect(extractAudio).toHaveBeenCalledTimes(1);
+    expect(extractAudio.mock.calls[0][0]).toBe(join(moviesDir, 'Test Movie.mp4'));
+    expect(extractAudio.mock.calls[0][2]).toBe(2);
+
+    await fs.unlink(job.expectedPath);
+  });
+
+  it('chooses the track again when the job runs, and a refusal then is not an engine failure', async () => {
+    const job = await enqueueCaptionJob({ mediaType: 'movie', mediaTitle: 'Test Movie', language: 'en' });
+
+    // The file was replaced while the job waited in the queue.
+    mockGetAudioTracks.mockResolvedValue([audioTrack(1, 'ger', { isDefault: true })]);
+    await queuedFn().then(queuedResolver, queuedRejecter);
+    await new Promise(r => setImmediate(r));
+
+    expect(extractAudio).not.toHaveBeenCalled();
+    const stored = getJob(job.jobId);
+    expect(stored.status).toBe('failed');
+    expect(stored.error).toBe('No English audio track to caption (audio: German)');
+
+    const snapshot = await getHealthSnapshot();
+    expect(snapshot.queue.lastFailureAt).toBeNull();
+    expect(snapshot.status).toBe('ready');
+  });
+
+  it('still counts any other job failure against the engine', async () => {
+    await enqueueCaptionJob({ mediaType: 'movie', mediaTitle: 'Test Movie', language: 'en' });
+    extractAudio.mockRejectedValueOnce(new Error('ffmpeg exited with code 1'));
+
+    await queuedFn().then(queuedResolver, queuedRejecter);
+    await new Promise(r => setImmediate(r));
+
+    const snapshot = await getHealthSnapshot();
+    expect(snapshot.queue.lastFailureReason).toBe('ffmpeg exited with code 1');
+    expect(snapshot.status).toBe('degraded');
   });
 });
