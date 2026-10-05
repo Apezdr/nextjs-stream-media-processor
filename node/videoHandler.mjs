@@ -1,7 +1,7 @@
 // videoHandler.mjs
 //
 // GET /videoClip/movie/:movieName and /videoClip/tv/:showName/:season/:episode
-//   ?start=<s>&end=<s>[&useOriginalVideo=true][&codec=h264]
+//   ?start=<s>&end=<s>[&quality=high|medium|low][&useOriginalVideo=true][&codec=h264]
 //
 // A short clip of a title, made once and cached on disk as MP4. What the two
 // kinds of clip are, and why, is in ffmpeg/clipEncode.mjs. This file is the
@@ -33,6 +33,8 @@ import {
   transcodeClip,
   copyOriginalClip,
   ClipNotCopyableError,
+  resolveClipQuality,
+  CLIP_QUALITY_VALUES,
 } from './ffmpeg/clipEncode.mjs';
 
 const logger = createCategoryLogger('videoHandler');
@@ -272,7 +274,8 @@ async function serveOriginalClip(req, res, clip) {
 
 /** The H.264 clip: what a browser gets, and the fallback for the original path. */
 async function serveTranscodedClip(req, res, clip) {
-  const cacheKey = `${clip.keyBase}-h264`;
+  // Each quality level is its own file.
+  const cacheKey = `${clip.keyBase}-h264-${clip.quality}`;
   const cachedPath = getCachedClipPath(cacheKey, '.mp4');
 
   if (!(await fileExists(cachedPath))) {
@@ -287,6 +290,7 @@ async function serveTranscodedClip(req, res, clip) {
         start: clip.start,
         duration: clip.duration,
         source,
+        quality: clip.quality,
         outputPath: cachedPath,
       });
     });
@@ -326,6 +330,14 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
       return res.status(400).send(`Unsupported codec. Supported values: ${CLIP_CODEC_VALUES.join(', ')}.`);
     }
 
+    // How much picture the encoded clip carries (CLIP_QUALITIES in
+    // ffmpeg/clipEncode.mjs). An original-quality clip is a copy and has no
+    // levels; there it only decides the clip sent when the source cannot be copied.
+    const quality = resolveClipQuality(req.query.quality);
+    if (!quality) {
+      return res.status(400).send(`Unsupported quality. Supported values: ${CLIP_QUALITY_VALUES.join(', ')}.`);
+    }
+
     const { title, videoPath } = await resolveClipMedia(type, req.params, basePath);
 
     // Check if video file exists
@@ -348,6 +360,7 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
       start,
       end,
       duration: end - start,
+      quality,
       keyBase: `${title}-key_${info.uuid}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}`,
     };
 

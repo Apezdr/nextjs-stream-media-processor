@@ -113,7 +113,15 @@ The application periodically clears old cache files to free up disk space. Adjus
 
 `/videoClip/...?start=<s>&end=<s>` makes a bounded preview clip (at most 10 minutes) and caches it. Every clip is H.264 + AAC stereo in a faststart MP4, at most 1280x720, which plays on practically any device, an iPhone included; HDR and Dolby Vision sources are tone-mapped to SDR. The clip starts exactly at `start`. `codec=h264` and `codec=auto` are accepted and mean the same thing (share links written while there was a choice still carry `codec=h264`); any other value is a 400.
 
-`&useOriginalVideo=true` asks for the source's own picture instead (at most 2 minutes): the video stream is copied into MP4 and the audio re-encoded to AAC stereo. A copy has to begin on a keyframe, so this clip starts at the last keyframe at or before `start`. Sources that cannot be copied this way (anything other than 8-bit H.264 or 8/10-bit HEVC, and Dolby Vision that needs its RPU) get the encoded clip.
+`&quality=` picks how much picture the clip carries. Each level is cached separately, and a value other than these three is a 400:
+
+| `quality` | Picture | Video | Audio | A 50 s clip (dark film / clean digital / 2160p HDR) |
+|---|---|---|---|---|
+| `high` (default) | inside 1280x720 | CRF 23, at most 2 Mb/s | 128 kb/s | 2.1 / 7.8 / 8.9 MB |
+| `medium` | inside 1280x720 | CRF 28, at most 1.2 Mb/s | 96 kb/s | 1.3 / 4.1 / 4.7 MB |
+| `low` | inside 854x480 | CRF 30, at most 600 kb/s | 64 kb/s | 0.7 / 2.0 / 2.2 MB |
+
+`&useOriginalVideo=true` asks for the source's own picture instead (at most 2 minutes): the video stream is copied into MP4 and the audio re-encoded to AAC stereo. A copy has to begin on a keyframe, so this clip starts at the last keyframe at or before `start`. Sources that cannot be copied this way (anything other than 8-bit H.264 or 8/10-bit HEVC, and Dolby Vision that needs its RPU) get the encoded clip, at the `quality` the URL asks for. A copy itself has no quality levels.
 
 `VIDEO_CLIP_CONCURRENCY` sets how many clips are encoded at once (default: one per eight logical CPUs, between 2 and 4). Full-length playback and transcoding are not served from here: the JIT transcoder (`jit-transcoder` repo) owns them.
 

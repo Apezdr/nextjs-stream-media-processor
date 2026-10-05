@@ -206,6 +206,27 @@ describeWithTools('clips made by the real ffmpeg', () => {
       expect(clip.videoPackets).toBe(96); // 4 s at 24 fps, not 4 s plus a lead-in
     });
 
+    it('makes a smaller picture and a smaller file at each lower quality level', async () => {
+      const made = {};
+      for (const quality of ['high', 'medium', 'low']) {
+        const outputPath = output(`h264-${quality}.mp4`);
+        await clipEncode.transcodeClip({
+          videoPath: source('h264.mp4'), start: 3.5, duration: 4, source: sources['h264.mp4'], quality, outputPath,
+        });
+        made[quality] = { clip: await inspect(outputPath), size: (await fs.stat(outputPath)).size };
+        expect(made[quality].clip.video.codec_name).toBe('h264');
+        expect(made[quality].clip.video.profile).toBe('High');
+        expect(made[quality].clip.video.pix_fmt).toBe('yuv420p');
+        expect(made[quality].clip.videoPackets).toBe(96); // the same four seconds at every level
+      }
+
+      expect([made.high.clip.video.width, made.high.clip.video.height]).toEqual([1280, 720]);
+      expect([made.medium.clip.video.width, made.medium.clip.video.height]).toEqual([1280, 720]);
+      expect([made.low.clip.video.width, made.low.clip.video.height]).toEqual([854, 480]);
+      expect(made.medium.size).toBeLessThan(made.high.size);
+      expect(made.low.size).toBeLessThan(made.medium.size);
+    });
+
     it('keeps a small picture small, makes an odd size even, and downmixes 5.1', async () => {
       const outputPath = output('odd-transcode.mp4');
       await clipEncode.transcodeClip({
@@ -359,7 +380,7 @@ describeWithTools('clips made by the real ffmpeg', () => {
       }
 
       // One clip in the cache, no temp file, and it is what was sent.
-      const cacheFile = 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-h264.mp4';
+      const cacheFile = 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-h264-high.mp4';
       expect(await fs.readdir(library.cacheDir)).toEqual([cacheFile]);
       const clip = await inspect(path.join(library.cacheDir, cacheFile));
       expectStrictMp4(clip);
@@ -392,6 +413,20 @@ describeWithTools('clips made by the real ffmpeg', () => {
       expect((await download(second)).equals(bytes)).toBe(true);
       expect(second.headers.get('etag')).toBe(first.headers.get('etag'));
       expect((await fs.stat(cacheFile)).mtimeMs).toBe(written.mtimeMs);
+    });
+
+    it('serves a lower quality level when the URL asks for one', async () => {
+      const response = await fetch(url('start=3.5&end=7.5&quality=low'));
+      expect(response.status).toBe(200);
+      const bytes = await download(response);
+      expect(isMp4(bytes)).toBe(true);
+
+      const cacheFile = path.join(library.cacheDir, 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-h264-low.mp4');
+      const clip = await inspect(cacheFile);
+      expect([clip.video.width, clip.video.height]).toEqual([854, 480]);
+
+      const high = await fs.stat(path.join(library.cacheDir, 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-h264-high.mp4'));
+      expect(bytes.length).toBeLessThan(high.size);
     });
 
     it('answers 404 for a title it does not know, without running anything', async () => {

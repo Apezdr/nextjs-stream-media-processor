@@ -16,6 +16,10 @@ import {
   buildOriginalArgs,
   canCopyOriginal,
   planOriginalCopy,
+  resolveClipQuality,
+  CLIP_QUALITIES,
+  CLIP_QUALITY_VALUES,
+  DEFAULT_CLIP_QUALITY,
 } from '../../../ffmpeg/clipEncode.mjs';
 
 const videoStream = (overrides = {}) => ({
@@ -160,6 +164,74 @@ describe('buildClipVideoFilter', () => {
     expect(filter).toContain('setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc,');
     expect(filter).toContain('zscale=tin=arib-std-b67:');
     expect(filter).not.toContain('smpte2084');
+  });
+});
+
+describe('quality levels (?quality=)', () => {
+  it('offers high, medium and low, and gives high to a request that does not say', () => {
+    expect(CLIP_QUALITY_VALUES).toEqual(['high', 'medium', 'low']);
+    expect(DEFAULT_CLIP_QUALITY).toBe('high');
+    for (const param of [undefined, '']) {
+      expect(resolveClipQuality(param)).toBe('high');
+    }
+  });
+
+  it('accepts a level in any case', () => {
+    expect(resolveClipQuality('low')).toBe('low');
+    expect(resolveClipQuality('MEDIUM')).toBe('medium');
+    expect(resolveClipQuality(' High ')).toBe('high');
+  });
+
+  it('rejects anything else instead of falling back to a level nobody asked for', () => {
+    for (const param of ['best', 'ultra', '720p', '28', 'toString', '__proto__', ['low', 'low'], 3, null]) {
+      expect(resolveClipQuality(param)).toBeNull();
+    }
+  });
+
+  it('gets smaller from high to low, in picture, bitrate ceiling and audio', () => {
+    const bits = (value) => (value.endsWith('M') ? parseFloat(value) * 1000 : parseFloat(value));
+    const { high, medium, low } = CLIP_QUALITIES;
+
+    expect(medium.crf).toBeGreaterThan(high.crf);
+    expect(low.crf).toBeGreaterThan(medium.crf);
+    expect(bits(medium.maxrate)).toBeLessThan(bits(high.maxrate));
+    expect(bits(low.maxrate)).toBeLessThan(bits(medium.maxrate));
+    expect(bits(low.audioBitrate)).toBeLessThan(bits(high.audioBitrate));
+    expect(low.width * low.height).toBeLessThan(high.width * high.height);
+    // The ceiling is a VBV limit: it needs its buffer.
+    for (const level of [high, medium, low]) {
+      expect(bits(level.bufsize)).toBe(bits(level.maxrate) * 2);
+      expect(level.width % 2).toBe(0);
+      expect(level.height % 2).toBe(0);
+    }
+  });
+
+  it('encodes medium inside the same 720p box at a lower target', () => {
+    const args = buildTranscodeArgs({
+      videoPath: '/media/a.mkv', start: 0, duration: 10, source: SDR, pipeline: 'none', quality: 'medium', outputPath: '/cache/x.part',
+    });
+    expect(args[args.indexOf('-vf') + 1]).toBe(`scale=${FIT},format=yuv420p`);
+    expect(args.join(' ')).toContain('-crf 28 -maxrate 1200k -bufsize 2400k');
+    expect(args.join(' ')).toContain('-c:a aac -b:a 96k');
+  });
+
+  it('encodes low inside 854x480, for SDR and for both tone-maps', () => {
+    const lowFit = "w='min(854,iw)':h='min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    const args = buildTranscodeArgs({
+      videoPath: '/media/a.mkv', start: 0, duration: 10, source: SDR, pipeline: 'none', quality: 'low', outputPath: '/cache/x.part',
+    });
+    expect(args[args.indexOf('-vf') + 1]).toBe(`scale=${lowFit},format=yuv420p`);
+    expect(args.join(' ')).toContain('-crf 30 -maxrate 600k -bufsize 1200k');
+    expect(args.join(' ')).toContain('-c:a aac -b:a 64k');
+
+    expect(buildClipVideoFilter(HDR10, 'libplacebo', 'low')).toContain(`libplacebo=${lowFit}:apply_dolbyvision=1`);
+    expect(buildClipVideoFilter(HDR10, 'zscale', 'low')).toContain(`,scale=${lowFit},zscale=`);
+  });
+
+  it('is the default level when a builder is not told', () => {
+    const base = { videoPath: '/media/a.mkv', start: 0, duration: 10, source: SDR, pipeline: 'none', outputPath: '/cache/x.part' };
+    expect(buildTranscodeArgs(base)).toEqual(buildTranscodeArgs({ ...base, quality: 'high' }));
+    expect(buildClipVideoFilter(HDR10, 'libplacebo')).toBe(buildClipVideoFilter(HDR10, 'libplacebo', 'high'));
   });
 });
 

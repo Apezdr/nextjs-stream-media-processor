@@ -5,7 +5,8 @@
 // client of this endpoint plays: desktop browsers, Safari on an iPhone,
 // ExoPlayer on Android TV and AVPlayer on Apple TV.
 //
-//   transcode  H.264 High, 8-bit 4:2:0, AAC stereo, fitted inside 1280x720.
+//   transcode  H.264 High, 8-bit 4:2:0, AAC stereo, fitted inside 1280x720 (or
+//              854x480 at the lowest quality level; see CLIP_QUALITIES).
 //              ONE ffmpeg pass seeks, decodes and encodes, so the clip starts on
 //              the requested frame with audio and video together. HDR and Dolby
 //              Vision are tone-mapped to BT.709. Every browser gets this one.
@@ -70,9 +71,56 @@ const COPYABLE_PIXEL_FORMATS = Object.freeze({
   hevc: new Set(['yuv420p', 'yuvj420p', 'yuv420p10le']),
 });
 
-// The picture fits inside 1280x720 and is never enlarged; libx264 needs even sides.
-const FIT_WIDTH = "'min(1280,iw)'";
-const FIT_HEIGHT = "'min(720,ih)'";
+/**
+ * How much picture a transcoded clip carries, chosen with `?quality=`.
+ *
+ * Named levels rather than encoder numbers, so a URL keeps meaning the same
+ * thing if the encoder behind it changes. Each level is a box the picture is
+ * fitted inside, an x264 quality target with a bitrate ceiling, and an audio
+ * bitrate. Measured on three 20 s samples from the production library (clean
+ * digital, dark, grainy film), video only:
+ *
+ *   high    987 / 221 / 2011 kb/s   the default
+ *   medium  476 / 106 / 1203 kb/s   about half of high
+ *   low     206 /  46 /  608 kb/s   about a fifth of high, at 480p
+ *
+ * For scale, the hardware VP9 clips this endpoint used to make came out at
+ * 509 / 331 / 517 kb/s on the same samples.
+ *
+ * Changing a level's numbers changes the bytes of clips already in the cache
+ * under that name: bump VIDEO_CLIP_VERSION in videoHandler.mjs when you do.
+ */
+export const CLIP_QUALITIES = Object.freeze({
+  high: Object.freeze({ width: 1280, height: 720, crf: 23, maxrate: '2M', bufsize: '4M', audioBitrate: '128k' }),
+  medium: Object.freeze({ width: 1280, height: 720, crf: 28, maxrate: '1200k', bufsize: '2400k', audioBitrate: '96k' }),
+  low: Object.freeze({ width: 854, height: 480, crf: 30, maxrate: '600k', bufsize: '1200k', audioBitrate: '64k' }),
+});
+
+/** The level a request gets when it does not ask for one. */
+export const DEFAULT_CLIP_QUALITY = 'high';
+
+/** Every value `?quality=` accepts, for error messages and docs. */
+export const CLIP_QUALITY_VALUES = Object.freeze(Object.keys(CLIP_QUALITIES));
+
+/**
+ * Parse `?quality=`. Absent or empty is the default level; a known level, in
+ * any case, is itself; anything else (a repeated parameter included, which
+ * Express hands over as an array) is null, for the caller to reject rather
+ * than quietly serve a level nobody asked for.
+ *
+ * @param {unknown} param - req.query.quality
+ * @returns {keyof typeof CLIP_QUALITIES | null}
+ */
+export function resolveClipQuality(param) {
+  if (param === undefined || param === '') return DEFAULT_CLIP_QUALITY;
+  if (typeof param !== 'string') return null;
+  const value = param.trim().toLowerCase();
+  return Object.hasOwn(CLIP_QUALITIES, value) ? value : null;
+}
+
+// The picture fits inside the level's box and is never enlarged; libx264 needs even sides.
+const fitWidth = (level) => `'min(${level.width},iw)'`;
+const fitHeight = (level) => `'min(${level.height},ih)'`;
 const FIT_FLAGS = 'force_original_aspect_ratio=decrease:force_divisible_by=2';
 
 const QUIET_FLAGS = Object.freeze(['-hide_banner', '-loglevel', 'error', '-nostdin', '-y']);
@@ -94,19 +142,20 @@ const STREAM_SELECTION = Object.freeze([
 //   subme=1   measured there on a 50 s 1080p clip: 12.1 s with veryfast's
 //             default of 2, 5.1 s with 1, for a file within 3% of the same
 //             size. More encoder threads did not close that gap.
-//   crf 23, capped at 2 Mb/s: a 50 s clip stays under ~13 MB however grainy.
+//   crf with a bitrate ceiling (both from the quality level): at the default
+//             level a 50 s clip stays under ~13 MB however grainy the film.
 //   -g 48     a keyframe at least every 2 s at film rates.
-const H264_ARGS = Object.freeze([
+const h264Args = (level) => [
   '-c:v', 'libx264',
   '-preset', 'veryfast',
   '-x264-params', 'subme=1',
-  '-crf', '23',
-  '-maxrate', '2M',
-  '-bufsize', '4M',
+  '-crf', String(level.crf),
+  '-maxrate', level.maxrate,
+  '-bufsize', level.bufsize,
   '-profile:v', 'high',
   '-pix_fmt', 'yuv420p',
   '-g', '48',
-]);
+];
 
 // Only for a tone-mapped clip, where the output is BT.709 by construction. An
 // SDR source keeps whatever tags it came with (an SD title is BT.601, and
@@ -244,27 +293,31 @@ export function selectColorPipeline(source, { libplacebo }) {
 }
 
 /**
- * The -vf for a transcoded clip: fit inside 1280x720, 8-bit 4:2:0, BT.709.
+ * The -vf for a transcoded clip: fit inside the quality level's box, 8-bit
+ * 4:2:0, BT.709.
  *
  * @param {ClipSource} source
  * @param {'none'|'libplacebo'|'zscale'} pipeline
+ * @param {keyof typeof CLIP_QUALITIES} [quality]
  * @returns {string}
  */
-export function buildClipVideoFilter(source, pipeline) {
+export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QUALITY) {
+  const level = CLIP_QUALITIES[quality];
+
   if (pipeline === 'libplacebo') {
     // Tone-map and scale in one GPU pass. The same filter (and so the same
     // look) as the stills and sprite sheets of a Dolby Vision title. It reads
     // the frame's own color tags, so only a source that has none needs telling.
     const toneMap = doviReshapeFilter({
-      width: FIT_WIDTH,
-      height: FIT_HEIGHT,
+      width: fitWidth(level),
+      height: fitHeight(level),
       output: 'sdr',
       fitInside: true,
     });
     return source.assumedPq ? `${bt2020Tags('smpte2084')},${toneMap}` : toneMap;
   }
 
-  const fit = `scale=w=${FIT_WIDTH}:h=${FIT_HEIGHT}:${FIT_FLAGS}`;
+  const fit = `scale=w=${fitWidth(level)}:h=${fitHeight(level)}:${FIT_FLAGS}`;
 
   if (pipeline === 'zscale') {
     const transferIn = source.transfer === 'hlg' ? 'arib-std-b67' : 'smpte2084';
@@ -273,7 +326,7 @@ export function buildClipVideoFilter(source, pipeline) {
       // tags. A source with any of them missing fails there ("no path between
       // colorspaces"), so the frames are tagged in full first.
       bt2020Tags(transferIn),
-      // Scale before the float tone-map, so it runs on a 720p picture, not a 2160p one.
+      // Scale before the float tone-map, so it runs on the small picture, not a 2160p one.
       fit,
       `zscale=tin=${transferIn}:min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=100`,
       'format=gbrpf32le',
@@ -298,10 +351,20 @@ export function buildClipVideoFilter(source, pipeline) {
  * @param {number} params.duration  - Seconds
  * @param {ClipSource} params.source
  * @param {'none'|'libplacebo'|'zscale'} params.pipeline
+ * @param {keyof typeof CLIP_QUALITIES} [params.quality]
  * @param {string} params.outputPath
  * @returns {string[]}
  */
-export function buildTranscodeArgs({ videoPath, start, duration, source, pipeline, outputPath }) {
+export function buildTranscodeArgs({
+  videoPath,
+  start,
+  duration,
+  source,
+  pipeline,
+  quality = DEFAULT_CLIP_QUALITY,
+  outputPath,
+}) {
+  const level = CLIP_QUALITIES[quality];
   return [
     ...QUIET_FLAGS,
     ...(pipeline === 'libplacebo' ? DOVI_RESHAPE_INPUT_ARGS : []),
@@ -309,10 +372,10 @@ export function buildTranscodeArgs({ videoPath, start, duration, source, pipelin
     '-i', videoPath,
     '-t', seconds(duration),
     ...STREAM_SELECTION,
-    '-vf', buildClipVideoFilter(source, pipeline),
-    ...H264_ARGS,
+    '-vf', buildClipVideoFilter(source, pipeline, quality),
+    ...h264Args(level),
     ...(pipeline === 'none' ? [] : BT709_TAGS),
-    ...aacArgs('128k'),
+    ...aacArgs(level.audioBitrate),
     ...MP4_OUTPUT_FLAGS,
     outputPath,
   ];
@@ -461,10 +524,18 @@ async function writeClipFile({ outputPath, buildArgs, timeoutMs, span }) {
  * @param {number} params.start
  * @param {number} params.duration
  * @param {ClipSource} params.source
+ * @param {keyof typeof CLIP_QUALITIES} [params.quality]
  * @param {string} params.outputPath - Final cache path
  * @returns {Promise<void>}
  */
-export async function transcodeClip({ videoPath, start, duration, source, outputPath }) {
+export async function transcodeClip({
+  videoPath,
+  start,
+  duration,
+  source,
+  quality = DEFAULT_CLIP_QUALITY,
+  outputPath,
+}) {
   // Probed only for a source that needs it; an SDR library never touches Vulkan.
   const wantsColorManagement = selectColorPipeline(source, { libplacebo: true }) === 'libplacebo';
   const libplacebo = wantsColorManagement && (await libplaceboAvailable());
@@ -473,9 +544,9 @@ export async function transcodeClip({ videoPath, start, duration, source, output
   await writeClipFile({
     outputPath,
     buildArgs: (tempPath) =>
-      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, outputPath: tempPath }),
+      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, quality, outputPath: tempPath }),
     timeoutMs: transcodeTimeoutMs(duration),
-    span: { inputPath: videoPath, startTime: start, duration, codec: 'h264' },
+    span: { inputPath: videoPath, startTime: start, duration, codec: `h264-${quality}` },
   });
 }
 

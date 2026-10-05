@@ -61,12 +61,17 @@ const probeClipSource = jest.fn();
 const canCopyOriginal = jest.fn();
 const transcodeClip = jest.fn();
 const copyOriginalClip = jest.fn();
+// The quality levels are the real ones: they are pure, and the handler's
+// validation and cache names are about them.
+const { resolveClipQuality, CLIP_QUALITY_VALUES } = await import('../../ffmpeg/clipEncode.mjs');
 jest.unstable_mockModule('../../ffmpeg/clipEncode.mjs', () => ({
   probeClipSource,
   canCopyOriginal,
   transcodeClip,
   copyOriginalClip,
   ClipNotCopyableError,
+  resolveClipQuality,
+  CLIP_QUALITY_VALUES,
 }));
 
 const { handleVideoClipRequest } = await import('../../videoHandler.mjs');
@@ -161,6 +166,15 @@ describe('request validation', () => {
     expect(transcodeClip).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects a quality level it does not have', async () => {
+    for (const value of ['best', '28', 'low&quality=low']) {
+      const response = await fetch(clipUrl(`start=0&end=10&quality=${value}`));
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe('Unsupported quality. Supported values: high, medium, low.');
+    }
+    expect(transcodeClip).not.toHaveBeenCalled();
+  });
+
   it('rejects a clip that runs past the end of the video', async () => {
     probeClipSource.mockResolvedValue({ ...SOURCE, duration: 3240 });
     const response = await fetch(clipUrl('start=3200&end=3250'));
@@ -215,7 +229,8 @@ describe('the encoded clip', () => {
       start: 3200,
       duration: 50,
       source: SOURCE,
-      outputPath: path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264.mp4`),
+      quality: 'high',
+      outputPath: path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`),
     });
 
     const second = await fetch(clipUrl());
@@ -225,7 +240,7 @@ describe('the encoded clip', () => {
   });
 
   it('serves a cached clip without touching ffprobe at all', async () => {
-    await fs.writeFile(path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264.mp4`), TRANSCODED);
+    await fs.writeFile(path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`), TRANSCODED);
 
     const response = await fetch(clipUrl());
     expect((await body(response)).equals(TRANSCODED)).toBe(true);
@@ -261,6 +276,23 @@ describe('the encoded clip', () => {
       expect((await body(response)).equals(TRANSCODED)).toBe(true);
     }
     expect(transcodeClip).toHaveBeenCalledTimes(1);
+    expect(probeClipSource).toHaveBeenCalledTimes(1);
+  });
+
+  it('makes and caches each quality level separately, and treats no level as high', async () => {
+    await fetch(clipUrl('start=3200&end=3250')).then(body);
+    await fetch(clipUrl('start=3200&end=3250&quality=high')).then(body);
+    await fetch(clipUrl('start=3200&end=3250&quality=LOW')).then(body);
+    await fetch(clipUrl('start=3200&end=3250&quality=medium')).then(body);
+    await fetch(clipUrl('start=3200&end=3250&quality=low')).then(body);
+
+    expect(transcodeClip.mock.calls.map(([params]) => params.quality)).toEqual(['high', 'low', 'medium']);
+    expect((await cached()).sort()).toEqual([
+      `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`,
+      `A Film-key_${uuid}-start_3200-end_3250-v2-h264-low.mp4`,
+      `A Film-key_${uuid}-start_3200-end_3250-v2-h264-medium.mp4`,
+    ]);
+    // One source, probed once for all three.
     expect(probeClipSource).toHaveBeenCalledTimes(1);
   });
 
@@ -314,7 +346,7 @@ describe('the encoded clip', () => {
     await pause(100);
 
     expect(transcodeClip).toHaveBeenCalledTimes(1);
-    expect(await cached()).toEqual([`A Film-key_${uuid}-start_100-end_150-v2-h264.mp4`]);
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_100-end_150-v2-h264-high.mp4`]);
   });
 
   it('serves a TV episode clip under the show title', async () => {
@@ -323,7 +355,7 @@ describe('the encoded clip', () => {
     expect(resolveEpisodeVideo).toHaveBeenCalledWith({
       basePath: root, showName: 'A Show', season: '1', episode: '2', preferFilename: 'S01E02.mkv',
     });
-    expect(await cached()).toEqual([`A Show-key_${uuid}-start_600-end_650-v2-h264.mp4`]);
+    expect(await cached()).toEqual([`A Show-key_${uuid}-start_600-end_650-v2-h264-high.mp4`]);
   });
 });
 
@@ -357,6 +389,19 @@ describe('the original-quality clip (?useOriginalVideo=true)', () => {
     expect(response.status).toBe(200);
     expect((await body(response)).equals(TRANSCODED)).toBe(true);
     expect(copyOriginalClip).not.toHaveBeenCalled();
+  });
+
+  it('uses the requested quality level for that fallback, and for nothing else', async () => {
+    // A copy has no levels: the same original-quality file answers every one.
+    await fetch(originalUrl('start=100&end=150&quality=low')).then(body);
+    await fetch(originalUrl('start=100&end=150&quality=high')).then(body);
+    expect(copyOriginalClip).toHaveBeenCalledTimes(1);
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_100-end_150-v2-original.mp4`]);
+
+    canCopyOriginal.mockReturnValue(false);
+    const response = await fetch(originalUrl('start=200&end=250&quality=low'));
+    expect((await body(response)).equals(TRANSCODED)).toBe(true);
+    expect(transcodeClip).toHaveBeenCalledWith(expect.objectContaining({ start: 200, quality: 'low' }));
   });
 
   it('sends the encoded clip when the copy finds no keyframe to start on', async () => {
