@@ -20,6 +20,7 @@ import {
   CLIP_QUALITIES,
   CLIP_QUALITY_VALUES,
   DEFAULT_CLIP_QUALITY,
+  CLIP_ENCODERS,
 } from '../../../ffmpeg/clipEncode.mjs';
 
 const videoStream = (overrides = {}) => ({
@@ -192,17 +193,42 @@ describe('quality levels (?quality=)', () => {
     const bits = (value) => (value.endsWith('M') ? parseFloat(value) * 1000 : parseFloat(value));
     const { high, medium, low } = CLIP_QUALITIES;
 
-    expect(medium.crf).toBeGreaterThan(high.crf);
-    expect(low.crf).toBeGreaterThan(medium.crf);
-    expect(bits(medium.maxrate)).toBeLessThan(bits(high.maxrate));
-    expect(bits(low.maxrate)).toBeLessThan(bits(medium.maxrate));
+    expect(medium.libx264.crf).toBeGreaterThan(high.libx264.crf);
+    expect(low.libx264.crf).toBeGreaterThan(medium.libx264.crf);
+    expect(bits(medium.libx264.maxrate)).toBeLessThan(bits(high.libx264.maxrate));
+    expect(bits(low.libx264.maxrate)).toBeLessThan(bits(medium.libx264.maxrate));
     expect(bits(low.audioBitrate)).toBeLessThan(bits(high.audioBitrate));
     expect(low.width * low.height).toBeLessThan(high.width * high.height);
     // The ceiling is a VBV limit: it needs its buffer.
     for (const level of [high, medium, low]) {
-      expect(bits(level.bufsize)).toBe(bits(level.maxrate) * 2);
+      expect(bits(level.libx264.bufsize)).toBe(bits(level.libx264.maxrate) * 2);
       expect(level.width % 2).toBe(0);
       expect(level.height % 2).toBe(0);
+    }
+  });
+
+  it('has settings for every encoder at every level, falling the same way', () => {
+    const { high, medium, low } = CLIP_QUALITIES;
+    for (const encoder of Object.keys(CLIP_ENCODERS)) {
+      for (const level of [high, medium, low]) {
+        expect(level[encoder]).toBeDefined();
+      }
+    }
+
+    // A higher number is a lower quality target for all three encoders.
+    expect(medium.libsvtav1.crf).toBeGreaterThan(high.libsvtav1.crf);
+    expect(low.libsvtav1.crf).toBeGreaterThan(medium.libsvtav1.crf);
+    expect(medium.libsvtav1.maxKbps).toBeLessThan(high.libsvtav1.maxKbps);
+    expect(low.libsvtav1.maxKbps).toBeLessThan(medium.libsvtav1.maxKbps);
+    expect(medium.av1_qsv.quality).toBeGreaterThan(high.av1_qsv.quality);
+    expect(low.av1_qsv.quality).toBeGreaterThan(medium.av1_qsv.quality);
+
+    // The two capped encoders share their ceilings, so a level means one size limit.
+    for (const level of [high, medium, low]) {
+      const x264Ceiling = level.libx264.maxrate.endsWith('M')
+        ? parseFloat(level.libx264.maxrate) * 1000
+        : parseFloat(level.libx264.maxrate);
+      expect(level.libsvtav1.maxKbps).toBe(x264Ceiling);
     }
   });
 
@@ -232,6 +258,79 @@ describe('quality levels (?quality=)', () => {
     const base = { videoPath: '/media/a.mkv', start: 0, duration: 10, source: SDR, pipeline: 'none', outputPath: '/cache/x.part' };
     expect(buildTranscodeArgs(base)).toEqual(buildTranscodeArgs({ ...base, quality: 'high' }));
     expect(buildClipVideoFilter(HDR10, 'libplacebo')).toBe(buildClipVideoFilter(HDR10, 'libplacebo', 'high'));
+  });
+});
+
+describe('AV1 (?codec=av1)', () => {
+  const base = { videoPath: '/media/movies/A Film/A Film.mkv', start: 3200, duration: 50, outputPath: '/cache/x.part' };
+
+  it('names the codec each encoder makes', () => {
+    expect(CLIP_ENCODERS.libx264.codec).toBe('h264');
+    expect(CLIP_ENCODERS.libsvtav1.codec).toBe('av1');
+    expect(CLIP_ENCODERS.av1_qsv.codec).toBe('av1');
+  });
+
+  it('encodes with SVT-AV1 in software: same pass, same streams, same container', () => {
+    expect(buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'libsvtav1' })).toEqual([
+      '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+      '-ss', '3200',
+      '-i', '/media/movies/A Film/A Film.mkv',
+      '-t', '50',
+      '-map', '0:V:0', '-map', '0:a:0?', '-sn', '-dn', '-map_chapters', '-1', '-map_metadata', '-1',
+      '-vf', `scale=${FIT},format=yuv420p`,
+      '-c:v', 'libsvtav1', '-preset', '10', '-crf', '30', '-svtav1-params', 'mbr=2000',
+      '-pix_fmt', 'yuv420p', '-g', '48',
+      '-c:a', 'aac', '-b:a', '128k', '-ac', '2', '-ar', '48000',
+      '-max_muxing_queue_size', '9999', '-movflags', '+faststart', '-f', 'mp4',
+      '/cache/x.part',
+    ]);
+  });
+
+  it('follows the quality levels: a higher crf, a lower ceiling, a smaller box', () => {
+    const medium = buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'libsvtav1', quality: 'medium' });
+    expect(medium.join(' ')).toContain('-crf 44 -svtav1-params mbr=1200');
+    expect(medium.join(' ')).toContain('-b:a 96k');
+
+    const low = buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'libsvtav1', quality: 'low' });
+    expect(low.join(' ')).toContain('-crf 52 -svtav1-params mbr=600');
+    expect(low[low.indexOf('-vf') + 1]).toContain("w='min(854,iw)':h='min(480,ih)'");
+  });
+
+  it('encodes on an Intel GPU with a quality level only, fed NV12', () => {
+    const args = buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'av1_qsv' });
+    expect(args[args.indexOf('-vf') + 1]).toBe(`scale=${FIT},format=nv12`);
+    expect(args.slice(args.indexOf('-c:v'), args.indexOf('-c:a'))).toEqual([
+      '-c:v', 'av1_qsv', '-global_quality', '26', '-g', '48',
+    ]);
+    // No bitrate: with one, Quick Sync leaves its quality mode (see clipEncode.mjs).
+    expect(args).not.toContain('-b:v');
+    expect(args).not.toContain('-maxrate');
+    // And no software pixel format forced on a hardware encoder.
+    expect(args).not.toContain('-pix_fmt');
+
+    expect(buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'av1_qsv', quality: 'medium' }).join(' '))
+      .toContain('-global_quality 31');
+    expect(buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'av1_qsv', quality: 'low' }).join(' '))
+      .toContain('-global_quality 33');
+  });
+
+  it('tone-maps HDR for the GPU encoder exactly as for the others, then repacks to NV12', () => {
+    expect(buildClipVideoFilter(HDR10, 'libplacebo', 'high', 'av1_qsv')).toBe(`${LIBPLACEBO},format=nv12`);
+    expect(buildClipVideoFilter(HDR10, 'libplacebo', 'high', 'libsvtav1')).toBe(LIBPLACEBO);
+
+    const cpu = buildClipVideoFilter(HDR10, 'zscale', 'high', 'av1_qsv');
+    expect(cpu).toContain('tonemap=tonemap=hable');
+    expect(cpu.endsWith(',zscale=t=bt709:m=bt709:r=tv,format=nv12')).toBe(true);
+
+    const args = buildTranscodeArgs({ ...base, source: HDR10, pipeline: 'libplacebo', encoder: 'av1_qsv' });
+    expect(args.slice(args.indexOf('-init_hw_device'), args.indexOf('-init_hw_device') + 2)).toEqual(['-init_hw_device', 'vulkan']);
+    expect(args.join(' ')).toContain('-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv');
+  });
+
+  it('is H.264 when a builder is not told which encoder', () => {
+    const untold = buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none' });
+    expect(untold).toEqual(buildTranscodeArgs({ ...base, source: SDR, pipeline: 'none', encoder: 'libx264' }));
+    expect(untold).toContain('libx264');
   });
 });
 

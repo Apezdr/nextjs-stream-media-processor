@@ -58,10 +58,12 @@ const haveProbe = (await toolOutput('ffprobe', ['-version'])) !== null;
 
 const haveTools = haveProbe && encoders !== null && /\blibx264\b/.test(encoders);
 const haveHevc = haveTools && /\blibx265\b/.test(encoders);
+const haveSvtAv1 = haveTools && /\blibsvtav1\b/.test(encoders);
 const haveToneMap = haveHevc && filters !== null && /\bzscale\b/.test(filters) && /\btonemap\b/.test(filters);
 
 const describeWithTools = haveTools ? describe : describe.skip;
 const itWithHevc = haveHevc ? it : it.skip;
+const itWithSvtAv1 = haveSvtAv1 ? it : it.skip;
 const itWithToneMap = haveToneMap ? it : it.skip;
 
 const ffmpeg = (args) => run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
@@ -226,6 +228,31 @@ describeWithTools('clips made by the real ffmpeg', () => {
       expect(made.medium.size).toBeLessThan(made.high.size);
       expect(made.low.size).toBeLessThan(made.medium.size);
     });
+
+    itWithSvtAv1('makes the same clip as AV1: Main profile in MP4, same start, same streams', async () => {
+      for (const quality of ['high', 'low']) {
+        const outputPath = output(`av1-${quality}.mp4`);
+        await clipEncode.transcodeClip({
+          videoPath: source('h264.mp4'), start: 3.5, duration: 4, source: sources['h264.mp4'],
+          quality, encoder: 'libsvtav1', outputPath,
+        });
+
+        const clip = await inspect(outputPath);
+        expect(clip.formatName).toContain('mp4');
+        expect(clip.boxes.indexOf('moov')).toBeLessThan(clip.boxes.indexOf('mdat'));
+        expect(clip.streamTypes).toEqual(['video', 'audio']);
+        expect(clip.video.codec_name).toBe('av1');
+        expect(clip.video.profile).toBe('Main');
+        expect(clip.video.codec_tag_string).toBe('av01');
+        expect(clip.video.pix_fmt).toBe('yuv420p');
+        expect([clip.video.width, clip.video.height]).toEqual(quality === 'high' ? [1280, 720] : [854, 480]);
+        expect(clip.audio.codec_name).toBe('aac');
+        expect(clip.audio.channels).toBe(2);
+        expect(clip.videoStart).toBeCloseTo(0, 1);
+        expect(clip.videoDuration).toBeCloseTo(4, 1);
+        expect(clip.videoPackets).toBe(96);
+      }
+    }, 60_000);
 
     it('keeps a small picture small, makes an odd size even, and downmixes 5.1', async () => {
       const outputPath = output('odd-transcode.mp4');
@@ -428,6 +455,29 @@ describeWithTools('clips made by the real ffmpeg', () => {
       const high = await fs.stat(path.join(library.cacheDir, 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-h264-high.mp4'));
       expect(bytes.length).toBeLessThan(high.size);
     });
+
+    itWithSvtAv1('serves the AV1 clip beside the H.264 one, and still serves it when the URL asks for a GPU that is not there', async () => {
+      const av1 = await fetch(url('start=3.5&end=7.5&codec=av1'));
+      expect(av1.status).toBe(200);
+      expect(av1.headers.get('content-type')).toBe('video/mp4');
+      const bytes = await download(av1);
+      expect(isMp4(bytes)).toBe(true);
+
+      const software = path.join(library.cacheDir, 'A Film-key_real-binary-test-start_3.5-end_7.5-v2-av1-high-svt.mp4');
+      expect((await inspect(software)).video.codec_name).toBe('av1');
+      expect(bytes.length).toBe((await fs.stat(software)).size);
+
+      // Whether this machine has a working Quick Sync AV1 encoder is whatever it
+      // is. Either way the answer is an AV1 clip: the GPU's, or the software one.
+      const gpu = await fetch(url('start=3.5&end=7.5&codec=av1&encoder=gpu'));
+      expect(gpu.status).toBe(200);
+      expect(isMp4(await download(gpu))).toBe(true);
+      const made = (await fs.readdir(library.cacheDir)).filter((name) => name.includes('-av1-high-'));
+      expect(made).toContain('A Film-key_real-binary-test-start_3.5-end_7.5-v2-av1-high-svt.mp4');
+      for (const name of made) {
+        expect((await inspect(path.join(library.cacheDir, name))).video.codec_name).toBe('av1');
+      }
+    }, 60_000);
 
     it('answers 404 for a title it does not know, without running anything', async () => {
       const response = await fetch(`${origin}/videoClip/movie/Unknown?start=0&end=5`);

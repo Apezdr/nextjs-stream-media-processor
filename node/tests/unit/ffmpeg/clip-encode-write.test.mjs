@@ -29,18 +29,34 @@ jest.unstable_mockModule('../../../ffmpeg/dolbyVision.mjs', () => ({
   libplaceboAvailable,
 }));
 
-// ffprobe, as the keyframe probe calls it: execFile(file, args, callback).
+// The two things this module runs with execFile(file, args[, options], callback):
+// ffprobe for the keyframe, and ffmpeg for a one-frame encoder probe.
 let keyframeProbeOutput = '';
+let brokenEncoders = new Set();
 const execFile = jest.fn((file, args, optionsOrCallback, maybeCallback) => {
   const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+  if (file === 'ffmpeg') {
+    const encoder = args[args.indexOf('-c:v') + 1];
+    if (brokenEncoders.has(encoder)) {
+      callback(Object.assign(new Error('Command failed'), { stderr: `[${encoder}] Error creating a MFX session: -9.` }));
+      return;
+    }
+    callback(null, { stdout: '', stderr: '' });
+    return;
+  }
   callback(null, { stdout: keyframeProbeOutput, stderr: '' });
 });
 jest.unstable_mockModule('child_process', () => ({ execFile }));
+
+// av1_qsv is "broken" for the whole file: the probe result is kept per process,
+// as it is in production, so it is decided before the first import.
+brokenEncoders = new Set(['av1_qsv']);
 
 const {
   transcodeClip,
   copyOriginalClip,
   sweepClipTempFiles,
+  clipEncoderAvailable,
   ClipNotCopyableError,
   CLIP_TEMP_SUFFIX,
 } = await import('../../../ffmpeg/clipEncode.mjs');
@@ -116,6 +132,39 @@ describe('writing a clip', () => {
   });
 });
 
+describe('clipEncoderAvailable', () => {
+  it('runs one small frame through the encoder, with the settings a clip uses, and remembers the answer', async () => {
+    execFile.mockClear();
+    expect(await clipEncoderAvailable('libsvtav1')).toBe(true);
+    expect(await clipEncoderAvailable('libsvtav1')).toBe(true);
+
+    const probes = execFile.mock.calls.filter(([file, args]) => file === 'ffmpeg' && args.includes('libsvtav1'));
+    expect(probes).toHaveLength(1);
+    const [, args, options] = probes[0];
+    // Not 64x64: the Arc's AV1 encoder refuses a picture that small.
+    expect(args).toEqual(expect.arrayContaining(['-i', 'color=c=black:s=256x144:d=0.2', '-frames:v', '1']));
+    expect(args.join(' ')).toContain('-c:v libsvtav1 -preset 10 -crf 52 -svtav1-params mbr=600');
+    expect(args.slice(-3)).toEqual(['-f', 'null', '-']);
+    // The encoder's banner is kept out of the result.
+    expect(options.env.SVT_LOG).toBe('1');
+    expect(options.timeout).toBeGreaterThan(0);
+  });
+
+  it('says no for an encoder that is listed but cannot open, and logs why once', async () => {
+    quiet.warn.mockClear();
+    expect(await clipEncoderAvailable('av1_qsv')).toBe(false);
+    expect(await clipEncoderAvailable('av1_qsv')).toBe(false);
+
+    expect(quiet.warn).toHaveBeenCalledTimes(1);
+    expect(quiet.warn.mock.calls[0][0]).toContain('av1_qsv does not work here');
+    expect(quiet.warn.mock.calls[0][0]).toContain('Error creating a MFX session');
+
+    const probe = execFile.mock.calls.find(([file, args]) => file === 'ffmpeg' && args.includes('av1_qsv'));
+    expect(probe[1].join(' ')).toContain('-vf format=nv12 -c:v av1_qsv -global_quality 33');
+    expect(probe[2].env.LIBVA_MESSAGING_LEVEL).toBe('1');
+  });
+});
+
 describe('transcodeClip', () => {
   it('does not probe for Vulkan to encode an SDR source', async () => {
     await transcode(SDR);
@@ -128,6 +177,22 @@ describe('transcodeClip', () => {
     const args = executeFFmpeg.mock.calls[0][0];
     expect(args).toContain('-init_hw_device');
     expect(args[args.indexOf('-vf') + 1]).toMatch(/^libplacebo=/);
+  });
+
+  it('makes AV1 with the encoder it is given, with that encoder\'s log noise turned off', async () => {
+    await transcodeClip({
+      videoPath: '/media/a.mkv', start: 3200, duration: 50, source: SDR, encoder: 'libsvtav1', outputPath,
+    });
+    const [args, options] = executeFFmpeg.mock.calls[0];
+    expect(args).toContain('libsvtav1');
+    expect(options.env.SVT_LOG).toBe('1');
+    expect(options.env.PATH ?? options.env.Path).toBe(process.env.PATH ?? process.env.Path); // the rest of the environment is kept
+
+    await transcodeClip({
+      videoPath: '/media/a.mkv', start: 3200, duration: 50, source: SDR, encoder: 'av1_qsv', outputPath: `${outputPath}.qsv`,
+    });
+    expect(executeFFmpeg.mock.calls[1][0]).toContain('av1_qsv');
+    expect(executeFFmpeg.mock.calls[1][1].env.LIBVA_MESSAGING_LEVEL).toBe('1');
   });
 
   it('tone-maps HDR on the CPU where it does not', async () => {

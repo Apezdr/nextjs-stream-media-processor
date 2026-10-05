@@ -1,7 +1,8 @@
 // videoHandler.mjs
 //
 // GET /videoClip/movie/:movieName and /videoClip/tv/:showName/:season/:episode
-//   ?start=<s>&end=<s>[&quality=high|medium|low][&useOriginalVideo=true][&codec=h264]
+//   ?start=<s>&end=<s>[&quality=high|medium|low][&codec=h264|av1][&encoder=software|gpu]
+//   [&useOriginalVideo=true]
 //
 // A short clip of a title, made once and cached on disk as MP4. What the two
 // kinds of clip are, and why, is in ffmpeg/clipEncode.mjs. This file is the
@@ -24,7 +25,13 @@ import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from './util
 import { getTVShowByName, getMovieByName } from './sqliteDatabase.mjs';
 import { getInfo } from './infoManager.mjs';
 import { createCategoryLogger } from './lib/logger.mjs';
-import { isAcceptedClipCodec, CLIP_CODEC_VALUES } from './utils/clipCodec.mjs';
+import {
+  resolveClipCodec,
+  resolveClipEncoderChoice,
+  av1EncoderChoiceFromEnvironment,
+  CLIP_CODEC_VALUES,
+  CLIP_ENCODER_VALUES,
+} from './utils/clipCodec.mjs';
 import { createClipJobRunner } from './utils/clipJobs.mjs';
 import { sendFileWithRanges } from './utils/rangeFile.mjs';
 import {
@@ -34,6 +41,7 @@ import {
   copyOriginalClip,
   ClipNotCopyableError,
   resolveClipQuality,
+  clipEncoderAvailable,
   CLIP_QUALITY_VALUES,
 } from './ffmpeg/clipEncode.mjs';
 
@@ -100,27 +108,105 @@ function describeSource({ videoPath, sourceId }) {
   return pending;
 }
 
-// A copy that failed is not tried again for a while. The TV app asks for the
-// same clip every time its banner comes round, and without this each of those
-// requests would run (and log) the same failing ffmpeg before falling back.
-const COPY_RETRY_AFTER_MS = 10 * 60 * 1000;
-const FAILED_COPY_LIMIT = 500;
-const failedCopies = new Map(); // cache key -> time it may be tried again
+// A way of making a clip that has a fallback (a stream copy, a GPU encode) is
+// not tried again for a while once it has failed for that clip. The TV app
+// asks for the same clip every time its banner comes round, and without this
+// each of those requests would run (and log) the same failing ffmpeg before
+// falling back.
+const RETRY_FAILED_AFTER_MS = 10 * 60 * 1000;
+const RECENT_FAILURE_LIMIT = 500;
+const recentFailures = new Map(); // cache key -> time it may be tried again
 
-function copyFailedRecently(cacheKey) {
-  const retryAt = failedCopies.get(cacheKey);
+function failedRecently(cacheKey) {
+  const retryAt = recentFailures.get(cacheKey);
   if (retryAt === undefined) return false;
   if (Date.now() < retryAt) return true;
-  failedCopies.delete(cacheKey);
+  recentFailures.delete(cacheKey);
   return false;
 }
 
-function rememberFailedCopy(cacheKey) {
-  failedCopies.delete(cacheKey); // re-insert, so the map stays in age order
-  failedCopies.set(cacheKey, Date.now() + COPY_RETRY_AFTER_MS);
-  if (failedCopies.size > FAILED_COPY_LIMIT) {
-    failedCopies.delete(failedCopies.keys().next().value); // oldest entry
+function rememberFailure(cacheKey) {
+  recentFailures.delete(cacheKey); // re-insert, so the map stays in age order
+  recentFailures.set(cacheKey, Date.now() + RETRY_FAILED_AFTER_MS);
+  if (recentFailures.size > RECENT_FAILURE_LIMIT) {
+    recentFailures.delete(recentFailures.keys().next().value); // oldest entry
   }
+}
+
+// How each encoder's clips are named in the cache: the codec, then the quality
+// level, then (for AV1, which has two) which encoder made it. The two AV1
+// encoders are tuned to the same levels but do not write the same bytes, so a
+// clip is cached as what it is.
+const clipCachePath = (clip, encoder) =>
+  getCachedClipPath(
+    {
+      libx264: `${clip.keyBase}-h264-${clip.quality}`,
+      libsvtav1: `${clip.keyBase}-av1-${clip.quality}-svt`,
+      av1_qsv: `${clip.keyBase}-av1-${clip.quality}-qsv`,
+    }[encoder],
+    '.mp4'
+  );
+
+const AV1_ENCODERS = Object.freeze(['av1_qsv', 'libsvtav1']);
+
+let warnedAboutEncoderEnvironment = false;
+
+/** `software` or `gpu`: what makes an AV1 clip when the URL does not say. */
+function defaultAv1EncoderChoice() {
+  const { choice, invalid } = av1EncoderChoiceFromEnvironment(process.env.VIDEO_CLIP_AV1_ENCODER);
+  if (invalid && !warnedAboutEncoderEnvironment) {
+    warnedAboutEncoderEnvironment = true;
+    logger.warn(
+      `Ignoring VIDEO_CLIP_AV1_ENCODER="${process.env.VIDEO_CLIP_AV1_ENCODER}": ` +
+      `it must be one of ${CLIP_ENCODER_VALUES.join(', ')}`
+    );
+  }
+  return choice;
+}
+
+/**
+ * How a request's encoded clip is found and, if need be, made.
+ *
+ *   make     The encoders to make it with, in the order to try them. The last
+ *            is the one whose failure is the request's failure; one before it
+ *            falls through to the next.
+ *   accept   The encoders whose cached clip the request will take as it is.
+ *
+ * H.264 has one encoder. AV1 has the software encoder, preceded by the GPU's
+ * when the GPU is asked for (by `?encoder=gpu`, or by VIDEO_CLIP_AV1_ENCODER for
+ * a URL that does not say) and this server has one that works.
+ *
+ * A URL that names an encoder gets that encoder's clip, so the two can be told
+ * apart. One that does not (every URL a page builds) takes whichever AV1 clip
+ * already exists: changing the server default must not re-encode the cache.
+ *
+ * @param {'h264'|'av1'} codec
+ * @param {'software'|'gpu'|undefined} encoderChoice - From the URL; undefined when it does not say
+ * @returns {Promise<{ make: string[], accept: string[] }|null>} null when this
+ *   server cannot make the codec at all
+ */
+async function planEncoders(codec, encoderChoice) {
+  if (codec === 'h264') return { make: ['libx264'], accept: ['libx264'] };
+
+  const make = [];
+  if ((encoderChoice ?? defaultAv1EncoderChoice()) === 'gpu' && (await clipEncoderAvailable('av1_qsv'))) {
+    make.push('av1_qsv');
+  }
+  if (await clipEncoderAvailable('libsvtav1')) {
+    make.push('libsvtav1');
+  }
+  if (make.length === 0) return null;
+
+  const accept = encoderChoice === undefined
+    ? [...make, ...AV1_ENCODERS.filter((encoder) => !make.includes(encoder))]
+    : [make[0]];
+  return { make, accept };
+}
+
+/** What `?codec=` can be on this server, for the message that refuses anything else. */
+async function supportedCodecValues() {
+  const av1 = (await planEncoders('av1', undefined)) !== null;
+  return CLIP_CODEC_VALUES.filter((value) => value !== 'av1' || av1);
 }
 
 /** The title the request names is not in the library. Answered with a 404. */
@@ -222,7 +308,7 @@ async function serveOriginalClip(req, res, clip) {
   const cachedPath = getCachedClipPath(cacheKey, '.mp4');
 
   if (!(await fileExists(cachedPath))) {
-    if (copyFailedRecently(cacheKey)) return false;
+    if (failedRecently(cacheKey)) return false;
 
     const source = await describeSource(clip);
     if (rejectIfPastEnd(res, clip, source)) return true;
@@ -258,7 +344,7 @@ async function serveOriginalClip(req, res, clip) {
       } else {
         logger.error(`Original-quality clip of ${clip.title} failed, sending the transcode: ${error.message}`);
       }
-      rememberFailedCopy(cacheKey);
+      rememberFailure(cacheKey);
       return false;
     }
   }
@@ -272,35 +358,62 @@ async function serveOriginalClip(req, res, clip) {
   return true;
 }
 
-/** The H.264 clip: what a browser gets, and the fallback for the original path. */
+/**
+ * The encoded clip: what a browser gets, and the fallback for the original
+ * path. Each codec, quality level and encoder is its own file; see
+ * planEncoders for which of them a request takes and makes.
+ */
 async function serveTranscodedClip(req, res, clip) {
-  // Each quality level is its own file.
-  const cacheKey = `${clip.keyBase}-h264-${clip.quality}`;
-  const cachedPath = getCachedClipPath(cacheKey, '.mp4');
-
-  if (!(await fileExists(cachedPath))) {
-    const source = await describeSource(clip);
-    if (rejectIfPastEnd(res, clip, source)) return;
-
-    const clientWaiting = await waitForClip(res, transcodeJobs, cacheKey, async () => {
-      if (await fileExists(cachedPath)) return;
-      logger.info(`Encoding clip: ${cacheKey}`);
-      await transcodeClip({
-        videoPath: clip.videoPath,
-        start: clip.start,
-        duration: clip.duration,
-        source,
-        quality: clip.quality,
-        outputPath: cachedPath,
-      });
+  const send = (cachedPath) =>
+    sendFileWithRanges(req, res, cachedPath, {
+      contentType: CLIP_CONTENT_TYPE,
+      cacheControl: CLIP_CACHE_CONTROL,
     });
-    if (!clientWaiting) return;
+
+  // Anything already made that this request can have, before making anything.
+  for (const encoder of clip.encoders.accept) {
+    const cachedPath = clipCachePath(clip, encoder);
+    if (await fileExists(cachedPath)) return send(cachedPath);
   }
 
-  await sendFileWithRanges(req, res, cachedPath, {
-    contentType: CLIP_CONTENT_TYPE,
-    cacheControl: CLIP_CACHE_CONTROL,
-  });
+  const source = await describeSource(clip);
+  if (rejectIfPastEnd(res, clip, source)) return;
+
+  for (const [index, encoder] of clip.encoders.make.entries()) {
+    const fallback = clip.encoders.make[index + 1];
+    const cachedPath = clipCachePath(clip, encoder);
+    const cacheKey = cachedPath; // one job, and one failure record, per file
+
+    if (!(await fileExists(cachedPath))) {
+      if (fallback && failedRecently(cacheKey)) continue;
+
+      try {
+        const clientWaiting = await waitForClip(res, transcodeJobs, cacheKey, async () => {
+          if (await fileExists(cachedPath)) return;
+          logger.info(`Encoding clip with ${encoder}: ${cachedPath}`);
+          await transcodeClip({
+            videoPath: clip.videoPath,
+            start: clip.start,
+            duration: clip.duration,
+            source,
+            quality: clip.quality,
+            encoder,
+            outputPath: cachedPath,
+          });
+        });
+        if (!clientWaiting) return;
+      } catch (error) {
+        if (!fallback) throw error;
+        // The GPU was asked to do this and could not. The same clip from the
+        // software encoder is still the clip the request wanted.
+        logger.error(`${encoder} failed for ${cachedPath}, making the clip with ${fallback}: ${error.message}`);
+        rememberFailure(cacheKey);
+        continue;
+      }
+    }
+
+    return send(cachedPath);
+  }
 }
 
 /**
@@ -326,8 +439,25 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
     }
 
     // See utils/clipCodec.mjs. Not echoed back: res.send answers text/html.
-    if (!isAcceptedClipCodec(req.query.codec)) {
-      return res.status(400).send(`Unsupported codec. Supported values: ${CLIP_CODEC_VALUES.join(', ')}.`);
+    const codec = resolveClipCodec(req.query.codec);
+    if (!codec) {
+      return res.status(400).send(`Unsupported codec. Supported values: ${(await supportedCodecValues()).join(', ')}.`);
+    }
+
+    const encoderChoice = resolveClipEncoderChoice(req.query.encoder);
+    if (encoderChoice === null) {
+      return res.status(400).send(`Unsupported encoder. Supported values: ${CLIP_ENCODER_VALUES.join(', ')}.`);
+    }
+    if (encoderChoice !== undefined && codec !== 'av1') {
+      return res.status(400).send('The encoder parameter applies to codec=av1 only.');
+    }
+
+    // A server whose ffmpeg cannot make AV1 refuses it exactly as it did before
+    // AV1 was an option. A page that lists the AV1 URL first then plays the
+    // H.264 one, which is the point of listing both.
+    const encoders = await planEncoders(codec, encoderChoice);
+    if (!encoders) {
+      return res.status(400).send(`Unsupported codec. Supported values: ${(await supportedCodecValues()).join(', ')}.`);
     }
 
     // How much picture the encoded clip carries (CLIP_QUALITIES in
@@ -361,6 +491,7 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
       end,
       duration: end - start,
       quality,
+      encoders,
       keyBase: `${title}-key_${info.uuid}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}`,
     };
 

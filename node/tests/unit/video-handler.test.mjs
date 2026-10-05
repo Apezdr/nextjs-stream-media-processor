@@ -61,6 +61,7 @@ const probeClipSource = jest.fn();
 const canCopyOriginal = jest.fn();
 const transcodeClip = jest.fn();
 const copyOriginalClip = jest.fn();
+const clipEncoderAvailable = jest.fn();
 // The quality levels are the real ones: they are pure, and the handler's
 // validation and cache names are about them.
 const { resolveClipQuality, CLIP_QUALITY_VALUES } = await import('../../ffmpeg/clipEncode.mjs');
@@ -69,6 +70,7 @@ jest.unstable_mockModule('../../ffmpeg/clipEncode.mjs', () => ({
   canCopyOriginal,
   transcodeClip,
   copyOriginalClip,
+  clipEncoderAvailable,
   ClipNotCopyableError,
   resolveClipQuality,
   CLIP_QUALITY_VALUES,
@@ -77,7 +79,10 @@ jest.unstable_mockModule('../../ffmpeg/clipEncode.mjs', () => ({
 const { handleVideoClipRequest } = await import('../../videoHandler.mjs');
 
 const TRANSCODED = Buffer.from('h264 clip '.repeat(200));
+const AV1_SOFTWARE = Buffer.from('av1 clip from svt '.repeat(200));
+const AV1_GPU = Buffer.from('av1 clip from the gpu '.repeat(200));
 const ORIGINAL = Buffer.from('original clip '.repeat(200));
+const CLIP_BYTES = { libx264: TRANSCODED, libsvtav1: AV1_SOFTWARE, av1_qsv: AV1_GPU };
 const SOURCE = { codec: 'hevc', pixFmt: 'yuv420p10le', dovi: false, duration: 5400, startTime: 0 };
 
 let server;
@@ -116,8 +121,11 @@ beforeEach(async () => {
   getInfo.mockImplementation(async () => ({ uuid }));
   probeClipSource.mockResolvedValue(SOURCE);
   canCopyOriginal.mockReturnValue(true);
-  transcodeClip.mockImplementation(async ({ outputPath }) => fs.writeFile(outputPath, TRANSCODED));
+  transcodeClip.mockImplementation(async ({ outputPath, encoder }) => fs.writeFile(outputPath, CLIP_BYTES[encoder]));
   copyOriginalClip.mockImplementation(async ({ outputPath }) => fs.writeFile(outputPath, ORIGINAL));
+  // A server with the software AV1 encoder and no GPU, unless a test says otherwise.
+  clipEncoderAvailable.mockImplementation(async (encoder) => encoder !== 'av1_qsv');
+  delete process.env.VIDEO_CLIP_AV1_ENCODER;
 });
 
 const clipUrl = (query = 'start=3200&end=3250', title = 'A Film') =>
@@ -139,6 +147,8 @@ function heldTranscode() {
   return release;
 }
 
+const encodersUsed = () => transcodeClip.mock.calls.map(([params]) => params.encoder);
+
 describe('request validation', () => {
   it('rejects a missing, reversed or negative time range', async () => {
     for (const query of ['', 'start=10', 'start=10&end=10', 'start=20&end=10', 'start=-5&end=10', 'start=a&end=b']) {
@@ -158,7 +168,7 @@ describe('request validation', () => {
   it('rejects a codec it does not make, and accepts the two names for the one it does', async () => {
     const rejected = await fetch(clipUrl('start=0&end=10&codec=vp9'));
     expect(rejected.status).toBe(400);
-    expect(await rejected.text()).toBe('Unsupported codec. Supported values: auto, h264.');
+    expect(await rejected.text()).toBe('Unsupported codec. Supported values: auto, h264, av1.');
 
     expect((await fetch(clipUrl('start=0&end=10&codec=h264'))).status).toBe(200);
     expect((await fetch(clipUrl('start=0&end=10&codec=auto'))).status).toBe(200);
@@ -230,6 +240,7 @@ describe('the encoded clip', () => {
       duration: 50,
       source: SOURCE,
       quality: 'high',
+      encoder: 'libx264',
       outputPath: path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`),
     });
 
@@ -359,6 +370,158 @@ describe('the encoded clip', () => {
   });
 });
 
+describe('the AV1 clip (?codec=av1)', () => {
+  const name = (suffix, range = 'start_3200-end_3250') => `A Film-key_${uuid}-${range}-v2-${suffix}.mp4`;
+
+  it('is made by the software encoder, beside the H.264 clip and not instead of it', async () => {
+    const av1 = await fetch(clipUrl('start=3200&end=3250&codec=av1'));
+    expect(av1.status).toBe(200);
+    expect(av1.headers.get('content-type')).toBe('video/mp4');
+    expect((await body(av1)).equals(AV1_SOFTWARE)).toBe(true);
+
+    const h264 = await fetch(clipUrl('start=3200&end=3250'));
+    expect((await body(h264)).equals(TRANSCODED)).toBe(true);
+
+    expect(encodersUsed()).toEqual(['libsvtav1', 'libx264']);
+    expect((await cached()).sort()).toEqual([name('av1-high-svt'), name('h264-high')]);
+    // The GPU was never asked about: nobody opted in to it.
+    expect(clipEncoderAvailable).not.toHaveBeenCalledWith('av1_qsv');
+  });
+
+  it('has the same quality levels', async () => {
+    await fetch(clipUrl('start=3200&end=3250&codec=av1&quality=low')).then(body);
+    expect(transcodeClip).toHaveBeenCalledWith(expect.objectContaining({ encoder: 'libsvtav1', quality: 'low' }));
+    expect(await cached()).toEqual([name('av1-low-svt')]);
+  });
+
+  it('is refused on a server that cannot make AV1, exactly as before AV1 was an option', async () => {
+    clipEncoderAvailable.mockResolvedValue(false);
+
+    const response = await fetch(clipUrl('start=0&end=10&codec=av1'));
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe('Unsupported codec. Supported values: auto, h264.');
+    expect(transcodeClip).not.toHaveBeenCalled();
+
+    // H.264 is not affected.
+    expect((await fetch(clipUrl('start=0&end=10'))).status).toBe(200);
+  });
+
+  describe('on the GPU (opt-in)', () => {
+    it('uses the GPU when the URL asks for it and the server has one that works', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+
+      const response = await fetch(clipUrl('start=3200&end=3250&codec=av1&encoder=gpu'));
+      expect((await body(response)).equals(AV1_GPU)).toBe(true);
+      expect(encodersUsed()).toEqual(['av1_qsv']);
+      expect(await cached()).toEqual([name('av1-high-qsv')]);
+    });
+
+    it('makes the clip in software when the URL asks for the GPU and there is none', async () => {
+      const response = await fetch(clipUrl('start=3200&end=3250&codec=av1&encoder=gpu'));
+      expect(response.status).toBe(200);
+      expect((await body(response)).equals(AV1_SOFTWARE)).toBe(true);
+      expect(encodersUsed()).toEqual(['libsvtav1']);
+    });
+
+    it('makes the clip in software when the GPU encode fails, and does not keep retrying the GPU', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+      transcodeClip.mockImplementation(async ({ outputPath, encoder }) => {
+        if (encoder === 'av1_qsv') throw new Error('FFmpeg exited with code 218: Error creating a MFX session');
+        await fs.writeFile(outputPath, CLIP_BYTES[encoder]);
+      });
+
+      for (let request = 0; request < 3; request += 1) {
+        const response = await fetch(clipUrl('start=3200&end=3250&codec=av1&encoder=gpu'));
+        expect(response.status).toBe(200);
+        expect((await body(response)).equals(AV1_SOFTWARE)).toBe(true);
+      }
+
+      expect(encodersUsed()).toEqual(['av1_qsv', 'libsvtav1']);
+      expect(quiet.error).toHaveBeenCalledTimes(1);
+      expect(quiet.error.mock.calls[0][0]).toContain('av1_qsv failed');
+      expect(await cached()).toEqual([name('av1-high-svt')]);
+    });
+
+    it('makes the GPU the default with VIDEO_CLIP_AV1_ENCODER=gpu, and lets a URL ask for software anyway', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+      process.env.VIDEO_CLIP_AV1_ENCODER = 'gpu';
+
+      await fetch(clipUrl('start=100&end=150&codec=av1')).then(body);
+      await fetch(clipUrl('start=200&end=250&codec=av1&encoder=software')).then(body);
+
+      expect(encodersUsed()).toEqual(['av1_qsv', 'libsvtav1']);
+      expect((await cached()).sort()).toEqual([
+        name('av1-high-qsv', 'start_100-end_150'),
+        name('av1-high-svt', 'start_200-end_250'),
+      ]);
+    });
+
+    it('never uses the GPU for H.264, whatever the default', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+      process.env.VIDEO_CLIP_AV1_ENCODER = 'gpu';
+
+      await fetch(clipUrl('start=3200&end=3250')).then(body);
+      expect(encodersUsed()).toEqual(['libx264']);
+    });
+
+    it('ignores a value of the variable it does not know, saying so once', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+      process.env.VIDEO_CLIP_AV1_ENCODER = 'yes please';
+
+      await fetch(clipUrl('start=100&end=150&codec=av1')).then(body);
+      await fetch(clipUrl('start=200&end=250&codec=av1')).then(body);
+
+      expect(encodersUsed()).toEqual(['libsvtav1', 'libsvtav1']);
+      const warnings = quiet.warn.mock.calls.filter(([message]) => message.includes('VIDEO_CLIP_AV1_ENCODER'));
+      expect(warnings).toHaveLength(1); // two requests, one warning
+    });
+
+    it('gives a URL that names no encoder whichever AV1 clip exists, so changing the default re-encodes nothing', async () => {
+      // Made on the GPU earlier; the server default is software again.
+      await fs.writeFile(path.join(cacheDir, name('av1-high-qsv')), AV1_GPU);
+
+      const response = await fetch(clipUrl('start=3200&end=3250&codec=av1'));
+      expect((await body(response)).equals(AV1_GPU)).toBe(true);
+      expect(transcodeClip).not.toHaveBeenCalled();
+      expect(probeClipSource).not.toHaveBeenCalled();
+
+      // And the other way round: the default is the GPU, the clip was made in software.
+      clipEncoderAvailable.mockResolvedValue(true);
+      process.env.VIDEO_CLIP_AV1_ENCODER = 'gpu';
+      await fs.writeFile(path.join(cacheDir, name('av1-high-svt', 'start_100-end_150')), AV1_SOFTWARE);
+
+      const other = await fetch(clipUrl('start=100&end=150&codec=av1'));
+      expect((await body(other)).equals(AV1_SOFTWARE)).toBe(true);
+      expect(transcodeClip).not.toHaveBeenCalled();
+    });
+
+    it('gives a URL that does name an encoder that encoder\'s clip, so the two can be compared', async () => {
+      clipEncoderAvailable.mockResolvedValue(true);
+      await fs.writeFile(path.join(cacheDir, name('av1-high-qsv')), AV1_GPU);
+
+      const software = await fetch(clipUrl('start=3200&end=3250&codec=av1&encoder=software'));
+      expect((await body(software)).equals(AV1_SOFTWARE)).toBe(true);
+      const gpu = await fetch(clipUrl('start=3200&end=3250&codec=av1&encoder=gpu'));
+      expect((await body(gpu)).equals(AV1_GPU)).toBe(true);
+
+      expect(encodersUsed()).toEqual(['libsvtav1']);
+    });
+
+    it('rejects an encoder it does not know, and the parameter on anything but AV1', async () => {
+      const unknown = await fetch(clipUrl('start=0&end=10&codec=av1&encoder=qsv'));
+      expect(unknown.status).toBe(400);
+      expect(await unknown.text()).toBe('Unsupported encoder. Supported values: software, gpu.');
+
+      for (const query of ['start=0&end=10&encoder=gpu', 'start=0&end=10&codec=h264&encoder=software']) {
+        const misplaced = await fetch(clipUrl(query));
+        expect(misplaced.status).toBe(400);
+        expect(await misplaced.text()).toBe('The encoder parameter applies to codec=av1 only.');
+      }
+      expect(transcodeClip).not.toHaveBeenCalled();
+    });
+  });
+});
+
 describe('the original-quality clip (?useOriginalVideo=true)', () => {
   const originalUrl = (query = 'start=3200&end=3250') => clipUrl(`${query}&useOriginalVideo=true`);
 
@@ -402,6 +565,10 @@ describe('the original-quality clip (?useOriginalVideo=true)', () => {
     const response = await fetch(originalUrl('start=200&end=250&quality=low'));
     expect((await body(response)).equals(TRANSCODED)).toBe(true);
     expect(transcodeClip).toHaveBeenCalledWith(expect.objectContaining({ start: 200, quality: 'low' }));
+
+    // The codec the URL asked for is the codec of the fallback too.
+    const av1 = await fetch(originalUrl('start=300&end=350&codec=av1'));
+    expect((await body(av1)).equals(AV1_SOFTWARE)).toBe(true);
   });
 
   it('sends the encoded clip when the copy finds no keyframe to start on', async () => {

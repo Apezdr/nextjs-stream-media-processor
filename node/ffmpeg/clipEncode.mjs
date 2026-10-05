@@ -9,7 +9,10 @@
 //              854x480 at the lowest quality level; see CLIP_QUALITIES).
 //              ONE ffmpeg pass seeks, decodes and encodes, so the clip starts on
 //              the requested frame with audio and video together. HDR and Dolby
-//              Vision are tone-mapped to BT.709. Every browser gets this one.
+//              Vision are tone-mapped to BT.709. Every browser plays this one.
+//              The same clip can be asked for as AV1 (?codec=av1), which is
+//              about half the size for a browser that can play it; see
+//              CLIP_ENCODERS.
 //
 //   original   The source's own video stream, copied (H.264 / HEVC only), with
 //              the audio re-encoded to AAC stereo. A copy can only begin on a
@@ -72,28 +75,82 @@ const COPYABLE_PIXEL_FORMATS = Object.freeze({
 });
 
 /**
+ * The encoders a transcoded clip can be made with, and what each one makes.
+ *
+ *   libx264    H.264. Every deployment has it and every client plays it, so it
+ *              is what a clip is unless the URL says otherwise.
+ *   libsvtav1  AV1, in software (?codec=av1). At the same SSIM it needs 40-60%
+ *              fewer bits than libx264 on clean and dark material and about the
+ *              same on heavy grain, in the same time: decoding the source is
+ *              the slow part of a clip, not encoding it.
+ *   av1_qsv    AV1 on an Intel GPU through Quick Sync. Opt-in (the handler
+ *              decides when), because it only exists where there is such a
+ *              GPU, shares it with whatever else uses it, and has no bitrate
+ *              ceiling: the driver refuses its capped quality mode, so a
+ *              grainy clip comes out larger than from the other two.
+ *
+ * `pixelFormat` is what the encoder takes from the filter chain.
+ */
+export const CLIP_ENCODERS = Object.freeze({
+  libx264: Object.freeze({ codec: 'h264', pixelFormat: 'yuv420p' }),
+  libsvtav1: Object.freeze({ codec: 'av1', pixelFormat: 'yuv420p' }),
+  av1_qsv: Object.freeze({ codec: 'av1', pixelFormat: 'nv12' }),
+});
+
+/**
  * How much picture a transcoded clip carries, chosen with `?quality=`.
  *
- * Named levels rather than encoder numbers, so a URL keeps meaning the same
- * thing if the encoder behind it changes. Each level is a box the picture is
- * fitted inside, an x264 quality target with a bitrate ceiling, and an audio
- * bitrate. Measured on three 20 s samples from the production library (clean
- * digital, dark, grainy film), video only:
+ * Named levels rather than encoder numbers, so a URL means the same thing
+ * whichever encoder makes the clip. Each level is a box the picture is fitted
+ * inside, an audio bitrate, and one group of settings per encoder, tuned to
+ * land on about the same picture:
  *
- *   high    987 / 221 / 2011 kb/s   the default
- *   medium  476 / 106 / 1203 kb/s   about half of high
- *   low     206 /  46 /  608 kb/s   about a fifth of high, at 480p
+ *   libx264    a quality target (crf) with a bitrate ceiling
+ *   libsvtav1  a quality target (crf) with a bitrate ceiling in kb/s
+ *   av1_qsv    a quality target only (see CLIP_ENCODERS)
  *
- * For scale, the hardware VP9 clips this endpoint used to make came out at
- * 509 / 331 / 517 kb/s on the same samples.
+ * Measured on three 20 s samples from the production library (clean digital /
+ * dark / grainy film), video only, in kb/s:
+ *
+ *             libx264             libsvtav1           av1_qsv
+ *   high      987 / 221 / 2011    583 / 82 / 1976     512 / 92 / 2371
+ *   medium    476 / 106 / 1203    243 / 37 /  906     301 / 57 / 1295
+ *   low       206 /  46 /  608    120 / 20 /  405     151 / 31 /  595
+ *
+ * The AV1 numbers were chosen so each level scores the same SSIM as libx264's
+ * on those samples, to within a few tenths of a dB either way.
+ *
+ * `high` is the default; `low` is 480p. For scale, the hardware VP9 clips this
+ * endpoint used to make came out at 509 / 331 / 517 kb/s on the same samples.
  *
  * Changing a level's numbers changes the bytes of clips already in the cache
  * under that name: bump VIDEO_CLIP_VERSION in videoHandler.mjs when you do.
  */
 export const CLIP_QUALITIES = Object.freeze({
-  high: Object.freeze({ width: 1280, height: 720, crf: 23, maxrate: '2M', bufsize: '4M', audioBitrate: '128k' }),
-  medium: Object.freeze({ width: 1280, height: 720, crf: 28, maxrate: '1200k', bufsize: '2400k', audioBitrate: '96k' }),
-  low: Object.freeze({ width: 854, height: 480, crf: 30, maxrate: '600k', bufsize: '1200k', audioBitrate: '64k' }),
+  high: Object.freeze({
+    width: 1280,
+    height: 720,
+    audioBitrate: '128k',
+    libx264: Object.freeze({ crf: 23, maxrate: '2M', bufsize: '4M' }),
+    libsvtav1: Object.freeze({ crf: 30, maxKbps: 2000 }),
+    av1_qsv: Object.freeze({ quality: 26 }),
+  }),
+  medium: Object.freeze({
+    width: 1280,
+    height: 720,
+    audioBitrate: '96k',
+    libx264: Object.freeze({ crf: 28, maxrate: '1200k', bufsize: '2400k' }),
+    libsvtav1: Object.freeze({ crf: 44, maxKbps: 1200 }),
+    av1_qsv: Object.freeze({ quality: 31 }),
+  }),
+  low: Object.freeze({
+    width: 854,
+    height: 480,
+    audioBitrate: '64k',
+    libx264: Object.freeze({ crf: 30, maxrate: '600k', bufsize: '1200k' }),
+    libsvtav1: Object.freeze({ crf: 52, maxKbps: 600 }),
+    av1_qsv: Object.freeze({ quality: 33 }),
+  }),
 });
 
 /** The level a request gets when it does not ask for one. */
@@ -118,7 +175,7 @@ export function resolveClipQuality(param) {
   return Object.hasOwn(CLIP_QUALITIES, value) ? value : null;
 }
 
-// The picture fits inside the level's box and is never enlarged; libx264 needs even sides.
+// The picture fits inside the level's box and is never enlarged; the encoders need even sides.
 const fitWidth = (level) => `'min(${level.width},iw)'`;
 const fitHeight = (level) => `'min(${level.height},ih)'`;
 const FIT_FLAGS = 'force_original_aspect_ratio=decrease:force_divisible_by=2';
@@ -136,26 +193,101 @@ const STREAM_SELECTION = Object.freeze([
   '-map_metadata', '-1',
 ]);
 
-// libx264 rather than a hardware encoder: the same bitstream on every
-// deployment, and on the production host (72 threads) the encode is not the
-// slow part — software decode of the source is.
-//   subme=1   measured there on a 50 s 1080p clip: 12.1 s with veryfast's
-//             default of 2, 5.1 s with 1, for a file within 3% of the same
-//             size. More encoder threads did not close that gap.
-//   crf with a bitrate ceiling (both from the quality level): at the default
-//             level a 50 s clip stays under ~13 MB however grainy the film.
-//   -g 48     a keyframe at least every 2 s at film rates.
-const h264Args = (level) => [
-  '-c:v', 'libx264',
-  '-preset', 'veryfast',
-  '-x264-params', 'subme=1',
-  '-crf', String(level.crf),
-  '-maxrate', level.maxrate,
-  '-bufsize', level.bufsize,
-  '-profile:v', 'high',
-  '-pix_fmt', 'yuv420p',
-  '-g', '48',
-];
+// Every encoder: `-g 48`, a keyframe at least every 2 s at film rates.
+const VIDEO_ENCODER_ARGS = Object.freeze({
+  // The same bitstream on every deployment, and on the production host (72
+  // threads) the encode is not the slow part — software decode of the source is.
+  //   subme=1   measured there on a 50 s 1080p clip: 12.1 s with veryfast's
+  //             default of 2, 5.1 s with 1, for a file within 3% of the same
+  //             size. More encoder threads did not close that gap.
+  //   crf with a bitrate ceiling: at the default level a 50 s clip stays under
+  //             ~13 MB however grainy the film.
+  libx264: (settings) => [
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-x264-params', 'subme=1',
+    '-crf', String(settings.crf),
+    '-maxrate', settings.maxrate,
+    '-bufsize', settings.bufsize,
+    '-profile:v', 'high',
+    '-pix_fmt', 'yuv420p',
+    '-g', '48',
+  ],
+  // Preset 10 is the fastest there is for a file like this (11-13 encode
+  // exactly as 10 outside low-delay mode) and keeps pace with libx264 above.
+  // `mbr` is the bitrate ceiling, in kb/s.
+  libsvtav1: (settings) => [
+    '-c:v', 'libsvtav1',
+    '-preset', '10',
+    '-crf', String(settings.crf),
+    '-svtav1-params', `mbr=${settings.maxKbps}`,
+    '-pix_fmt', 'yuv420p',
+    '-g', '48',
+  ],
+  // A quality level alone selects Quick Sync's ICQ mode. Adding a bitrate to
+  // cap it selects a mode this driver rejects ("parameters not supported by
+  // the QSV runtime"), and a bitrate without the quality level spends that
+  // bitrate on a clip that needs a tenth of it.
+  av1_qsv: (settings) => [
+    '-c:v', 'av1_qsv',
+    '-global_quality', String(settings.quality),
+    '-g', '48',
+  ],
+});
+
+// Libraries that write to stderr on every run whatever ffmpeg's own log level
+// is (an encoder banner, driver lookups). Errors still come through.
+const ENCODER_ENVIRONMENT = Object.freeze({
+  libsvtav1: Object.freeze({ SVT_LOG: '1' }),
+  av1_qsv: Object.freeze({ LIBVA_MESSAGING_LEVEL: '1' }),
+});
+
+const encoderEnvironment = (encoder) => ({ ...process.env, ...ENCODER_ENVIRONMENT[encoder] });
+
+const encoderProbes = new Map();
+
+/**
+ * Whether an encoder actually works in this process's environment: one small
+ * frame through it, with the settings a real clip uses. Listed is not the same
+ * as working — av1_qsv is listed by any ffmpeg built with Quick Sync, GPU or no
+ * GPU. Probed once per process and logged once.
+ *
+ * The picture is 256x144 on purpose: the Arc's AV1 encoder refuses 64x64.
+ *
+ * @param {keyof typeof CLIP_ENCODERS} encoder
+ * @returns {Promise<boolean>}
+ */
+export function clipEncoderAvailable(encoder) {
+  let probe = encoderProbes.get(encoder);
+  if (!probe) {
+    probe = execFileAsync(
+      'ffmpeg',
+      [
+        '-hide_banner', '-v', 'error', '-nostdin',
+        '-f', 'lavfi', '-i', 'color=c=black:s=256x144:d=0.2',
+        '-frames:v', '1',
+        '-vf', `format=${CLIP_ENCODERS[encoder].pixelFormat}`,
+        ...VIDEO_ENCODER_ARGS[encoder](CLIP_QUALITIES.low[encoder]),
+        '-f', 'null', '-',
+      ],
+      { env: encoderEnvironment(encoder), timeout: 30_000 }
+    ).then(
+      () => {
+        logger.info(`Clip encoder ${encoder} works here`);
+        return true;
+      },
+      (error) => {
+        logger.warn(
+          `Clip encoder ${encoder} does not work here, so no clip will be made with it ` +
+          `(${String(error.stderr || error.message).trim().slice(0, 300)})`
+        );
+        return false;
+      }
+    );
+    encoderProbes.set(encoder, probe);
+  }
+  return probe;
+}
 
 // Only for a tone-mapped clip, where the output is BT.709 by construction. An
 // SDR source keeps whatever tags it came with (an SD title is BT.601, and
@@ -294,15 +426,17 @@ export function selectColorPipeline(source, { libplacebo }) {
 
 /**
  * The -vf for a transcoded clip: fit inside the quality level's box, 8-bit
- * 4:2:0, BT.709.
+ * 4:2:0 in the layout the encoder takes, BT.709.
  *
  * @param {ClipSource} source
  * @param {'none'|'libplacebo'|'zscale'} pipeline
  * @param {keyof typeof CLIP_QUALITIES} [quality]
+ * @param {keyof typeof CLIP_ENCODERS} [encoder]
  * @returns {string}
  */
-export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QUALITY) {
+export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QUALITY, encoder = 'libx264') {
   const level = CLIP_QUALITIES[quality];
+  const { pixelFormat } = CLIP_ENCODERS[encoder];
 
   if (pipeline === 'libplacebo') {
     // Tone-map and scale in one GPU pass. The same filter (and so the same
@@ -314,7 +448,9 @@ export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QU
       output: 'sdr',
       fitInside: true,
     });
-    return source.assumedPq ? `${bt2020Tags('smpte2084')},${toneMap}` : toneMap;
+    const tagged = source.assumedPq ? `${bt2020Tags('smpte2084')},${toneMap}` : toneMap;
+    // The shared filter writes yuv420p; the same picture in another layout is a cheap repack.
+    return pixelFormat === 'yuv420p' ? tagged : `${tagged},format=${pixelFormat}`;
   }
 
   const fit = `scale=w=${fitWidth(level)}:h=${fitHeight(level)}:${FIT_FLAGS}`;
@@ -333,11 +469,11 @@ export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QU
       'zscale=p=bt709',
       'tonemap=tonemap=hable:desat=0:peak=100',
       'zscale=t=bt709:m=bt709:r=tv',
-      'format=yuv420p',
+      `format=${pixelFormat}`,
     ].join(',');
   }
 
-  return `${fit},format=yuv420p`;
+  return `${fit},format=${pixelFormat}`;
 }
 
 /**
@@ -352,6 +488,7 @@ export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QU
  * @param {ClipSource} params.source
  * @param {'none'|'libplacebo'|'zscale'} params.pipeline
  * @param {keyof typeof CLIP_QUALITIES} [params.quality]
+ * @param {keyof typeof CLIP_ENCODERS} [params.encoder]
  * @param {string} params.outputPath
  * @returns {string[]}
  */
@@ -362,6 +499,7 @@ export function buildTranscodeArgs({
   source,
   pipeline,
   quality = DEFAULT_CLIP_QUALITY,
+  encoder = 'libx264',
   outputPath,
 }) {
   const level = CLIP_QUALITIES[quality];
@@ -372,8 +510,8 @@ export function buildTranscodeArgs({
     '-i', videoPath,
     '-t', seconds(duration),
     ...STREAM_SELECTION,
-    '-vf', buildClipVideoFilter(source, pipeline, quality),
-    ...h264Args(level),
+    '-vf', buildClipVideoFilter(source, pipeline, quality, encoder),
+    ...VIDEO_ENCODER_ARGS[encoder](level[encoder]),
     ...(pipeline === 'none' ? [] : BT709_TAGS),
     ...aacArgs(level.audioBitrate),
     ...MP4_OUTPUT_FLAGS,
@@ -494,7 +632,7 @@ const copyTimeoutMs = (duration) => (60 + duration * 2) * 1000;
  * only if it exits cleanly with something in it. The rename is atomic, so a
  * reader sees no file or the whole file, never a growing one.
  */
-async function writeClipFile({ outputPath, buildArgs, timeoutMs, span }) {
+async function writeClipFile({ outputPath, buildArgs, timeoutMs, span, env }) {
   const tempPath = join(dirname(outputPath), `${randomUUID()}${CLIP_TEMP_SUFFIX}`);
   const args = buildArgs(tempPath);
 
@@ -502,7 +640,7 @@ async function writeClipFile({ outputPath, buildArgs, timeoutMs, span }) {
     const startedAt = Date.now();
     logger.info(`ffmpeg ${args.join(' ')}`);
     try {
-      await executeFFmpeg(args, { timeout: timeoutMs, killSignal: 'SIGKILL' });
+      await executeFFmpeg(args, { timeout: timeoutMs, killSignal: 'SIGKILL', ...(env && { env }) });
       const { size } = await fs.stat(tempPath);
       if (size === 0) {
         throw new Error('FFmpeg wrote an empty clip');
@@ -517,7 +655,7 @@ async function writeClipFile({ outputPath, buildArgs, timeoutMs, span }) {
 }
 
 /**
- * Encode the H.264 clip every browser gets.
+ * Encode a clip: H.264 unless another encoder is named.
  *
  * @param {Object} params
  * @param {string} params.videoPath
@@ -525,6 +663,7 @@ async function writeClipFile({ outputPath, buildArgs, timeoutMs, span }) {
  * @param {number} params.duration
  * @param {ClipSource} params.source
  * @param {keyof typeof CLIP_QUALITIES} [params.quality]
+ * @param {keyof typeof CLIP_ENCODERS} [params.encoder]
  * @param {string} params.outputPath - Final cache path
  * @returns {Promise<void>}
  */
@@ -534,6 +673,7 @@ export async function transcodeClip({
   duration,
   source,
   quality = DEFAULT_CLIP_QUALITY,
+  encoder = 'libx264',
   outputPath,
 }) {
   // Probed only for a source that needs it; an SDR library never touches Vulkan.
@@ -544,9 +684,10 @@ export async function transcodeClip({
   await writeClipFile({
     outputPath,
     buildArgs: (tempPath) =>
-      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, quality, outputPath: tempPath }),
+      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, quality, encoder, outputPath: tempPath }),
     timeoutMs: transcodeTimeoutMs(duration),
-    span: { inputPath: videoPath, startTime: start, duration, codec: `h264-${quality}` },
+    span: { inputPath: videoPath, startTime: start, duration, codec: `${encoder}-${quality}` },
+    env: ENCODER_ENVIRONMENT[encoder] ? encoderEnvironment(encoder) : undefined,
   });
 }
 
