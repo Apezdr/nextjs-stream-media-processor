@@ -182,16 +182,26 @@ const FIT_FLAGS = 'force_original_aspect_ratio=decrease:force_divisible_by=2';
 
 const QUIET_FLAGS = Object.freeze(['-hide_banner', '-loglevel', 'error', '-nostdin', '-y']);
 
-// First real video stream (`V` skips cover art), first audio stream if there is
-// one, and nothing else: subtitles, data tracks, chapters and global tags would
-// each add a track or box that a strict player has to cope with.
-const STREAM_SELECTION = Object.freeze([
-  '-map', '0:V:0',
-  '-map', '0:a:0?',
-  '-sn', '-dn',
-  '-map_chapters', '-1',
-  '-map_metadata', '-1',
-]);
+// First real video stream (`V` skips cover art), one audio stream if the file
+// has it, and nothing else: subtitles, data tracks, chapters and global tags
+// would each add a track or box that a strict player has to cope with.
+//
+// `audioTrack` is the audio stream's position among the file's audio streams
+// (0 is the first). The caller chooses it (videoHandler.mjs): by language on a
+// deployment that states one, since a film's first track is as often a dub as
+// the language its viewers want.
+function streamSelection(audioTrack) {
+  if (!Number.isInteger(audioTrack) || audioTrack < 0) {
+    throw new Error(`A clip's audio track is a position among the audio streams, got ${audioTrack}`);
+  }
+  return [
+    '-map', '0:V:0',
+    '-map', `0:a:${audioTrack}?`,
+    '-sn', '-dn',
+    '-map_chapters', '-1',
+    '-map_metadata', '-1',
+  ];
+}
 
 // Every encoder: `-g 48`, a keyframe at least every 2 s at film rates.
 const VIDEO_ENCODER_ARGS = Object.freeze({
@@ -489,6 +499,7 @@ export function buildClipVideoFilter(source, pipeline, quality = DEFAULT_CLIP_QU
  * @param {'none'|'libplacebo'|'zscale'} params.pipeline
  * @param {keyof typeof CLIP_QUALITIES} [params.quality]
  * @param {keyof typeof CLIP_ENCODERS} [params.encoder]
+ * @param {number} [params.audioTrack] - Which of the file's audio streams (0 is the first)
  * @param {string} params.outputPath
  * @returns {string[]}
  */
@@ -500,6 +511,7 @@ export function buildTranscodeArgs({
   pipeline,
   quality = DEFAULT_CLIP_QUALITY,
   encoder = 'libx264',
+  audioTrack = 0,
   outputPath,
 }) {
   const level = CLIP_QUALITIES[quality];
@@ -509,7 +521,7 @@ export function buildTranscodeArgs({
     '-ss', seconds(start),
     '-i', videoPath,
     '-t', seconds(duration),
-    ...STREAM_SELECTION,
+    ...streamSelection(audioTrack),
     '-vf', buildClipVideoFilter(source, pipeline, quality, encoder),
     ...VIDEO_ENCODER_ARGS[encoder](level[encoder]),
     ...(pipeline === 'none' ? [] : BT709_TAGS),
@@ -577,10 +589,11 @@ export function planOriginalCopy({ start, duration, startTime, keyframeTime }) {
  * @param {string} params.videoPath
  * @param {ClipSource} params.source
  * @param {{ seekTo: number, length: number }} params.plan - From planOriginalCopy
+ * @param {number} [params.audioTrack] - Which of the file's audio streams (0 is the first)
  * @param {string} params.outputPath
  * @returns {string[]}
  */
-export function buildOriginalArgs({ videoPath, source, plan, outputPath }) {
+export function buildOriginalArgs({ videoPath, source, plan, audioTrack = 0, outputPath }) {
   return [
     ...QUIET_FLAGS,
     '-seek_timestamp', '1', // -ss is a timestamp in the file, as ffprobe reported the keyframe
@@ -588,7 +601,7 @@ export function buildOriginalArgs({ videoPath, source, plan, outputPath }) {
     '-ss', seconds(plan.seekTo),
     '-t', seconds(plan.length),
     '-i', videoPath,
-    ...STREAM_SELECTION,
+    ...streamSelection(audioTrack),
     '-c:v', 'copy',
     ...(source.codec === 'hevc' ? ['-tag:v', 'hvc1'] : []),
     ...aacArgs('192k'),
@@ -674,6 +687,7 @@ export async function transcodeClip({
   source,
   quality = DEFAULT_CLIP_QUALITY,
   encoder = 'libx264',
+  audioTrack = 0,
   outputPath,
 }) {
   // Probed only for a source that needs it; an SDR library never touches Vulkan.
@@ -684,7 +698,7 @@ export async function transcodeClip({
   await writeClipFile({
     outputPath,
     buildArgs: (tempPath) =>
-      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, quality, encoder, outputPath: tempPath }),
+      buildTranscodeArgs({ videoPath, start, duration, source, pipeline, quality, encoder, audioTrack, outputPath: tempPath }),
     timeoutMs: transcodeTimeoutMs(duration),
     span: { inputPath: videoPath, startTime: start, duration, codec: `${encoder}-${quality}` },
     env: ENCODER_ENVIRONMENT[encoder] ? encoderEnvironment(encoder) : undefined,
@@ -703,7 +717,7 @@ export async function transcodeClip({
  * @returns {Promise<void>}
  * @throws {ClipNotCopyableError} when the source has no usable keyframe near `start`
  */
-export async function copyOriginalClip({ videoPath, start, duration, source, outputPath }) {
+export async function copyOriginalClip({ videoPath, start, duration, source, audioTrack = 0, outputPath }) {
   const keyframeTime = await probeKeyframeAtOrBefore(videoPath, source.startTime + start);
   const plan = planOriginalCopy({ start, duration, startTime: source.startTime, keyframeTime });
   if (!plan) {
@@ -714,7 +728,7 @@ export async function copyOriginalClip({ videoPath, start, duration, source, out
 
   await writeClipFile({
     outputPath,
-    buildArgs: (tempPath) => buildOriginalArgs({ videoPath, source, plan, outputPath: tempPath }),
+    buildArgs: (tempPath) => buildOriginalArgs({ videoPath, source, plan, audioTrack, outputPath: tempPath }),
     timeoutMs: copyTimeoutMs(duration),
     span: { inputPath: videoPath, startTime: start, duration, codec: `copy-${source.codec}` },
   });

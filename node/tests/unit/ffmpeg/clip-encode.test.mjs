@@ -470,3 +470,37 @@ describe('buildOriginalArgs', () => {
     expect(args.indexOf('-t')).toBeLessThan(args.indexOf('-i'));
   });
 });
+
+describe('the audio track', () => {
+  const transcode = {
+    videoPath: '/media/movies/A Film/A Film.mkv', start: 3200, duration: 50, outputPath: '/cache/x.part',
+    source: SDR, pipeline: 'none',
+  };
+  const copy = {
+    videoPath: '/media/movies/A Film/A Film.mkv', plan: { seekTo: 3199.446, length: 50.554 }, outputPath: '/cache/x.part',
+    source: SDR,
+  };
+  const maps = (args) => args.flatMap((arg, position) => (arg === '-map' ? [args[position + 1]] : []));
+
+  it('is the first when the caller names none', () => {
+    expect(maps(buildTranscodeArgs(transcode))).toEqual(['0:V:0', '0:a:0?']);
+    expect(maps(buildOriginalArgs(copy))).toEqual(['0:V:0', '0:a:0?']);
+  });
+
+  it('is the one the caller names, by its position among the audio streams', () => {
+    expect(maps(buildTranscodeArgs({ ...transcode, audioTrack: 2 }))).toEqual(['0:V:0', '0:a:2?']);
+    expect(maps(buildOriginalArgs({ ...copy, audioTrack: 2 }))).toEqual(['0:V:0', '0:a:2?']);
+    expect(maps(buildTranscodeArgs({ ...transcode, audioTrack: 1, encoder: 'libsvtav1' }))).toEqual(['0:V:0', '0:a:1?']);
+  });
+
+  it('is still one audio stream and nothing else', () => {
+    const args = buildTranscodeArgs({ ...transcode, audioTrack: 3 });
+    expect(args.filter((arg) => arg === '-map')).toHaveLength(2);
+    expect(args).toEqual(expect.arrayContaining(['-sn', '-dn', '-map_chapters', '-map_metadata']));
+  });
+
+  it.each([[-1], [1.5], ['1'], [null], [NaN]])('refuses %p, which is not a position', (audioTrack) => {
+    expect(() => buildTranscodeArgs({ ...transcode, audioTrack })).toThrow(/audio track/);
+    expect(() => buildOriginalArgs({ ...copy, audioTrack })).toThrow(/audio track/);
+  });
+});

@@ -68,6 +68,12 @@ const itWithToneMap = haveToneMap ? it : it.skip;
 
 const ffmpeg = (args) => run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
 
+/** The loudest sample of a file's audio, in dB: about -91 for silence, about -18 for the test tone. */
+async function maxVolume(file) {
+  const { stderr } = await run('ffmpeg', ['-hide_banner', '-nostdin', '-i', file, '-vn', '-af', 'volumedetect', '-f', 'null', '-']);
+  return Number(stderr.match(/max_volume: (-?[\d.]+) dB/)[1]);
+}
+
 /** What a player sees when it opens the file. */
 async function inspect(file) {
   const { stdout } = await run('ffprobe', [
@@ -144,6 +150,18 @@ describeWithTools('clips made by the real ffmpeg', () => {
       source('with-cover.mp4'),
     ]);
 
+    // A dubbed release: the dub first and marked default (silent here), the
+    // original second (the tone).
+    await ffmpeg([
+      ...picture('640x360', 6), '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000', ...tone(6),
+      '-map', '0:v', '-map', '1:a', '-map', '2:a', '-t', '6',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-g', '48', '-keyint_min', '48', '-sc_threshold', '0',
+      '-c:a', 'ac3',
+      '-metadata:s:a:0', 'language=ita', '-metadata:s:a:1', 'language=eng',
+      '-disposition:a:0', 'default', '-disposition:a:1', '0',
+      source('dubbed.mkv'),
+    ]);
+
     // The same picture in a file whose timestamps start at 5 s, not 0.
     await ffmpeg(['-i', source('h264.mp4'), '-c', 'copy', '-output_ts_offset', '5', source('offset.mkv')]);
 
@@ -159,7 +177,7 @@ describeWithTools('clips made by the real ffmpeg', () => {
       ]);
     }
 
-    for (const name of ['h264.mp4', 'odd.mkv', 'with-cover.mp4', 'offset.mkv', ...(haveHevc ? ['hdr10.mkv'] : [])]) {
+    for (const name of ['h264.mp4', 'odd.mkv', 'with-cover.mp4', 'offset.mkv', 'dubbed.mkv', ...(haveHevc ? ['hdr10.mkv'] : [])]) {
       sources[name] = await clipEncode.probeClipSource(source(name));
     }
   }, 120_000);
@@ -365,6 +383,50 @@ describeWithTools('clips made by the real ffmpeg', () => {
       expect(clip.videoPackets).toBeGreaterThanOrEqual(118);
       expect(clip.videoPackets).toBeLessThanOrEqual(130);
     });
+  });
+
+  describe('the audio track', () => {
+    const SILENT = -80;
+    const AUDIBLE = -40;
+
+    it('an encoded clip carries the track it is told to, and the first when told nothing', async () => {
+      const first = output('dubbed-first.mp4');
+      const second = output('dubbed-second.mp4');
+      const clip = { videoPath: source('dubbed.mkv'), start: 1, duration: 3, source: sources['dubbed.mkv'] };
+
+      await clipEncode.transcodeClip({ ...clip, outputPath: first });
+      await clipEncode.transcodeClip({ ...clip, audioTrack: 1, outputPath: second });
+
+      expect(await maxVolume(first)).toBeLessThan(SILENT);
+      expect(await maxVolume(second)).toBeGreaterThan(AUDIBLE);
+      // One audio stream either way, stereo AAC as ever.
+      const made = await inspect(second);
+      expect(made.streamTypes).toEqual(['video', 'audio']);
+      expect(made.audio.codec_name).toBe('aac');
+      expect(made.audio.channels).toBe(2);
+    }, 60_000);
+
+    it('an original-quality clip carries the track it is told to', async () => {
+      const first = output('dubbed-original-first.mp4');
+      const second = output('dubbed-original-second.mp4');
+      const clip = { videoPath: source('dubbed.mkv'), start: 2.5, duration: 3, source: sources['dubbed.mkv'] };
+
+      await clipEncode.copyOriginalClip({ ...clip, outputPath: first });
+      await clipEncode.copyOriginalClip({ ...clip, audioTrack: 1, outputPath: second });
+
+      expect(await maxVolume(first)).toBeLessThan(SILENT);
+      expect(await maxVolume(second)).toBeGreaterThan(AUDIBLE);
+      expect((await inspect(second)).streamTypes).toEqual(['video', 'audio']);
+    }, 60_000);
+
+    it('a position past the last audio stream makes a clip with no sound, not an error', async () => {
+      const outputPath = output('dubbed-none.mp4');
+      await clipEncode.transcodeClip({
+        videoPath: source('dubbed.mkv'), start: 1, duration: 2, source: sources['dubbed.mkv'], audioTrack: 5, outputPath,
+      });
+
+      expect((await inspect(outputPath)).streamTypes).toEqual(['video']);
+    }, 60_000);
   });
 
   describe('through the request handler', () => {

@@ -1,4 +1,12 @@
-import { canonicalizeLangCode, getLanguageName } from '../../../utils/languageMap.mjs';
+import { getLanguageName } from '../../../utils/languageMap.mjs';
+import {
+  taggedLanguage,
+  comparableLanguage,
+  ordinaryTracks,
+  trackInLanguage,
+  ffmpegDefaultAudioTrack,
+  tracksFromScanMetadata,
+} from '../../../utils/audioTracks.mjs';
 
 /**
  * Which audio track a caption is transcribed from.
@@ -22,10 +30,13 @@ import { canonicalizeLangCode, getLanguageName } from '../../../utils/languageMa
  * version of a French film. Among equals the file's default track wins, then
  * the first in the file.
  *
- * A track here is `{ index, language, title, isDefault, commentary, described,
- * channels }`: what `getAudioTracks` (ffprobe.mjs) returns, and what
- * `tracksFromScanMetadata` makes of the scanner's stored record.
+ * The reading of the tracks themselves (language tags, commentary, ffmpeg's own
+ * pick) is utils/audioTracks.mjs, shared with the preview clips. A track is
+ * what `getAudioTracks` (ffprobe.mjs) returns, or what `tracksFromScanMetadata`
+ * makes of the scanner's stored record.
  */
+
+export { ffmpegDefaultAudioTrack, tracksFromScanMetadata };
 
 export class NoCaptionAudioError extends Error {
   /**
@@ -48,28 +59,6 @@ export class NoCaptionAudioError extends Error {
   }
 }
 
-const SECONDARY_TITLE = /\b(commentary|audio description|descriptive|described)\b/i;
-
-/**
- * A track's language tag as a comparable code ("eng", "en", "en-US" are all
- * "en"), or null when the track does not say: no tag, or "und" (undetermined).
- */
-function taggedLanguage(track) {
-  const raw = typeof track.language === 'string' ? track.language.trim().toLowerCase() : '';
-  if (!raw || raw === 'und') return null;
-  return canonicalizeLangCode(raw.split(/[-_]/)[0]);
-}
-
-function isSecondary(track) {
-  return Boolean(track.commentary || track.described || (track.title && SECONDARY_TITLE.test(track.title)));
-}
-
-/** The tracks a caption may come from: the ordinary ones, or all of them when none is ordinary. */
-function candidateTracks(tracks) {
-  const ordinary = tracks.filter((track) => !isSecondary(track));
-  return ordinary.length > 0 ? ordinary : tracks;
-}
-
 /**
  * @param {Array<Object>|null|undefined} tracks - The file's audio tracks in file order
  * @param {string} langCode - The caption language ("en")
@@ -81,14 +70,10 @@ export function selectCaptionAudioTrack(tracks, langCode) {
     throw new NoCaptionAudioError(langCode, [], 0);
   }
 
-  const candidates = candidateTracks(tracks);
-  const wanted = canonicalizeLangCode(String(langCode).toLowerCase());
+  const inLanguage = trackInLanguage(tracks, langCode);
+  if (inLanguage) return inLanguage;
 
-  const inLanguage = candidates.filter((track) => taggedLanguage(track) === wanted);
-  if (inLanguage.length > 0) {
-    return inLanguage.find((track) => track.isDefault) || inLanguage[0];
-  }
-
+  const candidates = ordinaryTracks(tracks);
   const tagged = candidates.map(taggedLanguage).filter((language) => language !== null);
   throw new NoCaptionAudioError(
     langCode,
@@ -107,31 +92,12 @@ export function selectCaptionAudioTrack(tracks, langCode) {
  * @returns {boolean}
  */
 export function hasCaptionAudioTrack(tracks, langCode) {
-  try {
-    selectCaptionAudioTrack(tracks, langCode);
-    return true;
-  } catch (err) {
-    if (err instanceof NoCaptionAudioError) return false;
-    throw err;
-  }
-}
-
-/**
- * The track ffmpeg takes when it is not told which: the default one, else the
- * one with the most channels, else the first. This is what every caption made
- * before tracks were chosen by language was transcribed from.
- *
- * @param {Array<Object>} tracks
- * @returns {Object|null}
- */
-export function ffmpegDefaultAudioTrack(tracks) {
-  if (!Array.isArray(tracks) || tracks.length === 0) return null;
-  const score = (track) => (track.isDefault ? 5000000 : 0) + (Number(track.channels) || 0);
-  return tracks.reduce((best, track) => (score(track) > score(best) ? track : best));
+  return Array.isArray(tracks) && trackInLanguage(tracks, langCode) !== null;
 }
 
 /**
  * Whether a caption made from ffmpeg's own pick was made from the right audio.
+ * Every caption made before tracks were chosen by language came from that pick.
  *
  * @param {Array<Object>|null|undefined} tracks
  * @param {string} langCode
@@ -143,31 +109,7 @@ export function ffmpegDefaultAudioTrack(tracks) {
 export function judgeUnmappedCaption(tracks, langCode) {
   if (!hasCaptionAudioTrack(tracks, langCode)) return 'no-audio-in-language';
   const used = ffmpegDefaultAudioTrack(tracks);
-  const wanted = canonicalizeLangCode(String(langCode).toLowerCase());
-  const usedIsRight = candidateTracks(tracks).includes(used) && taggedLanguage(used) === wanted;
+  const usedIsRight =
+    ordinaryTracks(tracks).includes(used) && taggedLanguage(used) === comparableLanguage(langCode);
   return usedIsRight ? 'ok' : 'wrong-track';
-}
-
-/**
- * The audio tracks of a title's video as the scanner recorded them
- * (`additionalMetadata.audio`, see infoManager.mjs), in the shape the
- * functions above take. Null when the record does not say which language each
- * track is in: no audio list, or one written before `languageTag` existed.
- *
- * @param {Object|null|undefined} additionalMetadata
- * @returns {Array<Object>|null}
- */
-export function tracksFromScanMetadata(additionalMetadata) {
-  const audio = additionalMetadata?.audio;
-  if (!Array.isArray(audio)) return null;
-  if (audio.some((track) => !track || !('languageTag' in track))) return null;
-  return audio.map((track, position) => ({
-    index: position,
-    channels: track.channels,
-    language: track.languageTag,
-    title: track.title ?? null,
-    isDefault: Boolean(track.disposition?.default),
-    commentary: Boolean(track.disposition?.comment),
-    described: Boolean(track.disposition?.visual_impaired || track.disposition?.descriptions),
-  }));
 }

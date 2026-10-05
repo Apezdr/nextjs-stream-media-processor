@@ -35,6 +35,11 @@ import {
 import { createClipJobRunner } from './utils/clipJobs.mjs';
 import { sendFileWithRanges } from './utils/rangeFile.mjs';
 import {
+  tracksFromScanMetadata,
+  trackInLanguage,
+  preferredAudioLanguageFromEnvironment,
+} from './utils/audioTracks.mjs';
+import {
   probeClipSource,
   canCopyOriginal,
   transcodeClip,
@@ -55,6 +60,42 @@ const logger = createCategoryLogger('videoHandler');
 //      VP9/WebM on Arc); original-quality clips are always MP4 (was the
 //      source's container).
 const VIDEO_CLIP_VERSION = 2;
+
+let warnedAboutAudioLanguage = false;
+
+/**
+ * Which of the file's audio streams a clip carries, as a position among them
+ * (0 is the first).
+ *
+ * The first, unless the deployment names a language it prefers
+ * (PREFERRED_AUDIO_LANGUAGE) and the file has an ordinary track tagged with
+ * it. A release is as likely to put a dub first as the original, so "the first
+ * track" is whatever the release group chose; a deployment that knows what its
+ * viewers speak can say so. With nothing set nothing is assumed, and a clip is
+ * what it always was.
+ *
+ * Read from the scanner's record of the file (the .info sidecar), which every
+ * request already loads, so the choice is known before the cache is looked in
+ * and costs no probe.
+ *
+ * @param {Object} info - getInfo() of the video
+ * @returns {number}
+ */
+function clipAudioTrack(info) {
+  const { language, invalid } = preferredAudioLanguageFromEnvironment(process.env.PREFERRED_AUDIO_LANGUAGE);
+  if (invalid && !warnedAboutAudioLanguage) {
+    warnedAboutAudioLanguage = true;
+    logger.warn(
+      `Ignoring PREFERRED_AUDIO_LANGUAGE="${process.env.PREFERRED_AUDIO_LANGUAGE}": ` +
+      'it must be a language code such as en, de or ja'
+    );
+  }
+  if (!language) return 0;
+
+  // Null for a sidecar that does not record each track's language: the first track.
+  const tracks = tracksFromScanMetadata(info.additionalMetadata);
+  return trackInLanguage(tracks, language)?.index ?? 0;
+}
 
 const MAX_CLIP_DURATION = 600; // 10 minutes
 
@@ -331,6 +372,7 @@ async function serveOriginalClip(req, res, clip) {
           start: clip.start,
           duration: clip.duration,
           source,
+          audioTrack: clip.audioTrack,
           outputPath: cachedPath,
         });
       });
@@ -398,6 +440,7 @@ async function serveTranscodedClip(req, res, clip) {
             source,
             quality: clip.quality,
             encoder,
+            audioTrack: clip.audioTrack,
             outputPath: cachedPath,
           });
         });
@@ -483,6 +526,12 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
       throw new Error(`No uuid in the .info sidecar of ${videoPath}`);
     }
 
+    // A clip with another audio track is another file. The first track adds
+    // nothing to the name, so every clip made before the track was chosen
+    // (always the first) is still found.
+    const audioTrack = clipAudioTrack(info);
+    const audioKey = audioTrack === 0 ? '' : `-a${audioTrack}`;
+
     const clip = {
       title,
       videoPath,
@@ -492,7 +541,8 @@ export async function handleVideoClipRequest(req, res, type, basePath) {
       duration: end - start,
       quality,
       encoders,
-      keyBase: `${title}-key_${info.uuid}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}`,
+      audioTrack,
+      keyBase: `${title}-key_${info.uuid}-start_${start}-end_${end}-v${VIDEO_CLIP_VERSION}${audioKey}`,
     };
 
     if (useOriginalVideo && (await serveOriginalClip(req, res, clip))) {
