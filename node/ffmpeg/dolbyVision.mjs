@@ -77,14 +77,23 @@ export async function needsDoviReshape(videoPath) {
  * Limited range is pinned: a Profile 5 base layer is full range, and libplacebo
  * otherwise carries that through.
  *
- * @param {{width: number, height: number, output: 'sdr'|'pq'}} options
+ * The same filter tone-maps ordinary HDR10 and HLG (the RPU step does nothing
+ * without an RPU), which is how /videoClip uses it for every HDR source.
+ *
+ * `fitInside` treats width x height as a box instead of an exact size: the
+ * picture keeps its shape, fits inside the box, and both sides come out even.
+ *
+ * @param {{width: number|string, height: number|string, output: 'sdr'|'pq', fitInside?: boolean}} options
  * @returns {string}
  */
-export function doviReshapeFilter({ width, height, output }) {
+export function doviReshapeFilter({ width, height, output, fitInside = false }) {
   const target = output === 'pq'
     ? 'colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084:range=tv:format=yuv420p10le'
     : 'colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p';
-  return `libplacebo=w=${width}:h=${height}:apply_dolbyvision=1:tonemapping=bt.2390:${target}`;
+  const size = fitInside
+    ? `w=${width}:h=${height}:force_original_aspect_ratio=decrease:force_divisible_by=2`
+    : `w=${width}:h=${height}`;
+  return `libplacebo=${size}:apply_dolbyvision=1:tonemapping=bt.2390:${target}`;
 }
 
 let libplaceboProbe = null;

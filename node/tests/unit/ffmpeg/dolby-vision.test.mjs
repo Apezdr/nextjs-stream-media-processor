@@ -49,6 +49,15 @@ describe('doviReshapeFilter', () => {
     );
   });
 
+  it('fits the picture inside a box, with even sides, when asked to', () => {
+    // What /videoClip uses for every HDR source: no enlarging, shape kept.
+    expect(doviReshapeFilter({ width: "'min(1280,iw)'", height: "'min(720,ih)'", output: 'sdr', fitInside: true })).toBe(
+      "libplacebo=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:" +
+      'apply_dolbyvision=1:tonemapping=bt.2390:' +
+      'colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=yuv420p'
+    );
+  });
+
   it('runs on a Vulkan device', () => {
     expect([...DOVI_RESHAPE_INPUT_ARGS]).toEqual(['-init_hw_device', 'vulkan']);
   });

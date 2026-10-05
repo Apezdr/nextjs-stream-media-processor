@@ -28,12 +28,13 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } from "./lib/mediaPayload.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
+import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
@@ -1098,15 +1099,11 @@ app.get('/api/logs/categories', (req, res) => {
 
 // Clipping routes for movies and TV shows
 app.get("/videoClip/movie/:movieName", async (req, res) => {
-  const db = await initializeDatabase();
-  await handleVideoClipRequest(req, res, "movies", BASE_PATH, db);
-  await releaseDatabase(db);
+  await handleVideoClipRequest(req, res, "movies", BASE_PATH);
 });
 
 app.get("/videoClip/tv/:showName/:season/:episode", async (req, res) => {
-  const db = await initializeDatabase();
-  await handleVideoClipRequest(req, res, "tv", BASE_PATH, db);
-  await releaseDatabase(db);
+  await handleVideoClipRequest(req, res, "tv", BASE_PATH);
 });
 
 let isScanning = false;
@@ -1306,6 +1303,12 @@ function scheduleTasks() {
 
 async function initialize() {
   await ensureCacheDirs();
+  // An encode cut short by a restart leaves its temp file in the clip cache.
+  // Swept here, before the server listens: once requests arrive, a temp file
+  // may belong to an encode that is still running.
+  await sweepClipTempFiles(videoClipsCacheDir)
+    .then(removed => { if (removed > 0) logger.info(`Removed ${removed} unfinished clip temp file(s)`); })
+    .catch(err => logger.error(`Clip temp sweep failed: ${err.message}`));
   const port = 3000;
   server = app.listen(port, async () => {
     scheduleTasks();
