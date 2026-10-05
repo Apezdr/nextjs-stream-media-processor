@@ -9,7 +9,9 @@
  *   - a cache hit does not probe the source;
  *   - an unknown title is a 404, not a 422;
  *   - the TV app's original-quality clip is cached like any other, and falls
- *     back to the encoded clip when the source cannot be copied.
+ *     back to the encoded clip when the source cannot be copied;
+ *   - a clip carries the audio track in the deployment's preferred language,
+ *     when it names one (it used to be the file's first track, whatever that was).
  */
 
 import { describe, it, expect, jest, beforeAll, afterAll, beforeEach } from '@jest/globals';
@@ -126,6 +128,7 @@ beforeEach(async () => {
   // A server with the software AV1 encoder and no GPU, unless a test says otherwise.
   clipEncoderAvailable.mockImplementation(async (encoder) => encoder !== 'av1_qsv');
   delete process.env.VIDEO_CLIP_AV1_ENCODER;
+  delete process.env.PREFERRED_AUDIO_LANGUAGE;
 });
 
 const clipUrl = (query = 'start=3200&end=3250', title = 'A Film') =>
@@ -241,6 +244,7 @@ describe('the encoded clip', () => {
       source: SOURCE,
       quality: 'high',
       encoder: 'libx264',
+      audioTrack: 0,
       outputPath: path.join(cacheDir, `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`),
     });
 
@@ -624,5 +628,171 @@ describe('the original-quality clip (?useOriginalVideo=true)', () => {
 
     release();
     expect((await encoding).status).toBe(200);
+  });
+});
+
+describe('the audio track (PREFERRED_AUDIO_LANGUAGE)', () => {
+  // A video's audio as the scanner records it in the .info sidecar.
+  const audio = (...tracks) => ({
+    audio: tracks.map(([languageTag, flags = {}]) => ({
+      codec: 'eac3',
+      channels: 6,
+      language: languageTag,
+      languageTag,
+      title: flags.title ?? null,
+      disposition: {
+        default: Boolean(flags.default),
+        comment: Boolean(flags.comment),
+        visual_impaired: false,
+        descriptions: false,
+      },
+    })),
+  });
+  const withAudio = (additionalMetadata) => getInfo.mockImplementation(async () => ({ uuid, additionalMetadata }));
+  const audioTracksUsed = () => transcodeClip.mock.calls.map(([params]) => params.audioTrack);
+
+  // The Lighthouse as it sits in the library: an English commentary, the
+  // Italian dub as the default track, the English original last.
+  const DUBBED = audio(['eng', { comment: true }], ['ita', { default: true }], ['eng']);
+
+  it('assumes no language when it is not set: the first track, and the cache name clips always had', async () => {
+    withAudio(DUBBED);
+
+    await fetch(clipUrl()).then(body);
+
+    expect(audioTracksUsed()).toEqual([0]);
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`]);
+  });
+
+  it('carries the track in the preferred language, as its own cache file', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    withAudio(DUBBED);
+
+    const response = await fetch(clipUrl());
+    expect(response.status).toBe(200);
+
+    expect(audioTracksUsed()).toEqual([2]);
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_3200-end_3250-v2-a2-h264-high.mp4`]);
+
+    // Served from that file afterwards, like any clip.
+    await fetch(clipUrl()).then(body);
+    expect(transcodeClip).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not serve a clip cached with the first track to a deployment that prefers another', async () => {
+    withAudio(DUBBED);
+    await fetch(clipUrl()).then(body); // made with nothing set: the first track
+
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    await fetch(clipUrl()).then(body);
+
+    expect(audioTracksUsed()).toEqual([0, 2]);
+    expect((await cached()).sort()).toEqual([
+      `A Film-key_${uuid}-start_3200-end_3250-v2-a2-h264-high.mp4`,
+      `A Film-key_${uuid}-start_3200-end_3250-v2-h264-high.mp4`,
+    ]);
+  });
+
+  it('keeps the cached clip of a title whose first track is already the preferred one', async () => {
+    withAudio(audio(['eng', { default: true }], ['spa']));
+    await fetch(clipUrl()).then(body);
+
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    await fetch(clipUrl()).then(body);
+
+    expect(transcodeClip).toHaveBeenCalledTimes(1);
+    expect(await cached()).toHaveLength(1);
+  });
+
+  it.each([
+    ['de', 1],
+    ['ger', 1],
+    ['DE', 1],
+    ['ja', 2],
+    ['pt-BR', 0], // nothing in Portuguese: the first track
+  ])('PREFERRED_AUDIO_LANGUAGE=%s picks track %i of an English, German and Japanese file', async (language, expected) => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = language;
+    withAudio(audio(['eng', { default: true }], ['ger'], ['jpn']));
+
+    await fetch(clipUrl()).then(body);
+
+    expect(audioTracksUsed()).toEqual([expected]);
+  });
+
+  it('takes the default track among several in the preferred language', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    withAudio(audio(['ita'], ['eng'], ['eng', { default: true }]));
+
+    await fetch(clipUrl()).then(body);
+
+    expect(audioTracksUsed()).toEqual([2]);
+  });
+
+  it('uses the first track when the file has none in the preferred language, or none tagged', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+
+    withAudio(audio(['ita', { default: true }], ['fre']));
+    await fetch(clipUrl()).then(body);
+    withAudio(audio([null, { default: true }], [null]));
+    await fetch(clipUrl('start=100&end=150')).then(body);
+
+    expect(audioTracksUsed()).toEqual([0, 0]);
+  });
+
+  it('uses the first track when the sidecar does not record the tracks', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+
+    withAudio(undefined);
+    await fetch(clipUrl()).then(body);
+    // A sidecar from before each track's language tag was recorded.
+    withAudio({ audio: [{ codec: 'ac3', channels: 6, language: 'ita' }, { codec: 'ac3', channels: 6, language: 'eng' }] });
+    await fetch(clipUrl('start=100&end=150')).then(body);
+
+    expect(audioTracksUsed()).toEqual([0, 0]);
+  });
+
+  it('gives the original-quality clip the same track', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    withAudio(DUBBED);
+
+    const response = await fetch(clipUrl('start=3200&end=3250&useOriginalVideo=true'));
+    expect(response.status).toBe(200);
+
+    expect(copyOriginalClip).toHaveBeenCalledWith(expect.objectContaining({ audioTrack: 2 }));
+    // Still ends in the suffix clearOriginalSegmentsCache (utils.mjs) evicts by.
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_3200-end_3250-v2-a2-original.mp4`]);
+  });
+
+  it('gives the AV1 clip the same track', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'en';
+    withAudio(DUBBED);
+
+    await fetch(clipUrl('start=3200&end=3250&codec=av1')).then(body);
+
+    expect(transcodeClip).toHaveBeenCalledWith(expect.objectContaining({ encoder: 'libsvtav1', audioTrack: 2 }));
+    expect(await cached()).toEqual([`A Film-key_${uuid}-start_3200-end_3250-v2-a2-av1-high-svt.mp4`]);
+  });
+
+  it('ignores a value that is not a language code, saying so once', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = 'English, please';
+    withAudio(DUBBED);
+
+    await fetch(clipUrl()).then(body);
+    await fetch(clipUrl('start=100&end=150')).then(body);
+
+    expect(audioTracksUsed()).toEqual([0, 0]);
+    const warnings = quiet.warn.mock.calls.filter(([message]) => message.includes('PREFERRED_AUDIO_LANGUAGE'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0][0]).toContain('"English, please"');
+  });
+
+  it('treats an empty value as not set', async () => {
+    process.env.PREFERRED_AUDIO_LANGUAGE = '  ';
+    withAudio(DUBBED);
+
+    await fetch(clipUrl()).then(body);
+
+    expect(audioTracksUsed()).toEqual([0]);
+    expect(quiet.warn).not.toHaveBeenCalled();
   });
 });

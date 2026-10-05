@@ -136,6 +136,8 @@ AV1 is encoded in software (SVT-AV1) unless the GPU is opted in to. An Intel GPU
 
 `&useOriginalVideo=true` asks for the source's own picture instead (at most 2 minutes): the video stream is copied into MP4 and the audio re-encoded to AAC stereo. A copy has to begin on a keyframe, so this clip starts at the last keyframe at or before `start`. Sources that cannot be copied this way (anything other than 8-bit H.264 or 8/10-bit HEVC, and Dolby Vision that needs its RPU) get the encoded clip, at the `quality` the URL asks for. A copy itself has no quality levels.
 
+A clip carries one audio track: the file's first, or with `PREFERRED_AUDIO_LANGUAGE` set (a language code such as `en`) the one tagged with that language when the file has one. Commentary and audio-description tracks are passed over while there is an ordinary track.
+
 `VIDEO_CLIP_CONCURRENCY` sets how many clips are encoded at once (default: one per eight logical CPUs, between 2 and 4), GPU encodes included. Full-length playback and transcoding are not served from here: the JIT transcoder (`jit-transcoder` repo) owns them.
 
 For more detailed information about the implementation, refer to the source code in the repository.

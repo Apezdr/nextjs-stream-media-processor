@@ -31,8 +31,11 @@ Almost all of this backend's state is derived and rebuildable (SQLite mirrors th
 
 - VIDEO_CLIP_CONCURRENCY=2  # How many `/videoClip` preview clips are encoded at once (default: one per eight logical CPUs, between 2 and 4)
 - VIDEO_CLIP_AV1_ENCODER=gpu  # Make AV1 clips (`?codec=av1`) on an Intel GPU through Quick Sync instead of in software (default: software)
+- PREFERRED_AUDIO_LANGUAGE=en  # The language your viewers want to hear in a preview clip, as a language code (en, de, ja, ...). Unset: no preference, the file's first audio track
 
 Requests beyond the limit wait their turn, and a waiting clip is dropped if the viewer who asked for it has gone. Lower it on a server where clip encodes compete with the scanner; raise it on one with cores to spare.
+
+A file with several audio tracks (a film with its original and a dub) has them in whatever order its release put them. With `PREFERRED_AUDIO_LANGUAGE` set, a clip carries the track tagged with that language when the file has one, passing over commentary and audio-description tracks; otherwise, and always when it is unset, it carries the first track. Nothing is assumed about the language until you set it. Changing it makes new clips for the titles it affects and leaves the rest of the cache alone.
 
 The GPU is opt-in because it is shared with whatever else encodes on it. A single request can also ask for it with `&encoder=gpu`. A server without a usable Intel AV1 encoder makes the clip in software either way.
 
