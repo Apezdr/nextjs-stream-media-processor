@@ -227,9 +227,8 @@ describeWithFfmpegOnPath('the caption audio track against the real ffmpeg', () =
   });
 
   it('the English caption is extracted from the English dub', async () => {
-    const { track, matchedLanguage } = selectCaptionAudioTrack(await getAudioTracks(dubbed), 'en');
+    const track = selectCaptionAudioTrack(await getAudioTracks(dubbed), 'en');
     expect(track.index).toBe(2);
-    expect(matchedLanguage).toBe(true);
 
     const wav = path.join(dir, 'english.wav');
     await extractAudio(dubbed, wav, track.index);

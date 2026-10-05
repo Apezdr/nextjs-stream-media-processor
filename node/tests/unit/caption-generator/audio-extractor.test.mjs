@@ -1,6 +1,7 @@
 /**
  * extractAudio names the audio track it extracts. Without `-map` ffmpeg takes
- * the track with the most channels, whatever its language.
+ * the file's default track (else the one with the most channels), whatever
+ * its language.
  */
 
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';

@@ -6,8 +6,8 @@ import { executeFFmpeg } from '../../../ffmpeg/ffmpeg.mjs';
  * Extract a 16 kHz mono PCM WAV from one audio track of a video file.
  * This is whisper.cpp's required input format.
  *
- * The track is named, never left to ffmpeg, which would take the one with the
- * most channels whatever its language (see audio-track.mjs).
+ * The track is named, never left to ffmpeg, which would take the file's default
+ * track whatever its language (see audio-track.mjs).
  *
  * @param {string} videoPath   - Source media file
  * @param {string} wavPath     - Destination WAV file

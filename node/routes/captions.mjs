@@ -15,6 +15,8 @@ import {
   findInflightJob,
   getJob,
   getHealthSnapshot,
+  auditAutoCaptions,
+  CaptionAuditInputError,
   FeatureDisabledError,
   LanguageNotAllowedError,
   TargetExistsError,
@@ -51,6 +53,7 @@ async function tryAttachUser(req) {
  * - GET  /api/captions/jobs/:jobId                     (public — IDs unguessable)
  * - GET  /api/captions/health                          (webhook OR admin)
  * - POST /api/admin/captions/generate                  (admin)
+ * - POST /api/admin/captions/audit                     (admin)
  */
 export function setupCaptionsRoutes() {
   const router = express.Router();
@@ -202,6 +205,35 @@ export function setupCaptionsRoutes() {
     }
   );
 
+  // ---- Admin audit of the captions on disk --------------------------------
+  //
+  // Body: { apply?: boolean, madeBefore?: ISO date-time | "start" }.
+  // Without `apply: true` it only reports. See auditAutoCaptions.
+
+  router.post(
+    '/admin/captions/audit',
+    authenticateUser,
+    requireAdmin,
+    async (req, res) => {
+      try {
+        const { apply, madeBefore } = req.body || {};
+        const report = await auditAutoCaptions({ apply: apply === true, madeBefore: madeBefore ?? null });
+        const changed = report.items.filter(item => item.result === 'removed' || item.result === 'queued').length;
+        logger.info(
+          `Caption audit by ${req.user?.email}: ${report.scanned} captions, ${report.items.length} flagged` +
+          (report.applied ? `, ${changed} acted on` : ' (report only)')
+        );
+        return res.json(report);
+      } catch (err) {
+        if (err instanceof CaptionAuditInputError) {
+          return res.status(400).json({ error: err.message, code: err.code });
+        }
+        logger.error(`Caption audit failed: ${err.message}`);
+        return res.status(500).json({ error: err.message });
+      }
+    }
+  );
+
   return router;
 }
 
@@ -232,9 +264,14 @@ function mapEnqueueError(res, err) {
   if (err instanceof TargetExistsError) {
     return res.status(409).json({ error: err.message, code: err.code, path: err.path });
   }
-  // The file has no audio in the caption's language: nothing to retry.
+  // The file has no audio tagged with the caption's language: nothing to retry.
   if (err instanceof NoCaptionAudioError) {
-    return res.status(422).json({ error: err.message, code: err.code, audioLanguages: err.audioLanguages });
+    return res.status(422).json({
+      error: err.message,
+      code: err.code,
+      audioLanguages: err.audioLanguages,
+      untaggedTracks: err.untaggedTracks
+    });
   }
   // resolveTarget throws plain Errors for missing files — surface as 404
   if (err && /not found/i.test(err.message)) {

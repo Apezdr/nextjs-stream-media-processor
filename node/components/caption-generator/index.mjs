@@ -5,6 +5,8 @@ export {
   getJob,
   sweepOrphanTempFiles,
   getHealthSnapshot,
+  auditAutoCaptions,
+  CaptionAuditInputError,
   FeatureDisabledError,
   LanguageNotAllowedError,
   TargetExistsError,
