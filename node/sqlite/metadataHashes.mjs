@@ -19,7 +19,15 @@ export const HASH_DATA_VERSION = 1;
  * config state and combine it with each stored hash before returning. Toggling
  * the flag or changing the language list now naturally invalidates all hashes
  * for one sync cycle (after which they stabilise again until the next change).
+ *
+ * `stubRule` is the same lever for a change in WHICH titles get a stub under
+ * an unchanged config. Rule 2: only a title whose video has an audio track
+ * tagged with the caption's language (caption-stubs.mjs). Without the bump the
+ * titles that lost their stub would keep it in every consumer for ever, their
+ * stored hashes not having moved. Raise it whenever that rule changes.
  */
+const AUTO_CAPTION_STUB_RULE = 2;
+
 async function getAutoCaptionsContextHash() {
   try {
     const config = await getAutoCaptionsConfigCached();
@@ -29,6 +37,7 @@ async function getAutoCaptionsContextHash() {
     const fingerprint = JSON.stringify({
       enabled: Boolean(config?.enabled),
       languages: sortedLangs,
+      stubRule: AUTO_CAPTION_STUB_RULE,
     });
     return createHash('sha1').update(fingerprint).digest('hex');
   } catch (err) {

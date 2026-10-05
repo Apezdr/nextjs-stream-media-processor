@@ -216,7 +216,7 @@ export async function getVideoCodec(videoPath) {
 /**
  * Retrieves the audio tracks from the specified video file.
  * @param {string} videoPath - The path to the video file.
- * @returns {Promise<Array<{ index: number, codec: string, channels: number }>} - A promise that resolves to an array of audio track objects, containing the index, codec, and number of channels for each audio track.
+ * @returns {Promise<Array<{ index: number, codec: string, channels: number, language: string|null, title: string|null, isDefault: boolean, commentary: boolean, described: boolean }>} - A promise that resolves to an array of audio track objects, in file order. `index` is the stream's index in the file (what `-map 0:<index>` takes). `language` and `title` are the stream's tags as written, or null. `commentary` and `described` are the stream's disposition flags (a commentary track; a track narrated for the visually impaired).
  */
 export async function getAudioTracks(videoPath) {
   const args = [
@@ -234,11 +234,24 @@ export async function getAudioTracks(videoPath) {
     const audioStreams = output.streams.filter((stream) => stream.codec_type === "audio");
 
     // Map to desired output format. Reverted `index` to original ffprobe index.
-    const audioTracks = audioStreams.map((stream) => ({
-      index: stream.index, // Use original ffprobe index for robustness
-      codec: stream.codec_name,
-      channels: stream.channels,
-    }));
+    const audioTracks = audioStreams.map((stream) => {
+      // Matroska and MP4 report lower-case tag names; some containers keep the
+      // case the file was written with.
+      const tags = Object.fromEntries(
+        Object.entries(stream.tags || {}).map(([name, value]) => [name.toLowerCase(), value])
+      );
+      const disposition = stream.disposition || {};
+      return {
+        index: stream.index, // Use original ffprobe index for robustness
+        codec: stream.codec_name,
+        channels: stream.channels,
+        language: tags.language || null,
+        title: tags.title || null,
+        isDefault: disposition.default === 1,
+        commentary: disposition.comment === 1,
+        described: disposition.visual_impaired === 1 || disposition.descriptions === 1,
+      };
+    });
 
     return audioTracks;
   } catch (error) {

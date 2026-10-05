@@ -153,3 +153,86 @@ describeWithTools('chapters against the real ffprobe', () => {
     );
   });
 });
+
+// extractAudio runs `ffmpeg` from PATH (ffmpeg/ffmpeg.mjs), not the binary beside ffprobe.
+const haveFfmpegOnPath = haveTools && (await usable('ffmpeg'));
+const describeWithFfmpegOnPath = haveFfmpegOnPath ? describe : describe.skip;
+
+describeWithFfmpegOnPath('the caption audio track against the real ffmpeg', () => {
+  let dir;
+  let dubbed;
+  let getAudioTracks;
+  let selectCaptionAudioTrack;
+  let extractAudio;
+
+  // Loudest sample of a 16-bit PCM WAV: 0 for silence, thousands for a tone.
+  async function peak(wavPath) {
+    const wav = await fs.readFile(wavPath);
+    const samples = wav.subarray(wav.indexOf('data') + 8);
+    let loudest = 0;
+    for (let offset = 0; offset + 1 < samples.length; offset += 2) {
+      loudest = Math.max(loudest, Math.abs(samples.readInt16LE(offset)));
+    }
+    return loudest;
+  }
+
+  beforeAll(async () => {
+    ({ getAudioTracks } = await import('../../ffmpeg/ffprobe.mjs'));
+    ({ selectCaptionAudioTrack } = await import('../../components/caption-generator/domain/audio-track.mjs'));
+    ({ extractAudio } = await import('../../components/caption-generator/domain/audio-extractor.mjs'));
+
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'caption-audio-track-'));
+    dubbed = path.join(dir, 'dubbed.mkv');
+
+    // A foreign film as it arrives: the original in 5.1 as the default track
+    // (silent here), an English dub (a tone), an English commentary.
+    await run(ffmpegBinary, [
+      '-v', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=size=64x36:rate=10:duration=2',
+      '-f', 'lavfi', '-i', 'anullsrc=channel_layout=5.1:sample_rate=48000',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+      '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+      '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:a',
+      '-t', '2',
+      '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p', '-c:a', 'ac3',
+      '-metadata:s:a:0', 'language=jpn',
+      '-metadata:s:a:1', 'language=eng',
+      '-metadata:s:a:2', 'language=eng', '-metadata:s:a:2', 'title=Commentary',
+      '-disposition:a:0', 'default', '-disposition:a:1', '0', '-disposition:a:2', 'comment',
+      dubbed,
+    ]);
+  });
+
+  afterAll(async () => {
+    if (dir) await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('getAudioTracks reports each track with its language, default and commentary flags', async () => {
+    const tracks = await getAudioTracks(dubbed);
+
+    expect(tracks.map(({ index, channels, language, title, isDefault, commentary }) => (
+      { index, channels, language, title, isDefault, commentary }
+    ))).toEqual([
+      { index: 1, channels: 6, language: 'jpn', title: null, isDefault: true, commentary: false },
+      { index: 2, channels: 1, language: 'eng', title: null, isDefault: false, commentary: false },
+      { index: 3, channels: 2, language: 'eng', title: 'Commentary', isDefault: false, commentary: true },
+    ]);
+  });
+
+  it('left to itself ffmpeg extracts the 5.1 original, which is why the track is named', async () => {
+    const wav = path.join(dir, 'unmapped.wav');
+    await run(ffmpegBinary, ['-v', 'error', '-y', '-i', dubbed, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav]);
+
+    expect(await peak(wav)).toBe(0);
+  });
+
+  it('the English caption is extracted from the English dub', async () => {
+    const track = selectCaptionAudioTrack(await getAudioTracks(dubbed), 'en');
+    expect(track.index).toBe(2);
+
+    const wav = path.join(dir, 'english.wav');
+    await extractAudio(dubbed, wav, track.index);
+
+    expect(await peak(wav)).toBeGreaterThan(1000);
+  });
+});

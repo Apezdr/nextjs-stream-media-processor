@@ -1,4 +1,5 @@
 import { getAutoCaptionsConfigCached } from '../data-access/caption-config.mjs';
+import { hasCaptionAudioTrack, tracksFromScanMetadata } from './audio-track.mjs';
 
 // The track URL prefix is deployment-controlled. By default, point at this
 // processor's own /api/captions/track route. The Next.js (or any front-end
@@ -39,10 +40,17 @@ function buildTrackUrl({ mediaType, mediaTitle, season, episode }, langCode) {
  *  - feature disabled, or
  *  - an `.auto.srt` for that language already exists on disk (the scanner
  *    will have emitted a real entry under the same display key, which we'd
- *    shadow with a stub).
+ *    shadow with a stub), or
+ *  - the title's video is not known to have an audio track in that language.
+ *    A caption is only ever made from a track tagged with its language
+ *    (audio-track.mjs), so offering one anywhere else is offering a request
+ *    that will be refused. "Not known" includes a record with no audio list:
+ *    the option appears once a scan has recorded the tracks.
  *
  * @param {Object} subtitles - Subtitles map keyed by display name; mutated in place.
- * @param {Object} ctx       - { mediaType, mediaTitle, season?, episode?, langMap }
+ * @param {Object} ctx       - { mediaType, mediaTitle, season?, episode?, langMap, audioTracks }
+ *   `audioTracks`: the video's audio tracks as the scanner recorded them
+ *   (`tracksFromScanMetadata`), or null when the record does not say.
  */
 export async function addCaptionStubs(subtitles, ctx) {
   const config = await getAutoCaptionsConfigCached().catch(() => null);
@@ -52,6 +60,7 @@ export async function addCaptionStubs(subtitles, ctx) {
     const langName = (ctx.langMap && ctx.langMap[langCode]) || langCode;
     const stubKey = `${langName} - Auto Generated`;
     if (subtitles[stubKey]) continue;
+    if (!hasCaptionAudioTrack(ctx.audioTracks, langCode)) continue;
 
     subtitles[stubKey] = {
       url: buildTrackUrl(ctx, langCode),
@@ -81,7 +90,8 @@ export async function injectMovieStubs(movies, langMap) {
     await addCaptionStubs(movie.urls.subtitles, {
       mediaType: 'movie',
       mediaTitle: movie.name,
-      langMap
+      langMap,
+      audioTracks: tracksFromScanMetadata(movie.additional_metadata)
     });
     if (Object.keys(movie.urls.subtitles).length === 0) {
       delete movie.urls.subtitles;
@@ -117,7 +127,8 @@ export async function injectTvStubs(shows, langMap) {
           mediaTitle: show.name,
           season: seasonNumber,
           episode: episodeNumber,
-          langMap
+          langMap,
+          audioTracks: tracksFromScanMetadata(episode.additionalMetadata)
         });
         if (Object.keys(episode.subtitles).length === 0) {
           delete episode.subtitles;

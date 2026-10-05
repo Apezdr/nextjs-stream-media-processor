@@ -1,13 +1,16 @@
 import { promises as fs } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, relative } from 'path';
+import PQueue from 'p-queue';
 import { createHash, randomUUID } from 'crypto';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import { enqueueTask, TaskType, getTaskStatus } from '../../../lib/taskManager.mjs';
 import { getAutoCaptionsConfig, isLanguageEnabled } from '../data-access/caption-config.mjs';
 import { resolveTarget } from '../domain/target-resolver.mjs';
 import { extractAudio } from '../domain/audio-extractor.mjs';
+import { selectCaptionAudioTrack, NoCaptionAudioError } from '../domain/audio-track.mjs';
+import { listAutoCaptions, decideAutoCaption } from '../domain/caption-audit.mjs';
 import { postProcessSrt } from '../domain/srt-postprocess.mjs';
-import { getVideoDuration } from '../../../ffmpeg/ffprobe.mjs';
+import { getVideoDuration, getAudioTracks } from '../../../ffmpeg/ffprobe.mjs';
 import * as whisper from '../../../lib/whisper.mjs';
 import {
   createOrUpdateProcessQueue,
@@ -59,6 +62,8 @@ export class TargetExistsError extends Error {
     this.path = path;
   }
 }
+
+export { NoCaptionAudioError };
 
 async function fileExists(p) {
   try { await fs.access(p); return true; } catch { return false; }
@@ -115,6 +120,15 @@ async function trackProcess(action, fileKey, ...args) {
   } finally {
     if (db) await releaseDatabase(db).catch(() => {});
   }
+}
+
+/**
+ * The audio track a caption in `langCode` is transcribed from.
+ *
+ * @throws {NoCaptionAudioError} when no track is tagged with that language
+ */
+async function chooseAudioTrack(videoPath, langCode) {
+  return selectCaptionAudioTrack(await getAudioTracks(videoPath), langCode);
 }
 
 /**
@@ -202,6 +216,10 @@ export async function enqueueCaptionJob(req) {
     return enrichJobState(inflight);
   }
 
+  // Refuse now, not minutes later from the queue: a file with no audio in this
+  // language gets no caption, and the caller should hear that from its request.
+  await chooseAudioTrack(target.videoPath, langCode);
+
   const jobId = `cap-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const taskName = `Caption: ${req.mediaType}/${req.mediaTitle}${req.season ? `/S${req.season}E${req.episode}` : ''} [${langCode}]`;
   const processFileKey = buildProcessFileKey(req, langCode);
@@ -250,8 +268,11 @@ export async function enqueueCaptionJob(req) {
         s.completedAt = new Date().toISOString();
       }
       dedupeIndex.delete(state.dedupeKey);
-      health.lastFailureAt = new Date().toISOString();
-      health.lastFailureReason = err.message;
+      // A file with nothing to caption is not the caption engine failing.
+      if (!(err instanceof NoCaptionAudioError)) {
+        health.lastFailureAt = new Date().toISOString();
+        health.lastFailureReason = err.message;
+      }
       trackProcess('finalize', processFileKey, 'error', err.message);
       logger.error(`Caption job ${jobId} failed: ${err.message}`);
     });
@@ -289,9 +310,12 @@ async function runJob({ jobId, target, langCode, config, processFileKey }) {
   await fs.mkdir(CAPTIONS_TMP_DIR, { recursive: true });
 
   try {
-    logger.info(`[${jobId}] extracting audio: ${target.videoPath}`);
+    // Chosen again here, from the file as it is now: the job may have waited
+    // in the queue behind others, and the file can be replaced in that time.
+    const track = await chooseAudioTrack(target.videoPath, langCode);
+    logger.info(`[${jobId}] extracting audio: ${target.videoPath} (stream ${track.index}, tagged ${track.language})`);
     await trackProcess('update', processFileKey, 1, 'in-progress', 'Extracting audio');
-    await extractAudio(target.videoPath, wavPath);
+    await extractAudio(target.videoPath, wavPath, track.index);
 
     await trackProcess('update', processFileKey, 2, 'in-progress', 'Probing audio duration');
     let audioDurationSec;
@@ -340,6 +364,149 @@ async function runJob({ jobId, target, langCode, config, processFileKey }) {
     await fs.unlink(wavPath).catch(() => {});
     await fs.unlink(whisperOutSrt).catch(() => {});
   }
+}
+
+export class CaptionAuditInputError extends Error {
+  constructor(message) { super(message); this.code = 'INVALID_AUDIT_REQUEST'; }
+}
+
+const PROCESS_STARTED_AT = new Date();
+const AUDIT_PROBE_CONCURRENCY = 4;
+
+/**
+ * `madeBefore` as a Date. "start" is when this process started: right after
+ * the deploy that brought track selection, every caption older than that was
+ * made by the code before it.
+ */
+function parseMadeBefore(madeBefore) {
+  if (madeBefore == null) return null;
+  if (madeBefore === 'start') return PROCESS_STARTED_AT;
+  const parsed = new Date(madeBefore);
+  if (typeof madeBefore !== 'string' || Number.isNaN(parsed.getTime())) {
+    throw new CaptionAuditInputError('madeBefore must be an ISO date-time or "start"');
+  }
+  return parsed;
+}
+
+function describeTracks(tracks) {
+  return tracks.map((track) => ({
+    stream: track.index,
+    language: track.language,
+    channels: track.channels,
+    default: track.isDefault,
+    ...(track.title ? { title: track.title } : {}),
+  }));
+}
+
+/**
+ * Look at every auto-caption on disk and report, or with `apply` fix, the ones
+ * that are wrong (domain/caption-audit.mjs says which and why):
+ * - its video is gone, or has no audio in the caption's language: removed;
+ * - it was made from the wrong track of a video that has the right one: made
+ *   again, in place, through the ordinary job queue.
+ *
+ * Without `apply` nothing is touched. With it, `madeBefore` is required: only
+ * a caption written before that moment can have come from the wrong track, and
+ * without the line a caption this very audit had made again would be judged
+ * wrong for ever.
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.apply=false]
+ * @param {string|null} [options.madeBefore] - ISO date-time, or "start"
+ * @returns {Promise<Object>} { applied, madeBefore, scanned, counts, items } where
+ *   items lists every caption that is not kept as it is
+ */
+export async function auditAutoCaptions({ apply = false, madeBefore = null } = {}) {
+  const cutoff = parseMadeBefore(madeBefore);
+  if (apply && !cutoff) {
+    throw new CaptionAuditInputError('apply needs madeBefore: an ISO date-time, or "start"');
+  }
+
+  const captions = await listAutoCaptions(BASE_PATH);
+  const probes = new PQueue({ concurrency: AUDIT_PROBE_CONCURRENCY });
+
+  const judged = await Promise.all(captions.map((caption) => probes.add(async () => {
+    const item = {
+      path: relative(BASE_PATH, caption.srtPath),
+      mediaType: caption.mediaType,
+      mediaTitle: caption.mediaTitle,
+      language: caption.language,
+    };
+    try {
+      const writtenAt = (await fs.stat(caption.srtPath)).mtime;
+      const tracks = caption.videoFile
+        ? await getAudioTracks(join(caption.videoDir, caption.videoFile))
+        : null;
+      const decision = decideAutoCaption({
+        hasVideo: Boolean(caption.videoFile),
+        tracks,
+        language: caption.language,
+        writtenAt,
+        madeBefore: cutoff,
+      });
+      Object.assign(item, decision, { writtenAt: writtenAt.toISOString() });
+      if (tracks) item.audio = describeTracks(tracks);
+
+      // A caption can only be made again where a caption request for its title
+      // would write it. In a folder with several releases that is one file's
+      // caption; another's cannot be made again, only removed.
+      if (decision.action === 'regenerate') {
+        const request = {
+          mediaType: caption.mediaType,
+          // resolveTarget decodes the title, so it is given encoded.
+          mediaTitle: encodeURIComponent(caption.mediaTitle),
+          language: caption.language,
+          season: caption.season,
+          episode: caption.episode,
+        };
+        const target = await resolveRequest(request).catch(() => null);
+        if (target?.srtPath === caption.srtPath) {
+          item.request = request;
+        } else {
+          item.action = 'remove';
+          item.note = 'made for a video that captions are not made for now';
+        }
+      }
+    } catch (err) {
+      Object.assign(item, { verdict: 'unreadable', action: 'keep', error: err.message });
+    }
+    return { caption, item };
+  })));
+
+  if (apply) {
+    for (const { caption, item } of judged) {
+      try {
+        if (item.action === 'remove') {
+          await fs.unlink(caption.srtPath);
+          item.result = 'removed';
+          logger.info(`Caption audit removed ${caption.srtPath} (${item.verdict})`);
+        } else if (item.action === 'regenerate') {
+          const job = await enqueueCaptionJob({ ...item.request, force: true });
+          item.result = 'queued';
+          item.jobId = job.jobId;
+          logger.info(`Caption audit queued ${caption.srtPath} again as ${job.jobId} (${item.verdict})`);
+        }
+      } catch (err) {
+        item.result = 'failed';
+        item.error = err.message;
+        logger.error(`Caption audit could not ${item.action} ${caption.srtPath}: ${err.message}`);
+      }
+    }
+  }
+
+  const counts = {};
+  for (const { item } of judged) counts[item.verdict] = (counts[item.verdict] || 0) + 1;
+
+  return {
+    applied: apply,
+    madeBefore: cutoff ? cutoff.toISOString() : null,
+    scanned: judged.length,
+    counts,
+    items: judged
+      .map(({ item }) => item)
+      .filter((item) => item.action !== 'keep' || item.verdict === 'unreadable')
+      .map(({ request, ...rest }) => rest),
+  };
 }
 
 /** Test-only: clear all in-memory state. */
