@@ -539,6 +539,11 @@ export async function generateTVShowHashes(db, show) {
     // invalidates when any video file changes (same mtime/URL inputs that drive
     // the per-episode hash below), complementing the TMDB-metadata-only showHash.
     const episodeHashes = [];
+    // Season hashes join the contentHash too. A consumer that skips unchanged
+    // shows decides from the show hash and the contentHash alone — it never
+    // reads a season hash — and `season_poster` is in neither of those. A
+    // changed or removed season poster therefore never reached its normal sync.
+    const seasonHashes = [];
 
     // Generate and store season-level hashes
     for (const [seasonName, seasonData] of Object.entries(show.seasons)) {
@@ -553,6 +558,7 @@ export async function generateTVShowHashes(db, show) {
       };
 
       const seasonHash = generateHash(seasonHashableData);
+      seasonHashes.push(`${seasonName}:${seasonHash}`);
 
       // Store season-level hash
       await storeHash(
@@ -595,7 +601,15 @@ export async function generateTVShowHashes(db, show) {
           thumbnail: episodeData.thumbnail,
           metadata: episodeData.metadata,
           chapters: episodeData.chapters,
-          subtitles: episodeData.subtitles
+          subtitles: episodeData.subtitles,
+          // What the probe says about the file. A consumer stores these (size,
+          // duration, dimensions), and they can change with the file left as
+          // it is — a re-probe after an .info version bump corrects them — so
+          // mediaLastModified does not stand in for them. The length and
+          // dimensions are published in the season's maps, keyed by episode.
+          additionalMetadata: episodeData.additionalMetadata,
+          length: seasonData.lengths?.[episodeKey],
+          dimensions: seasonData.dimensions?.[episodeKey]
         };
 
         const episodeHash = generateHash(episodeHashableData);
@@ -616,7 +630,10 @@ export async function generateTVShowHashes(db, show) {
 
     // Deterministic aggregate — sort before hashing so season/episode iteration
     // order doesn't affect the result.
-    const contentHash = generateHash(episodeHashes.slice().sort());
+    const contentHash = generateHash({
+      episodes: episodeHashes.slice().sort(),
+      seasons: seasonHashes.slice().sort()
+    });
 
     // Store show-level hash with its aggregated contentHash. Must run AFTER the
     // episode loops so contentHash is available.

@@ -453,6 +453,76 @@ describe('convergence and stability', () => {
     }
   });
 
+  it('moves the show contentHash when a season poster is added, changed or removed', async () => {
+    // The frontend skips a whole show on its show hash + contentHash and never
+    // reads a season hash, and season_poster was in neither: a changed season
+    // poster never reached a normal sync.
+    const readContentHash = async () =>
+      (
+        await db.get(
+          `SELECT content_hash FROM metadata_hashes
+           WHERE media_type = 'tv' AND title = ? AND season_number IS NULL AND episode_key IS NULL`,
+          ['Mkv Show']
+        )
+      )?.content_hash;
+    const poster = join(MEDIA, 'tv', 'Mkv Show', 'Season 01', 'season_poster.jpg');
+
+    const without = await readContentHash();
+    expect(without).toBeTruthy();
+
+    await fs.writeFile(poster, 'first poster');
+    await runScan();
+    const withPoster = await readContentHash();
+    expect(withPoster).not.toBe(without);
+
+    // Same path, new image: the poster URL carries its mtime, and file mtimes
+    // have whole-millisecond resolution here.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await fs.writeFile(poster, 'a different poster');
+    await runScan();
+    const changed = await readContentHash();
+    expect(changed).not.toBe(withPoster);
+
+    await fs.rm(poster);
+    await runScan();
+    expect(await readContentHash()).toBe(without);
+  });
+
+  it('folds what the probe reports about an episode into its hash', async () => {
+    // Size, duration and dimensions are stored by the frontend, and a re-probe
+    // can correct them with the file untouched.
+    const { generateTVShowHashes } = await import('../../sqlite/metadataHashes.mjs');
+    const readHash = async () =>
+      (
+        await db.get(
+          `SELECT hash FROM metadata_hashes
+           WHERE media_type = 'tv' AND title = ? AND episode_key = ?`,
+          ['Mkv Show', 'S01E01']
+        )
+      )?.hash;
+
+    const show = await sqliteDb.getTVShowByName('Mkv Show');
+    const before = await readHash();
+    const mutated = (change) => {
+      const copy = JSON.parse(JSON.stringify(show));
+      change(copy.seasons['Season 01']);
+      return copy;
+    };
+
+    for (const change of [
+      (season) => { season.lengths.S01E01 = 999; },
+      (season) => { season.dimensions.S01E01 = '1280x720'; },
+      (season) => { season.episodes.S01E01.additionalMetadata = { size: { gb: 99 } }; },
+    ]) {
+      await generateTVShowHashes(db, mutated(change));
+      expect(await readHash()).not.toBe(before);
+    }
+
+    // Put the real hashes back.
+    await generateTVShowHashes(db, show);
+    expect(await readHash()).toBe(before);
+  });
+
   it('ROLLBACK: the host toggle removes every URL, not just every flag', async () => {
     // Decoupling URL emission from eligibility must not weaken the kill switch.
     // Multi Lang and Probe Gap now carry URLs while INELIGIBLE, so a rollback

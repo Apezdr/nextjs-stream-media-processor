@@ -654,6 +654,14 @@ Table in the `main` DB (`node/sqlite/metadataHashes.mjs`): one row per logical k
 
 Lifecycle: *absent* → *generated* (scanner immediate path, scheduled sweep, or lazy read-side backfill) → *replaced* (delete-then-insert in `storeHash()`, which is what collapses the historical NULL-key duplicate rows) → *mixed at read time* with an autoCaptions-config fingerprint on most read paths (`mixAutoCaptionsHash()` in `getMediaTypeHashes()`, `getShowHashes()`, and `getSeasonHashes()` — the stored hash never reflects caption-stub state, so it is combined per-request; the one exception is the single-title **movie** branch of `GET /api/metadata-hashes/:mediaType/:title` in `node/routes/metadataHashes.mjs`, which serves the raw stored hash unmixed, so an autoCaptions config toggle moves the bulk and TV hashes but not that endpoint's — arguably a code gap worth tracking) → deleted, in principle, by `deleteHashesForMedia()` — see F-3.
 
+**What the TV hashes cover.** A consumer that skips unchanged shows on these hashes decides from two values only, the show `hash` and its `content_hash`; it never reads a season hash, and it skips an episode on that episode's hash. So every published field a consumer acts on has to be in one of those, or it cannot reach that consumer's normal sync. (The frontend skipped this way until it began fingerprinting the payload it applies; it still uses the movie hash to decide whether to refetch a movie's metadata file, and older frontend builds rely on all of them.)
+
+- The show `hash` covers the show-level fields (metadata content, poster, logo, backdrop, identity, the season keys).
+- The episode hash covers the episode entry (video URL, sources, JIT facts, `hdr`, `mediaQuality`, thumbnail, metadata, chapters, subtitles, identity) and what the probe reports about the file: `additionalMetadata`, and the episode's entries in the season's `lengths` and `dimensions` maps. Those can change with the file untouched (a re-probe after an `.info` version bump), so `mediaLastModified` does not stand in for them.
+- `content_hash` aggregates the episode hashes **and the season hashes**. The season hash is where `season_poster` lives; before it joined the aggregate, a changed or removed season poster never reached a normal sync.
+
+Rows written before these were added keep their old values until the show is next rescanned or swept; `data_version` is stored but nothing invalidates on it.
+
 **Writers, and who is content-aware:**
 
 - **Scanner immediate path (content-aware).** `movie-scanner.mjs` parses `metadata.json` into a canonical fingerprint string, persists it to `movies.metadata` via `saveMovie()`, then re-reads the row through `getMovieByName()` and hashes THAT (so its hash input is the column value verbatim); `tv-scanner.mjs` calls `generateTVShowHashes()` with the freshly saved show (whose `tv_shows.metadata` column carries content).
