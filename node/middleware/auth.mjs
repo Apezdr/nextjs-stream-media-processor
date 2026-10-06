@@ -124,7 +124,9 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
   }
 
   if (webhookId) {
-    logger.warn(`Invalid webhook ID attempted, falling back to user authentication: ${webhookId.substring(0, 10)}...`)
+    // Never log any part of the value: a near-miss or a key from another
+    // server is still a credential.
+    logger.warn('Invalid webhook ID attempted, falling back to user authentication')
   }
 
   // STEP 2: session token (Bearer header or session cookie)
