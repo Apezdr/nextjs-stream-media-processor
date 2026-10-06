@@ -43,25 +43,32 @@ to match later code.
   mount fault) must be retained and retried next tick, never treated as removed.
   Remove a name from the existing-names set before any I/O on it, so a swallowed
   error can never turn into a false removal. One bad item must never skip the
-  rest of the scan, the removal loop, or downstream jobs.
+  rest of the scan, the removal loop, or downstream jobs. Decided, not yet on
+  main: SI-P0 on `epic/scan-integrity` implements it. Until that merges,
+  `scanMovies` drops a name only after its `readdir` and directory hash, and
+  `scanTVShows` has one try around the whole loop.
 - **Derived tables are a function of `movies`/`tv_shows`.** `metadata_hashes`,
   `missing_data_media`, `episode_metadata_missing` and `blurhash_hashes` are
   projections; no single failure may become a deletion in them, and removal
-  cascades must cover all of them (title row deleted last).
+  cascades must cover all of them (title row deleted last — main still deletes
+  it first; SI-P0 fixes the order).
 - **`withWriteTx` is not re-entrant.** A helper running inside a write
   transaction must issue raw statements; it must not call another `deleteX`
   helper that opens its own transaction.
-- **Stale hash rows are worse than missing ones.** The frontend sync skips a
-  title whose `metadata_hashes` row matches, forever — a stale row silently
-  freezes that title. A missing row merely costs a resync. When an inline hash
-  generate fails, degrade to MISSING (delete the title's rows), never leave
-  STALE.
+- **Stale hash rows are worse than missing ones.** The frontend's movie
+  metadata step (`MovieMetadataStrategy.ts`) still skips re-fetching a title
+  whose `metadata_hashes` entry matches the hash it stored, so a stale row can
+  freeze that title's metadata. A missing row merely costs a re-fetch. When an
+  inline hash generate fails, degrade to MISSING (delete the title's rows),
+  never leave STALE.
 - **JIT path keys are strict unpadded base64url** of the source path relative
   to its library root (`node/utils/jitUrl.mjs`), matching the transcoder's own
   `path_key` encoding. Never hand-build a stream URL another way.
-- The frontend's sync skip-gate compares per-title `hash` only (verified
-  2026-08-23 against `MovieSyncService.ts`), so regenerating identical hashes
-  causes no frontend churn.
+- The frontend no longer skips whole titles on these hashes. Since its
+  2026-10-05 determinism change (`1f4f66c`) it skips on per-server `syncGates`:
+  a fingerprint of the payload it received plus which servers report each
+  field (`src/utils/sync/core/syncGate.ts`). Regenerating identical hashes or
+  payloads causes no frontend churn.
 - Do not invent data to get past an error: missing, unknown, empty and
   unavailable are different states, and a sync or scan pass that suffered any
   failure is not authoritative — it may not delete rows or clear provenance.
@@ -70,8 +77,8 @@ to match later code.
 
 From `node/`: `npm test` (full Jest suite), `npm run test:unit`,
 `npm run test:integration`. Scanner behaviour changes need integration
-coverage (see `tests/integration/scan-failed-not-absent.test.mjs` for the
-pattern). Never claim a check passed unless it ran and succeeded.
+coverage (the pattern is `tests/integration/scan-failed-not-absent.test.mjs`,
+on `epic/scan-integrity` until SI-P0 merges). Never claim a check passed unless it ran and succeeded.
 
 ## Related repositories
 
