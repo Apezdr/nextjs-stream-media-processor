@@ -3,7 +3,14 @@ import { mongoClient } from "./lib/mongo.mjs";
 
 const logger = createCategoryLogger("mongoDB");
 
+/**
+ * The shared client, connected. connect() returns at once when the topology is
+ * up, shares one in-flight attempt between concurrent callers, and replaces
+ * the closed topology a failed attempt leaves behind — so a caller after
+ * mongod comes back gets a working client instead of "Topology is closed".
+ */
 export async function getClient() {
+  await mongoClient.connect();
   return mongoClient;
 }
 
