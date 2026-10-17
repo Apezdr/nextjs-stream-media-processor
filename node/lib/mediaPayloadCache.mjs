@@ -11,7 +11,7 @@
 // `Cache-Control: no-cache` to any request carrying If-None-Match, and Express's
 // freshness check answers no-cache with a full 200.
 //
-// So each route keeps its body, built once per scan:
+// So each route keeps its body, built once per change:
 //
 //   - the body bytes, and their gzip copy (compressed off the event loop);
 //   - per title, where its serialized entry sits in the body and the hash of
@@ -21,11 +21,25 @@
 //   - the autoCaptions settings it was built under, because the caption stubs
 //     are injected at build time from those settings, not from the rows.
 //
-// The cache is dropped when the rows can have changed — the end of a scan
-// tick, POST /media/scan — and when the autoCaptions settings change (they
-// live in Mongo, written by the frontend; watchPayloadContext polls them). A
-// body older than PAYLOAD_CACHE_MAX_AGE_MS is rebuilt on the next request
-// whatever happened, as a backstop for any change nothing told us about.
+// A body is dropped only when what it was built from changed:
+//
+//   - the rows. The writers of each table count the writes that changed a row
+//     (getMediaTableGeneration in sqliteDatabase.mjs), and a body keeps the
+//     count its build started at. The end of a scan tick and POST /media/scan
+//     drop a body whose count moved since (clearPayloadsAfterScan), and keep it
+//     otherwise, so after a tick that changed nothing the next conditional
+//     request is a 304 straight away. A scan that failed drops both bodies
+//     whatever the counts say. A write made anywhere else is seen by the next
+//     of these clear points.
+//   - the autoCaptions settings (they live in Mongo, written by the frontend;
+//     watchPayloadContext polls them).
+//
+// Nothing else goes into a body: the rows are read from the one table, the
+// caption stubs come from the rows and the settings, and everything else the
+// build reads (the language map, the track URL prefix from the env, the list
+// versions) is fixed for the life of the process. A body older than
+// PAYLOAD_CACHE_MAX_AGE_MS is rebuilt on the next request whatever happened,
+// as a backstop for any change nothing told us about.
 //
 // The handler answers If-None-Match itself, before any other work, and ignores
 // the request's Cache-Control. A 200 sends the cached bytes as they are; the
@@ -175,6 +189,7 @@ export class MediaPayloadCache {
   #describe;
   #loadRows;
   #readContext;
+  #dataGeneration;
   #maxAgeMs;
   #now;
   #logger;
@@ -194,6 +209,9 @@ export class MediaPayloadCache {
    *   order, with the caption stubs already injected
    * @param {() => Promise<string>} [options.readContext] - The current
    *   autoCaptions context key; must not throw
+   * @param {() => number} [options.dataGeneration] - The generation of the
+   *   rows loadRows reads (getMediaTableGeneration of its table). Without it,
+   *   invalidateIfDataChanged always drops the body.
    * @param {number} [options.maxAgeMs]
    * @param {() => number} [options.now]
    * @param {Object} [options.logger]
@@ -205,6 +223,7 @@ export class MediaPayloadCache {
     describe = null,
     loadRows,
     readContext = async () => '',
+    dataGeneration = null,
     maxAgeMs = PAYLOAD_CACHE_MAX_AGE_MS,
     now = Date.now,
     logger = null,
@@ -215,6 +234,7 @@ export class MediaPayloadCache {
     this.#describe = describe;
     this.#loadRows = loadRows;
     this.#readContext = readContext;
+    this.#dataGeneration = dataGeneration;
     this.#maxAgeMs = maxAgeMs;
     this.#now = now;
     this.#logger = logger;
@@ -253,10 +273,13 @@ export class MediaPayloadCache {
     }
 
     const generation = this.#generation;
-    const promise = this.#build(generation).finally(() => {
+    // Read before the build reads any row: a write that lands after this is
+    // newer than the body, whether or not the build happened to see it.
+    const dataGeneration = this.#readDataGeneration();
+    const promise = this.#build(generation, dataGeneration).finally(() => {
       if (this.#inflight?.promise === promise) this.#inflight = null;
     });
-    this.#inflight = { generation, promise };
+    this.#inflight = { generation, dataGeneration, promise };
     return promise;
   }
 
@@ -268,6 +291,38 @@ export class MediaPayloadCache {
     this.#generation += 1;
     this.#entry = null;
     this.#logger?.debug?.(`/media/${this.#kind} payload cache invalidated (${reason})`);
+  }
+
+  /**
+   * Drop the body only if its rows changed: the data generation moved since its
+   * build began. A build still running is judged the same way, so one that
+   * began before a write is not kept. Without a data generation to compare
+   * (none given, or it could not be read), the body is dropped.
+   *
+   * @param {string} reason - For the log
+   * @returns {boolean} whether it was dropped
+   */
+  invalidateIfDataChanged(reason) {
+    const current = this.#readDataGeneration();
+    const inflight = this.#inflight?.generation === this.#generation ? this.#inflight : null;
+    const outdated = (built) => Boolean(built) && built.dataGeneration !== current;
+    if (current === null || outdated(this.#entry) || outdated(inflight)) {
+      this.invalidate(reason);
+      return true;
+    }
+    this.#logger?.debug?.(`/media/${this.#kind} payload cache kept (${reason}): its rows did not change`);
+    return false;
+  }
+
+  /** The current data generation, or null when there is none to read. */
+  #readDataGeneration() {
+    if (!this.#dataGeneration) return null;
+    try {
+      const value = this.#dataGeneration();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -285,7 +340,7 @@ export class MediaPayloadCache {
     return true;
   }
 
-  async #build(generation) {
+  async #build(generation, dataGeneration) {
     const started = performance.now();
     // Read before the rows: the stubs injected while loading them come from
     // the same settings cache, which only moves forward. A change landing
@@ -307,6 +362,7 @@ export class MediaPayloadCache {
       gzipBody,
       titles,
       contextKey,
+      dataGeneration,
       builtAt: this.#now(),
       buildMs: Math.round(performance.now() - started),
     };
@@ -319,6 +375,30 @@ export class MediaPayloadCache {
     );
     return entry;
   }
+}
+
+/**
+ * The clear point after a scan: drop each body whose rows changed, and keep
+ * the others. When the scan failed, drop every body whatever the generations
+ * say: it may have stopped anywhere, and dropping is the conservative choice.
+ *
+ * @param {MediaPayloadCache[]} caches
+ * @param {Object} options
+ * @param {string} options.reason - For the log
+ * @param {boolean} [options.failed] - The scan threw, or stopped on an error
+ * @returns {string[]} the kinds whose body was dropped
+ */
+export function clearPayloadsAfterScan(caches, { reason, failed = false }) {
+  const dropped = [];
+  for (const cache of caches) {
+    if (failed) {
+      cache.invalidate(`${reason}, failed`);
+      dropped.push(cache.kind);
+    } else if (cache.invalidateIfDataChanged(reason)) {
+      dropped.push(cache.kind);
+    }
+  }
+  return dropped;
 }
 
 /**

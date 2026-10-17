@@ -17,7 +17,7 @@ import { createSpriteRoutes } from "./sprite-route.mjs";
 // (insertOrUpdateMovie/TVShow, delete*, missing-data bookkeeping) are live via
 // scanner-repository.mjs, not here — importing them in app.mjs wrongly implied
 // this file participates in scan persistence.
-import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
+import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase, getMediaTableGeneration } from "./sqliteDatabase.mjs";
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
 import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
@@ -36,7 +36,8 @@ import {
   createMediaListHandler,
   compressionFilter,
   watchPayloadContext,
-  autoCaptionsContextKey
+  autoCaptionsContextKey,
+  clearPayloadsAfterScan
 } from "./lib/mediaPayloadCache.mjs";
 import {
   tvManifestKeys,
@@ -772,6 +773,8 @@ scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hou
 /**
  * Wrapper function for backward compatibility
  * Calls the new media-scanner component, and shows the scan in /processes
+ * @returns {Promise<{titles: number, reprocessed: number, error: Error|null}>}
+ *   the scanner's summary; `error` is what stopped the pass, if anything did
  */
 async function generateListTV(db, dirPath) {
   const progress = createLibraryScanProgress('tv');
@@ -787,6 +790,7 @@ async function generateListTV(db, dirPath) {
       { onProgress: progress.onProgress, managedFilesFor: identityService.managedFilesFor }
     );
     await progress.complete(summary);
+    return summary;
   } catch (error) {
     await progress.fail(error);
     throw error;
@@ -810,8 +814,9 @@ async function readPayloadContext() {
   }
 }
 
-// The /media/tv and /media/movies bodies, built once per scan. See
-// lib/mediaPayloadCache.mjs for when they are dropped.
+// The /media/tv and /media/movies bodies, built again only when their rows or
+// the autoCaptions settings change. See lib/mediaPayloadCache.mjs for when
+// they are dropped.
 const tvPayloadCache = new MediaPayloadCache({
   kind: 'tv',
   version: TV_LIST_VERSION,
@@ -819,9 +824,13 @@ const tvPayloadCache = new MediaPayloadCache({
   // Each show's season and episode keys, for /media/tv/manifest.
   describe: tvManifestKeys,
   readContext: readPayloadContext,
+  // loadRows reads tv_shows only.
+  dataGeneration: () => getMediaTableGeneration('tv_shows'),
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
+    // A scan run from here writes after the build read the generation, so the
+    // next clear point drops this body: one extra build, on an empty table.
     if (await isDatabaseEmpty("tv_shows")) {
       await generateListTV(db, `${BASE_PATH}/tv`);
     }
@@ -840,6 +849,8 @@ const moviePayloadCache = new MediaPayloadCache({
   version: MOVIE_LIST_VERSION,
   builder: buildMoviePayloadEntry,
   readContext: readPayloadContext,
+  // loadRows reads movies only.
+  dataGeneration: () => getMediaTableGeneration('movies'),
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
@@ -856,10 +867,12 @@ const moviePayloadCache = new MediaPayloadCache({
   },
 });
 
-/** Drop both cached list bodies: the rows may have changed. */
-function invalidateMediaPayloads(reason) {
-  tvPayloadCache.invalidate(reason);
-  moviePayloadCache.invalidate(reason);
+/**
+ * After a scan: drop each cached list body whose rows changed, or both when the
+ * scan failed (it may have written some rows before it stopped).
+ */
+function clearMediaPayloads(reason, { failed = false } = {}) {
+  clearPayloadsAfterScan([tvPayloadCache, moviePayloadCache], { reason, failed });
 }
 
 app.get(
@@ -936,11 +949,13 @@ app.post(
 app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
+    let scanFailed = true;
     try {
       await generateListMovies(db, `${BASE_PATH}/movies`);
+      scanFailed = false;
     } finally {
       // A scan that failed part-way may still have written rows.
-      invalidateMediaPayloads('POST /media/scan');
+      clearMediaPayloads('POST /media/scan', { failed: scanFailed });
     }
     await releaseDatabase(db);
     res.status(200).send("Library scan completed");
@@ -1204,6 +1219,7 @@ async function runGenerateList() {
     // disk when the scanners below read mtimes. Never throws; disabled = no-op.
     await identityService.reconcileForTick();
 
+    let scanFailed = true;
     try {
       // Process movies using the specialized MOVIE_SCAN task type
       await enqueueTask(TaskType.MOVIE_SCAN, 'Movie List Generation', async () => {
@@ -1221,12 +1237,13 @@ async function runGenerateList() {
       });
 
       // Process TV shows using the specialized TV_SCAN task type
-      await enqueueTask(TaskType.TV_SCAN, 'TV Show List Generation', async () => {
+      const tvSummary = await enqueueTask(TaskType.TV_SCAN, 'TV Show List Generation', async () => {
         const tvDb = await initializeDatabase();
         try {
           logger.info('Processing TV shows');
-          await generateListTV(tvDb, `${BASE_PATH}/tv`);
+          const summary = await generateListTV(tvDb, `${BASE_PATH}/tv`);
           logger.info('Finished processing TV shows');
+          return summary;
         } catch (error) {
           logger.error(`Error processing TV shows: ${error}`);
           throw error; // Allow task manager to handle the error
@@ -1234,10 +1251,15 @@ async function runGenerateList() {
           await releaseDatabase(tvDb);
         }
       });
+      // The TV scanner logs the error that stopped it and returns it rather
+      // than throwing: that is a failed scan too.
+      scanFailed = Boolean(tvSummary?.error);
     } finally {
       // Before the sync push below, so the sync it starts reads this scan's
-      // rows. Also when a scan failed part-way: it may still have written some.
-      invalidateMediaPayloads('scan tick');
+      // rows. A body is dropped only if its rows changed, so after a quiet tick
+      // the sync's conditional GET is a 304 without a rebuild. A scan that
+      // failed part-way drops both: it may still have written some rows.
+      clearMediaPayloads('scan tick', { failed: scanFailed });
     }
 
     logger.info('Finished generating complete media list');
