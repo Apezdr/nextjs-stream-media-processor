@@ -134,9 +134,9 @@ async function extractAdditionalMetadata(filePath) {
       // `language` falls back to tags.title, which is not a language code — it
       // holds things like "English [DTS-HD MA 5.1]" or "Director Commentary".
       // Counting distinct `language` values would therefore report almost every
-      // multi-track file as multi-language. That field is left alone because it
-      // is published in additional_metadata and the frontend reads it; this one
-      // is what policy decisions may key on.
+      // multi-track file as multi-language. That field is left alone (older
+      // sidecars carry it; the published payload no longer does); this one is
+      // what policy decisions may key on.
       languageTag: normalizeLanguageTag(
         stream.tags?.language || stream.tags?.LANGUAGE || stream.tags?.lang
       ),

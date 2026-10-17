@@ -707,7 +707,9 @@ function buildImageUrl(baseUrl, cachedHash) {
 
 export async function getTVShows() {
   return withDb("main", async (db) => {
-    const shows = await withRetry(() => db.all('SELECT * FROM tv_shows'));
+    // Ordered, so /media/tv and its ETag (lib/mediaPayloadCache.mjs) depend on
+    // the rows alone, never on the order SQLite happens to return them in.
+    const shows = await withRetry(() => db.all('SELECT * FROM tv_shows ORDER BY name'));
     
     // Process each show using CACHED hashes for ALL images (NO filesystem I/O)
     const updatedShows = shows.map((show) => {
@@ -786,7 +788,8 @@ export async function getTVShowNamesAndHashes() {
 
 export async function getMovies() {
   return withDb("main", async (db) => {
-    const movies = await withRetry(() => db.all('SELECT * FROM movies'));
+    // Ordered for the same reason as getTVShows: the /media/movies ETag.
+    const movies = await withRetry(() => db.all('SELECT * FROM movies ORDER BY name'));
     
     // Process each movie using CACHED hashes (NO filesystem I/O)
     const updatedMovies = movies.map((movie) => {
