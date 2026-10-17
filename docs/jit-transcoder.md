@@ -272,8 +272,11 @@ consumer recompute it; a derived boolean would silently rot.
 
 Each video file has a `<filename>.info` sidecar next to it, written by
 [`node/infoManager.mjs`](../node/infoManager.mjs). It is a **cache**, not a source of truth —
-delete one and it regenerates. `additionalMetadata` is published to the frontend as
-`additional_metadata`.
+delete one and it regenerates. A trimmed copy of `additionalMetadata` is published to the
+frontend: a movie's `additional_metadata` keeps duration, dimensions, width, height, size, the
+first video track's codec, bitrate and frame_rate, and the first audio track's codec and
+channels; an episode's `additionalMetadata` keeps its size (`node/lib/mediaPayload.mjs`). The
+caption stubs and the metadata hashes still read the full record.
 
 v1.0011 adds the facts needed to decide whether the transcoder can serve a file without
 losing anything, at **zero extra subprocess cost** — the existing
@@ -304,8 +307,8 @@ additionalMetadata: {
 
 **`language` vs `languageTag`.** The pre-existing `language` field falls back to
 `tags.title` when no language tag is present, so it can hold `"Director Commentary"` or
-`"English [DTS-HD MA 5.1]"`. It is left exactly as-is because it is published and the frontend
-reads it. **Any policy decision about how many languages a file carries must use
+`"English [DTS-HD MA 5.1]"`. It is left exactly as-is in the sidecar (it is no longer
+published: the frontend never read it). **Any policy decision about how many languages a file carries must use
 `languageTag`**, which comes only from `tags.language|LANGUAGE|lang`. A three-track file with
 one tagged language yields 3 distinct `language` values and 1 distinct `languageTag`.
 

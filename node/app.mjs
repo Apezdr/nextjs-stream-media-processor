@@ -30,7 +30,15 @@ import {
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
-import { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } from "./lib/mediaPayload.mjs";
+import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
+import {
+  MediaPayloadCache,
+  createMediaListHandler,
+  compressionFilter,
+  watchPayloadContext,
+  autoCaptionsContextKey
+} from "./lib/mediaPayloadCache.mjs";
+import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
@@ -111,8 +119,9 @@ const CHROME_HEIGHT_LIMIT = 30780; // Chrome's maximum image height limit
 const TV_LIST_VERSION = 1.0001;
 const MOVIE_LIST_VERSION = 1.0001;
 
-// Enable compression for all responses
-app.use(compression());
+// Enable compression for all responses, except the cached media lists, which
+// send their own gzip copy (lib/mediaPayloadCache.mjs).
+app.use(compression({ filter: compressionFilter }));
 
 // Helper function to check if origin is related to server domain
 function isRelatedDomain(origin, serverDomain) {
@@ -778,8 +787,27 @@ async function generateListTV(db, dirPath) {
  * @deprecated Use scanTVShows from media-scanner component instead
  */
 
-app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
+/**
+ * The autoCaptions settings the caption stubs are built from, as a cache key.
+ * An unreadable config injects no stubs, so it reads as "none" too.
+ */
+async function readPayloadContext() {
   try {
+    return autoCaptionsContextKey(await getAutoCaptionsConfigCached());
+  } catch {
+    return autoCaptionsContextKey(null);
+  }
+}
+
+// The /media/tv and /media/movies bodies, built once per scan. See
+// lib/mediaPayloadCache.mjs for when they are dropped.
+const tvPayloadCache = new MediaPayloadCache({
+  kind: 'tv',
+  version: TV_LIST_VERSION,
+  builder: buildTvPayloadEntry,
+  readContext: readPayloadContext,
+  logger,
+  loadRows: async () => {
     const db = await initializeDatabase();
     if (await isDatabaseEmpty("tv_shows")) {
       await generateListTV(db, `${BASE_PATH}/tv`);
@@ -787,17 +815,45 @@ app.get("/media/tv", authenticateWebhookOrUser, async (req, res) => {
     const shows = await getTVShows();
     await releaseDatabase(db);
 
-    // Read-time injection of auto-caption stubs.
+    // Build-time injection of auto-caption stubs (from the settings, not the
+    // rows, which is why a settings change drops the cache).
     await injectTvStubs(shows, langMap);
-
-    const tvData = buildPayloadMap(shows, buildTvPayloadEntry);
-
-    res.json({ ...tvData, version: TV_LIST_VERSION });
-  } catch (error) {
-    logger.error(`Error fetching TV shows: ${error}`);
-    res.status(500).send("Internal server error");
-  }
+    return shows;
+  },
 });
+
+const moviePayloadCache = new MediaPayloadCache({
+  kind: 'movies',
+  version: MOVIE_LIST_VERSION,
+  builder: buildMoviePayloadEntry,
+  readContext: readPayloadContext,
+  logger,
+  loadRows: async () => {
+    const db = await initializeDatabase();
+    if (await isDatabaseEmpty()) {
+      await generateListMovies(db, `${BASE_PATH}/movies`);
+    }
+    const movies = await getMovies();
+    await releaseDatabase(db);
+
+    // Build-time injection of auto-caption stubs (no rescan needed when the
+    // autoCaptions flag or language list changes: the cache is dropped).
+    await injectMovieStubs(movies, langMap);
+    return movies;
+  },
+});
+
+/** Drop both cached list bodies: the rows may have changed. */
+function invalidateMediaPayloads(reason) {
+  tvPayloadCache.invalidate(reason);
+  moviePayloadCache.invalidate(reason);
+}
+
+app.get(
+  "/media/tv",
+  authenticateWebhookOrUser,
+  createMediaListHandler(tvPayloadCache, { logger, errorLabel: 'Error fetching TV shows' })
+);
 
 /**
  * Wrapper function for backward compatibility
@@ -829,32 +885,21 @@ async function generateListMovies(db, dirPath) {
  * @deprecated Use scanMovies from media-scanner component instead
  */
 
-app.get("/media/movies", authenticateWebhookOrUser, async (req, res) => {
-  try {
-    const db = await initializeDatabase();
-    if (await isDatabaseEmpty()) {
-      await generateListMovies(db, `${BASE_PATH}/movies`);
-    }
-    const movies = await getMovies();
-    await releaseDatabase(db);
-
-    // Read-time injection of auto-caption stubs (no rescan needed when the
-    // autoCaptions flag or language list changes).
-    await injectMovieStubs(movies, langMap);
-
-    const movieData = buildPayloadMap(movies, buildMoviePayloadEntry);
-
-    res.json({...movieData, 'version': MOVIE_LIST_VERSION});
-  } catch (error) {
-    logger.error(`Error fetching movies: ${error}`);
-    res.status(500).send("Internal server error");
-  }
-});
+app.get(
+  "/media/movies",
+  authenticateWebhookOrUser,
+  createMediaListHandler(moviePayloadCache, { logger, errorLabel: 'Error fetching movies' })
+);
 
 app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
   try {
     const db = await initializeDatabase();
-    await generateListMovies(db, `${BASE_PATH}/movies`);
+    try {
+      await generateListMovies(db, `${BASE_PATH}/movies`);
+    } finally {
+      // A scan that failed part-way may still have written rows.
+      invalidateMediaPayloads('POST /media/scan');
+    }
     await releaseDatabase(db);
     res.status(200).send("Library scan completed");
   } catch (error) {
@@ -1117,38 +1162,44 @@ async function runGenerateList() {
     // disk when the scanners below read mtimes. Never throws; disabled = no-op.
     await identityService.reconcileForTick();
 
-    // Process movies using the specialized MOVIE_SCAN task type
-    await enqueueTask(TaskType.MOVIE_SCAN, 'Movie List Generation', async () => {
-      const movieDb = await initializeDatabase();
-      try {
-        logger.info('Processing movies');
-        await generateListMovies(movieDb, `${BASE_PATH}/movies`);
-        logger.info('Finished processing movies');
-      } catch (error) {
-        logger.error(`Error processing movies: ${error}`);
-        throw error; // Allow task manager to handle the error
-      } finally {
-        await releaseDatabase(movieDb);
-      }
-    });
-    
-    // Process TV shows using the specialized TV_SCAN task type
-    await enqueueTask(TaskType.TV_SCAN, 'TV Show List Generation', async () => {
-      const tvDb = await initializeDatabase();
-      try {
-        logger.info('Processing TV shows');
-        await generateListTV(tvDb, `${BASE_PATH}/tv`);
-        logger.info('Finished processing TV shows');
-      } catch (error) {
-        logger.error(`Error processing TV shows: ${error}`);
-        throw error; // Allow task manager to handle the error
-      } finally {
-        await releaseDatabase(tvDb);
-      }
-    });
-    
+    try {
+      // Process movies using the specialized MOVIE_SCAN task type
+      await enqueueTask(TaskType.MOVIE_SCAN, 'Movie List Generation', async () => {
+        const movieDb = await initializeDatabase();
+        try {
+          logger.info('Processing movies');
+          await generateListMovies(movieDb, `${BASE_PATH}/movies`);
+          logger.info('Finished processing movies');
+        } catch (error) {
+          logger.error(`Error processing movies: ${error}`);
+          throw error; // Allow task manager to handle the error
+        } finally {
+          await releaseDatabase(movieDb);
+        }
+      });
+
+      // Process TV shows using the specialized TV_SCAN task type
+      await enqueueTask(TaskType.TV_SCAN, 'TV Show List Generation', async () => {
+        const tvDb = await initializeDatabase();
+        try {
+          logger.info('Processing TV shows');
+          await generateListTV(tvDb, `${BASE_PATH}/tv`);
+          logger.info('Finished processing TV shows');
+        } catch (error) {
+          logger.error(`Error processing TV shows: ${error}`);
+          throw error; // Allow task manager to handle the error
+        } finally {
+          await releaseDatabase(tvDb);
+        }
+      });
+    } finally {
+      // Before the sync push below, so the sync it starts reads this scan's
+      // rows. Also when a scan failed part-way: it may still have written some.
+      invalidateMediaPayloads('scan tick');
+    }
+
     logger.info('Finished generating complete media list');
-    
+
     // Run auto sync as a separate task
     await enqueueTask(TaskType.API_REQUEST, 'Auto Sync', async () => {
       try {
@@ -1312,6 +1363,9 @@ async function initialize() {
   const port = 3000;
   server = app.listen(port, async () => {
     scheduleTasks();
+    // The autoCaptions settings live in Mongo and the frontend writes them, so
+    // the cached list bodies learn of a change by polling.
+    watchPayloadContext([tvPayloadCache, moviePayloadCache], { logger });
     // The identity reconcile has its own cadence (IDENTITY_RECONCILE_INTERVAL_SECONDS,
     // default 60s) so the report stays fresh while a long scan tick runs.
     identityService.start();
