@@ -38,6 +38,12 @@ import {
   watchPayloadContext,
   autoCaptionsContextKey
 } from "./lib/mediaPayloadCache.mjs";
+import {
+  tvManifestKeys,
+  createManifestHandler,
+  createEntriesBodyParser,
+  createEntriesHandler
+} from "./lib/mediaManifest.mjs";
 import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
@@ -257,8 +263,13 @@ app.use(configureCORS());
 // own express.raw() middleware) to verify the Discord webhook signature —
 // parsing it here first would make that raw parser a no-op and force a
 // lossy JSON.stringify() re-serialization fallback before verification.
+// Skip the media entries routes too: they parse their own body, after auth,
+// with their own limit (lib/mediaManifest.mjs). Routing ignores case and a
+// trailing slash, so the check does as well.
+const OWN_JSON_PARSER_PATHS = new Set(['/media/tv/entries', '/media/movies/entries']);
 app.use((req, res, next) => {
   if (req.path === '/api/discord/events') return next();
+  if (OWN_JSON_PARSER_PATHS.has(req.path.toLowerCase().replace(/\/+$/, ''))) return next();
   return express.json({ limit: '30mb' })(req, res, next);
 });
 
@@ -805,6 +816,8 @@ const tvPayloadCache = new MediaPayloadCache({
   kind: 'tv',
   version: TV_LIST_VERSION,
   builder: buildTvPayloadEntry,
+  // Each show's season and episode keys, for /media/tv/manifest.
+  describe: tvManifestKeys,
   readContext: readPayloadContext,
   logger,
   loadRows: async () => {
@@ -855,6 +868,22 @@ app.get(
   createMediaListHandler(tvPayloadCache, { logger, errorLabel: 'Error fetching TV shows' })
 );
 
+// Per-title views of the same cached body: a manifest of title hashes (with
+// each show's season and episode keys), and the entries for chosen titles.
+// See lib/mediaManifest.mjs.
+app.get(
+  "/media/tv/manifest",
+  authenticateWebhookOrUser,
+  createManifestHandler(tvPayloadCache, { logger, errorLabel: 'Error building the TV manifest' })
+);
+
+app.post(
+  "/media/tv/entries",
+  authenticateWebhookOrUser,
+  createEntriesBodyParser(),
+  createEntriesHandler(tvPayloadCache, { logger, errorLabel: 'Error sending TV entries' })
+);
+
 /**
  * Wrapper function for backward compatibility
  * Calls the new media-scanner component, and shows the scan in /processes
@@ -889,6 +918,19 @@ app.get(
   "/media/movies",
   authenticateWebhookOrUser,
   createMediaListHandler(moviePayloadCache, { logger, errorLabel: 'Error fetching movies' })
+);
+
+app.get(
+  "/media/movies/manifest",
+  authenticateWebhookOrUser,
+  createManifestHandler(moviePayloadCache, { logger, errorLabel: 'Error building the movie manifest' })
+);
+
+app.post(
+  "/media/movies/entries",
+  authenticateWebhookOrUser,
+  createEntriesBodyParser(),
+  createEntriesHandler(moviePayloadCache, { logger, errorLabel: 'Error sending movie entries' })
 );
 
 app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
@@ -1428,7 +1470,7 @@ app.get('/', (req, res) => {
     endpoints: {
       media: {
         description: 'Media library endpoints',
-        routes: ['/media/movies', '/media/tv', '/media/scan']
+        routes: ['/media/movies', '/media/tv', '/media/movies/manifest', '/media/tv/manifest', '/media/movies/entries', '/media/tv/entries', '/media/scan']
       },
       api: {
         description: 'API operations',
@@ -1488,6 +1530,8 @@ app.use((req, res, next) => {
       endpoints: [
         '/media/movies - List all movies',
         '/media/tv - List all TV shows',
+        '/media/movies/manifest, /media/tv/manifest - Per-title hashes (TV: season and episode keys)',
+        '/media/movies/entries, /media/tv/entries - POST {titles} or {all}: chosen entries as NDJSON',
         '/media/scan - Trigger library scan'
       ]
     },

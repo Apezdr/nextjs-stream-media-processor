@@ -16,7 +16,8 @@
 //   - the body bytes, and their gzip copy (compressed off the event loop);
 //   - per title, where its serialized entry sits in the body and the hash of
 //     that entry. The library ETag is a hash over the ordered title hashes, so
-//     a manifest of title hashes is already here for whoever needs one;
+//     a manifest of title hashes is already here for whoever needs one
+//     (lib/mediaManifest.mjs serves it, and single entries cut from the body);
 //   - the autoCaptions settings it was built under, because the caption stubs
 //     are injected at build time from those settings, not from the rows.
 //
@@ -69,11 +70,16 @@ function sha1Hex(data) {
  * @param {Array<Object>} params.rows - Rows with a `name`, in body order
  * @param {(row: Object) => Object} params.builder - Row to wire entry
  * @param {number} params.version - The list version appended as `version`
- * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number}>, etag: string}>}
+ * @param {(entry: Object, row: Object) => *} [params.describe] - Optional: what
+ *   to keep about each built entry besides its bytes (the manifest's season and
+ *   episode keys; lib/mediaManifest.mjs). Kept as `titles[i].keys`. A describe
+ *   that throws leaves `keys` unset and records `describeError` instead: it
+ *   can fail the manifest, never the body.
+ * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number, keys?: *, describeError?: string}>, etag: string}>}
  *   `titles[i]` is the i-th entry: `body.subarray(start, end)` is its JSON and
  *   `hash` is the SHA-1 of those bytes.
  */
-export async function serializeKeyedList({ kind, rows, builder, version }) {
+export async function serializeKeyedList({ kind, rows, builder, version, describe = null }) {
   const parts = [Buffer.from('{')];
   const titles = [];
   let offset = 1;
@@ -81,12 +87,21 @@ export async function serializeKeyedList({ kind, rows, builder, version }) {
 
   for (const row of rows) {
     const name = String(row.name);
-    const entryBytes = Buffer.from(JSON.stringify(builder(row)), 'utf8');
+    const entry = builder(row);
+    const entryBytes = Buffer.from(JSON.stringify(entry), 'utf8');
     const prefix = Buffer.from(`${titles.length ? ',' : ''}${JSON.stringify(name)}:`, 'utf8');
     const start = offset + prefix.length;
     const end = start + entryBytes.length;
     parts.push(prefix, entryBytes);
-    titles.push({ name, hash: sha1Hex(entryBytes), start, end });
+    const title = { name, hash: sha1Hex(entryBytes), start, end };
+    if (describe) {
+      try {
+        title.keys = describe(entry, row);
+      } catch (error) {
+        title.describeError = String(error?.message ?? error);
+      }
+    }
+    titles.push(title);
     offset = end;
 
     if (performance.now() - sliceStart >= SERIALIZE_SLICE_MS) {
@@ -157,6 +172,7 @@ export class MediaPayloadCache {
   #kind;
   #version;
   #builder;
+  #describe;
   #loadRows;
   #readContext;
   #maxAgeMs;
@@ -171,6 +187,9 @@ export class MediaPayloadCache {
    * @param {string} options.kind - 'tv' | 'movies'
    * @param {number} options.version - TV_LIST_VERSION / MOVIE_LIST_VERSION
    * @param {(row: Object) => Object} options.builder - buildTvPayloadEntry / buildMoviePayloadEntry
+   * @param {(entry: Object, row: Object) => *} [options.describe] - Kept per
+   *   title as `keys` (see serializeKeyedList); the TV cache passes
+   *   tvManifestKeys from lib/mediaManifest.mjs
    * @param {() => Promise<Array<Object>>} options.loadRows - The rows, in name
    *   order, with the caption stubs already injected
    * @param {() => Promise<string>} [options.readContext] - The current
@@ -183,6 +202,7 @@ export class MediaPayloadCache {
     kind,
     version,
     builder,
+    describe = null,
     loadRows,
     readContext = async () => '',
     maxAgeMs = PAYLOAD_CACHE_MAX_AGE_MS,
@@ -192,6 +212,7 @@ export class MediaPayloadCache {
     this.#kind = kind;
     this.#version = version;
     this.#builder = builder;
+    this.#describe = describe;
     this.#loadRows = loadRows;
     this.#readContext = readContext;
     this.#maxAgeMs = maxAgeMs;
@@ -201,6 +222,11 @@ export class MediaPayloadCache {
 
   get kind() {
     return this.#kind;
+  }
+
+  /** The list version the body ends with (TV_LIST_VERSION / MOVIE_LIST_VERSION). */
+  get version() {
+    return this.#version;
   }
 
   /**
@@ -271,6 +297,7 @@ export class MediaPayloadCache {
       rows,
       builder: this.#builder,
       version: this.#version,
+      describe: this.#describe,
     });
     const gzipBody = await gzip(body);
 
@@ -335,6 +362,16 @@ export function watchPayloadContext(caches, { intervalMs = PAYLOAD_CONTEXT_POLL_
 export function compressionFilter(req, res) {
   if (res[PRECOMPRESSED]) return false;
   return compression.filter(req, res);
+}
+
+/**
+ * Tell compressionFilter to leave this response alone: the handler sends its
+ * own encoding (a cached gzip copy, or its own gzip stream).
+ *
+ * @param {import('express').Response} res
+ */
+export function markPrecompressed(res) {
+  res[PRECOMPRESSED] = true;
 }
 
 /**
