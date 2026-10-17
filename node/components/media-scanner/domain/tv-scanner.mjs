@@ -615,6 +615,33 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
 }
 
 /**
+ * A show's seasons in the order they are stored and published: by season
+ * number, then by folder name.
+ *
+ * The season tasks run concurrently, so `seasonsObj` is filled in the order
+ * they finish. The number alone ties for every folder without one
+ * ("Specials", "Extras") and for "Season 0", and for "Season 1" next to
+ * "Season 01"; a stable sort would keep the finish order for those, and the
+ * stored seasons JSON would differ from one reprocess to the next, moving the
+ * show's row, tv_shows' generation and the /media/tv ETag. The folder name
+ * breaks every tie (the keys are unique), compared by code unit so the order
+ * does not depend on the locale either.
+ *
+ * @param {Object<string, Object>} seasonsObj - Season folder name -> season data
+ * @returns {Object<string, Object>}
+ */
+export function sortSeasons(seasonsObj) {
+  const numberKey = (name) => name.match(/\d+/)?.[0].padStart(3, '0') || '000';
+  return Object.fromEntries(
+    Object.entries(seasonsObj).sort(([a], [b]) => {
+      const byNumber = numberKey(a).localeCompare(numberKey(b));
+      if (byNumber !== 0) return byNumber;
+      return a < b ? -1 : a > b ? 1 : 0;
+    })
+  );
+}
+
+/**
  * Scan and process all TV shows in a directory
  * @param {Object} db - Database instance
  * @param {string} dirPath - Directory path to scan
@@ -1061,14 +1088,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         }
       }
 
-      // Sort seasons
-      const sortedSeasons = Object.fromEntries(
-        Object.entries(seasonsObj).sort((a, b) => {
-          const seasonA = a[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
-          const seasonB = b[0].match(/\d+/)?.[0].padStart(3, '0') || '000';
-          return seasonA.localeCompare(seasonB);
-        })
-      );
+      const sortedSeasons = sortSeasons(seasonsObj);
 
       // File paths + cache-bust hashes come from the SAME resolve that built the
       // show-asset URLs (processShowAssets → resolveImage: one set lookup + one
