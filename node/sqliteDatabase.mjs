@@ -86,6 +86,82 @@ function getWriteMutex(dbType) {
   return m;
 }
 
+// --- Media table generations ---
+//
+// GET /media/tv and GET /media/movies keep their bodies between requests
+// (lib/mediaPayloadCache.mjs) and drop them at the end of a scan only when the
+// rows they were built from changed. Each table's generation counts the writes
+// that changed a row of it. The functions below that write movies and tv_shows
+// are the only code that writes those tables, and each one bumps the table's
+// generation itself when SQLite reports a changed row, so a write is seen
+// whoever made it, during a scan or not.
+//
+// A write that leaves the row as it was is not a change: both upserts skip an
+// update that would store what the row already holds (mediaUpsertUpdate), so a
+// scan of an unchanged library changes nothing and moves no generation. Any new
+// writer of these tables goes through writeMediaTable, or the cached bodies miss
+// its writes until their 10-minute backstop.
+const mediaTableGenerations = { movies: 0, tv_shows: 0 };
+
+/**
+ * How many writes have changed a row of `table` since the process started.
+ *
+ * @param {'movies'|'tv_shows'} table
+ * @returns {number}
+ */
+export function getMediaTableGeneration(table) {
+  if (!Object.hasOwn(mediaTableGenerations, table)) {
+    throw new Error(`No generation is kept for table "${table}"`);
+  }
+  return mediaTableGenerations[table];
+}
+
+/**
+ * Run one write statement on `table` in a write transaction, and bump the
+ * table's generation when the statement changed a row.
+ *
+ * The bump comes after the commit, so whoever reads the new generation can read
+ * the new row. It also comes when the transaction fails after the statement ran:
+ * a read on the shared connection may already have seen the row, and a
+ * generation that moved for nothing costs one rebuild, not stale data.
+ *
+ * @param {'movies'|'tv_shows'} table
+ * @param {(db: Object) => Promise<{changes?: number}>} statement - Runs the
+ *   statement and returns its run result
+ * @returns {Promise<void>}
+ */
+async function writeMediaTable(table, statement) {
+  let changes = 0;
+  try {
+    await withWriteTx("main", async (db) => {
+      const result = await statement(db);
+      // A result without a count is taken to have changed the row.
+      changes = Number.isInteger(result?.changes) ? result.changes : 1;
+    });
+  } finally {
+    if (changes > 0) mediaTableGenerations[table] += 1;
+  }
+}
+
+/**
+ * The DO UPDATE clause of an upsert that writes only what changes: the SET
+ * list, and a WHERE that holds when at least one column would get a value it
+ * does not hold already (IS NOT, so NULL compares like any value). An update
+ * that would leave the row as it is does not run, so SQLite reports no change
+ * for it (writeMediaTable). Both come from one list, so no column can be
+ * written without being compared.
+ *
+ * @param {string} table
+ * @param {Array<[string, string]>} columns - [column, the value it is set to]
+ * @returns {{set: string, changed: string}}
+ */
+function mediaUpsertUpdate(table, columns) {
+  return {
+    set: columns.map(([column, value]) => `${column}=${value}`).join(',\n          '),
+    changed: columns.map(([column, value]) => `${table}.${column} IS NOT ${value}`).join('\n          OR '),
+  };
+}
+
 
 async function applyPragmas(db) {
   // WAL: best general concurrency mode for "mostly reads, occasional writes"
@@ -1153,24 +1229,68 @@ export async function isDatabaseEmpty(tableName = 'movies') {
 }
 
 export async function deleteMovie(name) {
-  return withWriteTx("main", async (db) => {
+  return writeMediaTable("movies", (db) =>
     // No withRetry needed inside transaction - mutex prevents contention
-    await db.run('DELETE FROM movies WHERE name = ?', [name]);
-  });
+    db.run('DELETE FROM movies WHERE name = ?', [name])
+  );
 }
 
 export async function deleteTVShow(name) {
-  return withWriteTx("main", async (db) => {
+  return writeMediaTable("tv_shows", (db) =>
     // No withRetry needed inside transaction - mutex prevents contention
-    await db.run('DELETE FROM tv_shows WHERE name = ?', [name]);
-  });
+    db.run('DELETE FROM tv_shows WHERE name = ?', [name])
+  );
 }
 
-// P-2: the missing change-guard WHERE clause (vs. the movie upsert below) is
+// What insertOrUpdateTVShow's DO UPDATE writes. G-5 preservation: the
+// upsert rewrites on conflict whatever directory_hash says (see the P-2 note
+// below), so a save whose generator invocation performed no genuine TMDB fetch
+// (pristineMetadata === null) must carry the previously stored pristine payload
+// forward — hence the COALESCE on pristine_metadata. Never let an image-only or
+// backfill rewrite null it out. The three *_source_url columns (I-3) follow the
+// same rule per kind: a null update value means "no new provenance this pass —
+// keep what's stored"; only a real download (or the one-time NULL-bootstrap
+// adoption) supplies a value.
+const TV_SHOW_UPSERT_UPDATE = mediaUpsertUpdate('tv_shows', [
+  ['metadata', 'excluded.metadata'],
+  ['metadata_path', 'excluded.metadata_path'],
+  ['poster', 'excluded.poster'],
+  ['posterBlurhash', 'excluded.posterBlurhash'],
+  ['logo', 'excluded.logo'],
+  ['logoBlurhash', 'excluded.logoBlurhash'],
+  ['backdrop', 'excluded.backdrop'],
+  ['backdropBlurhash', 'excluded.backdropBlurhash'],
+  ['seasons', 'excluded.seasons'],
+  ['poster_file_path', 'excluded.poster_file_path'],
+  ['backdrop_file_path', 'excluded.backdrop_file_path'],
+  ['logo_file_path', 'excluded.logo_file_path'],
+  ['base_path', 'excluded.base_path'],
+  ['poster_hash', 'excluded.poster_hash'],
+  ['poster_mtime', 'excluded.poster_mtime'],
+  ['backdrop_hash', 'excluded.backdrop_hash'],
+  ['backdrop_mtime', 'excluded.backdrop_mtime'],
+  ['logo_hash', 'excluded.logo_hash'],
+  ['logo_mtime', 'excluded.logo_mtime'],
+  ['directory_hash', 'excluded.directory_hash'],
+  ['backdrop_focal', 'excluded.backdrop_focal'],
+  ['backdrop_focal_suggested', 'excluded.backdrop_focal_suggested'],
+  ['pristine_metadata', 'COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata)'],
+  ['poster_source_url', 'COALESCE(excluded.poster_source_url, tv_shows.poster_source_url)'],
+  ['backdrop_source_url', 'COALESCE(excluded.backdrop_source_url, tv_shows.backdrop_source_url)'],
+  ['logo_source_url', 'COALESCE(excluded.logo_source_url, tv_shows.logo_source_url)'],
+  ['payload_signature', 'excluded.payload_signature'],
+  ['media_id', 'COALESCE(excluded.media_id, tv_shows.media_id)'],
+  // Same discipline as media_id: the sidecar is the durable copy, and a pass
+  // that could not read or write it must not blank the cached date.
+  ['first_seen', 'COALESCE(excluded.first_seen, tv_shows.first_seen)'],
+]);
+
+// P-2: the missing directory_hash change-guard (vs. the movie upsert below) is
 // INTENTIONAL — TV's shallower dir-hash depth (TV_DIR_HASH_MAX_DEPTH) plus the
 // episode-backfill fall-through can legitimately rewrite a show whose
 // directory_hash is unchanged; a movies-style guard here would silently drop
-// those writes. Do not "make it symmetric".
+// those writes. Do not "make it symmetric". The one WHERE it has skips only an
+// update that would store what the row already holds, which drops no write.
 export async function insertOrUpdateTVShow(
   showName,
   metadata,
@@ -1195,7 +1315,7 @@ export async function insertOrUpdateTVShow(
   mediaId = null,
   firstSeen = null
 ) {
-  return withWriteTx("main", async (db) => {
+  return writeMediaTable("tv_shows", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
     // that resolved each image file + built its URL (see resolveImage /
     // imageHashesFromResolved). Storing them directly keeps the URL filename,
@@ -1206,16 +1326,9 @@ export async function insertOrUpdateTVShow(
 
     const seasonsStr = JSON.stringify(seasonsObj);
 
-    // G-5 preservation: this upsert ALWAYS rewrites on conflict (see the P-2
-    // note above), so a save whose generator invocation performed no genuine
-    // TMDB fetch (pristineMetadata === null) must carry the previously stored
-    // pristine payload forward — hence the COALESCE on pristine_metadata
-    // below. Never let an image-only or backfill rewrite null it out.
-    // The three *_source_url columns (I-3) follow the same rule per kind: a
-    // null update value means "no new provenance this pass — keep what's
-    // stored"; only a real download (or the one-time NULL-bootstrap adoption)
-    // supplies a value.
-    await withRetry(() =>
+    // The column values, and the COALESCE preservation, are in
+    // TV_SHOW_UPSERT_UPDATE above.
+    return withRetry(() =>
       db.run(
         `INSERT INTO tv_shows (
           name, metadata, metadata_path, poster, posterBlurhash, logo, logoBlurhash,
@@ -1226,46 +1339,17 @@ export async function insertOrUpdateTVShow(
           poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
-          metadata=excluded.metadata,
-          metadata_path=excluded.metadata_path,
-          poster=excluded.poster,
-          posterBlurhash=excluded.posterBlurhash,
-          logo=excluded.logo,
-          logoBlurhash=excluded.logoBlurhash,
-          backdrop=excluded.backdrop,
-          backdropBlurhash=excluded.backdropBlurhash,
-          seasons=excluded.seasons,
-          poster_file_path=excluded.poster_file_path,
-          backdrop_file_path=excluded.backdrop_file_path,
-          logo_file_path=excluded.logo_file_path,
-          base_path=excluded.base_path,
-          poster_hash=excluded.poster_hash,
-          poster_mtime=excluded.poster_mtime,
-          backdrop_hash=excluded.backdrop_hash,
-          backdrop_mtime=excluded.backdrop_mtime,
-          logo_hash=excluded.logo_hash,
-          logo_mtime=excluded.logo_mtime,
-          directory_hash=excluded.directory_hash,
-          backdrop_focal=excluded.backdrop_focal,
-          backdrop_focal_suggested=excluded.backdrop_focal_suggested,
-          pristine_metadata=COALESCE(excluded.pristine_metadata, tv_shows.pristine_metadata),
-          poster_source_url=COALESCE(excluded.poster_source_url, tv_shows.poster_source_url),
-          backdrop_source_url=COALESCE(excluded.backdrop_source_url, tv_shows.backdrop_source_url),
-          logo_source_url=COALESCE(excluded.logo_source_url, tv_shows.logo_source_url),
-          payload_signature=excluded.payload_signature,
-          media_id=COALESCE(excluded.media_id, tv_shows.media_id),
-          -- Same discipline as media_id: the sidecar is the durable copy, and a
-          -- pass that could not read or write it must not blank the cached date.
-          first_seen=COALESCE(excluded.first_seen, tv_shows.first_seen)`,
+          ${TV_SHOW_UPSERT_UPDATE.set}
+        WHERE ${TV_SHOW_UPSERT_UPDATE.changed}`,
         [
           showName, metadata, metadataPath, poster, posterBlurhash, logo, logoBlurhash, backdrop, backdropBlurhash, seasonsStr,
           posterFilePath, backdropFilePath, logoFilePath, basePath,
           posterHash.hash, posterHash.mtime, backdropHash.hash, backdropHash.mtime, logoHash.hash, logoHash.mtime,
           directoryHash, backdropFocal, backdropFocalSuggested, pristineMetadata,
           sourceUrls?.poster ?? null, sourceUrls?.backdrop ?? null, sourceUrls?.logo ?? null,
-          // No WHERE guard on this upsert — it always rewrites — so the
-          // signature is recorded for the TV scanner's own fast-skip to compare
-          // against, not to gate the write.
+          // No directory_hash guard on this upsert, so the signature is
+          // recorded for the TV scanner's own fast-skip to compare against, not
+          // to gate the write. A new signature is a changed column, so it lands.
           currentPayloadSignature(),
           mediaId,
           firstSeen
@@ -1274,6 +1358,43 @@ export async function insertOrUpdateTVShow(
     );
   });
 }
+
+// What insertOrUpdateMovie's DO UPDATE writes, when its change guard lets it.
+const MOVIE_UPSERT_UPDATE = mediaUpsertUpdate('movies', [
+  ['file_names', 'excluded.file_names'],
+  ['lengths', 'excluded.lengths'],
+  ['dimensions', 'excluded.dimensions'],
+  ['urls', 'excluded.urls'],
+  ['metadata_url', 'excluded.metadata_url'],
+  ['directory_hash', 'excluded.directory_hash'],
+  ['hdr', 'excluded.hdr'],
+  ['media_quality', 'excluded.media_quality'],
+  ['additional_metadata', 'excluded.additional_metadata'],
+  ['_id', 'excluded._id'],
+  ['poster_file_path', 'excluded.poster_file_path'],
+  ['backdrop_file_path', 'excluded.backdrop_file_path'],
+  ['logo_file_path', 'excluded.logo_file_path'],
+  ['base_path', 'excluded.base_path'],
+  ['poster_hash', 'excluded.poster_hash'],
+  ['poster_mtime', 'excluded.poster_mtime'],
+  ['backdrop_hash', 'excluded.backdrop_hash'],
+  ['backdrop_mtime', 'excluded.backdrop_mtime'],
+  ['logo_hash', 'excluded.logo_hash'],
+  ['logo_mtime', 'excluded.logo_mtime'],
+  ['backdrop_focal', 'excluded.backdrop_focal'],
+  ['backdrop_focal_suggested', 'excluded.backdrop_focal_suggested'],
+  ['metadata', 'excluded.metadata'],
+  ['pristine_metadata', 'COALESCE(excluded.pristine_metadata, movies.pristine_metadata)'],
+  ['poster_source_url', 'COALESCE(excluded.poster_source_url, movies.poster_source_url)'],
+  ['backdrop_source_url', 'COALESCE(excluded.backdrop_source_url, movies.backdrop_source_url)'],
+  ['logo_source_url', 'COALESCE(excluded.logo_source_url, movies.logo_source_url)'],
+  ['payload_signature', 'excluded.payload_signature'],
+  // COALESCE-preserved: identity comes from the sidecar, and a pass that could
+  // not read it (unmounted share, transient IO error) must not blank the
+  // cached value.
+  ['media_id', 'COALESCE(excluded.media_id, movies.media_id)'],
+  ['first_seen', 'COALESCE(excluded.first_seen, movies.first_seen)'],
+]);
 
 export async function insertOrUpdateMovie(
   name,
@@ -1300,7 +1421,7 @@ export async function insertOrUpdateMovie(
   mediaId = null,
   firstSeen = null
 ) {
-  return withWriteTx("main", async (db) => {
+  return writeMediaTable("movies", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
     // that resolved each image file + built its URL (see resolveImage /
     // imageHashesFromResolved). Storing them directly keeps the URL filename,
@@ -1351,7 +1472,11 @@ export async function insertOrUpdateMovie(
     // NULL and a metadata.json exists (one-shot backfill), so pre-migration
     // rows converge on the first scan pass after deploy rather than waiting
     // for their directory to change.
-    await withRetry(() =>
+    // Whatever the guard lets through, an update that would store what the
+    // row already holds does not run (MOVIE_UPSERT_UPDATE.changed): the
+    // backdrop_focal_suggested hatch stays open for a movie with no backdrop,
+    // so without it every reprocess of such a movie rewrote an identical row.
+    return withRetry(() =>
       db.run(
         `INSERT INTO movies (
           name, file_names, lengths, dimensions, urls, metadata_url, directory_hash,
@@ -1362,40 +1487,8 @@ export async function insertOrUpdateMovie(
           poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
-          file_names=excluded.file_names,
-          lengths=excluded.lengths,
-          dimensions=excluded.dimensions,
-          urls=excluded.urls,
-          metadata_url=excluded.metadata_url,
-          directory_hash=excluded.directory_hash,
-          hdr=excluded.hdr,
-          media_quality=excluded.media_quality,
-          additional_metadata=excluded.additional_metadata,
-          _id=excluded._id,
-          poster_file_path=excluded.poster_file_path,
-          backdrop_file_path=excluded.backdrop_file_path,
-          logo_file_path=excluded.logo_file_path,
-          base_path=excluded.base_path,
-          poster_hash=excluded.poster_hash,
-          poster_mtime=excluded.poster_mtime,
-          backdrop_hash=excluded.backdrop_hash,
-          backdrop_mtime=excluded.backdrop_mtime,
-          logo_hash=excluded.logo_hash,
-          logo_mtime=excluded.logo_mtime,
-          backdrop_focal=excluded.backdrop_focal,
-          backdrop_focal_suggested=excluded.backdrop_focal_suggested,
-          metadata=excluded.metadata,
-          pristine_metadata=COALESCE(excluded.pristine_metadata, movies.pristine_metadata),
-          poster_source_url=COALESCE(excluded.poster_source_url, movies.poster_source_url),
-          backdrop_source_url=COALESCE(excluded.backdrop_source_url, movies.backdrop_source_url),
-          logo_source_url=COALESCE(excluded.logo_source_url, movies.logo_source_url),
-          payload_signature=excluded.payload_signature,
-          -- COALESCE-preserved: identity comes from the sidecar, and a pass
-          -- that could not read it (unmounted share, transient IO error) must
-          -- not blank the cached value.
-          media_id=COALESCE(excluded.media_id, movies.media_id),
-          first_seen=COALESCE(excluded.first_seen, movies.first_seen)
-        WHERE movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
+          ${MOVIE_UPSERT_UPDATE.set}
+        WHERE (movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
         OR movies.backdrop_focal_suggested IS NULL
         OR (movies.metadata IS NULL AND excluded.metadata IS NOT NULL)
         OR (movies.poster_source_url IS NULL AND excluded.poster_source_url IS NOT NULL)
@@ -1404,7 +1497,8 @@ export async function insertOrUpdateMovie(
         -- Payload-shape change (new field, or the JIT toggle flipping). Nothing
         -- on disk moved, so directory_hash cannot see it. IS NOT rather than <>
         -- so the NULL -> '2:jit0' transition on pre-migration rows fires.
-        OR movies.payload_signature IS NOT excluded.payload_signature`,
+        OR movies.payload_signature IS NOT excluded.payload_signature)
+        AND (${MOVIE_UPSERT_UPDATE.changed})`,
         [
           name,
           movie.file_names,

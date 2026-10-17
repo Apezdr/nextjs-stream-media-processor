@@ -11,20 +11,35 @@
 // `Cache-Control: no-cache` to any request carrying If-None-Match, and Express's
 // freshness check answers no-cache with a full 200.
 //
-// So each route keeps its body, built once per scan:
+// So each route keeps its body, built once per change:
 //
 //   - the body bytes, and their gzip copy (compressed off the event loop);
 //   - per title, where its serialized entry sits in the body and the hash of
 //     that entry. The library ETag is a hash over the ordered title hashes, so
-//     a manifest of title hashes is already here for whoever needs one;
+//     a manifest of title hashes is already here for whoever needs one
+//     (lib/mediaManifest.mjs serves it, and single entries cut from the body);
 //   - the autoCaptions settings it was built under, because the caption stubs
 //     are injected at build time from those settings, not from the rows.
 //
-// The cache is dropped when the rows can have changed — the end of a scan
-// tick, POST /media/scan — and when the autoCaptions settings change (they
-// live in Mongo, written by the frontend; watchPayloadContext polls them). A
-// body older than PAYLOAD_CACHE_MAX_AGE_MS is rebuilt on the next request
-// whatever happened, as a backstop for any change nothing told us about.
+// A body is dropped only when what it was built from changed:
+//
+//   - the rows. The writers of each table count the writes that changed a row
+//     (getMediaTableGeneration in sqliteDatabase.mjs), and a body keeps the
+//     count its build started at. The end of a scan tick and POST /media/scan
+//     drop a body whose count moved since (clearPayloadsAfterScan), and keep it
+//     otherwise, so after a tick that changed nothing the next conditional
+//     request is a 304 straight away. A scan that failed drops both bodies
+//     whatever the counts say. A write made anywhere else is seen by the next
+//     of these clear points.
+//   - the autoCaptions settings (they live in Mongo, written by the frontend;
+//     watchPayloadContext polls them).
+//
+// Nothing else goes into a body: the rows are read from the one table, the
+// caption stubs come from the rows and the settings, and everything else the
+// build reads (the language map, the track URL prefix from the env, the list
+// versions) is fixed for the life of the process. A body older than
+// PAYLOAD_CACHE_MAX_AGE_MS is rebuilt on the next request whatever happened,
+// as a backstop for any change nothing told us about.
 //
 // The handler answers If-None-Match itself, before any other work, and ignores
 // the request's Cache-Control. A 200 sends the cached bytes as they are; the
@@ -69,11 +84,16 @@ function sha1Hex(data) {
  * @param {Array<Object>} params.rows - Rows with a `name`, in body order
  * @param {(row: Object) => Object} params.builder - Row to wire entry
  * @param {number} params.version - The list version appended as `version`
- * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number}>, etag: string}>}
+ * @param {(entry: Object, row: Object) => *} [params.describe] - Optional: what
+ *   to keep about each built entry besides its bytes (the manifest's season and
+ *   episode keys; lib/mediaManifest.mjs). Kept as `titles[i].keys`. A describe
+ *   that throws leaves `keys` unset and records `describeError` instead: it
+ *   can fail the manifest, never the body.
+ * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number, keys?: *, describeError?: string}>, etag: string}>}
  *   `titles[i]` is the i-th entry: `body.subarray(start, end)` is its JSON and
  *   `hash` is the SHA-1 of those bytes.
  */
-export async function serializeKeyedList({ kind, rows, builder, version }) {
+export async function serializeKeyedList({ kind, rows, builder, version, describe = null }) {
   const parts = [Buffer.from('{')];
   const titles = [];
   let offset = 1;
@@ -81,12 +101,21 @@ export async function serializeKeyedList({ kind, rows, builder, version }) {
 
   for (const row of rows) {
     const name = String(row.name);
-    const entryBytes = Buffer.from(JSON.stringify(builder(row)), 'utf8');
+    const entry = builder(row);
+    const entryBytes = Buffer.from(JSON.stringify(entry), 'utf8');
     const prefix = Buffer.from(`${titles.length ? ',' : ''}${JSON.stringify(name)}:`, 'utf8');
     const start = offset + prefix.length;
     const end = start + entryBytes.length;
     parts.push(prefix, entryBytes);
-    titles.push({ name, hash: sha1Hex(entryBytes), start, end });
+    const title = { name, hash: sha1Hex(entryBytes), start, end };
+    if (describe) {
+      try {
+        title.keys = describe(entry, row);
+      } catch (error) {
+        title.describeError = String(error?.message ?? error);
+      }
+    }
+    titles.push(title);
     offset = end;
 
     if (performance.now() - sliceStart >= SERIALIZE_SLICE_MS) {
@@ -157,8 +186,10 @@ export class MediaPayloadCache {
   #kind;
   #version;
   #builder;
+  #describe;
   #loadRows;
   #readContext;
+  #dataGeneration;
   #maxAgeMs;
   #now;
   #logger;
@@ -171,10 +202,16 @@ export class MediaPayloadCache {
    * @param {string} options.kind - 'tv' | 'movies'
    * @param {number} options.version - TV_LIST_VERSION / MOVIE_LIST_VERSION
    * @param {(row: Object) => Object} options.builder - buildTvPayloadEntry / buildMoviePayloadEntry
+   * @param {(entry: Object, row: Object) => *} [options.describe] - Kept per
+   *   title as `keys` (see serializeKeyedList); the TV cache passes
+   *   tvManifestKeys from lib/mediaManifest.mjs
    * @param {() => Promise<Array<Object>>} options.loadRows - The rows, in name
    *   order, with the caption stubs already injected
    * @param {() => Promise<string>} [options.readContext] - The current
    *   autoCaptions context key; must not throw
+   * @param {() => number} [options.dataGeneration] - The generation of the
+   *   rows loadRows reads (getMediaTableGeneration of its table). Without it,
+   *   invalidateIfDataChanged always drops the body.
    * @param {number} [options.maxAgeMs]
    * @param {() => number} [options.now]
    * @param {Object} [options.logger]
@@ -183,8 +220,10 @@ export class MediaPayloadCache {
     kind,
     version,
     builder,
+    describe = null,
     loadRows,
     readContext = async () => '',
+    dataGeneration = null,
     maxAgeMs = PAYLOAD_CACHE_MAX_AGE_MS,
     now = Date.now,
     logger = null,
@@ -192,8 +231,10 @@ export class MediaPayloadCache {
     this.#kind = kind;
     this.#version = version;
     this.#builder = builder;
+    this.#describe = describe;
     this.#loadRows = loadRows;
     this.#readContext = readContext;
+    this.#dataGeneration = dataGeneration;
     this.#maxAgeMs = maxAgeMs;
     this.#now = now;
     this.#logger = logger;
@@ -201,6 +242,11 @@ export class MediaPayloadCache {
 
   get kind() {
     return this.#kind;
+  }
+
+  /** The list version the body ends with (TV_LIST_VERSION / MOVIE_LIST_VERSION). */
+  get version() {
+    return this.#version;
   }
 
   /**
@@ -227,10 +273,13 @@ export class MediaPayloadCache {
     }
 
     const generation = this.#generation;
-    const promise = this.#build(generation).finally(() => {
+    // Read before the build reads any row: a write that lands after this is
+    // newer than the body, whether or not the build happened to see it.
+    const dataGeneration = this.#readDataGeneration();
+    const promise = this.#build(generation, dataGeneration).finally(() => {
       if (this.#inflight?.promise === promise) this.#inflight = null;
     });
-    this.#inflight = { generation, promise };
+    this.#inflight = { generation, dataGeneration, promise };
     return promise;
   }
 
@@ -242,6 +291,38 @@ export class MediaPayloadCache {
     this.#generation += 1;
     this.#entry = null;
     this.#logger?.debug?.(`/media/${this.#kind} payload cache invalidated (${reason})`);
+  }
+
+  /**
+   * Drop the body only if its rows changed: the data generation moved since its
+   * build began. A build still running is judged the same way, so one that
+   * began before a write is not kept. Without a data generation to compare
+   * (none given, or it could not be read), the body is dropped.
+   *
+   * @param {string} reason - For the log
+   * @returns {boolean} whether it was dropped
+   */
+  invalidateIfDataChanged(reason) {
+    const current = this.#readDataGeneration();
+    const inflight = this.#inflight?.generation === this.#generation ? this.#inflight : null;
+    const outdated = (built) => Boolean(built) && built.dataGeneration !== current;
+    if (current === null || outdated(this.#entry) || outdated(inflight)) {
+      this.invalidate(reason);
+      return true;
+    }
+    this.#logger?.debug?.(`/media/${this.#kind} payload cache kept (${reason}): its rows did not change`);
+    return false;
+  }
+
+  /** The current data generation, or null when there is none to read. */
+  #readDataGeneration() {
+    if (!this.#dataGeneration) return null;
+    try {
+      const value = this.#dataGeneration();
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -259,7 +340,7 @@ export class MediaPayloadCache {
     return true;
   }
 
-  async #build(generation) {
+  async #build(generation, dataGeneration) {
     const started = performance.now();
     // Read before the rows: the stubs injected while loading them come from
     // the same settings cache, which only moves forward. A change landing
@@ -271,6 +352,7 @@ export class MediaPayloadCache {
       rows,
       builder: this.#builder,
       version: this.#version,
+      describe: this.#describe,
     });
     const gzipBody = await gzip(body);
 
@@ -280,6 +362,7 @@ export class MediaPayloadCache {
       gzipBody,
       titles,
       contextKey,
+      dataGeneration,
       builtAt: this.#now(),
       buildMs: Math.round(performance.now() - started),
     };
@@ -292,6 +375,30 @@ export class MediaPayloadCache {
     );
     return entry;
   }
+}
+
+/**
+ * The clear point after a scan: drop each body whose rows changed, and keep
+ * the others. When the scan failed, drop every body whatever the generations
+ * say: it may have stopped anywhere, and dropping is the conservative choice.
+ *
+ * @param {MediaPayloadCache[]} caches
+ * @param {Object} options
+ * @param {string} options.reason - For the log
+ * @param {boolean} [options.failed] - The scan threw, or stopped on an error
+ * @returns {string[]} the kinds whose body was dropped
+ */
+export function clearPayloadsAfterScan(caches, { reason, failed = false }) {
+  const dropped = [];
+  for (const cache of caches) {
+    if (failed) {
+      cache.invalidate(`${reason}, failed`);
+      dropped.push(cache.kind);
+    } else if (cache.invalidateIfDataChanged(reason)) {
+      dropped.push(cache.kind);
+    }
+  }
+  return dropped;
 }
 
 /**
@@ -335,6 +442,16 @@ export function watchPayloadContext(caches, { intervalMs = PAYLOAD_CONTEXT_POLL_
 export function compressionFilter(req, res) {
   if (res[PRECOMPRESSED]) return false;
   return compression.filter(req, res);
+}
+
+/**
+ * Tell compressionFilter to leave this response alone: the handler sends its
+ * own encoding (a cached gzip copy, or its own gzip stream).
+ *
+ * @param {import('express').Response} res
+ */
+export function markPrecompressed(res) {
+  res[PRECOMPRESSED] = true;
 }
 
 /**
