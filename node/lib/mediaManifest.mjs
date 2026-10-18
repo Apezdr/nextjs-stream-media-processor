@@ -14,7 +14,7 @@
 // THE MANIFEST (GET /media/tv/manifest, GET /media/movies/manifest)
 //
 //   {
-//     "format": 1,                     MANIFEST_FORMAT_VERSION
+//     "format": 2,                     MANIFEST_FORMAT_VERSION
 //     "kind": "tv",                    or "movies"
 //     "version": 1.0001,               the list version GET /media/<kind> ends with
 //     "titles": {
@@ -41,24 +41,47 @@
 // (Node's fetch adds no-cache to every conditional request); the bytes and
 // their gzip copy are built once per cache generation.
 //
-// Raise MANIFEST_FORMAT_VERSION when this shape or the hash changes: a frontend
-// that sees a format it did not store fetches everything.
+// MANIFEST_FORMAT_VERSION versions both routes: raise it when this shape, the
+// hash or the entries lines below change. A frontend that sees a format it did
+// not store fetches everything. Format 2 added the entries' closing line;
+// format 1 had none.
 //
 // THE ENTRIES (POST /media/tv/entries, POST /media/movies/entries)
 //
 //   Request:  {"titles": ["<folder name>", ...]}   or   {"all": true}
 //   Response: application/x-ndjson, one title per line: in the order asked
-//             (a name asked twice is sent once), or in body order for `all`.
+//             (a name asked twice is sent once), or in body order for `all`;
+//             then the closing line.
 //
 //     {"title":"<folder name>","hash":"0123456789abcdef","entry":{...}}
 //     {"title":"<folder name>","missing":true}
+//     {"end":true,"count":2}
 //
-// `entry` is the title's bytes cut from the cached body, exactly the bytes the
-// manifest hash covers (re-serializing the parsed entry gives the same bytes),
-// and `hash` is the hash of those bytes from the same generation. A title the
-// library does not have (any more) gets a `missing` line. The headers name the
-// generation the lines come from: X-Manifest-ETag is its manifest's ETag,
-// X-Library-ETag the ETag GET /media/<kind> has for it.
+// Lines end with a single 0x0A byte, and a reader splits them on 0x0A only.
+// A line is JSON.stringify output, which leaves U+2028 and U+2029 raw inside
+// strings, and a folder name may hold either. Node's readline also ends a line
+// at U+2028 and U+2029, so it cuts such a line in two: never read these
+// responses with readline.
+//
+// The closing line, {"end":true,"count":N}, follows the last title line, and
+// nothing follows it. N is the number of title lines sent, `missing` lines
+// included; an empty list is answered with {"end":true,"count":0} alone. No
+// title line has an `end` key. A reader treats a response without the closing
+// line, or with a count that does not match the title lines it read, as
+// failed: a stream that fails part-way is cut off and never gets one, however
+// whole the lines before the cut look.
+//
+// `entry` is the title's bytes cut from the cached body, the very bytes the
+// manifest hash covers. A line's `hash` covers exactly the bytes of its
+// `entry`: from the byte after `"entry":` to the byte before the line's final
+// `}`. Re-serializing the parsed entry gives the same bytes, so a reader can
+// check the hash itself. The hash comes from the same generation as the bytes.
+// A title the library does not have (any more) gets a `missing` line.
+//
+// Two headers name the generation the lines come from, on every 200, before
+// the first line: X-Manifest-ETag is the ETag GET /media/<kind>/manifest has
+// for it, X-Library-ETag the ETag GET /media/<kind> has for it. Neither is
+// exposed to browsers through CORS: read them from a server-side fetch.
 //
 // The frontend stores the line's hash with what it applied. If the cache was
 // rebuilt between its manifest and entries requests, the line's hash (and
@@ -68,8 +91,7 @@
 // One response is cut from one generation: the handler holds the body it
 // started with, so an invalidation mid-stream cannot mix two. It streams with
 // backpressure, gzip when the client takes it. A stream that fails part-way is
-// cut off, not ended: a client must treat a response that does not end cleanly
-// (chunked terminator, final newline) as failed.
+// cut off, not ended, and so has no closing line.
 //
 // The request body is parsed by createEntriesBodyParser, mounted after the auth
 // middleware with ENTRIES_REQUEST_BODY_LIMIT; app.mjs's global JSON parser
@@ -85,8 +107,11 @@ import { ifNoneMatchMatches, markPrecompressed } from './mediaPayloadCache.mjs';
 
 const gzip = promisify(gzipCallback);
 
-/** The manifest's shape and hash. Raise it when either changes. */
-export const MANIFEST_FORMAT_VERSION = 1;
+/**
+ * The manifest's shape and hash, and the entries lines. Raise it when any of
+ * them changes.
+ */
+export const MANIFEST_FORMAT_VERSION = 2;
 
 /** Hex digits of the entry's SHA-1 a manifest or entries line carries. */
 export const TITLE_HASH_LENGTH = 16;
@@ -104,6 +129,11 @@ const ENTRIES_CHUNK_BYTES = 64 * 1024;
 
 const NDJSON_CONTENT_TYPE = 'application/x-ndjson; charset=utf-8';
 const ENTRY_LINE_END = Buffer.from('}\n', 'utf8');
+
+/** The line that closes an entries response of `count` title lines. */
+function closingLine(count) {
+  return Buffer.from(`{"end":true,"count":${count}}\n`, 'utf8');
+}
 
 function sha1Hex(data) {
   return createHash('sha1').update(data).digest('hex');
@@ -257,8 +287,9 @@ export function parseEntriesRequest(body) {
 }
 
 /**
- * The NDJSON lines for `picks`, in chunks of about `chunkBytes`. Pulled one
- * chunk at a time, so it runs only as fast as the client reads.
+ * The NDJSON lines for `picks`, then the closing line, in chunks of about
+ * `chunkBytes`. Pulled one chunk at a time, so it runs only as fast as the
+ * client reads; a stream cut off part-way never pulls the closing line.
  *
  * @param {Buffer} body - The cache entry's body
  * @param {Array<{name: string, title: Object|null}>} picks
@@ -286,7 +317,11 @@ function* entryLineChunks(body, picks, chunkBytes) {
       size = 0;
     }
   }
-  if (size) yield Buffer.concat(parts, size);
+  // One line per pick was sent above, missing ones included.
+  const end = closingLine(picks.length);
+  parts.push(end);
+  size += end.length;
+  yield Buffer.concat(parts, size);
 }
 
 /**
