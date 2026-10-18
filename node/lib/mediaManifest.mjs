@@ -68,8 +68,9 @@
 // included; an empty list is answered with {"end":true,"count":0} alone. No
 // title line has an `end` key. A reader treats a response without the closing
 // line, or with a count that does not match the title lines it read, as
-// failed: a stream that fails part-way is cut off and never gets one, however
-// whole the lines before the cut look.
+// failed: a stream that fails part-way is cut off and never gets one. A reader
+// applies none of a failed response's lines, however whole they look: the
+// response proves nothing about any title in it.
 //
 // `entry` is the title's bytes cut from the cached body, the very bytes the
 // manifest hash covers. A line's `hash` covers exactly the bytes of its
@@ -80,8 +81,11 @@
 //
 // Two headers name the generation the lines come from, on every 200, before
 // the first line: X-Manifest-ETag is the ETag GET /media/<kind>/manifest has
-// for it, X-Library-ETag the ETag GET /media/<kind> has for it. Neither is
-// exposed to browsers through CORS: read them from a server-side fetch.
+// for it, X-Library-ETag the ETag GET /media/<kind> has for it. The manifest's
+// bytes begin with its `format`, so X-Manifest-ETag also pins the format: lines
+// whose X-Manifest-ETag is the ETag of the manifest a reader holds are in that
+// manifest's format. Neither header is exposed to browsers through CORS: read
+// them from a server-side fetch.
 //
 // The frontend stores the line's hash with what it applied. If the cache was
 // rebuilt between its manifest and entries requests, the line's hash (and
