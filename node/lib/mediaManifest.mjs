@@ -94,8 +94,8 @@
 // cut off, not ended, and so has no closing line.
 //
 // The request body is parsed by createEntriesBodyParser, mounted after the auth
-// middleware with ENTRIES_REQUEST_BODY_LIMIT; app.mjs's global JSON parser
-// leaves these paths alone.
+// middleware with ENTRIES_REQUEST_BODY_LIMIT; the global JSON parser leaves
+// these paths alone. Both are wired in lib/requestBodyParsers.mjs.
 
 import { createHash } from 'crypto';
 import { createGzip, gzip as gzipCallback } from 'zlib';
