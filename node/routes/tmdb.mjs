@@ -1,33 +1,17 @@
 import crypto from 'crypto';
 import express from 'express';
 import { createCategoryLogger } from '../lib/logger.mjs';
-import { authenticateUser, createRateLimiter, requireAdmin, requireFullAccess } from '../middleware/auth.mjs';
+import { authenticateUser, createRateLimiter, requireFullAccess } from '../middleware/auth.mjs';
 import {
   searchMedia,
   getMediaDetails,
-  getMediaCast,
-  getStructuredMediaCast,
-  getMediaVideos,
   getMediaImages,
-  getMediaRating,
-  getEpisodeDetails,
   getEpisodeImages,
   fetchComprehensiveMediaDetails,
-  searchCollections,
   getCollectionDetails,
-  getCollectionImages,
-  fetchEnhancedCollectionData,
-  makeTmdbRequest
+  fetchEnhancedCollectionData
 } from '../utils/tmdb.mjs';
 import { classifyTmdbError } from '../utils/tmdbErrors.mjs';
-import {
-  initializeDatabase,
-  releaseDatabase,
-  getTmdbCacheStats,
-  clearTmdbCache,
-  clearExpiredTmdbCache,
-  refreshTmdbCacheEntry
-} from '../sqliteDatabase.mjs';
 
 const logger = createCategoryLogger('tmdb-api');
 
@@ -64,7 +48,7 @@ const rateLimiter = createRateLimiter(800, 60000);
 const ETAG_VOLATILE_FIELDS = ['_cached', '_cachedAt', '_expiresAt', '_etag', '_notModified', 'last_updated'];
 
 function sendJsonWithETag(req, res, data) {
-  // Bare-array payloads (e.g. /cast) cannot carry the bookkeeping fields;
+  // Bare-array payloads cannot carry the bookkeeping fields;
   // hash them as serialized rather than spread into an {"0": ...} object.
   let hashInput = data;
   if (!Array.isArray(data)) {
@@ -122,22 +106,6 @@ export function setupTmdbRoutes() {
 
   // STANDARDIZED ENDPOINTS - All use query parameters consistently
 
-  // Search movie collections. Must stay registered before /search/:type,
-  // which would otherwise capture /search/collection as type "collection".
-  router.get('/search/collection', authenticateUser, rateLimiter, async (req, res) => {
-    try {
-      const { query, page = 1, blurhash } = req.query;
-
-      const includeBlurhash = blurhash === 'true';
-      const data = await searchCollections(query, page, includeBlurhash);
-
-      logger.info(`User ${req.user.email} searched for collections: "${query}"${includeBlurhash ? ' with blurhash' : ''}`);
-      res.json(data);
-    } catch (error) {
-      sendTmdbError(res, error, 'Collection search error:');
-    }
-  });
-
   // Search movies or TV shows
   router.get('/search/:type', authenticateUser, rateLimiter, async (req, res) => {
   try {
@@ -194,64 +162,6 @@ router.get('/details/:type', authenticateUser, rateLimiter, async (req, res) => 
   }
 });
 
-// Get cast information
-router.get('/cast/:type', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { type } = req.params;
-    const { tmdb_id } = req.query;
-    
-    if (!tmdb_id) {
-      return res.status(400).json({ error: 'tmdb_id parameter is required' });
-    }
-    
-    const cast = await getMediaCast(type, tmdb_id);
-    
-    logger.info(`User ${req.user.email} requested cast for ${type} ID: ${tmdb_id}`);
-    return sendJsonWithETag(req, res, cast);
-  } catch (error) {
-    sendTmdbError(res, error, 'Cast error:');
-  }
-});
-
-// Get structured cast information (with recurring and optionally guest cast)
-router.get('/structured-cast/:type', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { type } = req.params;
-    const { tmdb_id, include_guest } = req.query;
-    
-    if (!tmdb_id) {
-      return res.status(400).json({ error: 'tmdb_id parameter is required' });
-    }
-    
-    const includeGuestCast = include_guest === 'true';
-    const castData = await getStructuredMediaCast(type, tmdb_id, includeGuestCast);
-    
-    logger.info(`User ${req.user.email} requested structured cast for ${type} ID: ${tmdb_id}${includeGuestCast ? ' with guest cast' : ''}`);
-    res.json(castData);
-  } catch (error) {
-    sendTmdbError(res, error, 'Structured cast error:');
-  }
-});
-
-// Get trailer information
-router.get('/videos/:type', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { type } = req.params;
-    const { tmdb_id } = req.query;
-    
-    if (!tmdb_id) {
-      return res.status(400).json({ error: 'tmdb_id parameter is required' });
-    }
-    
-    const videos = await getMediaVideos(type, tmdb_id);
-    
-    logger.info(`User ${req.user.email} requested videos for ${type} ID: ${tmdb_id}`);
-    return sendJsonWithETag(req, res, videos);
-  } catch (error) {
-    sendTmdbError(res, error, 'Videos error:');
-  }
-});
-
 // Get images (logos, backdrops, posters)
 router.get('/images/:type', authenticateUser, rateLimiter, async (req, res) => {
   try {
@@ -269,43 +179,6 @@ router.get('/images/:type', authenticateUser, rateLimiter, async (req, res) => {
     return sendJsonWithETag(req, res, images);
   } catch (error) {
     sendTmdbError(res, error, 'Images error:');
-  }
-});
-
-// Get content ratings
-router.get('/rating/:type', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { type } = req.params;
-    const { tmdb_id } = req.query;
-    
-    if (!tmdb_id) {
-      return res.status(400).json({ error: 'tmdb_id parameter is required' });
-    }
-    
-    const rating = await getMediaRating(type, tmdb_id);
-    
-    logger.info(`User ${req.user.email} requested rating for ${type} ID: ${tmdb_id}`);
-    return sendJsonWithETag(req, res, rating);
-  } catch (error) {
-    sendTmdbError(res, error, 'Rating error:');
-  }
-});
-
-// Get TV episode details
-router.get('/episode', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { tmdb_id, season, episode } = req.query;
-    
-    if (!tmdb_id || !season || !episode) {
-      return res.status(400).json({ error: 'tmdb_id, season, and episode parameters are required' });
-    }
-    
-    const data = await getEpisodeDetails(tmdb_id, season, episode);
-    
-    logger.info(`User ${req.user.email} requested episode details: ${tmdb_id} S${season}E${episode}`);
-    return sendJsonWithETag(req, res, data);
-  } catch (error) {
-    sendTmdbError(res, error, 'Episode error:');
   }
 });
 
@@ -350,152 +223,6 @@ router.get('/collection', authenticateUser, rateLimiter, async (req, res) => {
     res.json(data);
   } catch (error) {
     sendTmdbError(res, error, 'Collection details error:');
-  }
-});
-
-// Get images for movie collection
-router.get('/collection/images', authenticateUser, rateLimiter, async (req, res) => {
-  try {
-    const { tmdb_id, blurhash } = req.query;
-    
-    if (!tmdb_id) {
-      return res.status(400).json({ error: 'tmdb_id parameter is required' });
-    }
-    
-    const includeBlurhash = blurhash === 'true';
-    const images = await getCollectionImages(tmdb_id, includeBlurhash);
-    
-    logger.info(`User ${req.user.email} requested collection images for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
-    res.json(images);
-  } catch (error) {
-    sendTmdbError(res, error, 'Collection images error:');
-  }
-});
-
-// Admin-only endpoint reporting global TMDB integration status.
-// A-4a (implemented): this route was GET /api/tmdb/config, which collided by
-// name with the unrelated per-title `tmdb.config` editor at
-// GET/PUT /api/admin/metadata/config (routes/admin.mjs). The read-only global
-// resource was renamed to /status — it *is* a status report, and it sits
-// naturally beside /api/tmdb/health. Breaking change by decision (no alias);
-// external callers of the old path get the router's 404.
-router.get('/status', authenticateUser, requireAdmin, async (req, res) => {
-  try {
-    const cacheStats = await getTmdbCacheStats();
-
-    res.json({
-      tmdb_configured: !!process.env.TMDB_API_KEY,
-      base_url: 'https://api.themoviedb.org/3',
-      image_base_url: 'https://image.tmdb.org/t/p/original',
-      rate_limits: {
-        // Matches the actual createRateLimiter(800, 60000) on these routes
-        // (historically misreported as 100).
-        requests_per_minute: 800,
-        window_ms: 60000
-      },
-      cache: {
-        enabled: true,
-        default_ttl_hours: 1440, // 60 days
-        database: 'tmdb_cache.db',
-        stats: cacheStats
-      }
-    });
-  } catch (error) {
-    logger.error('Status error:', error);
-    res.status(500).json({ error: 'Failed to fetch TMDB status' });
-  }
-});
-
-// Admin-only endpoint to get cache statistics
-router.get('/cache/stats', authenticateUser, requireAdmin, async (req, res) => {
-  try {
-    const stats = await getTmdbCacheStats();
-
-    logger.info(`Admin ${req.user.email} requested TMDB cache stats`);
-    res.json(stats);
-  } catch (error) {
-    logger.error('Cache stats error:', error);
-    res.status(500).json({ error: 'Failed to fetch cache statistics' });
-  }
-});
-
-// Admin-only endpoint to clear cache
-router.delete('/cache', authenticateUser, requireAdmin, async (req, res) => {
-  try {
-    const { pattern } = req.query;
-    
-    const deletedCount = await clearTmdbCache(pattern || null);
-
-    logger.info(`Admin ${req.user.email} cleared TMDB cache${pattern ? ` with pattern: ${pattern}` : ''} - ${deletedCount} entries deleted`);
-    res.json({
-      success: true,
-      deletedCount,
-      message: pattern ? `Cleared ${deletedCount} cache entries matching pattern: ${pattern}` : `Cleared all ${deletedCount} cache entries`
-    });
-  } catch (error) {
-    logger.error('Cache clear error:', error);
-    res.status(500).json({ error: 'Failed to clear cache' });
-  }
-});
-
-// Admin-only endpoint to clear expired cache entries
-router.delete('/cache/expired', authenticateUser, requireAdmin, async (req, res) => {
-  try {
-    const deletedCount = await clearExpiredTmdbCache();
-
-    logger.info(`Admin ${req.user.email} cleared expired TMDB cache - ${deletedCount} entries deleted`);
-    res.json({
-      success: true,
-      deletedCount,
-      message: `Cleared ${deletedCount} expired cache entries`
-    });
-  } catch (error) {
-    logger.error('Cache clear expired error:', error);
-    res.status(500).json({ error: 'Failed to clear expired cache' });
-  }
-});
-
-// Admin-only endpoint to force refresh specific cache entry: drops the stale
-// row, then eagerly refetches through makeTmdbRequest(forceRefresh) so the
-// fresh response is re-cached via the normal setTmdbCache() path.
-// Limitation: blurhash-enhanced responses live under a different custom key
-// (generateBlurhashCacheKey in utils/tmdbBlurhash.mjs) that this endpoint
-// cannot address — only the plain variant of {endpoint, params} is refreshed;
-// a stale blurhash variant ages out via its TTL.
-router.post('/cache/refresh', authenticateUser, requireAdmin, async (req, res) => {
-  try {
-    const { endpoint, params = {} } = req.body;
-
-    if (!endpoint) {
-      return res.status(400).json({ error: 'Endpoint parameter is required' });
-    }
-
-    // `refreshed` keeps its original meaning — "a cached row existed and was
-    // dropped" — so existing consumers of the field are unaffected.
-    const refreshed = await refreshTmdbCacheEntry(endpoint, params);
-
-    try {
-      await makeTmdbRequest(endpoint, params, 3, 1440, /* forceRefresh */ true);
-    } catch (fetchError) {
-      logger.error(`Cache refresh refetch failed for ${endpoint}: ${fetchError.message}`);
-      return res.status(502).json({
-        success: false,
-        refreshed,
-        fetched: false,
-        error: `Stale entry ${refreshed ? 'cleared' : 'not found'}, but the TMDB refetch failed: ${fetchError.message}`
-      });
-    }
-
-    logger.info(`Admin ${req.user.email} refreshed TMDB cache for endpoint: ${endpoint} (stale row ${refreshed ? 'dropped' : 'absent'}, fresh data fetched and re-cached)`);
-    res.json({
-      success: true,
-      refreshed,
-      fetched: true,
-      message: 'Fresh TMDB data fetched and re-cached'
-    });
-  } catch (error) {
-    logger.error('Cache refresh error:', error);
-    res.status(500).json({ error: 'Failed to refresh cache entry' });
   }
 });
 

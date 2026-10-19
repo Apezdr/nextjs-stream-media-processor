@@ -31,32 +31,14 @@ GET /api/tmdb/comprehensive/movie?tmdb_id=27205&blurhash=true
 # Get images with blurhash
 GET /api/tmdb/images/movie?tmdb_id=27205&blurhash=true
 
-# Get cast information
-GET /api/tmdb/cast/movie?tmdb_id=27205
-
-# Get videos/trailers
-GET /api/tmdb/videos/movie?tmdb_id=27205
-
-# Get content ratings
-GET /api/tmdb/rating/movie?tmdb_id=27205
-
-# Get episode details
-GET /api/tmdb/episode?tmdb_id=1399&season=1&episode=1
-
 # Get episode images with blurhash
 GET /api/tmdb/episode/images?tmdb_id=1399&season=1&episode=1&blurhash=true
-
-# Search collections with blurhash
-GET /api/tmdb/search/collection?query=marvel&blurhash=true
 
 # Get collection details with blurhash
 GET /api/tmdb/collection?tmdb_id=86311&blurhash=true
 
 # Get enhanced collection details with blurhash
 GET /api/tmdb/collection?tmdb_id=86311&enhanced=true&blurhash=true
-
-# Get collection images with blurhash
-GET /api/tmdb/collection/images?tmdb_id=86311&blurhash=true
 ```
 
 ### Response Format
@@ -82,18 +64,14 @@ All endpoints now use standardized query parameters. The following endpoints sup
 - **Details**: `/details/:type` (movie/tv) - requires `tmdb_id` parameter
 - **Comprehensive**: `/comprehensive/:type` (movie/tv) - requires `tmdb_id` or `name` parameter
 - **Images**: `/images/:type` (movie/tv) - requires `tmdb_id` parameter
-- **Cast**: `/cast/:type` (movie/tv) - requires `tmdb_id` parameter
-- **Videos**: `/videos/:type` (movie/tv) - requires `tmdb_id` parameter
-- **Rating**: `/rating/:type` (movie/tv) - requires `tmdb_id` parameter
 
 ### Episode Endpoints
-- **Episode Details**: `/episode` - requires `tmdb_id`, `season`, `episode` parameters
 - **Episode Images**: `/episode/images` - requires `tmdb_id`, `season`, `episode` parameters
 
 ### Collection Endpoints
-- **Search Collections**: `/search/collection` - requires `query` parameter
 - **Collection Details**: `/collection` - requires `tmdb_id` parameter, optional `enhanced=true`
-- **Collection Images**: `/collection/images` - requires `tmdb_id` parameter
+
+The cast, videos, rating, episode details, collection search and collection images endpoints were removed in P2 (no caller).
 
 ## Database Schema
 
@@ -284,23 +262,7 @@ function MoviePoster({ movie }) {
 
 ## Monitoring and Maintenance
 
-### Cache Statistics
-
-Access cache statistics via admin endpoints:
-
-```bash
-GET /api/tmdb/cache/stats
-```
-
-### Cache Cleanup
-
-```bash
-# Clear expired entries
-DELETE /api/tmdb/cache/expired
-
-# Clear all blurhash cache
-DELETE /api/tmdb/cache?pattern=*_blurhash
-```
+The admin cache endpoints (`/api/tmdb/cache/stats`, `DELETE /api/tmdb/cache`, `DELETE /api/tmdb/cache/expired`) were removed in P2 (no caller). Expired rows are pruned by the cache's own probabilistic sweep.
 
 ### Performance Monitoring
 

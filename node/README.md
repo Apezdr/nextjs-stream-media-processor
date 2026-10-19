@@ -73,9 +73,7 @@ The application exposes the following API endpoints:
 - **WebVTT Request:**
   - Movie: `GET /vtt/movie/:movieName`
   - TV: `GET /vtt/tv/:showName/:season/:episode`
-- **Chapter Information Request:**
-  - Movie: `GET /chapters/movie/:movieName`
-  - TV: `GET /chapters/tv/:showName/:season/:episode`
+- **Chapters:** the scanners write each title's chapter VTT next to the media, and the file server serves it as a static file (the payload's chapter URLs point there). There is no chapter route.
 
 ## API Endpoint Placeholders
 

@@ -70,8 +70,9 @@ function parseStoredUrls(urls) {
  * in tv-scanner.mjs (C-1 — this was historically a silent no-op: it passed
  * the quietMode boolean into generateChapters' chapterData parameter, which
  * short-circuited the probe and discarded the returned VTT string). Movies
- * without chapter atoms (chapterInfo → null) write nothing; the lazy
- * /chapters/movie/:movieName route remains the on-demand fallback.
+ * without chapter atoms (chapterInfo → null) write nothing. (There is no
+ * on-demand fallback: the /chapters/* routes were removed in P2, and the
+ * payload's chapter URLs point at the file server's static files.)
  *
  * Ordering constraint (hard): scanMovies must call this (via processChapters)
  * BEFORE computing final_hash — calculateDirectoryHash recurses into

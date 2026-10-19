@@ -18,11 +18,7 @@ import { describe, it, expect, jest, beforeAll, afterAll, beforeEach } from '@je
 
 const fetchComprehensiveMediaDetails = jest.fn();
 const getMediaDetails = jest.fn();
-const getMediaCast = jest.fn();
-const getMediaVideos = jest.fn();
 const getMediaImages = jest.fn();
-const getMediaRating = jest.fn();
-const getEpisodeDetails = jest.fn();
 const getEpisodeImages = jest.fn();
 
 jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
@@ -38,28 +34,11 @@ jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
 jest.unstable_mockModule('../../../utils/tmdb.mjs', () => ({
   searchMedia: jest.fn(),
   getMediaDetails,
-  getMediaCast,
-  getStructuredMediaCast: jest.fn(),
-  getMediaVideos,
   getMediaImages,
-  getMediaRating,
-  getEpisodeDetails,
   getEpisodeImages,
   fetchComprehensiveMediaDetails,
-  searchCollections: jest.fn(),
   getCollectionDetails: jest.fn(),
-  getCollectionImages: jest.fn(),
   fetchEnhancedCollectionData: jest.fn(),
-  makeTmdbRequest: jest.fn(),
-}));
-
-jest.unstable_mockModule('../../../sqliteDatabase.mjs', () => ({
-  initializeDatabase: jest.fn(),
-  releaseDatabase: jest.fn(),
-  getTmdbCacheStats: jest.fn(),
-  clearTmdbCache: jest.fn(),
-  clearExpiredTmdbCache: jest.fn(),
-  refreshTmdbCacheEntry: jest.fn(),
 }));
 
 let server;
@@ -84,11 +63,7 @@ beforeEach(() => {
   for (const fn of [
     fetchComprehensiveMediaDetails,
     getMediaDetails,
-    getMediaCast,
-    getMediaVideos,
     getMediaImages,
-    getMediaRating,
-    getEpisodeDetails,
     getEpisodeImages,
   ]) {
     fn.mockReset();
@@ -246,31 +221,9 @@ describe('GET /api/tmdb/comprehensive/:type content ETag', () => {
 });
 
 describe('content ETag on the other single-resource TMDB GET endpoints', () => {
-  it('revalidates a bare-array payload (/cast) with a 304', async () => {
-    const cast = [{ id: 6384, name: 'Keanu Reeves', character: 'Neo' }];
-    getMediaCast.mockResolvedValue(cast);
-
-    const first = await fetch(`${baseUrl}/api/tmdb/cast/movie?tmdb_id=603`);
-    expect(first.status).toBe(200);
-    const etag = first.headers.get('etag');
-    expect(etag).toMatch(/^W\/"[0-9a-f]{32}"$/);
-    const body = await first.json();
-    expect(Array.isArray(body)).toBe(true);
-    expect(body).toEqual(cast);
-
-    const replay = await fetch(`${baseUrl}/api/tmdb/cast/movie?tmdb_id=603`, {
-      headers: { 'If-None-Match': etag },
-    });
-    expect(replay.status).toBe(304);
-    expect(await replay.text()).toBe('');
-  });
-
   it.each([
     ['/details/movie?tmdb_id=603', getMediaDetails, () => cacheHitShape()],
-    ['/videos/movie?tmdb_id=603', getMediaVideos, () => ({ trailer_url: 'https://youtu.be/x', videos: [] })],
     ['/images/movie?tmdb_id=603', getMediaImages, () => ({ logo_path: null, backdrops: [], posters: [], logos: [] })],
-    ['/rating/movie?tmdb_id=603', getMediaRating, () => ({ rating: 'R' })],
-    ['/episode?tmdb_id=1399&season=1&episode=1', getEpisodeDetails, () => cacheHitShape()],
     ['/episode/images?tmdb_id=1399&season=1&episode=1', getEpisodeImages, () => ({ thumbnail_url: null, stills: [] })],
   ])('emits a weak content ETag on %s', async (path, mock, payload) => {
     mock.mockResolvedValue(payload());

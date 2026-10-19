@@ -90,60 +90,7 @@ Typical hit rates by usage pattern:
 
 ## API Endpoints
 
-### Get Cache Statistics
-
-```http
-GET /api/admin/session-cache/stats
-Authorization: Bearer <admin-token>
-```
-
-**Response:**
-
-```json
-{
-  "cacheStats": {
-    "hits": 12543,
-    "misses": 234,
-    "hitRate": "98.17%",
-    "evictions": 5,
-    "memoryCleanups": 0,
-    "lastCleanup": "2024-03-17T02:00:00.000Z"
-  },
-  "cacheSizes": {
-    "sessionCache": 234,
-    "requestCache": 12,
-    "inflightRequests": 0
-  },
-  "memoryStatus": {
-    "memoryPressure": false,
-    "heapUsed": "245.34 MB",
-    "heapTotal": "512.00 MB"
-  },
-  "circuitBreaker": {
-    "state": "CLOSED",
-    "failureCount": 0,
-    "nextAttempt": null,
-    "lastFailure": null
-  }
-}
-```
-
-### Clear Session Cache
-
-```http
-POST /api/admin/session-cache/clear
-Authorization: Bearer <admin-token>
-```
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "message": "Session cache cleared successfully",
-  "timestamp": "2024-03-17T02:00:00.000Z"
-}
-```
+None. `GET /api/admin/session-cache/stats` and `POST /api/admin/session-cache/clear` were removed in P2: neither had a caller. `sessionManager.getStats()` and `clearCache()` remain on the class.
 
 ## Configuration
 
@@ -222,14 +169,6 @@ Each user's session data is isolated by token:
 - No cross-user cache contamination
 - Token-based cache keys
 - Automatic expiration of stale sessions
-
-### Admin-Only Access
-
-Cache management endpoints require admin privileges:
-
-- Statistics viewing: Admin only
-- Cache clearing: Admin only
-- Respects existing auth middleware chain
 
 ## Troubleshooting
 

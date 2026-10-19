@@ -70,13 +70,13 @@ Two reassurances also verified: `pristineMetadata` is serialized from the exact 
 
 ### Admin / config / rescan routes
 
-**A-4a — Two unrelated resources share the name "config."**
+**A-4a — Two unrelated resources share the name "config."** *Moot since P2: `GET /api/tmdb/status` was removed (no caller).*
 `PUT /api/admin/metadata/config` (per-title tmdb.config) and `GET /api/tmdb/config` (global TMDB settings, `node/routes/tmdb.mjs`) are unrelated resources with the same trailing name. Pure naming clarity — no bug, and a rename breaks whatever external frontend calls either path.
 **Decision:** rename one of the two resources, accepting the breaking-change coordination with the frontend. *Status: Implemented (this branch).* Per the scrutiny recommendation, the read-only global endpoint took the rename: `GET /api/tmdb/config` → **`GET /api/tmdb/status`** (it *is* a status report, and it sits beside `/api/tmdb/health`); the per-title `metadata/config` editor keeps its path because breaking its PUT would silently block config authoring. No alias — external callers of the old path get a 404, and since no in-repo caller or test referenced either path, the only remaining coordination is a **frontend release note** (⚠ flag `GET /api/tmdb/config` → `/api/tmdb/status` when deploying alongside the `nextjs-stream` frontend). The response's `requests_per_minute` field was also corrected to the real 800/min limiter (was hardcoded 100). Entry removed once absorbed post-merge (route table in `BACKEND_ARCHITECTURE.md` Appendix A.3 is updated).
 
 ### Scheduling / concurrency
 
-**S-2 — On-demand routes bypass the task manager.**
+**S-2 — On-demand routes bypass the task manager.** *Since P2 the admin metadata routes (`/api/admin/metadata/show`, `/movie`, `/bulk`) and `GET /rescan/tmdb` are gone (no caller), so the write-heavy part of this is moot.*
 `GET /media/tv`, `GET /media/movies`, `POST /media/scan`, `GET /rescan/tmdb`, and the admin metadata routes call scan/generate functions directly rather than through `enqueueTask()`, so they can run concurrently with the every-3-minute scheduled scan or each other. For the write-heavy admin routes this is a genuine correctness race, not just lock contention: a forceRefresh image wipe can interleave with a scan mid-read/write on the same title.
 **Decision:** gate the write-heavy admin routes (`/api/admin/metadata/show`, `/movie`, `/bulk`) through `enqueueTask()` with the existing task types; leave the read-mostly listing endpoints as-is. **Rationale:** the listing endpoints' race window is essentially cold-start/operator-paced and low stakes; coupling their HTTP latency to the task queue buys little. **Sequencing:** if this gating is later extended to `/rescan/tmdb`, it must wrap the handler that A-1 (Branch 9, merged) authenticates — not replace or revert that middleware.
 **⚠ Scrutiny findings (2026-07-12) — the decision is right but under-specified on HTTP blocking:**

@@ -6,7 +6,7 @@ import { scheduleJob } from "node-schedule";
 import { exec } from "child_process";
 import { promisify } from "util";
 import os from "os";
-import { join, resolve, basename, dirname, normalize } from "path";
+import { join, resolve, dirname, normalize } from "path";
 import { createReadStream } from "fs"; // Callback-based version of fs
 import { promises as fs } from "fs"; // Use the promise-based version of fs
 import compression from "compression";
@@ -27,7 +27,7 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
 import {
@@ -41,7 +41,6 @@ import {
 import { tvManifestKeys, createManifestHandler } from "./lib/mediaManifest.mjs";
 import { createGlobalJsonParser, mountMediaEntriesRoute } from "./lib/requestBodyParsers.mjs";
 import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
-import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
@@ -51,7 +50,6 @@ import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/l
 import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
-import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
@@ -345,246 +343,6 @@ async function handleFrameRequest(req, res, type) {
 //
 app.use(createSpriteRoutes(BASE_PATH));
 
-// Handle Chapter Requests
-app.get("/chapters/movie/:movieName", async (req, res) => {
-  await handleChapterRequest(req, res, "movies");
-});
-
-app.get("/chapters/tv/:showName", async (req, res) => {
-  await handleChapterRequest(req, res, "tv", true);
-});
-
-app.get("/chapters/tv/:showName/:season/:episode", async (req, res) => {
-  await handleChapterRequest(req, res, "tv");
-});
-
-async function handleChapterRequest(
-  req,
-  res,
-  type,
-  generateAllChapters = false
-) {
-  const db = await initializeDatabase();
-  const { movieName, showName, season, episode } = req.params;
-  let chapterFileName, mediaPath, chapterFilePath;
-
-  if (type === "movies") {
-    const movie = await db.get("SELECT * FROM movies WHERE name = ?", [
-      movieName,
-    ]);
-    if (!movie) {
-      return res.status(404).send(`Movie not found: ${movieName}`);
-    }
-    // Resolve the real file on disk rather than reconstructing its name. The
-    // previous version stripped the stored URL's actual extension and then
-    // re-appended '.mp4', so a title in any other container pointed mediaPath
-    // at a file that does not exist and 404'd even when its URL was correct.
-    const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
-    if (!videoRef) {
-      return res.status(404).send(`Movie file not found: ${movieName}`);
-    }
-    const movieFileName = stripVideoExtension(videoRef.filename);
-    chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = videoRef.path;
-    chapterFilePath = join(
-      `${BASE_PATH}/movies`,
-      movieName,
-      "chapters",
-      chapterFileName
-    );
-    await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
-  } else if (type === "tv") {
-    if (generateAllChapters) {
-      const shows = await getTVShows();
-      const showData = shows.find((show) => show.name === showName);
-
-      if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
-          for (const episodeKey in season.episodes) {
-            const episode = season.episodes[episodeKey];
-            const episodeFileName = episode.filename;
-            
-            // Extract episode number from the episode key (SxxEyy format)
-            const episodeMatch = episodeKey.match(/E(\d+)/i);
-            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
-            
-            if (!episodeNumber) {
-              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
-              continue;
-            }
-            
-            const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName,
-              "chapters",
-              `${showName} - S${seasonNumber.padStart(
-                2,
-                "0"
-              )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
-            );
-            const directoryPath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName
-            );
-            const mediaPath = join(directoryPath, episodeFileName);
-
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
-          }
-        }
-
-        return res.status(200).send("Chapter files generated successfully");
-      } else {
-        return res.status(404).send(`Show not found: ${showName}`);
-      }
-    }
-    if (!season && !episode) {
-      const shows = await getTVShows();
-      const showData = shows.find((show) => show.name === showName);
-
-      if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
-          for (const episodeKey in season.episodes) {
-            const episode = season.episodes[episodeKey];
-            const episodeFileName = episode.filename;
-            
-            // Extract episode number from the episode key (SxxEyy format)
-            const episodeMatch = episodeKey.match(/E(\d+)/i);
-            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
-            
-            if (!episodeNumber) {
-              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
-              continue;
-            }
-            
-            const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName,
-              "chapters",
-              `${showName} - S${seasonNumber.padStart(
-                2,
-                "0"
-              )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
-            );
-            const directoryPath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName
-            );
-            const mediaPath = join(directoryPath, episodeFileName);
-
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
-          }
-        }
-
-        return res.status(200).send("Chapter files generated successfully");
-      } else {
-        return res.status(404).send(`Show not found: ${showName}`);
-      }
-    } else {
-      const episodeNumber = String(parseInt(episode, 10)).padStart(2, "0");
-      const seasonNumber = String(parseInt(season, 10)).padStart(2, "0");
-      chapterFileName = `${showName} - S${seasonNumber}E${episodeNumber}_chapters.vtt`;
-
-      try {
-        const videoRef = await resolveEpisodeVideo({
-          basePath: BASE_PATH,
-          showName,
-          season,
-          episode,
-        });
-
-        if (!videoRef) {
-          logger.error(
-            `Associated video file not found for ${showName} - S${seasonNumber}E${episodeNumber}`
-          );
-          return res.status(404).send("Associated video file not found");
-        }
-
-        mediaPath = videoRef.path;
-        chapterFilePath = join(videoRef.dir, "chapters", chapterFileName);
-      } catch (error) {
-        logger.error(
-          `Error resolving episode video for ${showName} - S${seasonNumber}E${episodeNumber}`,
-          error
-        );
-        return res.status(500).send("Internal server error");
-      }
-    }
-  }
-
-  await releaseDatabase(db);
-  await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
-
-  res.setHeader("Content-Type", "text/vtt");
-  res.sendFile(chapterFilePath);
-}
-
-function getEpisodeNumber(episodeFileName) {
-  const match = episodeFileName.match(/E(\d+)/i);
-  return match ? match[1] : null;
-}
-
-async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietMode = false) {
-  try {
-    if (await fileExists(chapterFilePath)) {
-      if (!quietMode) {
-        logger.info(
-          `Serving chapter file from cache: ${basename(chapterFilePath)}`
-        );
-      }
-    } else {
-      if (!quietMode) {
-        logger.info(
-          `Chapter file not found in cache: ${basename(chapterFilePath)}`
-        );
-      }
-
-      // Check if the media file has chapter information
-      const chapterData = await chapterInfo(mediaPath);
-
-      if (chapterData) {
-        // Create the chapters directory if it doesn't exist
-        await fs.mkdir(dirname(chapterFilePath), { recursive: true });
-
-        // If the media file has chapter information, generate the chapter file
-        const chapterContent = await generateChapters(mediaPath, chapterData);
-
-        // Save the generated chapter content to the file
-        await fs.writeFile(chapterFilePath, chapterContent);
-        if (!quietMode) {
-          logger.info("The file has been saved!");
-        }
-      } else {
-        // If the media file doesn't have chapter information, send a 404 response
-        if (!quietMode) {
-          logger.warn(
-            `Chapter information not found for ${basename(mediaPath)}`
-          );
-        }
-      }
-    }
-  } catch (error) {
-    if (error.code === "EACCES") {
-      logger.error(
-        `Permission denied while accessing ${chapterFilePath}.\nPlease check the directory permissions.`,
-        error
-      );
-    } else {
-      logger.error(
-        `Error generating chapter file for ${basename(mediaPath)}:`,
-        error
-      );
-    }
-  }
-}
-
 /**
  * GET /processes
  * Retrieves the current process queue information in JSON format.
@@ -618,16 +376,6 @@ app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
   } catch (error) {
     logger.error(`Error fetching processes: ${error.message}`);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
-  }
-});
-
-app.get("/rescan/tmdb", authenticateWebhookOrUser, async (req, res) => {
-  try {
-    await runDownloadTmdbImages({ fullScan: true });
-    res.status(200).send("Rescan initiated");
-  } catch (error) {
-    logger.error(error);
-    res.status(500).send("Rescan Failed: Internal server error");
   }
 });
 
@@ -1389,8 +1137,8 @@ async function initialize() {
 }
 
 // Use the modular route system
-// Identity provider webhooks + status/report, next to /rescan/tmdb in spirit:
-// the service instance lives here, so the routes mount here.
+// Identity provider webhooks + status/report: the service instance lives
+// here, so the routes mount here.
 app.use('/api', setupIdentityRoutes(identityService));
 app.use(setupRoutes());
 
@@ -1421,10 +1169,6 @@ app.get('/', (req, res) => {
       spritesheets: {
         description: 'Sprite sheets and VTT files',
         routes: ['/spritesheet/movie/:movieName', '/vtt/movie/:movieName']
-      },
-      chapters: {
-        description: 'Chapter information',
-        routes: ['/chapters/movie/:movieName', '/chapters/tv/:showName/:season/:episode']
       },
       clips: {
         description: 'Video clip generation',
@@ -1491,13 +1235,6 @@ app.use((req, res, next) => {
       endpoints: [
         '/vtt/movie/:movieName - Get movie VTT file',
         '/vtt/tv/:showName/:season/:episode - Get TV VTT file'
-      ]
-    },
-    '/chapters': {
-      description: 'Chapter endpoints',
-      endpoints: [
-        '/chapters/movie/:movieName - Get movie chapters',
-        '/chapters/tv/:showName/:season/:episode - Get TV chapters'
       ]
     },
     '/videoClip': {
