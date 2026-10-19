@@ -7,9 +7,11 @@ import fs from 'fs';
 
 // Ensure base log directory exists. `recursive: true` makes this idempotent so
 // concurrent importers (e.g. parallel Jest workers) can't race an existsSync
-// check and lose with EEXIST.
-const logDirectory = path.resolve('logs');
-fs.mkdirSync(logDirectory, { recursive: true });
+// check and lose with EEXIST. GET /api/logs (routes/logs.mjs) reads the
+// application-%DATE%.log files written here; lib/logReader.mjs depends on
+// that name and on the date pattern below.
+export const LOG_DIRECTORY = path.resolve('logs');
+fs.mkdirSync(LOG_DIRECTORY, { recursive: true });
 
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -46,33 +48,18 @@ const baseLogger = createLogger({
       level: isProduction ? 'info' : 'debug',
     }),
     new DailyRotateFile({
-      filename: path.join(logDirectory, 'application-%DATE%.log'),
+      filename: path.join(LOG_DIRECTORY, 'application-%DATE%.log'),
       datePattern: 'YYYY-MM-DD',
       zippedArchive: true,
       maxSize: '4m',
       maxFiles: '14d',
     }),
-    new transports.File({ filename: path.join(logDirectory, 'error.log'), level: 'error' }),
+    new transports.File({ filename: path.join(LOG_DIRECTORY, 'error.log'), level: 'error' }),
   ],
   exceptionHandlers: [
-    new transports.File({ filename: path.join(logDirectory, 'exceptions.log') })
+    new transports.File({ filename: path.join(LOG_DIRECTORY, 'exceptions.log') })
   ]
 });
-
-// Add a separate transport for Python script logs
-const pythonTransport = new DailyRotateFile({
-  filename: path.join(logDirectory, 'python-%DATE%.log'),
-  datePattern: 'YYYY-MM-DD',
-  zippedArchive: true,
-  maxSize: '4m',
-  maxFiles: '14d',
-  level: isProduction ? 'info' : 'debug',
-  format: format.combine(
-    format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    format.json()
-  )
-});
-baseLogger.add(pythonTransport);
 
 // In-memory store for categories
 const categories = new Set();
@@ -105,7 +92,9 @@ export function normalizeLogMeta(meta) {
 
 /**
  * Create a category-specific logger that tags each message with `category`.
- * All logs go to the base transports; Python logs also get routed to python-%DATE%.log
+ * Every category goes to the same transports. (A python-%DATE%.log transport
+ * used to sit on the base logger too, so it got a full second copy of every
+ * line, not just the Python ones.)
  */
 function makeLogger(category) {
   categories.add(category);

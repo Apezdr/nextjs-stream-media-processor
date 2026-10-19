@@ -16,6 +16,10 @@
  * command). P3 removed POST /api/trigger-system-status: its one caller,
  * ServerApiClient.triggerStatusCheck(), ran only from getSystemStatus(true),
  * which nothing called with true.
+ *
+ * GET /api/logs moved out of app.mjs into routes/logs.mjs (mounted at /api),
+ * behind admin auth; GET /api/logs/categories went with it, its list now part
+ * of the /api/logs answer.
  */
 
 import { describe, it, expect } from '@jest/globals';
@@ -47,8 +51,14 @@ const FILES = {
       'GET /chapters/tv/:showName',
       'GET /chapters/tv/:showName/:season/:episode',
       'GET /rescan/tmdb',
+      'GET /api/logs',
+      'GET /api/logs/categories',
     ],
-    kept: ['GET /processes', 'POST /media/scan', 'GET /media/tv', 'GET /media/movies', 'GET /api/logs'],
+    kept: ['GET /processes', 'POST /media/scan', 'GET /media/tv', 'GET /media/movies'],
+  },
+  'routes/logs.mjs': {
+    removed: ['GET /logs/categories'],
+    kept: ['GET /logs'],
   },
   'routes/metadataHashes.mjs': {
     removed: [

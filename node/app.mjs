@@ -46,8 +46,7 @@ import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
-import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
-import chokidar from "chokidar";
+import { createCategoryLogger, createPythonLogger } from "./lib/logger.mjs";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
@@ -68,7 +67,6 @@ const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
 const app = express();
-const logDirectory = resolve('logs');
 const LOG_FILE = process.env.LOG_PATH
   ? join(process.env.LOG_PATH, "cron.log")
   : "/var/log/cron.log";
@@ -642,7 +640,7 @@ async function runGeneratePosterCollage() {
     args: [],                       // no extra flags
     label: 'GeneratePosterCollage', // appears in the log prefix
     logger: posterLogger,          
-    logFile: LOG_FILE,              // python-<date>.log and fallback file
+    logFile: LOG_FILE,              // cron.log, written only in debug mode
     debug: isDebugMode,             // redirect to file when true
     env: {
       ...process.env,
@@ -706,167 +704,6 @@ async function runDownloadTmdbImages({
     throw error;
   }
 }
-
-// Function to parse and format a log line
-const formatLogEntry = (entry) => {
-  try {
-    const timestamp = entry.timestamp || new Date().toISOString();
-    const category = entry.category || "general";
-    const message = entry.message || "";
-
-    // Format: [category timestamp] message
-    return `[${category} ${timestamp}] ${message}`;
-  } catch (e) {
-    console.error("Failed to format log entry:", e);
-    return null;
-  }
-};
-
-// Function to load all logs up to the current point
-const loadHistoricalLogs = async (category) => {
-  const logs = [];
-  const logFiles = (await fs.readdir(logDirectory)).filter((file) => file.endsWith(".log"));
-
-  for (const file of logFiles) {
-    const filePath = join(logDirectory, file);
-    const fileContent = await fs.readFile(filePath, "utf8");
-    const logLines = fileContent.split("\n").filter((line) => line);
-
-    logLines.forEach((line) => {
-      try {
-        const logEntry = JSON.parse(line);
-        if (!category || logEntry.category === category) {
-          logs.push(formatLogEntry(logEntry));
-        }
-      } catch (e) {
-        console.error("Failed to parse log line:", e);
-      }
-    });
-  }
-
-  // Sort logs by timestamp ascending
-  return logs.sort((a, b) => {
-    const timestampA = a.match(/\[(.*?)\]/)[1];
-    const timestampB = b.match(/\[(.*?)\]/)[1];
-    return new Date(timestampA) - new Date(timestampB);
-  });
-};
-
-// SSE Headers
-const setSSEHeaders = (res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders(); // Flush headers to establish SSE connection
-};
-
-// SSE Streaming Logs
-const streamLogs = async (req, res, category) => {
-  setSSEHeaders(res);
-
-  // Load historical logs and send them to the client
-  try {
-    const historicalLogs = await loadHistoricalLogs(category);
-    historicalLogs.forEach((log) => {
-      res.write(`data: ${log}\n\n`);
-    });
-  } catch (err) {
-    console.error("Failed to load historical logs:", err);
-    res.write(`event: error\ndata: ${JSON.stringify({ error: "Failed to load historical logs" })}\n\n`);
-  }
-
-  // Keep connection alive with a comment
-  const keepAliveInterval = setInterval(() => {
-    res.write(": keep-alive\n\n");
-  }, 15000); // Send a keep-alive message every 15 seconds
-
-  // Watch for new logs
-  const watcher = chokidar.watch(logDirectory, {
-    persistent: true,
-    ignoreInitial: true,
-  });
-
-  // Function to handle new or updated log files
-  const sendLog = async (filePath) => {
-    if (!filePath.endsWith(".log")) return;
-
-    try {
-      const fileContent = await fs.readFile(filePath, "utf8");
-      const logLines = fileContent.split("\n").filter((line) => line);
-
-      logLines.forEach((line) => {
-        try {
-          const logEntry = JSON.parse(line);
-          if (!category || logEntry.category === category) {
-            const formattedLog = formatLogEntry(logEntry);
-            if (formattedLog) {
-              res.write(`data: ${formattedLog}\n\n`);
-            }
-          }
-        } catch (e) {
-          console.error("Failed to parse log line:", e);
-        }
-      });
-    } catch (e) {
-      console.error(`Error reading log file ${filePath}:`, e);
-    }
-  };
-
-  // Set up chokidar event handlers
-  watcher
-    .on("add", sendLog) // Triggered when a new log file is added
-    .on("change", sendLog) // Triggered when an existing log file is updated
-    .on("error", (error) => {
-      console.error("Watcher error:", error);
-      res.write(`event: error\ndata: ${JSON.stringify({ error: "Watcher error" })}\n\n`);
-    });
-
-  // Handle client disconnection
-  req.on("close", () => {
-    console.log("Client disconnected from SSE");
-    clearInterval(keepAliveInterval); // Clear the keep-alive interval
-    watcher.close(); // Close the file watcher
-    res.end(); // End the response
-  });
-};
-
-// Enhanced /api/logs endpoint
-app.get("/api/logs", async (req, res) => {
-  res.header("Access-Control-Allow-Origin", process.env.FRONT_END_1);
-  res.header("Access-Control-Allow-Methods", "GET");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-
-  const { category, format = "json", stream } = req.query;
-
-  if (stream === "true") {
-    await streamLogs(req, res, category);
-    return;
-  }
-
-  // Default behavior: Load logs without streaming
-  try {
-    const logs = await loadHistoricalLogs(category);
-
-    if (format === "logViewer") {
-      res.setHeader("Content-Type", "text/plain");
-      res.send(logs.join("\n"));
-    } else {
-      res.json(logs); // Wrap logs in objects for JSON
-    }
-  } catch (err) {
-    console.error("Error retrieving logs:", err);
-    res.status(500).json({ error: "Failed to retrieve logs" });
-  }
-});
-
-// Log Categories
-app.get('/api/logs/categories', (req, res) => {
-  res.header("Access-Control-Allow-Origin", process.env.FRONT_END_1);
-  res.header("Access-Control-Allow-Methods", "GET");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-  res.json(getCategories());
-});
-
 
 // Clipping routes for movies and TV shows
 app.get("/videoClip/movie/:movieName", async (req, res) => {
@@ -1220,7 +1057,7 @@ app.use((req, res, next) => {
         '/api/admin/* - Administrative operations (requires auth)',
         '/api/metadata-hashes/:mediaType - Get metadata hashes',
         '/api/system-status - System status information',
-        '/api/logs - Server logs (supports SSE streaming)'
+        '/api/logs - Server logs (admin)'
       ]
     },
     '/media': {

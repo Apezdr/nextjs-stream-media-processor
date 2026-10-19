@@ -228,7 +228,7 @@ One entry per subsystem. Each entry states what the subsystem owns (its exclusiv
 
 ### 2.8 Admin and API surface
 
-**Owns:** Operator-facing mutation and read endpoints. The admin router (`node/routes/admin.mjs`, mounted at `/api/admin` by `node/routes/index.mjs`) covers subtitle saves, per-title `tmdb.config` updates, and related metadata mutations. All user-supplied title/show-name path segments in these handlers pass through `safeJoin` in `node/routes/admin.mjs`, which rejects `..` traversal after `decodeURIComponent` (shipped fix, SEC-1). Top-level operational routes live in `node/app.mjs`: `/media/movies`, `/media/tv`, `/media/scan`, `/processes`, and `/api/logs`.
+**Owns:** Operator-facing mutation and read endpoints. The admin router (`node/routes/admin.mjs`, mounted at `/api/admin` by `node/routes/index.mjs`) covers subtitle saves, per-title `tmdb.config` updates, and related metadata mutations. All user-supplied title/show-name path segments in these handlers pass through `safeJoin` in `node/routes/admin.mjs`, which rejects `..` traversal after `decodeURIComponent` (shipped fix, SEC-1). Top-level operational routes live in `node/app.mjs`: `/media/movies`, `/media/tv`, `/media/scan` and `/processes`; the admin log reader is `/api/logs` in `node/routes/logs.mjs`.
 
 **Does not own:** The work itself — handlers delegate to the scanner, generator, and cache modules.
 
@@ -834,16 +834,15 @@ A JSON body parser (`express.json({ limit: '30mb' })`) is applied globally throu
 | POST | `/media/tv/entries` | webhook-or-admin | Same, for TV. | Same. |
 | POST | `/media/scan` | webhook-or-admin | Trigger an on-demand **movies-only** library scan (`generateListMovies`, which delegates to the scanner component's `scanMovies`), as a `MEDIA_SCAN` task: it waits behind a running scan tick, healing pass or metadata-hash update, then answers 200 once its scan is done (500 when it fails), so the answer can take as long as the running tick. | No TV equivalent exists. Decided 2026-07-07 (S-3) — not yet implemented: a symmetric TV path is to be added; frontend adoption of both variants is TBD (see §4.7). |
 | GET | `/processes` | webhook-or-admin | List process-tracking queue entries; filterable by `processType` / `status` query params. | |
-| GET | `/api/logs` | none | Return server logs as JSON/plaintext, or stream via SSE with `?stream=true`. | Sets its own `Access-Control-Allow-Origin` from `FRONT_END_1`. |
-| GET | `/api/logs/categories` | none | List available log categories. | |
 
-### A.2 `/api` core routes (`node/routes/metadataHashes.mjs`, `node/routes/systemStatus.mjs`)
+### A.2 `/api` core routes (`node/routes/metadataHashes.mjs`, `node/routes/systemStatus.mjs`, `node/routes/logs.mjs`)
 
 | Method | Path | Auth | Purpose | Notes |
 |---|---|---|---|---|
 | GET | `/api/metadata-hashes/:mediaType` | none | All metadata hashes for `movies` or `tv` (the frontend's bulk sync poll). | |
 | GET | `/api/system-status` | webhook-or-admin | CPU/memory/disk status snapshot with severity levels (cached ~60 s). | |
 | GET | `/api/tasks` | webhook-or-admin | Task-manager status report (queues, running tasks, concurrency limits). | |
+| GET | `/api/logs` | webhook-or-admin | This process's log for the admin Logs page, read by `node/lib/logReader.mjs` from the rotating `logs/application-<date>.log[.N][.gz]` files: `{entries, older, newer, reset, truncated, scannedFrom, categories}`. Filters `category`, `level` (least severe kept), `q`; pages back with `before=<older>` and follows with `after=<newer>` (cursors `<date>.<index>:<byte offset>`). | Reached only through the frontend's `/api/authenticated/admin/logs` proxy; no CORS headers. Until 2026-10 it had no auth and read only names ending in `.log`, so it served nothing once the live file rotated. `/api/logs/categories` was folded into it. |
 
 `POST /api/trigger-system-status` was removed in P3: its one caller, the Discord bot's `ServerApiClient.triggerStatusCheck()`, ran only from `getSystemStatus(true)`, which nothing called with `true`.
 

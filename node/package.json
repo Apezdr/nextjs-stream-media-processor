@@ -33,7 +33,6 @@
     "axios": "^1.13.2",
     "better-auth": "^1.5.5",
     "blurhash": "^2.0.5",
-    "chokidar": "^4.0.1",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "discord-interactions": "^4.4.0",
@@ -80,4 +79,3 @@
     "testTimeout": 30000
   }
 }
-
