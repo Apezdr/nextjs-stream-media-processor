@@ -1,4 +1,5 @@
 import { createCategoryLogger } from '../lib/logger.mjs';
+import { describeWebhookId } from '../lib/webhookIdRedaction.mjs';
 
 const logger = createCategoryLogger('webhook-auth');
 
@@ -67,14 +68,14 @@ export function validateWebhookAuth(req, res, next) {
   }
   
   if (!validWebhookIds.includes(providedWebhookId)) {
-    logger.warn(`Unauthorized webhook request attempted with ID: ${providedWebhookId.substring(0, 8)}...`);
+    logger.warn(`Unauthorized webhook request attempted with ID: ${describeWebhookId(providedWebhookId)}`);
     return res.status(401).json({ 
       error: 'Unauthorized',
       message: 'Invalid webhook ID'
     });
   }
   
-  logger.debug(`Webhook authenticated successfully with ID: ${providedWebhookId.substring(0, 8)}...`);
+  logger.debug(`Webhook authenticated successfully with ID: ${describeWebhookId(providedWebhookId)}`);
   next();
 }
 

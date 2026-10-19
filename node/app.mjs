@@ -47,6 +47,7 @@ import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger } from "./lib/logger.mjs";
+import { describeWebhookId } from "./lib/webhookIdRedaction.mjs";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
@@ -798,7 +799,11 @@ async function autoSync() {
       };
 
       if (isDebugMode) {
-        logger.info(`Sending headers:${debugMessage}`, headers);
+        // A copy: `headers` itself goes out with the request.
+        logger.info(`Sending headers:${debugMessage}`, {
+          ...headers,
+          "X-Webhook-ID": describeWebhookId(headers["X-Webhook-ID"]),
+        });
       }
 
       const response = await axios.post(

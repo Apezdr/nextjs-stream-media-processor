@@ -2,6 +2,7 @@ import { createLogger, format, transports } from 'winston';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import { trace, context } from '@opentelemetry/api';
 import { isOpenTelemetryEnabled } from './telemetry.mjs';
+import { redactWebhookIds, webhookIdsExposed } from './webhookIdRedaction.mjs';
 import path from 'path';
 import fs from 'fs';
 
@@ -38,6 +39,8 @@ const baseLogger = createLogger({
     format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     format.errors({ stack: true }),
     format.splat(),
+    // After splat, so IDs interpolated into a message are caught too.
+    format(redactWebhookIds)(),
     format.json()
   ),
   transports: [
@@ -60,6 +63,12 @@ const baseLogger = createLogger({
     new transports.File({ filename: path.join(LOG_DIRECTORY, 'exceptions.log') })
   ]
 });
+
+if (webhookIdsExposed()) {
+  baseLogger.warn('LOG_UNREDACTED_WEBHOOK_IDS=true: webhook IDs are written to the logs in full. Unset it when done.', {
+    category: 'logger',
+  });
+}
 
 // In-memory store for categories
 const categories = new Set();

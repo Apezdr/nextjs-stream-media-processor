@@ -24,6 +24,21 @@ export function extractSessionIdentifier(req) {
 }
 
 /**
+ * The request an auth log line is about: method, path (no query string), the
+ * forwarding chain or socket address, a browser's origin, and the user agent.
+ * "from origin: unknown" alone could not tell a stray curl from a broken
+ * client. The processor doesn't trust its proxy (req.ip is the proxy), so the
+ * chain is shown as received.
+ */
+export function describeRequest(req) {
+  const path = (req.originalUrl || req.url || '').split('?')[0]
+  const from = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'an unknown address'
+  const origin = req.headers.origin ? `, origin ${req.headers.origin}` : ''
+  const agent = req.headers['user-agent'] ? `, agent "${String(req.headers['user-agent']).slice(0, 120)}"` : ''
+  return `${req.method} ${path} from ${from}${origin}${agent}`
+}
+
+/**
  * Express middleware for authenticating users.
  * Validates the Bearer token issued by the Next.js / React Native auth frontend.
  * Clients must send: Authorization: Bearer <session.token>
@@ -35,11 +50,9 @@ export function extractSessionIdentifier(req) {
  */
 export const authenticateUser = async (req, res, next) => {
   try {
-    const origin = req.headers.origin || req.headers.referer || 'unknown'
-
     const sessionToken = extractSessionIdentifier(req)
     if (!sessionToken) {
-      logger.warn(`No authentication provided from origin: ${origin}`)
+      logger.warn(`No credentials on ${describeRequest(req)}`)
       return res.status(401).json({
         error: 'No authentication provided',
         message: 'Provide a session cookie or Authorization: Bearer <token> header',
@@ -58,7 +71,7 @@ export const authenticateUser = async (req, res, next) => {
     }
 
     req.user = user
-    logger.debug(`Authenticated user: ${user.email} (ID: ${user.id}) from origin: ${origin}`)
+    logger.debug(`Authenticated user: ${user.email} (ID: ${user.id}) on ${describeRequest(req)}`)
     next()
   } catch (error) {
     logger.error('Authentication error:', error)
@@ -126,16 +139,14 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
   if (webhookId) {
     // Never log any part of the value: a near-miss or a key from another
     // server is still a credential.
-    logger.warn('Invalid webhook ID attempted, falling back to user authentication')
+    logger.warn(`Invalid webhook ID on ${describeRequest(req)}; trying a user session instead`)
   }
 
   // STEP 2: session token (Bearer header or session cookie)
   try {
-    const origin = req.headers.origin || req.headers.referer || 'unknown'
-
     const sessionToken = extractSessionIdentifier(req)
     if (!sessionToken) {
-      logger.warn(`No authentication provided from origin: ${origin}`)
+      logger.warn(`No credentials on ${describeRequest(req)}`)
       return res.status(401).json({
         error: 'Authentication required',
         message: 'Either a valid webhook ID or admin user session is required',
@@ -166,7 +177,7 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     }
 
     req.user = user
-    logger.debug(`Authenticated admin user: ${user.email} (ID: ${user.id}) from origin: ${origin}`)
+    logger.debug(`Authenticated admin user: ${user.email} (ID: ${user.id}) on ${describeRequest(req)}`)
     next()
   } catch (error) {
     logger.error('Authentication error:', error)
@@ -197,7 +208,7 @@ export const requireWebhookOrAdmin = (req, res, next) => {
     return next()
   }
 
-  logger.warn(`Unauthorized request - no valid webhook ID or admin session. User: ${req.user ? req.user.email : 'none'}, Admin: ${req.user?.admin || false}`)
+  logger.warn(`Unauthorized: no valid webhook ID or admin session on ${describeRequest(req)}. User: ${req.user ? req.user.email : 'none'}, Admin: ${req.user?.admin || false}`)
   return res.status(401).json({ error: 'Unauthorized' })
 }
 

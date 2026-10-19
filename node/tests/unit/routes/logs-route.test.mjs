@@ -76,6 +76,24 @@ describe('GET /api/logs auth', () => {
   });
 });
 
+describe('auth log lines name the request', () => {
+  it('describes method, path without its query, the forwarding chain, origin and agent', async () => {
+    const { describeRequest } = await import('../../../middleware/auth.mjs');
+    const req = {
+      method: 'GET',
+      originalUrl: '/api/logs?token=should-not-appear',
+      headers: { 'x-forwarded-for': '203.0.113.7, 172.18.0.1', origin: 'https://cinema.example', 'user-agent': 'curl/8.5.0' },
+      socket: { remoteAddress: '172.18.0.5' },
+    };
+    expect(describeRequest(req)).toBe(
+      'GET /api/logs from 203.0.113.7, 172.18.0.1, origin https://cinema.example, agent "curl/8.5.0"'
+    );
+    expect(describeRequest({ method: 'POST', url: '/media/scan', headers: {}, socket: { remoteAddress: '172.18.0.5' } })).toBe(
+      'POST /media/scan from 172.18.0.5'
+    );
+  });
+});
+
 describe('GET /api/logs query checks', () => {
   const admin = { Authorization: 'Bearer admin-token' };
 
