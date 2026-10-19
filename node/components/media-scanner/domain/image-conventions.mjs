@@ -78,6 +78,21 @@ export function* iterateConventions(mediaType) {
 }
 
 /**
+ * Whether an image of this kind gets a `.blurhash` sidecar: a poster or a
+ * backdrop does, a logo does not. A logo is drawn with transparency over other
+ * art, so a blurred placeholder of it is of no use (owner decision,
+ * 2026-10-19). The scanners, the downloader and the startup healing pass all
+ * ask this. Season posters and episode thumbnails are not kinds here; they
+ * keep their sidecars.
+ *
+ * @param {'poster'|'backdrop'|'logo'} imageKey
+ * @returns {boolean}
+ */
+export function kindHasBlurhash(imageKey) {
+  return imageKey === 'poster' || imageKey === 'backdrop';
+}
+
+/**
  * Find an existing image file in a directory matching the convention.
  * Returns the first match in extension-priority order.
  *

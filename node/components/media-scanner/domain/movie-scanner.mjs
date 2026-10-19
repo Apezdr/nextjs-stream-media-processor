@@ -46,6 +46,7 @@ import {
   findExistingImageInSet,
   resolveImage,
   imageHashesFromResolved,
+  kindHasBlurhash,
 } from './image-conventions.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
@@ -238,7 +239,6 @@ async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
   const blurhashKeyMap = {
     poster:   'posterBlurhash',
     backdrop: 'backdropBlurhash',
-    logo:     'logoBlurhash',
   };
   for (const [imageKey, convention] of iterateConventions('movie')) {
     const r = await resolveImage({ dirPath: movieDir, fileSet, convention });
@@ -247,9 +247,11 @@ async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
     const encodedFileName = encodeURIComponent(r.fileName);
     urls[imageKey] = `${prefixPath}/movies/${encodedDirName}/${encodedFileName}?hash=${r.hash}`;
 
-    // SVG sources have no usable raster blurhash representation (`sharp` may
-    // error or emit a junk hash), so skip blurhash for them. Mirrors TV.
-    if (r.ext === 'svg') continue;
+    // A logo gets no blurhash: none is written and none published, even when
+    // an older sidecar is still on disk (kindHasBlurhash). SVG sources have no
+    // usable raster blurhash representation (`sharp` may error or emit a junk
+    // hash), so skip blurhash for them. Mirrors TV.
+    if (!kindHasBlurhash(imageKey) || r.ext === 'svg') continue;
     // Publish the sidecar when it exists or when this call writes it (as TV
     // does). The directory hash stored after this pass includes a sidecar
     // written here, so a URL left off now would be left off until the folder

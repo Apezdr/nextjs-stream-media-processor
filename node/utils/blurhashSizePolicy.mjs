@@ -12,7 +12,9 @@
  *
  *  - SIDECAR policy (library storage — `.blurhash` files next to media art):
  *    backdrops and episode thumbnails are blurred backgrounds → 'small';
- *    posters and season posters → 'medium'; logos need edge detail → 'large'.
+ *    posters and season posters → 'medium'. Logos get no sidecar at all
+ *    (kindHasBlurhash in image-conventions.mjs); their 'large' entry below
+ *    is what an unknown kind falls back to anyway.
  *    Used by both sidecar writers (`downloadImageWithBlurhash()` keyed on the
  *    imageType option, `getStoredBlurhash()` keyed on filename substring).
  *

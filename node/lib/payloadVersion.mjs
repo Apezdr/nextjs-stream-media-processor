@@ -38,7 +38,12 @@
 // 9 — a title with several video files publishes the one Radarr/Sonarr tracks
 //     (else the best) as its primary. Nothing on disk changes for a title whose
 //     leftover copy is still there, so only this bump moves it.
-export const MEDIA_PAYLOAD_VERSION = 9;
+// 10 — a logo gets no blurhash: a movie's urls.logoBlurhash is no longer
+//     published. The stored urls keep it until the movie is scanned again,
+//     and nothing on disk changes, so only this bump clears it. (/media/tv
+//     stopped publishing a show's logoBlurhash in its builder, which needs no
+//     pass.)
+export const MEDIA_PAYLOAD_VERSION = 10;
 
 /**
  * Whether this host advertises JIT transcoder capability.

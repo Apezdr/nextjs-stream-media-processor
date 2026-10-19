@@ -12,12 +12,13 @@
 // A sidecar written here moves the folder's directory hash, so the next scan
 // reprocesses the folder and publishes the blurhash URL.
 //
-// The images are the ones the rows publish: each movie's and show's poster,
-// backdrop and logo (their stored file paths, or their URLs for a row written
-// before the paths were stored), each season poster and each episode thumbnail
-// (their URLs). SVGs have no blurhash. Images are handled one at a time, so a
-// missing sidecar costs one decode through the blurhash worker pool and a
-// present one a single stat.
+// The images are the ones the rows publish a blurhash for: each movie's and
+// show's poster and backdrop (their stored file paths, or their URLs for a row
+// written before the paths were stored), each season poster and each episode
+// thumbnail (their URLs). A logo has no blurhash (kindHasBlurhash), and SVGs
+// have none either. Images are handled one at a time, so a missing sidecar
+// costs one decode through the blurhash worker pool and a present one a single
+// stat.
 
 import { extname, join } from 'path';
 import { fileExists, getStoredBlurhash } from '../utils/utils.mjs';
@@ -57,7 +58,8 @@ export function fileForPublishedUrl(url, { basePath, prefixPath = '' }) {
 }
 
 /**
- * Every image file the rows publish, each once, in row order.
+ * Every image file the rows publish a blurhash for, each once, in row order.
+ * Logos are left out: they have none.
  *
  * @param {{movies?: Array<Object>, shows?: Array<Object>, basePath: string, prefixPath?: string}} params
  *   Rows as getMovies() and getTVShows() return them.
@@ -72,12 +74,10 @@ export function publishedImagePaths({ movies = [], shows = [], basePath, prefixP
   for (const movie of movies) {
     add(movie.posterFilePath, movie.urls?.poster);
     add(movie.backdropFilePath, movie.urls?.backdrop);
-    add(movie.logoFilePath, movie.urls?.logo);
   }
   for (const show of shows) {
     add(show.posterFilePath, show.poster);
     add(show.backdropFilePath, show.backdrop);
-    add(show.logoFilePath, show.logo);
     if (!isPlainObject(show.seasons)) continue;
     for (const season of Object.values(show.seasons)) {
       if (!isPlainObject(season)) continue;
