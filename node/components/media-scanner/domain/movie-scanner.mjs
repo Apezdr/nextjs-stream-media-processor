@@ -486,9 +486,9 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
 
   await Promise.all(
     dirs.map((dir, index) => movieLimit(async () => {
-      if (isDebugMode) {
-        logger.info(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
-      }
+      // Debug: one line per title per scan was ~99% of the prod log (DEBUG is on
+      // there); the scan's own summary line says how it went.
+      logger.debug(`Processing movie: ${dir.name}: ${index + 1} of ${dirs.length}`);
 
       if (!dir.isDirectory()) return;
       onProgress({ position: ++started, total, name: dir.name });
@@ -527,9 +527,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
           existingMovie.metadata == null && files.includes('metadata.json');
 
         if (!needInfoRegeneration && !needMetadataBackfill && !needPayloadRefresh) {
-          if (isDebugMode) {
-            logger.info(`No changes detected in ${dirName}, skipping processing.`);
-          }
+          logger.debug(`No changes detected in ${dirName}, skipping processing.`);
           return;
         } else if (needPayloadRefresh) {
           logger.info(

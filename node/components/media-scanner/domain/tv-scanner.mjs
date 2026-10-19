@@ -692,9 +692,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
     for (let index = 0; index < shows.length; index++) {
       const show = shows[index];
 
-      if (isDebugMode) {
-        logger.info(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
-      }
+      // Debug: one line per title per scan was ~99% of the prod log (DEBUG is on
+      // there); the scan's own summary line says how it went.
+      logger.debug(`Processing show: ${show.name}: ${index + 1} of ${shows.length}`);
 
       if (!show.isDirectory()) continue;
       onProgress({ position: ++started, total, name: show.name });
@@ -895,9 +895,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
         if (!backfillWrote) {
           // Nothing rewritten → genuine fast-skip.
-          if (isDebugMode) {
-            logger.info(`No changes detected in ${showName}, skipping processing.`);
-          }
+          logger.debug(`No changes detected in ${showName}, skipping processing.`);
           continue;
         }
 

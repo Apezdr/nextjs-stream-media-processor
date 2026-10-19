@@ -59,7 +59,7 @@ describe('app.mjs library scans', () => {
       'scan: () => generateListMovies(db, `${BASE_PATH}/movies`),',
       'async function generateListMovies(db, dirPath) {',
       'scanMovies: (db) => generateListMovies(db, `${BASE_PATH}/movies`),',
-      'await generateListMovies(movieDb, `${BASE_PATH}/movies`);',
+      'const summary = await generateListMovies(movieDb, `${BASE_PATH}/movies`);',
       'const summary = await generateListTV(tvDb, `${BASE_PATH}/tv`);',
     ]);
     // The tick's two calls sit in its MOVIE_SCAN and TV_SCAN tasks.

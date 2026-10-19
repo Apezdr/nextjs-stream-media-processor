@@ -596,6 +596,7 @@ async function generateListMovies(db, dirPath) {
       { onProgress: progress.onProgress, managedFilesFor: identityService.managedFilesFor }
     );
     await progress.complete(summary);
+    return summary;
   } catch (error) {
     await progress.fail(error);
     throw error;
@@ -733,8 +734,12 @@ async function runGenerateList() {
         const movieDb = await initializeDatabase();
         try {
           logger.info('Processing movies');
-          await generateListMovies(movieDb, `${BASE_PATH}/movies`);
-          logger.info('Finished processing movies');
+          const started = Date.now();
+          const summary = await generateListMovies(movieDb, `${BASE_PATH}/movies`);
+          logger.info(
+            `Finished processing movies: ${summary.titles} titles, ${summary.reprocessed} reprocessed ` +
+            `in ${((Date.now() - started) / 1000).toFixed(1)} s`
+          );
         } catch (error) {
           logger.error(`Error processing movies: ${error}`);
           throw error; // Allow task manager to handle the error
@@ -748,8 +753,12 @@ async function runGenerateList() {
         const tvDb = await initializeDatabase();
         try {
           logger.info('Processing TV shows');
+          const started = Date.now();
           const summary = await generateListTV(tvDb, `${BASE_PATH}/tv`);
-          logger.info('Finished processing TV shows');
+          logger.info(
+            `Finished processing TV shows: ${summary.titles} titles, ${summary.reprocessed} reprocessed ` +
+            `in ${((Date.now() - started) / 1000).toFixed(1)} s`
+          );
           return summary;
         } catch (error) {
           logger.error(`Error processing TV shows: ${error}`);
