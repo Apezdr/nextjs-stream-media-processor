@@ -3,9 +3,9 @@
  *
  * The unification was a ZERO-behavior-change refactor: these tests freeze the
  * as-built sizes so any future edit to the shared module is a visible,
- * deliberate policy change (with its invalidation costs: sidecars need a
- * BLURHASH_GENERATION_VERSION bump — which today covers movies only, not TV —
- * and tmdb_blurhash_cache keys embed the size, orphaning old rows).
+ * deliberate policy change (with its invalidation costs: existing sidecars
+ * are never re-encoded, so they have to be deleted, and tmdb_blurhash_cache
+ * keys embed the size, orphaning old rows).
  */
 
 import { describe, it, expect } from '@jest/globals';

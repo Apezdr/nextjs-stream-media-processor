@@ -29,9 +29,8 @@ The session cache system is now active and requires no configuration. It will au
    - Both `authenticateUser` and `authenticateWebhookOrUser` now use caching
 
 2. **`node/routes/admin.mjs`**
-   - Added `GET /api/admin/session-cache/stats` endpoint
-   - Added `POST /api/admin/session-cache/clear` endpoint
-   - Imported `sessionManager` for admin operations
+   - Added a stats endpoint and a clear endpoint for the session cache
+     (both removed in P2: neither had a caller)
 
 3. **`docs/SESSION_CACHE.md`**
    - Complete documentation of architecture and usage
@@ -96,47 +95,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
   http://localhost:3000/api/tv
 ```
 
-### 3. Check Cache Statistics
-
-View cache performance metrics (requires admin token):
-
-```bash
-curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  http://localhost:3000/api/admin/session-cache/stats
-```
-
-Example output:
-
-```json
-{
-  "cacheStats": {
-    "hits": 245,
-    "misses": 12,
-    "hitRate": "95.33%",
-    "evictions": 0,
-    "memoryCleanups": 0,
-    "lastCleanup": "2024-03-17T02:00:00.000Z"
-  },
-  "cacheSizes": {
-    "sessionCache": 12,
-    "requestCache": 3,
-    "inflightRequests": 0
-  },
-  "memoryStatus": {
-    "memoryPressure": false,
-    "heapUsed": "234.56 MB",
-    "heapTotal": "512.00 MB"
-  },
-  "circuitBreaker": {
-    "state": "CLOSED",
-    "failureCount": 0,
-    "nextAttempt": null,
-    "lastFailure": null
-  }
-}
-```
-
-### 4. Monitor Logs
+### 3. Monitor Logs
 
 Watch for cache-related log messages:
 
@@ -158,26 +117,7 @@ Watch for cache-related log messages:
 
 ### Key Metrics to Watch
 
-1. **Cache Hit Rate** (should be > 90%)
-   ```bash
-   curl -H "Authorization: Bearer ADMIN_TOKEN" \
-     http://localhost:3000/api/admin/session-cache/stats | \
-     jq '.cacheStats.hitRate'
-   ```
-
-2. **Memory Pressure** (should be false)
-   ```bash
-   curl -H "Authorization: Bearer ADMIN_TOKEN" \
-     http://localhost:3000/api/admin/session-cache/stats | \
-     jq '.memoryStatus.memoryPressure'
-   ```
-
-3. **Circuit Breaker State** (should be CLOSED)
-   ```bash
-   curl -H "Authorization: Bearer ADMIN_TOKEN" \
-     http://localhost:3000/api/admin/session-cache/stats | \
-     jq '.circuitBreaker.state'
-   ```
+The cache has no HTTP endpoint (the stats and clear endpoints were removed in P2); watch the `session-cache` log category (see Monitor Logs above).
 
 ### Setting Up Alerts
 
@@ -193,18 +133,7 @@ Consider setting up alerts for:
 
 ### Clear Cache Manually
 
-If you need to force-refresh all sessions:
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  http://localhost:3000/api/admin/session-cache/clear
-```
-
-This is useful after:
-- User permission changes
-- Major system updates
-- Troubleshooting auth issues
+The cache lives in process memory: restarting the processor clears it.
 
 ### Graceful Shutdown
 
@@ -333,7 +262,7 @@ If you need to rollback to the non-cached version:
 
 - [x] Session cache implementation created
 - [x] Auth middleware updated to use cache
-- [x] Admin endpoints added for monitoring
+- [x] Admin endpoints added for monitoring (removed in P2)
 - [x] Documentation updated
 - [x] Memory safety measures implemented
 - [x] Circuit breaker protection added

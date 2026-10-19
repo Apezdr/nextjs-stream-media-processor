@@ -70,6 +70,8 @@ All endpoints are prefixed with `/api/tmdb`
 
 ## Endpoints
 
+The cast, videos, rating, episode details, collection search, collection images, status and admin cache endpoints were removed in P2: none had a caller. (`/api/tmdb/comprehensive/:type` still returns cast, videos and rating.)
+
 ### 1. Search Media
 
 Search for movies or TV shows.
@@ -173,65 +175,7 @@ GET /api/tmdb/comprehensive/movie?name=inception
 }
 ```
 
-### 4. Get Cast Information
-
-Get cast information for a movie or TV show.
-
-**Endpoint**: `GET /api/tmdb/cast/:type/:id`
-
-**Parameters**:
-- `type` (path): `movie` or `tv`
-- `id` (path): TMDB ID
-
-**Example**:
-```http
-GET /api/tmdb/cast/movie/27205
-```
-
-**Response**:
-```json
-[
-  {
-    "id": 6193,
-    "name": "Leonardo DiCaprio",
-    "character": "Dom Cobb",
-    "profile_path": "https://image.tmdb.org/t/p/original/wo2hJpn04vbtmh0B9utCFdsQhxM.jpg"
-  }
-]
-```
-
-### 5. Get Videos/Trailers
-
-Get videos and trailers for a movie or TV show.
-
-**Endpoint**: `GET /api/tmdb/videos/:type/:id`
-
-**Parameters**:
-- `type` (path): `movie` or `tv`
-- `id` (path): TMDB ID
-
-**Example**:
-```http
-GET /api/tmdb/videos/movie/27205
-```
-
-**Response**:
-```json
-{
-  "trailer_url": "https://www.youtube.com/watch?v=YoHD9XEInc0",
-  "videos": [
-    {
-      "id": "533ec654c3a36854480003eb",
-      "key": "YoHD9XEInc0",
-      "name": "Inception (2010) - Official Trailer",
-      "site": "YouTube",
-      "type": "Trailer"
-    }
-  ]
-}
-```
-
-### 6. Get Images
+### 4. Get Images
 
 Get images, logos, backdrops, and posters for a movie or TV show.
 
@@ -274,59 +218,7 @@ GET /api/tmdb/images/movie/27205
 }
 ```
 
-### 7. Get Content Rating
-
-Get content rating for a movie or TV show.
-
-**Endpoint**: `GET /api/tmdb/rating/:type/:id`
-
-**Parameters**:
-- `type` (path): `movie` or `tv`
-- `id` (path): TMDB ID
-
-**Example**:
-```http
-GET /api/tmdb/rating/movie/27205
-```
-
-**Response**:
-```json
-{
-  "rating": "PG-13"
-}
-```
-
-### 8. Get TV Episode Details
-
-Get detailed information for a specific TV episode.
-
-**Endpoint**: `GET /api/tmdb/episode/:showId/:season/:episode`
-
-**Parameters**:
-- `showId` (path): TMDB show ID
-- `season` (path): Season number
-- `episode` (path): Episode number
-
-**Example**:
-```http
-GET /api/tmdb/episode/1399/1/1
-```
-
-**Response**:
-```json
-{
-  "id": 63056,
-  "name": "Winter Is Coming",
-  "overview": "Eddard Stark is torn between his family...",
-  "air_date": "2011-04-17",
-  "episode_number": 1,
-  "season_number": 1,
-  "runtime": 62,
-  "last_updated": "2025-01-28T02:00:00.000Z"
-}
-```
-
-### 9. Get Episode Images
+### 5. Get Episode Images
 
 Get images for a specific TV episode.
 
@@ -356,40 +248,7 @@ GET /api/tmdb/episode/1399/1/1/images
 }
 ```
 
-### 10. Search Collections
-
-Search for movie collections (franchises, series).
-
-**Endpoint**: `GET /api/tmdb/search/collection`
-
-**Parameters**:
-- `query` (query): Search term (required)
-- `page` (query): Page number (optional, default: 1)
-
-**Example**:
-```http
-GET /api/tmdb/search/collection?query=marvel&page=1
-```
-
-**Response**:
-```json
-{
-  "page": 1,
-  "results": [
-    {
-      "id": 86311,
-      "name": "The Avengers Collection",
-      "overview": "A superhero film series based on the Marvel Comics superhero team of the same name.",
-      "poster_path": "/yFSIUVTCvgYrpalUktulvk3Gi5Y.jpg",
-      "backdrop_path": "/zuW6fOiusv4X9nnW3paHGfXcSll.jpg"
-    }
-  ],
-  "total_pages": 1,
-  "total_results": 12
-}
-```
-
-### 11. Get Collection Details
+### 6. Get Collection Details
 
 Get detailed information for a specific movie collection.
 
@@ -433,206 +292,7 @@ GET /api/tmdb/collection/86311
 }
 ```
 
-### 12. Get Collection Images
-
-Get images (posters and backdrops) for a movie collection.
-
-**Endpoint**: `GET /api/tmdb/collection/:id/images`
-
-**Parameters**:
-- `id` (path): Collection ID (required)
-
-**Example**:
-```http
-GET /api/tmdb/collection/86311/images
-```
-
-**Response**:
-```json
-{
-  "backdrops": [
-    {
-      "aspect_ratio": 1.778,
-      "file_path": "https://image.tmdb.org/t/p/original/zuW6fOiusv4X9nnW3paHGfXcSll.jpg",
-      "height": 2160,
-      "width": 3840,
-      "iso_639_1": null,
-      "vote_average": 5.388,
-      "vote_count": 4
-    }
-  ],
-  "posters": [
-    {
-      "aspect_ratio": 0.667,
-      "file_path": "https://image.tmdb.org/t/p/original/yFSIUVTCvgYrpalUktulvk3Gi5Y.jpg",
-      "height": 3000,
-      "width": 2000,
-      "iso_639_1": "en",
-      "vote_average": 5.312,
-      "vote_count": 1
-    }
-  ]
-}
-```
-
-### 13. Get TMDB Configuration (Admin Only)
-
-Get TMDB API configuration and cache statistics.
-
-**Endpoint**: `GET /api/tmdb/config`
-
-**Authentication**: Requires admin privileges
-
-**Example**:
-```http
-GET /api/tmdb/config
-```
-
-**Response**:
-```json
-{
-  "tmdb_configured": true,
-  "base_url": "https://api.themoviedb.org/3",
-  "image_base_url": "https://image.tmdb.org/t/p/original",
-  "rate_limits": {
-    "requests_per_minute": 100,
-    "window_ms": 60000
-  },
-  "cache": {
-    "enabled": true,
-    "default_ttl_hours": 1440,
-    "stats": {
-      "total": 150,
-      "expired": 5,
-      "active": 145,
-      "byEndpoint": [
-        {
-          "endpoint": "/search/movie",
-          "count": 45,
-          "oldest": "2025-01-15T10:30:00.000Z",
-          "most_recent": "2025-01-28T01:45:00.000Z"
-        }
-      ]
-    }
-  }
-}
-```
-
-### 14. Get Cache Statistics (Admin Only)
-
-Get detailed cache statistics.
-
-**Endpoint**: `GET /api/tmdb/cache/stats`
-
-**Authentication**: Requires admin privileges
-
-**Example**:
-```http
-GET /api/tmdb/cache/stats
-```
-
-**Response**:
-```json
-{
-  "total": 150,
-  "expired": 5,
-  "active": 145,
-  "byEndpoint": [
-    {
-      "endpoint": "/search/movie",
-      "count": 45,
-      "oldest": "2025-01-15T10:30:00.000Z",
-      "most_recent": "2025-01-28T01:45:00.000Z"
-    },
-    {
-      "endpoint": "/movie/27205",
-      "count": 1,
-      "oldest": "2025-01-20T14:20:00.000Z",
-      "most_recent": "2025-01-20T14:20:00.000Z"
-    }
-  ]
-}
-```
-
-### 15. Clear Cache (Admin Only)
-
-Clear all or specific cache entries.
-
-**Endpoint**: `DELETE /api/tmdb/cache`
-
-**Authentication**: Requires admin privileges
-
-**Parameters**:
-- `pattern` (query, optional): SQL LIKE pattern to match endpoints (e.g., `/search/%`)
-
-**Examples**:
-```http
-# Clear all cache
-DELETE /api/tmdb/cache
-
-# Clear only search cache
-DELETE /api/tmdb/cache?pattern=/search/%
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "deletedCount": 45,
-  "message": "Cleared 45 cache entries matching pattern: /search/%"
-}
-```
-
-### 16. Clear Expired Cache (Admin Only)
-
-Clear only expired cache entries.
-
-**Endpoint**: `DELETE /api/tmdb/cache/expired`
-
-**Authentication**: Requires admin privileges
-
-**Example**:
-```http
-DELETE /api/tmdb/cache/expired
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "deletedCount": 5,
-  "message": "Cleared 5 expired cache entries"
-}
-```
-
-### 17. Force Refresh Cache Entry (Admin Only)
-
-Force refresh a specific cache entry.
-
-**Endpoint**: `POST /api/tmdb/cache/refresh`
-
-**Authentication**: Requires admin privileges
-
-**Body**:
-```json
-{
-  "endpoint": "/movie/27205",
-  "params": {
-    "language": "en-US"
-  }
-}
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "refreshed": true,
-  "message": "Cache entry refreshed successfully"
-}
-```
-
-### 18. Health Check
+### 7. Health Check
 
 Check the health and status of the TMDB API service.
 
@@ -746,35 +406,9 @@ const getComprehensiveDetails = async (name, type = 'movie') => {
   return response.json();
 };
 
-// Search collections
-const searchCollections = async (query) => {
-  const response = await fetch('/api/tmdb/search/collection?query=' + encodeURIComponent(query), {
-    headers: {
-      'Authorization': `Bearer ${sessionToken}`
-    }
-  });
-  
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  
-  return response.json();
-};
-
 // Get collection details
 const getCollectionDetails = async (collectionId) => {
   const response = await fetch(`/api/tmdb/collection/${collectionId}`, {
-    headers: {
-      'Authorization': `Bearer ${sessionToken}`
-    }
-  });
-  
-  return response.json();
-};
-
-// Get collection images
-const getCollectionImages = async (collectionId) => {
-  const response = await fetch(`/api/tmdb/collection/${collectionId}/images`, {
     headers: {
       'Authorization': `Bearer ${sessionToken}`
     }
@@ -837,16 +471,6 @@ const useTMDBSearch = (query, type = 'movie') => {
 - **Cleanup**: 10% chance of automatic cleanup on each request
 - **Storage**: SQLite database in `node/db/media.db`
 - **Indexing**: Optimized indexes for fast lookups and TTL cleanup
-
-### Manual Cache Management (Admin)
-
-Administrators can manage the cache through dedicated endpoints:
-
-1. **View Statistics**: Monitor cache usage and performance
-2. **Clear All Cache**: Remove all cached entries
-3. **Clear by Pattern**: Remove specific endpoint caches
-4. **Clear Expired**: Remove only expired entries
-5. **Force Refresh**: Invalidate and refresh specific entries
 
 ### Cache Performance Benefits
 

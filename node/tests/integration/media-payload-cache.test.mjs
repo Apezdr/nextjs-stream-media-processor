@@ -397,8 +397,17 @@ describe('the slim shape', () => {
 
     for (const key of Object.keys(stored)) {
       expect(episodeFactsTheFrontendReads(sent[key])).toEqual(episodeFactsTheFrontendReads(stored[key]));
-      // Everything else on the episode is untouched.
-      expect({ ...sent[key], additionalMetadata: null }).toEqual({ ...stored[key], additionalMetadata: null });
+      // Everything else on the episode is untouched, but the top-level
+      // filename, length and dimensions, which are not published (the primary
+      // source and the season maps below carry them).
+      const { filename, length, dimensions, ...storedRest } = stored[key];
+      expect({ filename, length, dimensions }).toEqual({
+        filename: expect.any(String),
+        length: expect.any(Number),
+        dimensions: expect.any(String),
+      });
+      expect(Object.keys(sent[key])).toEqual(Object.keys(storedRest));
+      expect({ ...sent[key], additionalMetadata: null }).toEqual({ ...storedRest, additionalMetadata: null });
     }
     expect(sent['Season 1/S01E01'].additionalMetadata).toEqual({
       size: { kb: 42.5 * 1024 * 1024, mb: 42.5 * 1024, gb: 42.5 },

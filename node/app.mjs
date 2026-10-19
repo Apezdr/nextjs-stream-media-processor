@@ -6,7 +6,7 @@ import { scheduleJob } from "node-schedule";
 import { exec } from "child_process";
 import { promisify } from "util";
 import os from "os";
-import { join, resolve, basename, dirname, normalize } from "path";
+import { join, resolve, dirname, normalize } from "path";
 import { createReadStream } from "fs"; // Callback-based version of fs
 import { promises as fs } from "fs"; // Use the promise-based version of fs
 import compression from "compression";
@@ -19,7 +19,6 @@ import { createSpriteRoutes } from "./sprite-route.mjs";
 // this file participates in scan persistence.
 import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase, getMediaTableGeneration } from "./sqliteDatabase.mjs";
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
-import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
 import {
@@ -28,7 +27,7 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif, stripVideoExtension } from "./utils/utils.mjs";
+import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
 import {
@@ -42,7 +41,6 @@ import {
 import { tvManifestKeys, createManifestHandler } from "./lib/mediaManifest.mjs";
 import { createGlobalJsonParser, mountMediaEntriesRoute } from "./lib/requestBodyParsers.mjs";
 import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
-import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
@@ -50,9 +48,8 @@ import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
-import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
-import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
@@ -62,6 +59,7 @@ import { createIdentityService } from "./integrations/identity/index.mjs";
 import { listMultiSourceTitles } from "./sqlite/multiSourceTitles.mjs";
 import { setupIdentityRoutes } from "./integrations/identity/routes.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
+import { healMissingBlurhashSidecars } from "./lib/blurhashHealing.mjs";
 import { langMap } from "./utils/languageMap.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
@@ -346,246 +344,6 @@ async function handleFrameRequest(req, res, type) {
 //
 app.use(createSpriteRoutes(BASE_PATH));
 
-// Handle Chapter Requests
-app.get("/chapters/movie/:movieName", async (req, res) => {
-  await handleChapterRequest(req, res, "movies");
-});
-
-app.get("/chapters/tv/:showName", async (req, res) => {
-  await handleChapterRequest(req, res, "tv", true);
-});
-
-app.get("/chapters/tv/:showName/:season/:episode", async (req, res) => {
-  await handleChapterRequest(req, res, "tv");
-});
-
-async function handleChapterRequest(
-  req,
-  res,
-  type,
-  generateAllChapters = false
-) {
-  const db = await initializeDatabase();
-  const { movieName, showName, season, episode } = req.params;
-  let chapterFileName, mediaPath, chapterFilePath;
-
-  if (type === "movies") {
-    const movie = await db.get("SELECT * FROM movies WHERE name = ?", [
-      movieName,
-    ]);
-    if (!movie) {
-      return res.status(404).send(`Movie not found: ${movieName}`);
-    }
-    // Resolve the real file on disk rather than reconstructing its name. The
-    // previous version stripped the stored URL's actual extension and then
-    // re-appended '.mp4', so a title in any other container pointed mediaPath
-    // at a file that does not exist and 404'd even when its URL was correct.
-    const videoRef = await resolveMovieVideo({ basePath: BASE_PATH, movieName });
-    if (!videoRef) {
-      return res.status(404).send(`Movie file not found: ${movieName}`);
-    }
-    const movieFileName = stripVideoExtension(videoRef.filename);
-    chapterFileName = `${movieFileName}_chapters.vtt`;
-    mediaPath = videoRef.path;
-    chapterFilePath = join(
-      `${BASE_PATH}/movies`,
-      movieName,
-      "chapters",
-      chapterFileName
-    );
-    await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
-  } else if (type === "tv") {
-    if (generateAllChapters) {
-      const shows = await getTVShows();
-      const showData = shows.find((show) => show.name === showName);
-
-      if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
-          for (const episodeKey in season.episodes) {
-            const episode = season.episodes[episodeKey];
-            const episodeFileName = episode.filename;
-            
-            // Extract episode number from the episode key (SxxEyy format)
-            const episodeMatch = episodeKey.match(/E(\d+)/i);
-            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
-            
-            if (!episodeNumber) {
-              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
-              continue;
-            }
-            
-            const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName,
-              "chapters",
-              `${showName} - S${seasonNumber.padStart(
-                2,
-                "0"
-              )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
-            );
-            const directoryPath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName
-            );
-            const mediaPath = join(directoryPath, episodeFileName);
-
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
-          }
-        }
-
-        return res.status(200).send("Chapter files generated successfully");
-      } else {
-        return res.status(404).send(`Show not found: ${showName}`);
-      }
-    }
-    if (!season && !episode) {
-      const shows = await getTVShows();
-      const showData = shows.find((show) => show.name === showName);
-
-      if (showData) {
-        for (const seasonName in showData.seasons) {
-          const season = showData.seasons[seasonName];
-          for (const episodeKey in season.episodes) {
-            const episode = season.episodes[episodeKey];
-            const episodeFileName = episode.filename;
-            
-            // Extract episode number from the episode key (SxxEyy format)
-            const episodeMatch = episodeKey.match(/E(\d+)/i);
-            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
-            
-            if (!episodeNumber) {
-              logger.warn(`Could not extract episode number from ${episodeKey}, skipping`);
-              continue;
-            }
-            
-            const seasonNumber = seasonName.replace("Season ", "");
-            const chapterFilePath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName,
-              "chapters",
-              `${showName} - S${seasonNumber.padStart(
-                2,
-                "0"
-              )}E${episodeNumber.padStart(2, "0")}_chapters.vtt`
-            );
-            const directoryPath = join(
-              `${BASE_PATH}/tv`,
-              showName,
-              seasonName
-            );
-            const mediaPath = join(directoryPath, episodeFileName);
-
-            await generateChapterFileIfNotExists(chapterFilePath, mediaPath, true); // Use quietMode for bulk operations
-          }
-        }
-
-        return res.status(200).send("Chapter files generated successfully");
-      } else {
-        return res.status(404).send(`Show not found: ${showName}`);
-      }
-    } else {
-      const episodeNumber = String(parseInt(episode, 10)).padStart(2, "0");
-      const seasonNumber = String(parseInt(season, 10)).padStart(2, "0");
-      chapterFileName = `${showName} - S${seasonNumber}E${episodeNumber}_chapters.vtt`;
-
-      try {
-        const videoRef = await resolveEpisodeVideo({
-          basePath: BASE_PATH,
-          showName,
-          season,
-          episode,
-        });
-
-        if (!videoRef) {
-          logger.error(
-            `Associated video file not found for ${showName} - S${seasonNumber}E${episodeNumber}`
-          );
-          return res.status(404).send("Associated video file not found");
-        }
-
-        mediaPath = videoRef.path;
-        chapterFilePath = join(videoRef.dir, "chapters", chapterFileName);
-      } catch (error) {
-        logger.error(
-          `Error resolving episode video for ${showName} - S${seasonNumber}E${episodeNumber}`,
-          error
-        );
-        return res.status(500).send("Internal server error");
-      }
-    }
-  }
-
-  await releaseDatabase(db);
-  await generateChapterFileIfNotExists(chapterFilePath, mediaPath);
-
-  res.setHeader("Content-Type", "text/vtt");
-  res.sendFile(chapterFilePath);
-}
-
-function getEpisodeNumber(episodeFileName) {
-  const match = episodeFileName.match(/E(\d+)/i);
-  return match ? match[1] : null;
-}
-
-async function generateChapterFileIfNotExists(chapterFilePath, mediaPath, quietMode = false) {
-  try {
-    if (await fileExists(chapterFilePath)) {
-      if (!quietMode) {
-        logger.info(
-          `Serving chapter file from cache: ${basename(chapterFilePath)}`
-        );
-      }
-    } else {
-      if (!quietMode) {
-        logger.info(
-          `Chapter file not found in cache: ${basename(chapterFilePath)}`
-        );
-      }
-
-      // Check if the media file has chapter information
-      const chapterData = await chapterInfo(mediaPath);
-
-      if (chapterData) {
-        // Create the chapters directory if it doesn't exist
-        await fs.mkdir(dirname(chapterFilePath), { recursive: true });
-
-        // If the media file has chapter information, generate the chapter file
-        const chapterContent = await generateChapters(mediaPath, chapterData);
-
-        // Save the generated chapter content to the file
-        await fs.writeFile(chapterFilePath, chapterContent);
-        if (!quietMode) {
-          logger.info("The file has been saved!");
-        }
-      } else {
-        // If the media file doesn't have chapter information, send a 404 response
-        if (!quietMode) {
-          logger.warn(
-            `Chapter information not found for ${basename(mediaPath)}`
-          );
-        }
-      }
-    }
-  } catch (error) {
-    if (error.code === "EACCES") {
-      logger.error(
-        `Permission denied while accessing ${chapterFilePath}.\nPlease check the directory permissions.`,
-        error
-      );
-    } else {
-      logger.error(
-        `Error generating chapter file for ${basename(mediaPath)}:`,
-        error
-      );
-    }
-  }
-}
-
 /**
  * GET /processes
  * Retrieves the current process queue information in JSON format.
@@ -619,41 +377,6 @@ app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
   } catch (error) {
     logger.error(`Error fetching processes: ${error.message}`);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
-  }
-});
-
-/**
- * GET /processes/:fileKey
- * Retrieves the process information for a specific fileKey.
- * Requires either webhook authentication or admin user access.
- */
-app.get('/processes/:fileKey', authenticateWebhookOrUser, async (req, res) => {
-  try {
-    const { fileKey } = req.params;
-    const db = await getProcessTrackingDb();
-
-    const process = await getProcessByFileKey(db, fileKey);
-
-    await releaseDatabase(db);
-
-    if (process) {
-      res.json({ success: true, data: process });
-    } else {
-      res.status(404).json({ success: false, message: 'Process not found' });
-    }
-  } catch (error) {
-    logger.error(`Error fetching process ${req.params.fileKey}: ${error.message}`);
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
-  }
-});
-
-app.get("/rescan/tmdb", authenticateWebhookOrUser, async (req, res) => {
-  try {
-    await runDownloadTmdbImages({ fullScan: true });
-    res.status(200).send("Rescan initiated");
-  } catch (error) {
-    logger.error(error);
-    res.status(500).send("Rescan Failed: Internal server error");
   }
 });
 
@@ -720,40 +443,6 @@ scheduleJob("*/10 * * * *", () => {
   });
 });
 
-// Update blurhash hashes every 18 minutes to stagger from other tasks
-// Use a scheduled job instead of setInterval for better precision and to coordinate with other scheduled tasks
-scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hour
-  // Use the task manager to handle concurrency and database access
-  enqueueTask(TaskType.BLURHASH, 'Blurhash Hashes Update', async () => {
-    logger.info("Running Blurhash Hashes Update...");
-    const db = await initializeDatabase();
-    
-    try {
-      // Use a timestamp to track changes since last scan
-      const lastScanTime = new Date();
-      lastScanTime.setMinutes(lastScanTime.getMinutes() - 18); // Only process files modified in the last 18 minutes
-      const sinceTimestamp = lastScanTime.toISOString();
-      
-      // Process movies first in a controlled manner
-      logger.info("Starting blurhash update for movies...");
-      await updateAllMovieBlurhashHashes(BASE_PATH, sinceTimestamp);
-      logger.info("Movie blurhash hashes completed, processing TV shows...");
-      
-      // Then process TV shows
-      await updateAllTVShowBlurhashHashes(BASE_PATH, sinceTimestamp);
-      logger.info("Blurhash Hashes Update Completed.");
-      
-      return 'Blurhash update completed successfully';
-    } catch (error) {
-      logger.error(`Blurhash Hashes Update Error: ${error.message}`);
-      throw error; // Let task manager handle the error
-    } finally {
-      await releaseDatabase(db);
-    }
-  }).catch(error => {
-    logger.error(`Failed to enqueue blurhash task: ${error.message}`);
-  });
-});
 //
 // End Cache Management
 
@@ -783,11 +472,6 @@ async function generateListTV(db, dirPath) {
     throw error;
   }
 }
-
-/**
- * Legacy implementation - moved to components/media-scanner/domain/tv-scanner.mjs
- * @deprecated Use scanTVShows from media-scanner component instead
- */
 
 /**
  * The autoCaptions settings the caption stubs are built from, as a cache key.
@@ -910,11 +594,6 @@ async function generateListMovies(db, dirPath) {
     throw error;
   }
 }
-
-/**
- * Legacy implementation - moved to components/media-scanner/domain/movie-scanner.mjs
- * @deprecated Use scanMovies from media-scanner component instead
- */
 
 app.get(
   "/media/movies",
@@ -1407,6 +1086,28 @@ function scheduleTasks() {
   // re-adding a cleanup here without enqueueTask would race the gated ones.
 }
 
+/**
+ * The blurhash sidecar healing pass, as a BLURHASH task. The task manager
+ * never runs a BLURHASH task beside a MEDIA_SCAN (one exclusive group), so the
+ * pass and a scheduled scan tick cannot write the same sidecar at once; a tick
+ * that comes due meanwhile waits for it. Rows are read when the task starts,
+ * so they are the startup scan's.
+ */
+function healBlurhashSidecars() {
+  return enqueueTask(TaskType.BLURHASH, 'Blurhash Sidecar Healing', async () => {
+    const summary = await healMissingBlurhashSidecars({
+      movies: await getMovies(),
+      shows: await getTVShows(),
+      basePath: BASE_PATH,
+      prefixPath: PREFIX_PATH,
+    });
+    logger.info(
+      `Blurhash sidecar healing: checked ${summary.checked}, generated ${summary.generated}, failed ${summary.failed}`
+    );
+    return summary;
+  });
+}
+
 async function initialize() {
   await ensureCacheDirs();
   // An encode cut short by a restart leaves its temp file in the clip cache.
@@ -1426,24 +1127,9 @@ async function initialize() {
     identityService.start();
     //runGenerateThumbnailJson().catch(logger.error);
     logger.info(`Server running on port ${port}`);
-    const db = await initializeDatabase();
-
-    // Initialize blurhash hashes table at startup
-    await initializeBlurhashHashesTable(db);
-    logger.info('Blurhash hashes table initialized at startup');
-    
-    
-    // Perform initial full scan of blurhashes - sequentially to avoid transaction conflicts
-    logger.info('Starting initial blurhash scan of all media files...');
-    try {
-      // Process movies first, then TV shows sequentially to avoid transaction conflicts
-      await updateAllMovieBlurhashHashes(BASE_PATH);
-      logger.info("Movie blurhash hashes completed, processing TV shows...");
-      await updateAllTVShowBlurhashHashes(BASE_PATH);
-      logger.info('Initial blurhash scan completed successfully');
-    } catch (error) {
-      logger.error(`Error during initial blurhash scan: ${error.message}`);
-    }
+    // Opens media.db, whose schema setup also drops the retired
+    // blurhash_hashes table (dropRetiredTables in sqliteDatabase.mjs).
+    await initializeDatabase();
 
   // As part of startup clear out any in progress processes from the process tracking database
   // This will prevent any processes from being stuck in the queue
@@ -1456,7 +1142,12 @@ async function initialize() {
       .catch((error) => {
         logger.error("Error during initialization:", error);
       });
-    runGenerateList().catch(logger.error);
+    runGenerateList()
+      .catch(logger.error)
+      // Once per process, after the startup scan: write the sidecar of any
+      // published image that has none (lib/blurhashHealing.mjs).
+      .then(() => healBlurhashSidecars())
+      .catch((error) => logger.error(`Blurhash sidecar healing failed: ${error?.message ?? error}`));
     runGeneratePosterCollage().catch(logger.error);
     // Sweep stale caption-generator temp files left behind by interrupted jobs
     sweepOrphanCaptionTempFiles().catch(err => logger.error(`Caption temp sweep failed: ${err.message}`));
@@ -1464,8 +1155,8 @@ async function initialize() {
 }
 
 // Use the modular route system
-// Identity provider webhooks + status/report, next to /rescan/tmdb in spirit:
-// the service instance lives here, so the routes mount here.
+// Identity provider webhooks + status/report: the service instance lives
+// here, so the routes mount here.
 app.use('/api', setupIdentityRoutes(identityService));
 app.use(setupRoutes());
 
@@ -1497,17 +1188,13 @@ app.get('/', (req, res) => {
         description: 'Sprite sheets and VTT files',
         routes: ['/spritesheet/movie/:movieName', '/vtt/movie/:movieName']
       },
-      chapters: {
-        description: 'Chapter information',
-        routes: ['/chapters/movie/:movieName', '/chapters/tv/:showName/:season/:episode']
-      },
       clips: {
         description: 'Video clip generation',
         routes: ['/videoClip/movie/:movieName', '/videoClip/tv/:showName/:season/:episode']
       },
       processes: {
         description: 'Process tracking',
-        routes: ['/processes', '/processes/:fileKey']
+        routes: ['/processes']
       }
     },
     documentation: 'Access any endpoint category above for detailed API information'
@@ -1532,7 +1219,6 @@ app.use((req, res, next) => {
       endpoints: [
         '/api/tmdb/* - TMDB metadata operations',
         '/api/admin/* - Administrative operations (requires auth)',
-        '/api/blurhash-changes - Get blurhash changes',
         '/api/metadata-hashes/:mediaType - Get metadata hashes',
         '/api/system-status - System status information',
         '/api/logs - Server logs (supports SSE streaming)'
@@ -1569,13 +1255,6 @@ app.use((req, res, next) => {
         '/vtt/tv/:showName/:season/:episode - Get TV VTT file'
       ]
     },
-    '/chapters': {
-      description: 'Chapter endpoints',
-      endpoints: [
-        '/chapters/movie/:movieName - Get movie chapters',
-        '/chapters/tv/:showName/:season/:episode - Get TV chapters'
-      ]
-    },
     '/videoClip': {
       description: 'Video clip endpoints',
       endpoints: [
@@ -1586,8 +1265,7 @@ app.use((req, res, next) => {
     '/processes': {
       description: 'Process tracking endpoints',
       endpoints: [
-        '/processes - List all processes',
-        '/processes/:fileKey - Get specific process status'
+        '/processes - List all processes'
       ]
     }
   };

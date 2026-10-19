@@ -1,18 +1,17 @@
 /**
- * Route order for the search endpoints: /search/collection must reach its
- * own handler (searchCollections). Registered after /search/:type, it was
- * captured as type "collection" and answered from searchMedia instead, so
- * the collection handler never ran. /search/movie and /search/tv must still
- * reach searchMedia.
+ * The search endpoint: /search/movie and /search/tv reach searchMedia. The
+ * /search/collection route was removed in P2 (no caller); that path now goes
+ * to searchMedia as type "collection", which the real client rejects as an
+ * invalid request (400).
  *
  * Runs the real router on an ephemeral port with the auth middleware and the
  * TMDB client mocked.
  */
 
 import { describe, it, expect, jest, beforeAll, afterAll, beforeEach } from '@jest/globals';
+import { TmdbInvalidRequestError } from '../../../utils/tmdbErrors.mjs';
 
 const searchMedia = jest.fn();
-const searchCollections = jest.fn();
 
 jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
   authenticateUser: (req, res, next) => {
@@ -27,28 +26,11 @@ jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
 jest.unstable_mockModule('../../../utils/tmdb.mjs', () => ({
   searchMedia,
   getMediaDetails: jest.fn(),
-  getMediaCast: jest.fn(),
-  getStructuredMediaCast: jest.fn(),
-  getMediaVideos: jest.fn(),
   getMediaImages: jest.fn(),
-  getMediaRating: jest.fn(),
-  getEpisodeDetails: jest.fn(),
   getEpisodeImages: jest.fn(),
   fetchComprehensiveMediaDetails: jest.fn(),
-  searchCollections,
   getCollectionDetails: jest.fn(),
-  getCollectionImages: jest.fn(),
   fetchEnhancedCollectionData: jest.fn(),
-  makeTmdbRequest: jest.fn(),
-}));
-
-jest.unstable_mockModule('../../../sqliteDatabase.mjs', () => ({
-  initializeDatabase: jest.fn(),
-  releaseDatabase: jest.fn(),
-  getTmdbCacheStats: jest.fn(),
-  clearTmdbCache: jest.fn(),
-  clearExpiredTmdbCache: jest.fn(),
-  refreshTmdbCacheEntry: jest.fn(),
 }));
 
 let server;
@@ -71,22 +53,9 @@ afterAll(async () => {
 
 beforeEach(() => {
   searchMedia.mockReset();
-  searchCollections.mockReset();
 });
 
 describe('search route dispatch', () => {
-  it('sends /search/collection to the collection handler', async () => {
-    const collections = { page: 2, results: [{ id: 10, name: 'Star Wars Collection' }] };
-    searchCollections.mockResolvedValue(collections);
-
-    const res = await fetch(`${baseUrl}/api/tmdb/search/collection?query=star%20wars&page=2&blurhash=true`);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual(collections);
-    expect(searchCollections).toHaveBeenCalledWith('star wars', '2', true);
-    expect(searchMedia).not.toHaveBeenCalled();
-  });
-
   it.each(['movie', 'tv'])('still sends /search/%s to searchMedia', async (type) => {
     searchMedia.mockResolvedValue({ page: 1, results: [] });
 
@@ -94,6 +63,15 @@ describe('search route dispatch', () => {
 
     expect(res.status).toBe(200);
     expect(searchMedia).toHaveBeenCalledWith(type, 'alien', 1, false);
-    expect(searchCollections).not.toHaveBeenCalled();
+  });
+
+  it('sends /search/collection to searchMedia, whose type check answers 400', async () => {
+    // The real client's check, which this mock stands in for.
+    searchMedia.mockRejectedValue(new TmdbInvalidRequestError('Type must be "movie" or "tv"'));
+
+    const res = await fetch(`${baseUrl}/api/tmdb/search/collection?query=star%20wars`);
+
+    expect(res.status).toBe(400);
+    expect(searchMedia).toHaveBeenCalledWith('collection', 'star wars', 1, false);
   });
 });

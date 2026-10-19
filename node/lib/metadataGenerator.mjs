@@ -295,7 +295,7 @@ export class MetadataGenerator {
    * Unconditionally delete a managed image file (and its `.blurhash` sidecar)
    * as part of a forceRefresh repull. Unlike `_safeUnlinkOwned`, this is NOT
    * gated by `SCANNER_RECONCILE_MODE` — a forceRefresh is explicit operator
-   * intent (a tmdb.config id change or `/rescan/tmdb`), so a stale image the
+   * intent (a tmdb.config id change), so a stale image the
    * new entity no longer provides must be cleared regardless of the cautious
    * reconcile default (dry-run). ENOENT-safe / idempotent.
    * @private

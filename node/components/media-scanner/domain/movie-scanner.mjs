@@ -70,8 +70,9 @@ function parseStoredUrls(urls) {
  * in tv-scanner.mjs (C-1 — this was historically a silent no-op: it passed
  * the quietMode boolean into generateChapters' chapterData parameter, which
  * short-circuited the probe and discarded the returned VTT string). Movies
- * without chapter atoms (chapterInfo → null) write nothing; the lazy
- * /chapters/movie/:movieName route remains the on-demand fallback.
+ * without chapter atoms (chapterInfo → null) write nothing. (There is no
+ * on-demand fallback: the /chapters/* routes were removed in P2, and the
+ * payload's chapter URLs point at the file server's static files.)
  *
  * Ordering constraint (hard): scanMovies must call this (via processChapters)
  * BEFORE computing final_hash — calculateDirectoryHash recurses into
@@ -249,10 +250,12 @@ async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
     // SVG sources have no usable raster blurhash representation (`sharp` may
     // error or emit a junk hash), so skip blurhash for them. Mirrors TV.
     if (r.ext === 'svg') continue;
-    if (await fileExists(`${r.path}.blurhash`)) {
+    // Publish the sidecar when it exists or when this call writes it (as TV
+    // does). The directory hash stored after this pass includes a sidecar
+    // written here, so a URL left off now would be left off until the folder
+    // changes. A failed generation writes nothing and publishes nothing.
+    if (await fileExists(`${r.path}.blurhash`) || await getStoredBlurhash(r.path, basePath)) {
       urls[blurhashKeyMap[imageKey]] = `${prefixPath}/movies/${encodedDirName}/${encodedFileName}.blurhash`;
-    } else {
-      await getStoredBlurhash(r.path, basePath);
     }
   }
 

@@ -267,54 +267,6 @@ router.get('/system-status', authenticateWebhookOrUser, async (req, res) => {
 });
 
 /**
- * Get last reported system health (public endpoint, no authentication required)
- * This endpoint returns the cached system status for quick health checks
- * @route GET /api/health
- * @public
- */
-router.get('/health', async (req, res) => {
-  try {
-    // Check if we have cached data
-    if (!statusCache.data) {
-      // No cache available yet - return a basic response
-      return res.json({
-        status: 'unknown',
-        message: 'System health data not yet available. Please try again in a moment.',
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    // Return lightweight health status from cache
-    const healthResponse = {
-      status: statusCache.data.status,
-      message: statusCache.data.message,
-      timestamp: statusCache.data.timestamp,
-      // Include incident information if there's an active or recently resolved incident
-      incident: currentIncident ? {
-        id: currentIncident.id,
-        status: currentIncident.status,
-        startTime: currentIncident.startTime,
-        latestUpdate: currentIncident.latestUpdate,
-        resolvedTime: currentIncident.resolvedTime
-      } : null
-    };
-    
-    // Set cache headers to reduce server load from frequent polling
-    res.set('Cache-Control', `public, max-age=${CLIENT_CACHE_TTL}`);
-    res.set('Expires', new Date(Date.now() + CLIENT_CACHE_TTL * 1000).toUTCString());
-    
-    res.json(healthResponse);
-  } catch (error) {
-    logger.error(`Error retrieving public health status: ${error.message}`);
-    res.status(500).json({
-      status: 'error',
-      message: 'Unable to retrieve system health status',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-/**
  * Send system status notifications to all configured platforms (frontends, Discord, etc.)
  * Uses the NotificationManager to handle multi-platform notifications
  * @param {string} status System status level

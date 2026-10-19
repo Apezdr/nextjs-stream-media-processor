@@ -20,19 +20,11 @@ import {
 const client = {
   searchMedia: jest.fn(),
   getMediaDetails: jest.fn(),
-  getMediaCast: jest.fn(),
-  getStructuredMediaCast: jest.fn(),
-  getMediaVideos: jest.fn(),
   getMediaImages: jest.fn(),
-  getMediaRating: jest.fn(),
-  getEpisodeDetails: jest.fn(),
   getEpisodeImages: jest.fn(),
   fetchComprehensiveMediaDetails: jest.fn(),
-  searchCollections: jest.fn(),
   getCollectionDetails: jest.fn(),
-  getCollectionImages: jest.fn(),
   fetchEnhancedCollectionData: jest.fn(),
-  makeTmdbRequest: jest.fn(),
 };
 
 jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
@@ -50,15 +42,6 @@ jest.unstable_mockModule('../../../utils/tmdb.mjs', () => client);
 const log = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
 jest.unstable_mockModule('../../../lib/logger.mjs', () => ({
   createCategoryLogger: () => log,
-}));
-
-jest.unstable_mockModule('../../../sqliteDatabase.mjs', () => ({
-  initializeDatabase: jest.fn(),
-  releaseDatabase: jest.fn(),
-  getTmdbCacheStats: jest.fn(),
-  clearTmdbCache: jest.fn(),
-  clearExpiredTmdbCache: jest.fn(),
-  refreshTmdbCacheEntry: jest.fn(),
 }));
 
 let server;
@@ -202,17 +185,10 @@ describe('every TMDB GET route maps failures the same way', () => {
     ['/search/tv?query=x', 'searchMedia'],
     [COMPREHENSIVE, 'fetchComprehensiveMediaDetails'],
     ['/details/tv?tmdb_id=275188', 'getMediaDetails'],
-    ['/cast/tv?tmdb_id=275188', 'getMediaCast'],
-    ['/structured-cast/tv?tmdb_id=275188', 'getStructuredMediaCast'],
-    ['/videos/tv?tmdb_id=275188', 'getMediaVideos'],
     ['/images/tv?tmdb_id=275188', 'getMediaImages'],
-    ['/rating/tv?tmdb_id=275188', 'getMediaRating'],
-    ['/episode?tmdb_id=275188&season=1&episode=1', 'getEpisodeDetails'],
     ['/episode/images?tmdb_id=275188&season=1&episode=1', 'getEpisodeImages'],
-    ['/search/collection?query=x', 'searchCollections'],
     ['/collection?tmdb_id=10', 'getCollectionDetails'],
     ['/collection?tmdb_id=10&enhanced=true', 'fetchEnhancedCollectionData'],
-    ['/collection/images?tmdb_id=10', 'getCollectionImages'],
   ])('%s answers a TMDB 404 with 404 TMDB_NOT_FOUND', async (path, fnName) => {
     client[fnName].mockRejectedValue(tmdbFailure(404));
 

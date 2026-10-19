@@ -20,7 +20,10 @@
 //     (MovieContentStrategy.extractVideoMetadataFromFileServerData);
 //   - an episode's `additionalMetadata`: size only (EpisodeSyncService, and the
 //     legacy flat sync's videoInfo). An episode's duration and dimensions come
-//     from the season's `lengths` and `dimensions` maps, not from here.
+//     from the season's `lengths` and `dimensions` maps, not from here;
+//   - an episode's top-level `filename`, `length` and `dimensions` are left out
+//     (copies of the primary source's filename and of the season maps; see
+//     EPISODE_UNPUBLISHED_KEYS).
 //
 // Before keeping a field out, check every reader in the frontend: the sync, and
 // anything that reads what the sync stored from it. A field read nowhere is
@@ -31,6 +34,15 @@
 const MOVIE_FACT_KEYS = new Set(['duration', 'dimensions', 'width', 'height', 'size', 'video', 'audio']);
 const MOVIE_VIDEO_TRACK_KEYS = ['codec', 'bitrate', 'frame_rate'];
 const MOVIE_AUDIO_TRACK_KEYS = ['codec', 'channels'];
+
+// An episode's top-level keys the wire leaves out. Each repeats a value
+// published elsewhere, and nothing reads the copy: `filename` is the primary
+// source's `sources[].filename`, and `length` and `dimensions` are the
+// episode's entries in the season's `lengths` and `dimensions` maps, which is
+// where the frontend sync reads them (as do each source's own `length` and
+// `dimensions`). The stored row keeps all three: the processor's frame,
+// sprite and clip routes read `episode.filename` from it.
+const EPISODE_UNPUBLISHED_KEYS = new Set(['filename', 'length', 'dimensions']);
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -85,9 +97,26 @@ export function slimEpisodeAdditionalMetadata(meta) {
 }
 
 /**
- * A show's `seasons` blob with every episode's additionalMetadata trimmed.
- * Builds new season and episode objects; everything else is passed by
- * reference and keeps its key order.
+ * An episode as published: the stored episode less the top-level keys in
+ * EPISODE_UNPUBLISHED_KEYS, with its additionalMetadata trimmed. The other
+ * keys keep their order; their values are passed by reference.
+ *
+ * @param {Object} episode - A stored episode (a plain object)
+ * @returns {Object}
+ */
+function slimEpisode(episode) {
+  const slim = {};
+  for (const [key, value] of Object.entries(episode)) {
+    if (EPISODE_UNPUBLISHED_KEYS.has(key)) continue;
+    slim[key] = key === 'additionalMetadata' ? slimEpisodeAdditionalMetadata(value) : value;
+  }
+  return slim;
+}
+
+/**
+ * A show's `seasons` blob with every episode slimmed (slimEpisode). Builds
+ * new season and episode objects; everything else is passed by reference and
+ * keeps its key order.
  *
  * @param {Object} seasons
  * @returns {Object}
@@ -102,10 +131,7 @@ function slimSeasons(seasons) {
     }
     const episodes = {};
     for (const [episodeKey, episode] of Object.entries(season.episodes)) {
-      episodes[episodeKey] =
-        isPlainObject(episode) && Object.hasOwn(episode, 'additionalMetadata')
-          ? { ...episode, additionalMetadata: slimEpisodeAdditionalMetadata(episode.additionalMetadata) }
-          : episode;
+      episodes[episodeKey] = isPlainObject(episode) ? slimEpisode(episode) : episode;
     }
     slim[seasonKey] = { ...season, episodes };
   }
@@ -166,8 +192,9 @@ export function buildMoviePayloadEntry(movie) {
  *
  * Episode-level fields (mediaIdentity, sources, jitEligible, jitUrl) ride
  * inside the `seasons` blob and pass through untouched — which is why TV was
- * unaffected by the movie allowlist bug. The one exception is each episode's
- * additionalMetadata, trimmed to its size (see the note at the top).
+ * unaffected by the movie allowlist bug. The exceptions: each episode's
+ * additionalMetadata is trimmed to its size, and its top-level filename,
+ * length and dimensions are left out (see the note at the top).
  *
  * @param {Object} show - A row as returned by getTVShows()
  * @returns {Object}
