@@ -473,11 +473,6 @@ async function generateListTV(db, dirPath) {
 }
 
 /**
- * Legacy implementation - moved to components/media-scanner/domain/tv-scanner.mjs
- * @deprecated Use scanTVShows from media-scanner component instead
- */
-
-/**
  * The autoCaptions settings the caption stubs are built from, as a cache key.
  * An unreadable config injects no stubs, so it reads as "none" too.
  */
@@ -598,11 +593,6 @@ async function generateListMovies(db, dirPath) {
     throw error;
   }
 }
-
-/**
- * Legacy implementation - moved to components/media-scanner/domain/movie-scanner.mjs
- * @deprecated Use scanMovies from media-scanner component instead
- */
 
 app.get(
   "/media/movies",
