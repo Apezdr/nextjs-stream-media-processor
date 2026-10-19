@@ -289,8 +289,9 @@ async function getJson(path) {
   return { res, json: JSON.parse(res.body) };
 }
 
+/** The titles of a parsed body: every key (no key of the body is reserved). */
 function titlesOfBody(body) {
-  return Object.keys(body).filter((key) => key !== 'version');
+  return Object.keys(body);
 }
 
 /** The cached body of `cache`, parsed: what the manifest and entries are cut from. */
@@ -973,6 +974,44 @@ describe('parseEntriesRequest', () => {
   it('refuses anything else', () => {
     for (const body of [undefined, null, 'all', [], {}, { titles: {} }, { titles: [1] }, { all: 1 }, { all: true, titles: [] }]) {
       expect(parseEntriesRequest(body).error).toEqual(expect.any(String));
+    }
+  });
+});
+
+describe('a folder named version', () => {
+  // The cached body holds titles and nothing else (P4): it used to end with a
+  // "version" key, which shadowed such a folder for anything that parsed it.
+  it('is a title like any other: the manifest lists it and the entries serve it with its hash', async () => {
+    await writeFiles(join(MEDIA, 'movies', 'version'), ['Version.1080p.mkv']);
+    await writeFiles(join(MEDIA, 'tv', 'version', 'Season 1'), ['version - S01E01.mkv']);
+    try {
+      await scanAll();
+      movieCache.invalidate('test');
+      tvCache.invalidate('test');
+
+      for (const [kind, cache] of [['movies', movieCache], ['tv', tvCache]]) {
+        const body = await cachedBody(cache);
+        expect(typeof body.version).toBe('object');
+
+        const { json: manifest } = await getJson(`/media/${kind}/manifest`);
+        expect(manifest.version).toBe(cache.version);
+        expect(Object.keys(manifest.titles)).toContain('version');
+        if (kind === 'tv') expect(manifest.titles.version.seasons).toEqual({ 'Season 1': ['S01E01'] });
+
+        const [line, ...rest] = ndjsonLines((await postJson(`/media/${kind}/entries`, { titles: ['version'] })).body);
+        expect(rest).toEqual([]);
+        expect(line.value.title).toBe('version');
+        expect(line.value.hash).toBe(manifest.titles.version.hash);
+        expect(short(entryBytesOf(line))).toBe(line.value.hash);
+        expect(line.value.entry).toEqual(body.version);
+
+        const all = ndjsonLines((await postJson(`/media/${kind}/entries`, { all: true })).body).map((l) => l.value.title);
+        expect(all).toEqual(Object.keys(manifest.titles));
+      }
+    } finally {
+      await fs.rm(join(MEDIA, 'movies', 'version'), { recursive: true, force: true });
+      await fs.rm(join(MEDIA, 'tv', 'version'), { recursive: true, force: true });
+      await scanAll();
     }
   });
 });

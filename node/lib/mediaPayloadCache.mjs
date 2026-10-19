@@ -63,18 +63,21 @@ function sha1Hex(data) {
 }
 
 /**
- * Serialize a keyed list — `{ <name>: entry, ..., "version": v }` — from rows
- * already in their final order.
+ * Serialize the titles — `{ <name>: entry, ... }` — from rows already in
+ * their final order.
  *
- * The body parses to `{ ...buildPayloadMap(rows, builder), version }`: the same
- * entries, each serialized by JSON.stringify, and `version` last. Only the
- * byte order of integer-like names can differ (an object literal lists those
- * first), and JSON.parse puts them first again.
+ * The body parses to `buildPayloadMap(rows, builder)`: the same entries, each
+ * serialized by JSON.stringify. Only the byte order of integer-like names can
+ * differ (an object literal lists those first), and JSON.parse puts them first
+ * again. The body holds titles and nothing else: the list version lives beside
+ * it (MediaPayloadCache.version, which the manifest names), so no key of the
+ * body is reserved and a folder named `version` is a title like any other.
+ * (Until P4 the body ended with a `"version"` key, the GET response's, which
+ * shadowed such a folder for anything that parsed the body.)
  *
  * @param {Object} params
  * @param {Array<Object>} params.rows - Rows with a `name`, in body order
  * @param {(row: Object) => Object} params.builder - Row to wire entry
- * @param {number} params.version - The list version appended as `version`
  * @param {(entry: Object, row: Object) => *} [params.describe] - Optional: what
  *   to keep about each built entry besides its bytes (the manifest's season and
  *   episode keys; lib/mediaManifest.mjs). Kept as `titles[i].keys`. A describe
@@ -84,7 +87,7 @@ function sha1Hex(data) {
  *   `titles[i]` is the i-th entry: `body.subarray(start, end)` is its JSON and
  *   `hash` is the SHA-1 of those bytes.
  */
-export async function serializeKeyedList({ rows, builder, version, describe = null }) {
+export async function serializeKeyedList({ rows, builder, describe = null }) {
   const parts = [Buffer.from('{')];
   const titles = [];
   let offset = 1;
@@ -115,7 +118,7 @@ export async function serializeKeyedList({ rows, builder, version, describe = nu
     }
   }
 
-  parts.push(Buffer.from(`${titles.length ? ',' : ''}"version":${JSON.stringify(version)}}`, 'utf8'));
+  parts.push(Buffer.from('}'));
   const body = Buffer.concat(parts);
 
   return { body, titles };
@@ -216,7 +219,7 @@ export class MediaPayloadCache {
     return this.#kind;
   }
 
-  /** The list version the body ends with (TV_LIST_VERSION / MOVIE_LIST_VERSION). */
+  /** The list version the manifest names (TV_LIST_VERSION / MOVIE_LIST_VERSION). */
   get version() {
     return this.#version;
   }
@@ -327,7 +330,6 @@ export class MediaPayloadCache {
     const { body, titles } = await serializeKeyedList({
       rows,
       builder: this.#builder,
-      version: this.#version,
       describe: this.#describe,
     });
 

@@ -441,17 +441,13 @@ describe('the slim shape', () => {
 // ---------------------------------------------------------------- body and ETag
 
 describe('the cached body', () => {
-  it('parses to the built entries, keyed by name, and the list version', async () => {
+  it('parses to the built entries, keyed by name, and nothing else', async () => {
     const movies = await movieCache.get();
     const shows = await tvCache.get();
-    expect(JSON.parse(movies.body)).toEqual({
-      ...buildPayloadMap(await loadMovies(), buildMoviePayloadEntry),
-      version: MOVIE_LIST_VERSION,
-    });
-    expect(JSON.parse(shows.body)).toEqual({
-      ...buildPayloadMap(await loadShows(), buildTvPayloadEntry),
-      version: TV_LIST_VERSION,
-    });
+    expect(JSON.parse(movies.body)).toEqual(buildPayloadMap(await loadMovies(), buildMoviePayloadEntry));
+    expect(JSON.parse(shows.body)).toEqual(buildPayloadMap(await loadShows(), buildTvPayloadEntry));
+    // The list version is the cache's, not a key of the body.
+    expect(movieCache.version).toBe(MOVIE_LIST_VERSION);
     // No whole-body gzip copy and no library ETag any more: only the manifest
     // and the entries go out.
     expect(movies.gzipBody).toBeUndefined();
@@ -521,25 +517,24 @@ describe('the cached body', () => {
     expect((await movieCache.get()).body.equals(before.body)).toBe(true);
   });
 
-  it('serializes awkward names and an empty library', async () => {
+  it('serializes awkward names, a folder named version, and an empty library', async () => {
     const rows = [
       { name: 'Quote " and \\ backslash' },
       { name: '1917' },
       { name: 'Ünïcödé — title' },
+      // No key of the body is reserved: a folder named version is a title.
+      { name: 'version' },
     ];
     const { body, titles } = await serializeKeyedList({
       rows,
       builder: (row) => ({ len: row.name.length }),
-      version: 1.0001,
     });
-    expect(JSON.parse(body)).toEqual({
-      ...Object.fromEntries(rows.map(({ name }) => [name, { len: name.length }])),
-      version: 1.0001,
-    });
+    expect(JSON.parse(body)).toEqual(Object.fromEntries(rows.map(({ name }) => [name, { len: name.length }])));
+    expect(JSON.parse(body).version).toEqual({ len: 7 });
     for (const t of titles) expect(JSON.parse(body.subarray(t.start, t.end))).toEqual({ len: t.name.length });
 
-    const empty = await serializeKeyedList({ rows: [], builder: () => ({}), version: 1.0001 });
-    expect(empty.body.toString()).toBe('{"version":1.0001}');
+    const empty = await serializeKeyedList({ rows: [], builder: () => ({}) });
+    expect(empty.body.toString()).toBe('{}');
   });
 });
 
