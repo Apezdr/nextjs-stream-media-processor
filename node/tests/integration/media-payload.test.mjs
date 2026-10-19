@@ -24,6 +24,7 @@ import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { fileURLToPath } from 'url';
 
 const tmpRoot = join(tmpdir(), `media-payload-${randomUUID()}`);
 const MEDIA = join(tmpRoot, 'media');
@@ -772,5 +773,58 @@ describe('primary source with a library manager', () => {
     await scanMovies(db, join(MEDIA, 'movies'), PREFIX, MEDIA, {}, 1.0011, false, async () => {});
     m = (await moviePayload())['Mixed Containers'];
     expect(m.urls.mp4).toMatch(/\/Solo\.1080p\.mp4$/);
+  });
+});
+
+describe('movie blurhash sidecars on a folder\'s first scan', () => {
+  // A real JPEG, so the real encoder runs (only the probe boundary is mocked).
+  const JPEG = fileURLToPath(new URL('../fixtures/backdrops/backdrop (7).jpg', import.meta.url));
+  const exists = (path) => fs.access(path).then(() => true, () => false);
+
+  it('publishes the blurhash URLs of a folder that arrives with images and no sidecars', async () => {
+    // The scanner writes the sidecars while it builds the URLs, and the
+    // directory hash it stores afterwards includes them, so every later scan
+    // skips the folder: URLs left off on this first scan would never be sent.
+    const dir = join(MEDIA, 'movies', 'Art Movie');
+    await writeFiles(dir, ['Art.1080p.mkv']);
+    await fs.copyFile(JPEG, join(dir, 'poster.jpg'));
+    await fs.copyFile(JPEG, join(dir, 'backdrop.jpg'));
+    await fs.copyFile(JPEG, join(dir, 'logo.jpg'));
+    // All three images and a metadata.json: nothing for the TMDB step to fetch,
+    // so the URLs are built once, before the sidecars exist.
+    await fs.writeFile(join(dir, 'metadata.json'), JSON.stringify({ id: 1, title: 'Art Movie' }));
+    try {
+      await runScan();
+      let urls = (await moviePayload())['Art Movie'].urls;
+      expect(await exists(join(dir, 'poster.jpg.blurhash'))).toBe(true);
+      expect(await exists(join(dir, 'backdrop.jpg.blurhash'))).toBe(true);
+      expect(await exists(join(dir, 'logo.jpg.blurhash'))).toBe(true);
+      expect(urls.posterBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/poster.jpg.blurhash`);
+      expect(urls.backdropBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/backdrop.jpg.blurhash`);
+      expect(urls.logoBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/logo.jpg.blurhash`);
+
+      // The next scan finds the folder unchanged and keeps them.
+      await runScan();
+      urls = (await moviePayload())['Art Movie'].urls;
+      expect(urls.posterBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/poster.jpg.blurhash`);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
+  });
+
+  it('publishes no blurhash URL when generation fails', async () => {
+    const dir = join(MEDIA, 'movies', 'Broken Art');
+    await writeFiles(dir, ['Broken.1080p.mkv', 'poster.jpg']); // not an image
+    try {
+      await runScan();
+      const urls = (await moviePayload())['Broken Art'].urls;
+      expect(urls.poster).toMatch(/\/movies\/Broken%20Art\/poster\.jpg\?hash=/);
+      expect(urls.posterBlurhash).toBeUndefined();
+      expect(await exists(join(dir, 'poster.jpg.blurhash'))).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
   });
 });

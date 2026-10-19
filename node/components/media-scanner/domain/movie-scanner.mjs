@@ -250,10 +250,12 @@ async function buildMovieURLs(fileSet, dirPath, dirName, prefixPath, basePath) {
     // SVG sources have no usable raster blurhash representation (`sharp` may
     // error or emit a junk hash), so skip blurhash for them. Mirrors TV.
     if (r.ext === 'svg') continue;
-    if (await fileExists(`${r.path}.blurhash`)) {
+    // Publish the sidecar when it exists or when this call writes it (as TV
+    // does). The directory hash stored after this pass includes a sidecar
+    // written here, so a URL left off now would be left off until the folder
+    // changes. A failed generation writes nothing and publishes nothing.
+    if (await fileExists(`${r.path}.blurhash`) || await getStoredBlurhash(r.path, basePath)) {
       urls[blurhashKeyMap[imageKey]] = `${prefixPath}/movies/${encodedDirName}/${encodedFileName}.blurhash`;
-    } else {
-      await getStoredBlurhash(r.path, basePath);
     }
   }
 
