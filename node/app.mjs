@@ -59,6 +59,7 @@ import { createIdentityService } from "./integrations/identity/index.mjs";
 import { listMultiSourceTitles } from "./sqlite/multiSourceTitles.mjs";
 import { setupIdentityRoutes } from "./integrations/identity/routes.mjs";
 import { destroyPool } from "./lib/blurhash-pool.mjs";
+import { healMissingBlurhashSidecars } from "./lib/blurhashHealing.mjs";
 import { langMap } from "./utils/languageMap.mjs";
 const logger = createCategoryLogger('main');
 const posterLogger = createPythonLogger('GeneratePosterCollage');
@@ -1085,6 +1086,28 @@ function scheduleTasks() {
   // re-adding a cleanup here without enqueueTask would race the gated ones.
 }
 
+/**
+ * The blurhash sidecar healing pass, as a BLURHASH task. The task manager
+ * never runs a BLURHASH task beside a MEDIA_SCAN (one exclusive group), so the
+ * pass and a scheduled scan tick cannot write the same sidecar at once; a tick
+ * that comes due meanwhile waits for it. Rows are read when the task starts,
+ * so they are the startup scan's.
+ */
+function healBlurhashSidecars() {
+  return enqueueTask(TaskType.BLURHASH, 'Blurhash Sidecar Healing', async () => {
+    const summary = await healMissingBlurhashSidecars({
+      movies: await getMovies(),
+      shows: await getTVShows(),
+      basePath: BASE_PATH,
+      prefixPath: PREFIX_PATH,
+    });
+    logger.info(
+      `Blurhash sidecar healing: checked ${summary.checked}, generated ${summary.generated}, failed ${summary.failed}`
+    );
+    return summary;
+  });
+}
+
 async function initialize() {
   await ensureCacheDirs();
   // An encode cut short by a restart leaves its temp file in the clip cache.
@@ -1119,7 +1142,12 @@ async function initialize() {
       .catch((error) => {
         logger.error("Error during initialization:", error);
       });
-    runGenerateList().catch(logger.error);
+    runGenerateList()
+      .catch(logger.error)
+      // Once per process, after the startup scan: write the sidecar of any
+      // published image that has none (lib/blurhashHealing.mjs).
+      .then(() => healBlurhashSidecars())
+      .catch((error) => logger.error(`Blurhash sidecar healing failed: ${error?.message ?? error}`));
     runGeneratePosterCollage().catch(logger.error);
     // Sweep stale caption-generator temp files left behind by interrupted jobs
     sweepOrphanCaptionTempFiles().catch(err => logger.error(`Caption temp sweep failed: ${err.message}`));
