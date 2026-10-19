@@ -48,8 +48,11 @@ const FILES = {
       'GET /chapters/tv/:showName',
       'GET /chapters/tv/:showName/:season/:episode',
       'GET /rescan/tmdb',
+      // P4: the whole-library payloads; the frontend reads the manifests and entries.
+      'GET /media/tv',
+      'GET /media/movies',
     ],
-    kept: ['GET /processes', 'POST /media/scan', 'GET /media/tv', 'GET /media/movies', 'GET /api/logs'],
+    kept: ['GET /processes', 'POST /media/scan', 'GET /media/tv/manifest', 'GET /media/movies/manifest', 'GET /api/logs'],
   },
   'routes/systemStatus.mjs': {
     removed: ['GET /health', 'POST /trigger-system-status'],

@@ -1,23 +1,20 @@
 // lib/mediaPayloadCache.mjs
 //
-// GET /media/tv and GET /media/movies serve the whole library, and the
-// frontend sync asks for both on every tick (every 3 minutes, from every
-// frontend that reads this server). The TV body alone is tens of megabytes.
+// The TV and movie libraries, serialized once per change. The frontend sync
+// reads them on every tick (every 3 minutes, from every frontend that reads
+// this server) through GET /media/<kind>/manifest and POST
+// /media/<kind>/entries (lib/mediaManifest.mjs), which are cut from this body.
+// The TV body alone is tens of megabytes, and building it reads every row and
+// injects the caption stubs, so it is built only when what it is made of
+// changes. (The whole-library GET /media/tv and /media/movies that this cache
+// was first built for were removed in P4.)
 //
-// Before this, every request read every row, injected the caption stubs and
-// serialized the lot, and Express hashed the result for its ETag — so even a
-// conditional request that ended in a 304 paid for the whole body (about 1.1 s
-// on the production library). Worse, it never ended in a 304: Node's fetch adds
-// `Cache-Control: no-cache` to any request carrying If-None-Match, and Express's
-// freshness check answers no-cache with a full 200.
+// So each kind keeps its body, built once per change:
 //
-// So each route keeps its body, built once per change:
-//
-//   - the body bytes, and their gzip copy (compressed off the event loop);
+//   - the body bytes;
 //   - per title, where its serialized entry sits in the body and the hash of
-//     that entry. The library ETag is a hash over the ordered title hashes, so
-//     a manifest of title hashes is already here for whoever needs one
-//     (lib/mediaManifest.mjs serves it, and single entries cut from the body);
+//     that entry: the manifest is made of these, and single entries are cut
+//     from the body by them;
 //   - the autoCaptions settings it was built under, because the caption stubs
 //     are injected at build time from those settings, not from the rows.
 //
@@ -28,9 +25,9 @@
 //     count its build started at. The end of a scan tick and POST /media/scan
 //     drop a body whose count moved since (clearPayloadsAfterScan), and keep it
 //     otherwise, so after a tick that changed nothing the next conditional
-//     request is a 304 straight away. A scan that failed drops both bodies
-//     whatever the counts say. A write made anywhere else is seen by the next
-//     of these clear points.
+//     manifest request is a 304 straight away. A scan that failed drops both
+//     bodies whatever the counts say. A write made anywhere else is seen by
+//     the next of these clear points.
 //   - the autoCaptions settings (they live in Mongo, written by the frontend;
 //     watchPayloadContext polls them).
 //
@@ -41,17 +38,12 @@
 // PAYLOAD_CACHE_MAX_AGE_MS is rebuilt on the next request whatever happened,
 // as a backstop for any change nothing told us about.
 //
-// The handler answers If-None-Match itself, before any other work, and ignores
-// the request's Cache-Control. A 200 sends the cached bytes as they are; the
-// compression middleware must skip them (compressionFilter), or it would
-// compress the identity body again on every request.
+// The manifest and entries handlers send their own encoding (a cached gzip
+// copy of the manifest, a gzip stream of the entries), so the compression
+// middleware must skip them (compressionFilter, markPrecompressed).
 
 import { createHash } from 'crypto';
-import { gzip as gzipCallback } from 'zlib';
-import { promisify } from 'util';
 import compression from 'compression';
-
-const gzip = promisify(gzipCallback);
 
 /** The backstop: a body this old is rebuilt on the next request. */
 export const PAYLOAD_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
@@ -71,16 +63,15 @@ function sha1Hex(data) {
 }
 
 /**
- * Serialize a keyed list response — `{ <name>: entry, ..., "version": v }` —
- * from rows already in their final order.
+ * Serialize a keyed list — `{ <name>: entry, ..., "version": v }` — from rows
+ * already in their final order.
  *
- * The body parses to exactly what `res.json({ ...buildPayloadMap(rows, builder),
- * version })` sent: the same entries, each serialized by JSON.stringify, and
- * `version` last. Only the byte order of integer-like names can differ (an
- * object literal lists those first), and JSON.parse puts them first again.
+ * The body parses to `{ ...buildPayloadMap(rows, builder), version }`: the same
+ * entries, each serialized by JSON.stringify, and `version` last. Only the
+ * byte order of integer-like names can differ (an object literal lists those
+ * first), and JSON.parse puts them first again.
  *
  * @param {Object} params
- * @param {string} params.kind - 'tv' | 'movies'; part of the ETag
  * @param {Array<Object>} params.rows - Rows with a `name`, in body order
  * @param {(row: Object) => Object} params.builder - Row to wire entry
  * @param {number} params.version - The list version appended as `version`
@@ -89,11 +80,11 @@ function sha1Hex(data) {
  *   episode keys; lib/mediaManifest.mjs). Kept as `titles[i].keys`. A describe
  *   that throws leaves `keys` unset and records `describeError` instead: it
  *   can fail the manifest, never the body.
- * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number, keys?: *, describeError?: string}>, etag: string}>}
+ * @returns {Promise<{body: Buffer, titles: Array<{name: string, hash: string, start: number, end: number, keys?: *, describeError?: string}>}>}
  *   `titles[i]` is the i-th entry: `body.subarray(start, end)` is its JSON and
  *   `hash` is the SHA-1 of those bytes.
  */
-export async function serializeKeyedList({ kind, rows, builder, version, describe = null }) {
+export async function serializeKeyedList({ rows, builder, version, describe = null }) {
   const parts = [Buffer.from('{')];
   const titles = [];
   let offset = 1;
@@ -127,26 +118,7 @@ export async function serializeKeyedList({ kind, rows, builder, version, describ
   parts.push(Buffer.from(`${titles.length ? ',' : ''}"version":${JSON.stringify(version)}}`, 'utf8'));
   const body = Buffer.concat(parts);
 
-  return { body, titles, etag: libraryEtag(kind, version, titles) };
-}
-
-/**
- * The library ETag: a hash over the version and the ordered (name, entry hash)
- * pairs, which is everything the body is made of. Weak, because the same tag
- * names the identity and the gzip bytes.
- *
- * @param {string} kind
- * @param {number} version
- * @param {Array<{name: string, hash: string}>} titles
- * @returns {string}
- */
-export function libraryEtag(kind, version, titles) {
-  const hash = createHash('sha1');
-  hash.update(`media-list:${kind}\nversion:${JSON.stringify(version)}\n`);
-  for (const { name, hash: entryHash } of titles) {
-    hash.update(`${JSON.stringify(name)}:${entryHash}\n`);
-  }
-  return `W/"${kind}-${hash.digest('hex')}"`;
+  return { body, titles };
 }
 
 /**
@@ -180,7 +152,7 @@ export function autoCaptionsContextKey(config) {
 }
 
 /**
- * One route's cached body.
+ * One kind's cached body.
  */
 export class MediaPayloadCache {
   #kind;
@@ -265,7 +237,7 @@ export class MediaPayloadCache {
    * one build. A build that an invalidation overtook still answers the requests
    * that were waiting for it, but is not kept.
    *
-   * Only the HTTP list, manifest and entries handlers may call this
+   * Only the HTTP manifest and entries handlers may call this
    * (tests/unit/payload-cache-callers.test.mjs): a build can wait for a
    * MEDIA_SCAN task, so a task holding the scan group that joined a request's
    * build would wait on a scan queued behind itself.
@@ -352,19 +324,15 @@ export class MediaPayloadCache {
     // mid-build is caught by the next checkContext.
     const contextKey = await this.#readContext();
     const rows = await this.#loadRows();
-    const { body, titles, etag } = await serializeKeyedList({
-      kind: this.#kind,
+    const { body, titles } = await serializeKeyedList({
       rows,
       builder: this.#builder,
       version: this.#version,
       describe: this.#describe,
     });
-    const gzipBody = await gzip(body);
 
     const entry = {
-      etag,
       body,
-      gzipBody,
       titles,
       contextKey,
       dataGeneration,
@@ -375,8 +343,7 @@ export class MediaPayloadCache {
 
     this.#logger?.info?.(
       `/media/${this.#kind} payload built: ${titles.length} titles, ` +
-        `${(body.length / 1048576).toFixed(1)} MB (${(gzipBody.length / 1048576).toFixed(1)} MB gzip) ` +
-        `in ${entry.buildMs} ms`
+        `${(body.length / 1048576).toFixed(1)} MB in ${entry.buildMs} ms`
     );
     return entry;
   }
@@ -438,7 +405,8 @@ export function watchPayloadContext(caches, { intervalMs = PAYLOAD_CONTEXT_POLL_
 
 /**
  * The `compression` filter for the app: everything the default filter
- * compresses, except a cached media list, which carries its own encoding.
+ * compresses, except a response marked with markPrecompressed (the media
+ * manifests and entries), which carries its own encoding.
  *
  * @param {import('express').Request} req
  * @param {import('express').Response} res
@@ -457,49 +425,4 @@ export function compressionFilter(req, res) {
  */
 export function markPrecompressed(res) {
   res[PRECOMPRESSED] = true;
-}
-
-/**
- * The GET handler for one cached list route. Mount it after the auth
- * middleware.
- *
- * @param {MediaPayloadCache} cache
- * @param {Object} options
- * @param {Object} options.logger
- * @param {string} options.errorLabel - Log prefix for a failed build
- * @returns {(req: import('express').Request, res: import('express').Response) => Promise<void>}
- */
-export function createMediaListHandler(cache, { logger, errorLabel }) {
-  return async function mediaListHandler(req, res) {
-    res[PRECOMPRESSED] = true;
-
-    let entry = cache.peek();
-    if (!entry) {
-      try {
-        entry = await cache.get();
-      } catch (error) {
-        logger.error(`${errorLabel}: ${error}`);
-        res.status(500).send('Internal server error');
-        return;
-      }
-    }
-
-    res.setHeader('ETag', entry.etag);
-    res.vary('Accept-Encoding');
-
-    // Before anything else, and regardless of the request's Cache-Control:
-    // a client that sends a tag it got from us wants to know if it is current.
-    if (ifNoneMatchMatches(req.headers['if-none-match'], entry.etag)) {
-      res.status(304).end();
-      return;
-    }
-
-    const useGzip = req.acceptsEncodings('gzip') === 'gzip';
-    const body = useGzip ? entry.gzipBody : entry.body;
-    res.status(200);
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    if (useGzip) res.setHeader('Content-Encoding', 'gzip');
-    res.setHeader('Content-Length', body.length);
-    res.end(body);
-  };
 }

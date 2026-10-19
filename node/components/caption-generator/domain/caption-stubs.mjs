@@ -72,7 +72,7 @@ export async function addCaptionStubs(subtitles, ctx) {
 }
 
 /**
- * Read-time injection for the /media/movies response. Mutates each movie's
+ * Read-time injection for the movie entries. Mutates each movie's
  * `urls.subtitles` map in place to add pending stubs for any enabled lang.
  *
  * Doing this at read time (instead of scan time) means toggling the autoCaptions
@@ -100,7 +100,7 @@ export async function injectMovieStubs(movies, langMap) {
 }
 
 /**
- * Read-time injection for the /media/tv response. Walks each show → season →
+ * Read-time injection for the TV entries. Walks each show → season →
  * episode and adds pending stubs to `episode.subtitles`.
  *
  * @param {Array} shows    - Records from getTVShows()

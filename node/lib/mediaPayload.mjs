@@ -1,6 +1,7 @@
 // lib/mediaPayload.mjs
 //
-// The shape /media/movies and /media/tv put on the wire.
+// The shape of each title's entry on the wire: the bytes POST
+// /media/<kind>/entries sends and the manifests hash (lib/mediaManifest.mjs).
 //
 // Extracted from the route handlers so it is reachable from a test. Every
 // payload defect this pivot produced was an EMISSION bug — the scanner computed
@@ -158,7 +159,7 @@ export function buildMediaIdentity(row) {
 }
 
 /**
- * One entry of the `/media/movies` response, keyed by movie name.
+ * One movie's entry (POST /media/movies/entries), keyed by movie name.
  *
  * @param {Object} movie - A row as returned by getMovies()
  * @returns {Object}
@@ -188,7 +189,7 @@ export function buildMoviePayloadEntry(movie) {
 }
 
 /**
- * One entry of the `/media/tv` response, keyed by show name.
+ * One show's entry (POST /media/tv/entries), keyed by show name.
  *
  * Episode-level fields (mediaIdentity, sources, jitEligible, jitUrl) ride
  * inside the `seasons` blob and pass through untouched — which is why TV was

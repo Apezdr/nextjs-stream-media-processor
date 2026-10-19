@@ -1,25 +1,25 @@
 /**
- * The cached /media/tv and /media/movies bodies, end to end: fixture library on
- * disk → real scanner → real SQLite → the real builders → MediaPayloadCache →
- * the real route handler behind the real compression middleware, over HTTP.
+ * The cached TV and movie bodies, end to end: fixture library on disk → real
+ * scanner → real SQLite → the real builders → MediaPayloadCache → the real
+ * manifest handler behind the real compression middleware, over HTTP.
  *
  * What it pins:
  *
  *   - the slim shape: every probe fact the frontend sync reads survives the
  *     trim, the rest of the entry is untouched, and the caption stubs are still
  *     decided from the full audio list;
- *   - the body parses to exactly what res.json sent before the cache;
- *   - the ETag is a function of the rows alone: same rows, same tag, whatever
- *     order SQLite returns them in; one changed row, a different tag (and only
- *     that title's hash moves);
- *   - a matching If-None-Match gets a 304 even with `Cache-Control: no-cache`,
- *     which Node's fetch adds to every conditional request and which Express's
- *     own freshness check answers with a full 200;
- *   - the cached bytes go out as they are: gzip when accepted, never
- *     recompressed by the middleware;
- *   - invalidation, the autoCaptions settings check and the 10-minute backstop.
+ *   - the body parses to the built entries keyed by name;
+ *   - the bytes are a function of the rows alone: same rows, same bytes,
+ *     whatever order SQLite returns them in; one changed row moves only that
+ *     title's hash;
+ *   - the compression middleware leaves every other response alone;
+ *   - invalidation, a failed build, the autoCaptions settings check and the
+ *     10-minute backstop.
  *
- * The ffprobe/mediainfo boundary is mocked, as in media-payload.test.mjs.
+ * The manifest route's own 304 and gzip handling is pinned in
+ * media-manifest.test.mjs. (The whole-library GET /media/<kind> this suite
+ * served first went in P4.) The ffprobe/mediainfo boundary is mocked, as in
+ * media-payload.test.mjs.
  */
 
 import { describe, it, expect, jest, beforeAll, afterAll, beforeEach } from '@jest/globals';
@@ -166,12 +166,12 @@ const { buildMoviePayloadEntry, buildTvPayloadEntry, buildPayloadMap } = await i
 const {
   MediaPayloadCache,
   PAYLOAD_CACHE_MAX_AGE_MS,
-  createMediaListHandler,
   compressionFilter,
   autoCaptionsContextKey,
   ifNoneMatchMatches,
   serializeKeyedList,
 } = await import('../../lib/mediaPayloadCache.mjs');
+const { createManifestHandler, tvManifestKeys } = await import('../../lib/mediaManifest.mjs');
 const express = (await import('express')).default;
 const compression = (await import('compression')).default;
 
@@ -182,7 +182,6 @@ const PREFIX = '/media';
 let db;
 let server;
 let baseUrl;
-let lastRequestCacheControl;
 const quietLogger = { info: () => {}, debug: () => {}, error: () => {}, warn: () => {} };
 
 // ---------------------------------------------------------------- wiring (as app.mjs)
@@ -215,6 +214,7 @@ const tvCache = new MediaPayloadCache({
   kind: 'tv',
   version: TV_LIST_VERSION,
   builder: buildTvPayloadEntry,
+  describe: tvManifestKeys,
   loadRows: loadShows,
   readContext,
 });
@@ -317,14 +317,11 @@ beforeAll(async () => {
   await scanAll();
 
   const app = express();
-  app.use((req, res, next) => {
-    lastRequestCacheControl = req.headers['cache-control'];
-    next();
-  });
   app.use(compression({ filter: compressionFilter }));
-  app.get('/media/movies', createMediaListHandler(movieCache, { logger: quietLogger, errorLabel: 'Error fetching movies' }));
-  app.get('/media/tv', createMediaListHandler(tvCache, { logger: quietLogger, errorLabel: 'Error fetching TV shows' }));
-  app.get('/broken', createMediaListHandler(brokenCache, { logger: quietLogger, errorLabel: 'Error fetching movies' }));
+  const opts = { logger: quietLogger, errorLabel: 'Error building the manifest' };
+  app.get('/media/movies/manifest', createManifestHandler(movieCache, opts));
+  app.get('/media/tv/manifest', createManifestHandler(tvCache, opts));
+  app.get('/broken/manifest', createManifestHandler(brokenCache, opts));
   // Any other JSON route: the filter must leave the middleware working for it.
   app.get('/other', (req, res) => res.json({ filler: 'x'.repeat(8192) }));
   await new Promise((resolve) => {
@@ -443,8 +440,8 @@ describe('the slim shape', () => {
 
 // ---------------------------------------------------------------- body and ETag
 
-describe('the cached body and its ETag', () => {
-  it('parses to exactly what res.json sent', async () => {
+describe('the cached body', () => {
+  it('parses to the built entries, keyed by name, and the list version', async () => {
     const movies = await movieCache.get();
     const shows = await tvCache.get();
     expect(JSON.parse(movies.body)).toEqual({
@@ -455,7 +452,10 @@ describe('the cached body and its ETag', () => {
       ...buildPayloadMap(await loadShows(), buildTvPayloadEntry),
       version: TV_LIST_VERSION,
     });
-    expect(gunzipSync(movies.gzipBody).equals(movies.body)).toBe(true);
+    // No whole-body gzip copy and no library ETag any more: only the manifest
+    // and the entries go out.
+    expect(movies.gzipBody).toBeUndefined();
+    expect(movies.etag).toBeUndefined();
   });
 
   it('keeps each title\'s entry and hash, in name order', async () => {
@@ -469,13 +469,13 @@ describe('the cached body and its ETag', () => {
     }
   });
 
-  it('builds the same ETag from the same rows', async () => {
+  it('builds the same bytes and title hashes from the same rows', async () => {
     const first = await movieCache.get();
     movieCache.invalidate('test');
     const second = await movieCache.get();
     expect(second).not.toBe(first);
-    expect(second.etag).toBe(first.etag);
     expect(second.body.equals(first.body)).toBe(true);
+    expect(second.titles).toEqual(first.titles);
 
     // An independent cache over the same rows agrees.
     const other = new MediaPayloadCache({
@@ -484,7 +484,7 @@ describe('the cached body and its ETag', () => {
       builder: buildMoviePayloadEntry,
       loadRows: loadMovies,
     });
-    expect((await other.get()).etag).toBe(first.etag);
+    expect((await other.get()).body.equals(first.body)).toBe(true);
   });
 
   it('does not depend on the order SQLite returns the rows in', async () => {
@@ -500,18 +500,17 @@ describe('the cached body and its ETag', () => {
     expect((await getMovies()).map((r) => r.name)).toEqual(['Alpha Movie', 'Probe Failed', 'Zeta Movie']);
     movieCache.invalidate('test');
     const after = await movieCache.get();
-    expect(after.etag).toBe(before.etag);
     expect(after.body.equals(before.body)).toBe(true);
   });
 
-  it('changes the ETag when one row changes, and only that title\'s hash', async () => {
+  it('moves only the changed title\'s hash when one row changes', async () => {
     const before = await movieCache.get();
     const { hdr } = await db.get(`SELECT hdr FROM movies WHERE name = 'Alpha Movie'`);
     await db.run(`UPDATE movies SET hdr = 'Dolby Vision' WHERE name = 'Alpha Movie'`);
     try {
       movieCache.invalidate('test');
       const after = await movieCache.get();
-      expect(after.etag).not.toBe(before.etag);
+      expect(after.body.equals(before.body)).toBe(false);
 
       const changed = after.titles.filter((t, i) => t.hash !== before.titles[i].hash).map((t) => t.name);
       expect(changed).toEqual(['Alpha Movie']);
@@ -519,7 +518,7 @@ describe('the cached body and its ETag', () => {
       await db.run(`UPDATE movies SET hdr = ? WHERE name = 'Alpha Movie'`, [hdr]);
     }
     movieCache.invalidate('test');
-    expect((await movieCache.get()).etag).toBe(before.etag);
+    expect((await movieCache.get()).body.equals(before.body)).toBe(true);
   });
 
   it('serializes awkward names and an empty library', async () => {
@@ -528,8 +527,7 @@ describe('the cached body and its ETag', () => {
       { name: '1917' },
       { name: 'Ünïcödé — title' },
     ];
-    const { body, titles, etag } = await serializeKeyedList({
-      kind: 'movies',
+    const { body, titles } = await serializeKeyedList({
       rows,
       builder: (row) => ({ len: row.name.length }),
       version: 1.0001,
@@ -539,78 +537,15 @@ describe('the cached body and its ETag', () => {
       version: 1.0001,
     });
     for (const t of titles) expect(JSON.parse(body.subarray(t.start, t.end))).toEqual({ len: t.name.length });
-    expect(etag).toMatch(/^W\/"movies-[0-9a-f]{40}"$/);
 
-    const empty = await serializeKeyedList({ kind: 'tv', rows: [], builder: () => ({}), version: 1.0001 });
+    const empty = await serializeKeyedList({ rows: [], builder: () => ({}), version: 1.0001 });
     expect(empty.body.toString()).toBe('{"version":1.0001}');
   });
 });
 
 // ---------------------------------------------------------------- HTTP
 
-describe('GET over HTTP', () => {
-  it('answers a matching If-None-Match with a 304, even with Cache-Control: no-cache', async () => {
-    const first = await fetch(`${baseUrl}/media/tv`, { headers: { 'x-webhook-id': 'test' } });
-    expect(first.status).toBe(200);
-    const etag = first.headers.get('etag');
-    await first.arrayBuffer();
-    expect(etag).toBe(tvCache.peek().etag);
-
-    // Node's fetch sends If-None-Match with Cache-Control: no-cache on its own.
-    const loadsBefore = tvLoads;
-    const conditional = await fetch(`${baseUrl}/media/tv`, { headers: { 'If-None-Match': etag } });
-    expect(lastRequestCacheControl).toBe('no-cache');
-    expect(conditional.status).toBe(304);
-    expect(conditional.headers.get('etag')).toBe(etag);
-    expect((await conditional.arrayBuffer()).byteLength).toBe(0);
-
-    // And said explicitly, on a plain request.
-    const explicit = await rawGet('/media/tv', { 'If-None-Match': etag, 'Cache-Control': 'no-cache' });
-    expect(explicit.status).toBe(304);
-    expect(explicit.headers.etag).toBe(etag);
-    expect(explicit.body.length).toBe(0);
-
-    // A 304 built nothing.
-    expect(tvLoads).toBe(loadsBefore);
-  });
-
-  it('matches weak, strong, listed and wildcard tags, and only those', async () => {
-    const { etag } = await tvCache.get();
-    const opaque = etag.slice(2);
-    for (const header of [etag, opaque, `"other", ${etag}`, `W/"a,b", ${opaque}`, '*']) {
-      expect((await rawGet('/media/tv', { 'If-None-Match': header })).status).toBe(304);
-    }
-    for (const header of ['W/"tv-0000"', `"${opaque}"`, opaque.slice(0, -2) + '"']) {
-      expect((await rawGet('/media/tv', { 'If-None-Match': header })).status).toBe(200);
-    }
-  });
-
-  it('sends the cached gzip bytes as they are, with today\'s headers', async () => {
-    const entry = await tvCache.get();
-    const res = await rawGet('/media/tv', { 'Accept-Encoding': 'gzip, deflate, br' });
-    expect(res.status).toBe(200);
-    expect(res.headers['content-type']).toBe('application/json; charset=utf-8');
-    expect(res.headers['content-encoding']).toBe('gzip');
-    expect(res.headers.vary).toMatch(/Accept-Encoding/);
-    expect(res.headers.etag).toBe(entry.etag);
-    expect(Number(res.headers['content-length'])).toBe(entry.gzipBody.length);
-    // Not recompressed: the very bytes the cache holds.
-    expect(res.body.equals(entry.gzipBody)).toBe(true);
-  });
-
-  it('sends the identity bytes to a client that does not take gzip, uncompressed', async () => {
-    const entry = await movieCache.get();
-    for (const headers of [{}, { 'Accept-Encoding': 'br' }, { 'Accept-Encoding': 'identity' }]) {
-      const res = await rawGet('/media/movies', headers);
-      expect(res.status).toBe(200);
-      // The middleware would brotli-compress the second; it must not touch it.
-      expect(res.headers['content-encoding']).toBeUndefined();
-      expect(res.headers['content-type']).toBe('application/json; charset=utf-8');
-      expect(res.headers.etag).toBe(entry.etag);
-      expect(res.body.equals(entry.body)).toBe(true);
-    }
-  });
-
+describe('over HTTP', () => {
   it('leaves compression on for every other response', async () => {
     const res = await rawGet('/other', { 'Accept-Encoding': 'gzip' });
     expect(res.headers['content-encoding']).toBe('gzip');
@@ -618,10 +553,13 @@ describe('GET over HTTP', () => {
   });
 
   it('serves the new body after an invalidation', async () => {
-    const before = await fetch(`${baseUrl}/media/tv`);
-    const oldEtag = before.headers.get('etag');
-    const oldBody = await before.json();
-    expect(Object.keys(oldBody['Some Show'].seasons['Season 1'].episodes)).toEqual(['S01E01', 'S01E02']);
+    const manifestOf = async (headers = {}) => {
+      const res = await rawGet('/media/tv/manifest', headers);
+      return { res, json: res.status === 200 ? JSON.parse(res.body) : null };
+    };
+    const before = await manifestOf();
+    const oldEtag = before.res.headers.etag;
+    expect(before.json.titles['Some Show'].seasons['Season 1']).toEqual(['S01E01', 'S01E02']);
 
     const seasonDir = join(MEDIA, 'tv', 'Some Show', 'Season 1');
     await fs.writeFile(join(seasonDir, 'Some Show - S01E03.mkv'), 'z'.repeat(64));
@@ -629,14 +567,15 @@ describe('GET over HTTP', () => {
       await scanTVShows(db, join(MEDIA, 'tv'), PREFIX, MEDIA, langMap, false, async () => {});
 
       // Until the cache is told, the old body still stands.
-      expect((await fetch(`${baseUrl}/media/tv`, { headers: { 'If-None-Match': oldEtag } })).status).toBe(304);
+      expect((await manifestOf({ 'If-None-Match': oldEtag })).res.status).toBe(304);
 
       tvCache.invalidate('scan tick');
-      const after = await fetch(`${baseUrl}/media/tv`, { headers: { 'If-None-Match': oldEtag } });
-      expect(after.status).toBe(200);
-      expect(after.headers.get('etag')).not.toBe(oldEtag);
-      const body = await after.json();
-      expect(Object.keys(body['Some Show'].seasons['Season 1'].episodes)).toEqual(['S01E01', 'S01E02', 'S01E03']);
+      const after = await manifestOf({ 'If-None-Match': oldEtag });
+      expect(after.res.status).toBe(200);
+      expect(after.res.headers.etag).not.toBe(oldEtag);
+      expect(after.json.titles['Some Show'].seasons['Season 1']).toEqual(['S01E01', 'S01E02', 'S01E03']);
+      expect(after.json.titles['Some Show'].hash).not.toBe(before.json.titles['Some Show'].hash);
+      const body = JSON.parse((await tvCache.get()).body);
       expect(body['Some Show'].seasons['Season 1'].episodes.S01E03.additionalMetadata).toEqual({
         size: { kb: 42.5 * 1024 * 1024, mb: 42.5 * 1024, gb: 42.5 },
       });
@@ -647,11 +586,11 @@ describe('GET over HTTP', () => {
   });
 
   it('answers 500 when the build fails, and builds again on the next request', async () => {
-    const failed = await rawGet('/broken');
+    const failed = await rawGet('/broken/manifest');
     expect(failed.status).toBe(500);
     expect(failed.body.toString()).toBe('Internal server error');
 
-    const retried = await rawGet('/broken');
+    const retried = await rawGet('/broken/manifest');
     expect(retried.status).toBe(200);
     expect(brokenLoads).toBe(2);
   });
@@ -662,7 +601,7 @@ describe('GET over HTTP', () => {
 describe('when the cache is rebuilt', () => {
   it('shares one build between concurrent requests', async () => {
     const loadsBefore = movieLoads;
-    const responses = await Promise.all(Array.from({ length: 6 }, () => rawGet('/media/movies')));
+    const responses = await Promise.all(Array.from({ length: 6 }, () => rawGet('/media/movies/manifest')));
     expect(responses.every((r) => r.status === 200)).toBe(true);
     expect(new Set(responses.map((r) => r.headers.etag)).size).toBe(1);
     expect(movieLoads - loadsBefore).toBe(1);
@@ -689,7 +628,7 @@ describe('when the cache is rebuilt', () => {
     cache.invalidate('scan tick');
     release();
     const stale = await pending;
-    expect(stale.etag).toBeTruthy(); // its requests are still answered
+    expect(stale.body.length).toBeGreaterThan(0); // its requests are still answered
     expect(cache.peek()).toBeNull();
 
     await cache.get();
@@ -707,7 +646,7 @@ describe('when the cache is rebuilt', () => {
     expect(movieCache.peek()).toBeNull();
 
     const withStubs = await movieCache.get();
-    expect(withStubs.etag).not.toBe(withoutStubs.etag);
+    expect(withStubs.body.equals(withoutStubs.body)).toBe(false);
     expect(JSON.parse(withStubs.body)['Alpha Movie'].urls.subtitles['English - Auto Generated']).toBeDefined();
     expect(await movieCache.checkContext()).toBe(false);
   });
@@ -742,7 +681,7 @@ describe('when the cache is rebuilt', () => {
 
     const second = await cache.get();
     expect(loads).toBe(2);
-    expect(second.etag).toBe(first.etag);
+    expect(second.body.equals(first.body)).toBe(true);
     expect(PAYLOAD_CACHE_MAX_AGE_MS).toBe(10 * 60 * 1000);
   });
 });

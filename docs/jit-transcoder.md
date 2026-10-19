@@ -177,7 +177,7 @@ allowlist is the first place to look.
 
 ## 5. Movie payload
 
-`GET /media/movies` → `urls`:
+A movie's entry (`POST /media/movies/entries`) → `urls`:
 
 | Field | Type | Status | Notes |
 |---|---|---|---|
@@ -191,7 +191,7 @@ allowlist is the first place to look.
 
 ## 6. TV payload
 
-`GET /media/tv` → `seasons[<Season Name>].episodes[<key>]`:
+A show's entry (`POST /media/tv/entries`) → `seasons[<Season Name>].episodes[<key>]`:
 
 | Field | Type | Status | Notes |
 |---|---|---|---|

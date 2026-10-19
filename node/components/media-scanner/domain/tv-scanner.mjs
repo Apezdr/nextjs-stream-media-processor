@@ -624,7 +624,7 @@ async function processSeason(season, showPath, showName, encodedShowName, prefix
  * ("Specials", "Extras") and for "Season 0", and for "Season 1" next to
  * "Season 01"; a stable sort would keep the finish order for those, and the
  * stored seasons JSON would differ from one reprocess to the next, moving the
- * show's row, tv_shows' generation and the /media/tv ETag. The folder name
+ * show's row, tv_shows' generation and its TV manifest hash. The folder name
  * breaks every tie (the keys are unique), compared by code unit so the order
  * does not depend on the locale either.
  *
@@ -1118,7 +1118,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         assetsResult.poster,
         assetsResult.posterBlurhash,
         assetsResult.logo,
-        // logoBlurhash: a logo has no blurhash, and /media/tv does not
+        // logoBlurhash: a logo has no blurhash, and the show's entry does not
         // publish the column.
         null,
         assetsResult.backdrop,

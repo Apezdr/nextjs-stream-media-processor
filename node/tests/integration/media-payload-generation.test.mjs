@@ -1,8 +1,8 @@
 /**
- * The cached /media/tv and /media/movies bodies across scan ticks, end to end:
+ * The cached TV and movie bodies across scan ticks, end to end:
  * fixture library on disk → the real scanners → real SQLite and its table
- * generations → MediaPayloadCache → the real list, manifest and entries
- * handlers, over HTTP. The tick is run as app.mjs's runGenerateList runs it:
+ * generations → MediaPayloadCache → the real manifest and entries handlers,
+ * over HTTP. The tick is run as app.mjs's runGenerateList runs it:
  * movies, then TV, then clearPayloadsAfterScan, failed when a scan threw or
  * the TV scan reported an error.
  *
@@ -15,7 +15,7 @@
  *   - after such a tick both bodies, their manifests and their entries stay as
  *     they were: no rebuild, and a matching If-None-Match is still a 304;
  *   - a tick that changes a row rebuilds the body of that table, and only that
- *     one, and its ETag moves; a manifest taken before it shows up in the
+ *     one, and its manifest's ETag moves; a manifest taken before it shows up in the
  *     entries as a hash mismatch, never as mixed data;
  *   - a tick that adds or deletes a title rebuilds;
  *   - a failed scan drops both bodies;
@@ -134,7 +134,6 @@ const { buildMoviePayloadEntry, buildTvPayloadEntry } = await import('../../lib/
 const {
   MediaPayloadCache,
   PAYLOAD_CACHE_MAX_AGE_MS,
-  createMediaListHandler,
   compressionFilter,
   autoCaptionsContextKey,
   clearPayloadsAfterScan,
@@ -313,7 +312,6 @@ beforeAll(async () => {
     ['/media/movies', movieCache],
     ['/media/tv', tvCache],
   ]) {
-    app.get(path, createMediaListHandler(cache, opts('list')));
     app.get(`${path}/manifest`, createManifestHandler(cache, opts('manifest')));
     app.post(`${path}/entries`, createEntriesBodyParser(), createEntriesHandler(cache, opts('entries')));
   }
@@ -359,9 +357,9 @@ describe('a scan of an unchanged library', () => {
     expect(dropped).toEqual([]);
   });
 
-  it('keeps both bodies: the next GET builds nothing, and a matching If-None-Match is still a 304', async () => {
-    const tvFirst = await rawRequest('GET', '/media/tv');
-    const movieFirst = await rawRequest('GET', '/media/movies');
+  it('keeps both bodies: the next manifest request builds nothing, and a matching If-None-Match is still a 304', async () => {
+    const tvFirst = await rawRequest('GET', '/media/tv/manifest');
+    const movieFirst = await rawRequest('GET', '/media/movies/manifest');
     expect([tvFirst.status, movieFirst.status]).toEqual([200, 200]);
     const tvEntry = tvCache.peek();
     const movieEntry = movieCache.peek();
@@ -373,16 +371,16 @@ describe('a scan of an unchanged library', () => {
     expect(movieCache.peek()).toBe(movieEntry);
 
     // As the frontend sync asks: Node's fetch adds Cache-Control: no-cache.
-    const tvConditional = await fetch(`${baseUrl}/media/tv`, { headers: { 'If-None-Match': tvFirst.headers.etag } });
+    const tvConditional = await fetch(`${baseUrl}/media/tv/manifest`, { headers: { 'If-None-Match': tvFirst.headers.etag } });
     expect(tvConditional.status).toBe(304);
     expect(tvConditional.headers.get('etag')).toBe(tvFirst.headers.etag);
-    const movieConditional = await fetch(`${baseUrl}/media/movies`, {
+    const movieConditional = await fetch(`${baseUrl}/media/movies/manifest`, {
       headers: { 'If-None-Match': movieFirst.headers.etag },
     });
     expect(movieConditional.status).toBe(304);
 
-    // A plain GET is the cached body, as it was.
-    const tvAgain = await rawRequest('GET', '/media/tv');
+    // A plain request gets the cached manifest, as it was.
+    const tvAgain = await rawRequest('GET', '/media/tv/manifest');
     expect(tvAgain.headers.etag).toBe(tvFirst.headers.etag);
     expect(tvAgain.body.equals(tvFirst.body)).toBe(true);
 
@@ -416,10 +414,10 @@ describe('a scan of an unchanged library', () => {
 // ---------------------------------------------------------------- ticks that change rows
 
 describe('a scan that changes rows', () => {
-  it('rebuilds the body of the table that changed, and only that one, and its ETag moves', async () => {
-    const tvFirst = await rawRequest('GET', '/media/tv');
-    const movieFirst = await rawRequest('GET', '/media/movies');
-    const oldManifestResponse = await rawRequest('GET', '/media/tv/manifest');
+  it('rebuilds the body of the table that changed, and only that one, and its manifest moves', async () => {
+    const tvFirst = await rawRequest('GET', '/media/tv/manifest');
+    const movieFirst = await rawRequest('GET', '/media/movies/manifest');
+    const oldManifestResponse = tvFirst;
     const oldManifest = JSON.parse(oldManifestResponse.body);
     const oldManifestEtag = oldManifestResponse.headers.etag;
     const before = { generations: generations(), loads: loads() };
@@ -435,16 +433,16 @@ describe('a scan that changes rows', () => {
         tv_shows: before.generations.tv_shows + 1,
       });
 
-      const tvAfter = await rawRequest('GET', '/media/tv', { headers: { 'If-None-Match': tvFirst.headers.etag } });
+      const tvAfter = await rawRequest('GET', '/media/tv/manifest', { headers: { 'If-None-Match': tvFirst.headers.etag } });
       expect(tvAfter.status).toBe(200);
       expect(tvAfter.headers.etag).not.toBe(tvFirst.headers.etag);
-      expect(Object.keys(JSON.parse(tvAfter.body)['Some Show'].seasons['Season 1'].episodes)).toEqual([
+      expect(JSON.parse(tvAfter.body).titles['Some Show'].seasons['Season 1']).toEqual([
         'S01E01',
         'S01E02',
         'S01E03',
       ]);
 
-      const movieAfter = await rawRequest('GET', '/media/movies', {
+      const movieAfter = await rawRequest('GET', '/media/movies/manifest', {
         headers: { 'If-None-Match': movieFirst.headers.etag },
       });
       expect(movieAfter.status).toBe(304);
@@ -455,7 +453,8 @@ describe('a scan that changes rows', () => {
       // manifest's ETag, so the mismatch shows. Never the old hash on new bytes.
       const entries = await postJson('/media/tv/entries', { titles: ['Some Show'] });
       expect(entries.headers['x-manifest-etag']).not.toBe(oldManifestEtag);
-      expect(entries.headers['x-library-etag']).toBe(tvAfter.headers.etag);
+      expect(entries.headers['x-manifest-etag']).toBe(tvAfter.headers.etag);
+      expect(entries.headers['x-library-etag']).toBeUndefined();
       const [line] = entryLines(entries.body);
       expect(line.value.hash).not.toBe(oldManifest.titles['Some Show'].hash);
       expect(line.value.hash).toBe(shortHash(line.entryBytes));
@@ -467,7 +466,7 @@ describe('a scan that changes rows', () => {
   });
 
   it('rebuilds when a title is added, and again when it is deleted', async () => {
-    const first = await rawRequest('GET', '/media/movies');
+    const first = await rawRequest('GET', '/media/movies/manifest');
     const folder = join(MEDIA, 'movies', 'Gamma Movie');
 
     await writeFiles(folder, ['Gamma.1080p.mp4']);
@@ -475,9 +474,9 @@ describe('a scan that changes rows', () => {
       const added = await tick();
       expect(added.dropped).toEqual(['movies']);
       expect(await writeLog()).toEqual([{ tbl: 'movies', op: 'insert', name: 'Gamma Movie' }]);
-      const withGamma = await rawRequest('GET', '/media/movies', { headers: { 'If-None-Match': first.headers.etag } });
+      const withGamma = await rawRequest('GET', '/media/movies/manifest', { headers: { 'If-None-Match': first.headers.etag } });
       expect(withGamma.status).toBe(200);
-      expect(Object.keys(JSON.parse(withGamma.body))).toContain('Gamma Movie');
+      expect(Object.keys(JSON.parse(withGamma.body).titles)).toContain('Gamma Movie');
 
       await clearWriteLog();
       await fs.rm(folder, { recursive: true, force: true });
@@ -487,11 +486,11 @@ describe('a scan that changes rows', () => {
       expect(await writeLog()).toEqual([{ tbl: 'movies', op: 'delete', name: 'Gamma Movie' }]);
       expect(generations().movies).toBe(generationBefore + 1);
 
-      const withoutGamma = await rawRequest('GET', '/media/movies', {
+      const withoutGamma = await rawRequest('GET', '/media/movies/manifest', {
         headers: { 'If-None-Match': withGamma.headers.etag },
       });
       expect(withoutGamma.status).toBe(200);
-      expect(Object.keys(JSON.parse(withoutGamma.body))).not.toContain('Gamma Movie');
+      expect(Object.keys(JSON.parse(withoutGamma.body).titles)).not.toContain('Gamma Movie');
       // The same rows as before the title came: the same ETag.
       expect(withoutGamma.headers.etag).toBe(first.headers.etag);
     } finally {
@@ -504,8 +503,8 @@ describe('a scan that changes rows', () => {
 
 describe('a failed scan', () => {
   it('drops both bodies, though no row changed', async () => {
-    const tvFirst = await rawRequest('GET', '/media/tv');
-    const movieFirst = await rawRequest('GET', '/media/movies');
+    const tvFirst = await rawRequest('GET', '/media/tv/manifest');
+    const movieFirst = await rawRequest('GET', '/media/movies/manifest');
     const before = { generations: generations(), loads: loads() };
 
     await expect(tick({ moviesDir: join(MEDIA, 'no-such-folder') })).rejects.toThrow(/ENOENT/);
@@ -514,8 +513,8 @@ describe('a failed scan', () => {
     expect(tvCache.peek()).toBeNull();
     expect(movieCache.peek()).toBeNull();
 
-    const tvAfter = await rawRequest('GET', '/media/tv', { headers: { 'If-None-Match': tvFirst.headers.etag } });
-    const movieAfter = await rawRequest('GET', '/media/movies', { headers: { 'If-None-Match': movieFirst.headers.etag } });
+    const tvAfter = await rawRequest('GET', '/media/tv/manifest', { headers: { 'If-None-Match': tvFirst.headers.etag } });
+    const movieAfter = await rawRequest('GET', '/media/movies/manifest', { headers: { 'If-None-Match': movieFirst.headers.etag } });
     // Rebuilt, and the rows did not change: the same tags, so still 304s.
     expect([tvAfter.status, movieAfter.status]).toEqual([304, 304]);
     expect(loads()).toEqual({ movies: before.loads.movies + 1, tv: before.loads.tv + 1 });
@@ -547,7 +546,7 @@ describe('the other reasons a body is dropped', () => {
     expect(movieCache.peek()).toBeNull();
 
     const withStubs = await movieCache.get();
-    expect(withStubs.etag).not.toBe(withoutStubs.etag);
+    expect(withStubs.body.equals(withoutStubs.body)).toBe(false);
     expect(JSON.parse(withStubs.body)['Alpha Movie'].urls.subtitles['English - Auto Generated']).toBeDefined();
   });
 
@@ -576,7 +575,7 @@ describe('the other reasons a body is dropped', () => {
     expect(cache.peek()).toBeNull();
     const second = await cache.get();
     expect(built).toBe(2);
-    expect(second.etag).toBe(first.etag);
+    expect(second.body.equals(first.body)).toBe(true);
   });
 
   it('a cache with no generation to compare is always dropped', async () => {
@@ -607,7 +606,7 @@ describe('the other reasons a body is dropped', () => {
 
 describe('a write made outside a scan', () => {
   it('is picked up by the next clear point', async () => {
-    const first = await rawRequest('GET', '/media/movies');
+    const first = await rawRequest('GET', '/media/movies/manifest');
     const tvEntry = await tvCache.get();
     const generationBefore = generations().movies;
 
@@ -617,22 +616,22 @@ describe('a write made outside a scan', () => {
       expect(generations().movies).toBe(generationBefore + 1);
 
       // The cache is not told until a clear point, as with a scan's writes.
-      const meanwhile = await rawRequest('GET', '/media/movies', { headers: { 'If-None-Match': first.headers.etag } });
+      const meanwhile = await rawRequest('GET', '/media/movies/manifest', { headers: { 'If-None-Match': first.headers.etag } });
       expect(meanwhile.status).toBe(304);
 
       // The next clear point (here POST /media/scan's, which runs the same
       // check as the tick's) drops the movie body and keeps the TV one.
       expect(clearPayloadsAfterScan(CACHES, { reason: 'POST /media/scan' })).toEqual(['movies']);
       expect(tvCache.peek()).toBe(tvEntry);
-      const after = await rawRequest('GET', '/media/movies', { headers: { 'If-None-Match': first.headers.etag } });
+      const after = await rawRequest('GET', '/media/movies/manifest', { headers: { 'If-None-Match': first.headers.etag } });
       expect(after.status).toBe(200);
-      expect(Object.keys(JSON.parse(after.body))).not.toContain('Alpha Movie');
+      expect(Object.keys(JSON.parse(after.body).titles)).not.toContain('Alpha Movie');
     } finally {
       // The next tick puts the row back: the folder is still on disk.
       const { dropped } = await tick();
       expect(dropped).toEqual(['movies']);
     }
-    const restored = await rawRequest('GET', '/media/movies');
+    const restored = await rawRequest('GET', '/media/movies/manifest');
     expect(restored.headers.etag).toBe(first.headers.etag);
   });
 
@@ -660,7 +659,7 @@ describe('a write made outside a scan', () => {
       expect(clearPayloadsAfterScan([cache], { reason: 'scan tick' })).toEqual(['movies']);
       release();
       const overtaken = await pending;
-      expect(overtaken.etag).toBeTruthy(); // its requests are still answered
+      expect(overtaken.body.length).toBeGreaterThan(0); // its requests are still answered
       expect(cache.peek()).toBeNull();
 
       const fresh = await cache.get();

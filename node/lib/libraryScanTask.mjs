@@ -1,15 +1,14 @@
 // lib/libraryScanTask.mjs
 //
 // The two library scans that are not the scan tick's: POST /media/scan, and the
-// scan the /media/tv and /media/movies payload loaders run when their table is
-// empty. Both run as MEDIA_SCAN tasks, so the task manager never runs them
+// scan the TV and movie payload loaders run when their table is empty. Both run as MEDIA_SCAN tasks, so the task manager never runs them
 // beside a scan tick or the startup blurhash healing pass (one exclusive
 // group): each waits until the group is free, then runs.
 // They used to call the scanners directly, so they could overlap any of those.
 //
 // WHERE THEY ARE CALLED FROM. Both are reached from an HTTP request, never from
 // inside a task. POST /media/scan is a route. The payload loader runs inside
-// MediaPayloadCache.get(), and only the /media/{tv,movies} list, manifest and
+// MediaPayloadCache.get(), and only the /media/{tv,movies} manifest and
 // entries handlers call that. A request is not a task, so it can wait for the
 // group. Called from code inside a task that holds the group (that task's own
 // code, or a task enqueued from it), waiting would never end: the group frees
@@ -19,7 +18,7 @@
 //
 // One path the task manager cannot see crosses the network: the scan tick holds
 // the group while its Auto Sync POSTs to the frontend, and the frontend's sync
-// then reads /media/tv and /media/movies. That does not deadlock because the
+// then reads the manifests and entries. That does not deadlock because the
 // frontend answers the POST (202) before its sync reads anything; a frontend
 // that answered only after its sync would make an empty-table read wait for a
 // tick that waits for it.

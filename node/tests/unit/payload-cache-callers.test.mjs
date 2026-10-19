@@ -1,5 +1,5 @@
 /**
- * MediaPayloadCache.get() is called from the HTTP list, manifest and entries
+ * MediaPayloadCache.get() is called from the HTTP manifest and entries
  * handlers only, read off the source.
  *
  * A build runs loadRows, which may scan an empty table as a MEDIA_SCAN task
@@ -9,14 +9,15 @@
  * task: neither would ever finish. So no task may reach get(). This pins every
  * path to it:
  *
- *   - the only `.get()` calls with no argument in the processor's code are the
- *     two in the list handler (createMediaListHandler's) and currentGeneration;
+ *   - the only `.get()` call with no argument in the processor's code is the
+ *     one in currentGeneration;
  *   - currentGeneration is called only by the manifest and entries handlers
  *     (createManifestHandler's and createEntriesHandler's);
- *   - the three handler factories are called only where a route is mounted:
- *     createMediaListHandler and createManifestHandler inside app.get(...) in
- *     app.mjs, createEntriesHandler inside mountMediaEntriesRoute, which only
- *     app.mjs calls;
+ *   - the two handler factories are called only where a route is mounted:
+ *     createManifestHandler inside app.get(...) in app.mjs,
+ *     createEntriesHandler inside mountMediaEntriesRoute, which only app.mjs
+ *     calls; the whole-library list handler (createMediaListHandler) went in
+ *     P4 and stays gone;
  *   - only app.mjs builds a MediaPayloadCache.
  *
  * Comment lines are not code, so they are left out of the scan.
@@ -73,12 +74,8 @@ describe('MediaPayloadCache.get() callers', () => {
     expect(names.some((name) => name.startsWith('node_modules/') || name.startsWith('tests/'))).toBe(false);
   });
 
-  it('has two get() calls, in the list handler and in the manifest and entries handlers\' reader', () => {
-    expect(callSites(FILES, /\.get\(\s*\)/g)).toEqual([
-      'lib/mediaManifest.mjs:currentGeneration',
-      // The handler createMediaListHandler returns.
-      'lib/mediaPayloadCache.mjs:mediaListHandler',
-    ]);
+  it('has one get() call, in the manifest and entries handlers\' reader', () => {
+    expect(callSites(FILES, /\.get\(\s*\)/g)).toEqual(['lib/mediaManifest.mjs:currentGeneration']);
   });
 
   it('reads currentGeneration from the manifest and entries handlers only', () => {
@@ -92,17 +89,17 @@ describe('MediaPayloadCache.get() callers', () => {
   it('calls the handler factories only where routes are mounted', () => {
     const calls = (name) => callSites(FILES, new RegExp(`(?<!function\\s)\\b${name}\\s*\\(`, 'g'));
     const files = (name) => calls(name).map((site) => site.split(':')[0]);
-    expect(files('createMediaListHandler')).toEqual(['app.mjs', 'app.mjs']);
+    expect(FILES.some(({ code }) => /\bcreateMediaListHandler\b/.test(code))).toBe(false);
     expect(files('createManifestHandler')).toEqual(['app.mjs', 'app.mjs']);
     expect(calls('createEntriesHandler')).toEqual(['lib/requestBodyParsers.mjs:mountMediaEntriesRoute']);
     expect(files('mountMediaEntriesRoute')).toEqual(['app.mjs', 'app.mjs']);
 
-    // In app.mjs those four calls are each the handler argument of an
-    // app.get(...) for a list or manifest path, and the two entries mounts
-    // are top-level statements.
+    // In app.mjs those two calls are each the handler argument of an
+    // app.get(...) for a manifest path, and the two entries mounts are
+    // top-level statements.
     const app = FILES.find((f) => f.file === 'app.mjs').code;
-    const mounted = /\bapp\.get\(\s*["'`]\/media\/(?:tv|movies)(?:\/manifest)?["'`]\s*,\s*authenticateWebhookOrUser\s*,\s*create(?:MediaList|Manifest)Handler\(/g;
-    expect(app.match(mounted)).toHaveLength(4);
+    const mounted = /\bapp\.get\(\s*["'`]\/media\/(?:tv|movies)\/manifest["'`]\s*,\s*authenticateWebhookOrUser\s*,\s*createManifestHandler\(/g;
+    expect(app.match(mounted)).toHaveLength(2);
     expect(app.match(/^mountMediaEntriesRoute\(app, \{$/gm)).toHaveLength(2);
   });
 

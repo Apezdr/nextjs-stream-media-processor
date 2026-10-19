@@ -31,7 +31,6 @@ import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./util
 import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
 import {
   MediaPayloadCache,
-  createMediaListHandler,
   compressionFilter,
   watchPayloadContext,
   autoCaptionsContextKey,
@@ -120,8 +119,8 @@ const CHROME_HEIGHT_LIMIT = 30780; // Chrome's maximum image height limit
 const TV_LIST_VERSION = 1.0001;
 const MOVIE_LIST_VERSION = 1.0001;
 
-// Enable compression for all responses, except the cached media lists, which
-// send their own gzip copy (lib/mediaPayloadCache.mjs).
+// Enable compression for all responses, except the media manifests and
+// entries, which send their own gzip (lib/mediaPayloadCache.mjs).
 app.use(compression({ filter: compressionFilter }));
 
 // Helper function to check if origin is related to server domain
@@ -485,9 +484,9 @@ async function readPayloadContext() {
   }
 }
 
-// The /media/tv and /media/movies bodies, built again only when their rows or
-// the autoCaptions settings change. See lib/mediaPayloadCache.mjs for when
-// they are dropped.
+// The TV and movie bodies the manifests and entries are cut from, built again
+// only when their rows or the autoCaptions settings change. See
+// lib/mediaPayloadCache.mjs for when they are dropped.
 const tvPayloadCache = new MediaPayloadCache({
   kind: 'tv',
   version: TV_LIST_VERSION,
@@ -546,22 +545,16 @@ const moviePayloadCache = new MediaPayloadCache({
 });
 
 /**
- * After a scan: drop each cached list body whose rows changed, or both when the
+ * After a scan: drop each cached body whose rows changed, or both when the
  * scan failed (it may have written some rows before it stopped).
  */
 function clearMediaPayloads(reason, { failed = false } = {}) {
   clearPayloadsAfterScan([tvPayloadCache, moviePayloadCache], { reason, failed });
 }
 
-app.get(
-  "/media/tv",
-  authenticateWebhookOrUser,
-  createMediaListHandler(tvPayloadCache, { logger, errorLabel: 'Error fetching TV shows' })
-);
-
-// Per-title views of the same cached body: a manifest of title hashes (with
-// each show's season and episode keys), and the entries for chosen titles.
-// See lib/mediaManifest.mjs.
+// Per-title views of the cached body: a manifest of title hashes (with each
+// show's season and episode keys), and the entries for chosen titles. See
+// lib/mediaManifest.mjs. (The whole-library GET /media/tv went in P4.)
 app.get(
   "/media/tv/manifest",
   authenticateWebhookOrUser,
@@ -601,12 +594,6 @@ async function generateListMovies(db, dirPath) {
     throw error;
   }
 }
-
-app.get(
-  "/media/movies",
-  authenticateWebhookOrUser,
-  createMediaListHandler(moviePayloadCache, { logger, errorLabel: 'Error fetching movies' })
-);
 
 app.get(
   "/media/movies/manifest",
@@ -1085,7 +1072,7 @@ async function initialize() {
   server = app.listen(port, async () => {
     scheduleTasks();
     // The autoCaptions settings live in Mongo and the frontend writes them, so
-    // the cached list bodies learn of a change by polling.
+    // the cached bodies learn of a change by polling.
     watchPayloadContext([tvPayloadCache, moviePayloadCache], { logger });
     // The identity reconcile has its own cadence (IDENTITY_RECONCILE_INTERVAL_SECONDS,
     // default 60s) so the report stays fresh while a long scan tick runs.
@@ -1139,7 +1126,7 @@ app.get('/', (req, res) => {
     endpoints: {
       media: {
         description: 'Media library endpoints',
-        routes: ['/media/movies', '/media/tv', '/media/movies/manifest', '/media/tv/manifest', '/media/movies/entries', '/media/tv/entries', '/media/scan']
+        routes: ['/media/movies/manifest', '/media/tv/manifest', '/media/movies/entries', '/media/tv/entries', '/media/scan']
       },
       api: {
         description: 'API operations',
@@ -1191,8 +1178,6 @@ app.use((req, res, next) => {
     '/media': {
       description: 'Media library endpoints',
       endpoints: [
-        '/media/movies - List all movies',
-        '/media/tv - List all TV shows',
         '/media/movies/manifest, /media/tv/manifest - Per-title hashes (TV: season and episode keys)',
         '/media/movies/entries, /media/tv/entries - POST {titles} or {all}: chosen entries as NDJSON',
         '/media/scan - POST: scan the movie library, after any running scan; 200 when done'

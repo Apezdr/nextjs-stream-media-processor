@@ -2,13 +2,13 @@
  * GET /media/<kind>/manifest and POST /media/<kind>/entries, end to end:
  * fixture library on disk → real scanner → real SQLite → the real builders →
  * MediaPayloadCache → the real handlers behind the real compression
- * middleware, over HTTP, next to the GET /media/<kind> they are cut from.
+ * middleware, over HTTP, next to the cached body they are cut from.
  *
  * What it pins:
  *
- *   - the manifest lists every title of the GET body by folder name, with the
- *     16-hex hash of the entry bytes, and each show's season and episode keys
- *     exactly as the GET body has them;
+ *   - the manifest lists every title of the cached body by folder name, with
+ *     the 16-hex hash of the entry bytes, and each show's season and episode
+ *     keys exactly as the body has them;
  *   - an entries line carries that hash over the very bytes it sends, so the
  *     frontend can store the hash of what it applied;
  *   - one changed row moves that title's hash and the manifest ETag, nothing
@@ -101,7 +101,7 @@ const { injectMovieStubs, injectTvStubs } = await import(
 );
 const { langMap } = await import('../../utils/languageMap.mjs');
 const { buildMoviePayloadEntry, buildTvPayloadEntry } = await import('../../lib/mediaPayload.mjs');
-const { MediaPayloadCache, createMediaListHandler, compressionFilter } = await import(
+const { MediaPayloadCache, compressionFilter } = await import(
   '../../lib/mediaPayloadCache.mjs'
 );
 const {
@@ -110,6 +110,7 @@ const {
   ENTRIES_REQUEST_BODY_LIMIT,
   tvManifestKeys,
   buildManifest,
+  getManifest,
   parseEntriesRequest,
   createManifestHandler,
   createEntriesBodyParser,
@@ -292,7 +293,12 @@ function titlesOfBody(body) {
   return Object.keys(body).filter((key) => key !== 'version');
 }
 
-/** A show's season → episode keys, read off the GET /media/tv body. */
+/** The cached body of `cache`, parsed: what the manifest and entries are cut from. */
+async function cachedBody(cache) {
+  return JSON.parse((await cache.get()).body);
+}
+
+/** A show's season → episode keys, read off the cached TV body. */
 function keysFromBody(show) {
   return Object.fromEntries(
     Object.entries(show.seasons ?? {}).map(([seasonKey, season]) => [seasonKey, Object.keys(season?.episodes ?? {})])
@@ -332,7 +338,6 @@ beforeAll(async () => {
     ['/big', bigCache],
     ['/broken', brokenCache],
   ]) {
-    app.get(path, createMediaListHandler(cache, opts('list')));
     app.get(`${path}/manifest`, createManifestHandler(cache, opts('manifest')));
     app.post(`${path}/entries`, createEntriesBodyParser(), createEntriesHandler(cache, opts('entries')));
   }
@@ -367,12 +372,12 @@ beforeEach(() => {
 // ---------------------------------------------------------------- the manifest
 
 describe('the manifest', () => {
-  it('lists every title of the GET body by folder name, with the hash of its entry bytes', async () => {
+  it('lists every title of the cached body by folder name, with the hash of its entry bytes', async () => {
     for (const [kind, cache, version] of [
       ['movies', movieCache, MOVIE_LIST_VERSION],
       ['tv', tvCache, TV_LIST_VERSION],
     ]) {
-      const { json: body } = await getJson(`/media/${kind}`);
+      const body = await cachedBody(cache);
       const { json: manifest } = await getJson(`/media/${kind}/manifest`);
 
       expect(MANIFEST_FORMAT_VERSION).toBe(2);
@@ -392,8 +397,8 @@ describe('the manifest', () => {
     }
   });
 
-  it('carries each show\'s season and episode keys exactly as GET /media/tv has them', async () => {
-    const { json: body } = await getJson('/media/tv');
+  it('carries each show\'s season and episode keys exactly as the cached body has them', async () => {
+    const body = await cachedBody(tvCache);
     const { json: manifest } = await getJson('/media/tv/manifest');
 
     expect(Object.keys(manifest.titles)).toEqual(['Other Show', 'Some Show']);
@@ -432,13 +437,6 @@ describe('the manifest', () => {
     expect(explicit.headers.etag).toBe(etag);
     expect(explicit.body.length).toBe(0);
     expect(tvLoads).toBe(loadsBefore);
-
-    // The manifest's tag and the list's tag name different bytes: neither
-    // answers for the other.
-    const listTag = (await rawRequest('GET', '/media/tv')).headers.etag;
-    expect(listTag).not.toBe(etag);
-    expect((await rawRequest('GET', '/media/tv/manifest', { headers: { 'If-None-Match': listTag } })).status).toBe(200);
-    expect((await rawRequest('GET', '/media/tv', { headers: { 'If-None-Match': etag } })).status).toBe(200);
   });
 
   it('sends its gzip copy when the client takes it, the identity bytes otherwise', async () => {
@@ -494,7 +492,7 @@ describe('the manifest', () => {
       expect(after.json.titles['Some Show'].seasons['Season 1']).toEqual(['S01E01', 'S01E02', 'S01E03']);
       expect(after.json.titles['Some Show'].hash).not.toBe(before.json.titles['Some Show'].hash);
       expect(after.json.titles['Other Show']).toEqual(before.json.titles['Other Show']);
-      expect(after.json.titles['Some Show'].seasons).toEqual(keysFromBody((await getJson('/media/tv')).json['Some Show']));
+      expect(after.json.titles['Some Show'].seasons).toEqual(keysFromBody((await cachedBody(tvCache))['Some Show']));
     } finally {
       await fs.rm(join(seasonDir, 'Some Show - S01E03.mkv'));
       await scanTVShows(db, join(MEDIA, 'tv'), PREFIX, MEDIA, langMap, false, async () => {});
@@ -510,7 +508,7 @@ describe('the manifest', () => {
     expect((await rawRequest('GET', '/broken/manifest')).status).toBe(200);
   });
 
-  it('fails closed without a show\'s keys, and leaves GET /media/tv as it was', async () => {
+  it('fails closed without a show\'s keys, and leaves the cached body as it was', async () => {
     const reference = await tvCache.get();
 
     // A describe that throws for one show: the list is untouched, the manifest
@@ -537,7 +535,6 @@ describe('the manifest', () => {
     const logger = { ...quietLogger, error: (message) => errors.push(message) };
     for (const cache of [throwing, undescribed]) {
       const built = await cache.get();
-      expect(built.etag).toBe(reference.etag);
       expect(built.body.equals(reference.body)).toBe(true);
 
       const app = express();
@@ -569,7 +566,7 @@ describe('the manifest', () => {
 
 describe('the entries', () => {
   it('answers a list in the order asked, once per title, with a line for a title it does not have', async () => {
-    const { res: listRes, json: body } = await getJson('/media/movies');
+    const body = await cachedBody(movieCache);
     const manifestRes = await rawRequest('GET', '/media/movies/manifest');
 
     const res = await postJson('/media/movies/entries', {
@@ -579,7 +576,8 @@ describe('the entries', () => {
     expect(res.headers['content-type']).toBe('application/x-ndjson; charset=utf-8');
     expect(res.headers['content-encoding']).toBeUndefined();
     expect(res.headers['x-manifest-etag']).toBe(manifestRes.headers.etag);
-    expect(res.headers['x-library-etag']).toBe(listRes.headers.etag);
+    // P4: the whole-library ETag went with its route.
+    expect(res.headers['x-library-etag']).toBeUndefined();
 
     const lines = ndjsonLines(res.body).map((line) => line.value);
     expect(lines.map((line) => line.title)).toEqual(['Zeta Movie', 'No Such Movie', 'Alpha Movie']);
@@ -607,9 +605,9 @@ describe('the entries', () => {
     }
   });
 
-  it('answers all with every title of the GET body, in its order', async () => {
-    for (const kind of ['movies', 'tv']) {
-      const { json: body } = await getJson(`/media/${kind}`);
+  it('answers all with every title of the cached body, in its order', async () => {
+    for (const [kind, cache] of [['movies', movieCache], ['tv', tvCache]]) {
+      const body = await cachedBody(cache);
       const lines = ndjsonLines((await postJson(`/media/${kind}/entries`, { all: true })).body).map((l) => l.value);
       expect(lines.map((line) => line.title)).toEqual(titlesOfBody(body));
       for (const line of lines) expect(line.entry).toEqual(body[line.title]);
@@ -835,7 +833,7 @@ describe('the entries stream', () => {
     bigFill = 'b';
     bigCache.invalidate('scan tick');
     const second = await bigCache.get();
-    expect(second.etag).not.toBe(first.etag);
+    expect(second.body.equals(first.body)).toBe(false);
 
     // Now read it all: every line from the generation the response began with.
     const chunks = [];
@@ -845,7 +843,7 @@ describe('the entries stream', () => {
       response.on('end', resolve);
       response.on('error', reject);
     });
-    expect(response.headers['x-library-etag']).toBe(first.etag);
+    expect(response.headers['x-manifest-etag']).toBe((await getManifest(bigCache, first)).etag);
 
     const lines = ndjsonLines(Buffer.concat(chunks));
     expect(lines).toHaveLength(BIG_TITLES);

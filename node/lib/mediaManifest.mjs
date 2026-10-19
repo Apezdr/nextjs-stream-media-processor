@@ -1,43 +1,42 @@
 // lib/mediaManifest.mjs
 //
-// GET /media/<kind>/manifest and POST /media/<kind>/entries: the cached
-// /media/tv and /media/movies bodies (lib/mediaPayloadCache.mjs), one title at
-// a time.
+// GET /media/<kind>/manifest and POST /media/<kind>/entries: the cached TV and
+// movie bodies (lib/mediaPayloadCache.mjs), one title at a time.
 //
-// Every sync tick downloads each server's whole library (about 31 MB on the
-// production library), though between two ticks a handful of titles change at
-// most. These routes let the frontend fetch only those: the manifest says what
-// each title's entry is (a hash) and, for TV, which seasons and episodes it
-// has; the entries route sends the entries asked for. Both read the same cache
-// generation as GET /media/<kind>, so nothing here builds or reads a row.
+// The whole library is about 31 MB on the production library, though between
+// two sync ticks a handful of titles change at most. These routes let the
+// frontend fetch only those: the manifest says what each title's entry is (a
+// hash) and, for TV, which seasons and episodes it has; the entries route
+// sends the entries asked for. Both read the cached body, so nothing here
+// builds or reads a row. (The whole-library GET /media/<kind> went in P4.)
 //
 // THE MANIFEST (GET /media/tv/manifest, GET /media/movies/manifest)
 //
 //   {
 //     "format": 2,                     MANIFEST_FORMAT_VERSION
 //     "kind": "tv",                    or "movies"
-//     "version": 1.0001,               the list version GET /media/<kind> ends with
+//     "version": 1.0001,               the list version (TV_LIST_VERSION / MOVIE_LIST_VERSION)
 //     "titles": {
 //       "<folder name>": {
 //         "hash": "0123456789abcdef",  the first 16 hex digits of the SHA-1 of the
 //                                      title's entry, byte for byte as it sits in
-//                                      the GET /media/<kind> body
+//                                      the cached body
 //         "seasons": {                 TV only: every season key with its episode
-//           "Season 1": ["S01E01", "S01E02"]   keys, as the GET body has them
+//           "Season 1": ["S01E01", "S01E02"]   keys, as the entry has them
 //         }
 //       }
 //     }
 //   }
 //
-// Titles are keyed by title: the folder name, the key of the GET body. Never by
-// mediaId, which can be null or differ between servers. They come in the body's
+// Titles are keyed by title: the folder name. Never by mediaId, which can be
+// null or differ between servers. They come in the body's
 // order (by name). A season without an episodes map lists []. On the production
 // library the manifest is about 130 KB.
 //
 // Its ETag is a weak tag over the manifest bytes, so it moves whenever a title
 // hash, the title set, a season or episode key set, the list version or the
-// format moves. It is answered like GET /media/<kind>: If-None-Match is compared
-// first and a match is a bodyless 304 whatever the request's Cache-Control says
+// format moves. If-None-Match is compared first, and a match is a bodyless 304
+// whatever the request's Cache-Control says
 // (Node's fetch adds no-cache to every conditional request); the bytes and
 // their gzip copy are built once per cache generation.
 //
@@ -79,13 +78,14 @@
 // check the hash itself. The hash comes from the same generation as the bytes.
 // A title the library does not have (any more) gets a `missing` line.
 //
-// Two headers name the generation the lines come from, on every 200, before
+// One header names the generation the lines come from, on every 200, before
 // the first line: X-Manifest-ETag is the ETag GET /media/<kind>/manifest has
-// for it, X-Library-ETag the ETag GET /media/<kind> has for it. The manifest's
-// bytes begin with its `format`, so X-Manifest-ETag also pins the format: lines
-// whose X-Manifest-ETag is the ETag of the manifest a reader holds are in that
-// manifest's format. Neither header is exposed to browsers through CORS: read
-// them from a server-side fetch.
+// for it. The manifest's bytes begin with its `format`, so X-Manifest-ETag also
+// pins the format: lines whose X-Manifest-ETag is the ETag of the manifest a
+// reader holds are in that manifest's format. The header is not exposed to
+// browsers through CORS: read it from a server-side fetch. (X-Library-ETag,
+// the ETag of the whole-library GET, went with that route in P4; no reader
+// used it.)
 //
 // The frontend stores the line's hash with what it applied. If the cache was
 // rebuilt between its manifest and entries requests, the line's hash (and
@@ -420,7 +420,6 @@ export function createEntriesHandler(cache, { logger, errorLabel, chunkBytes = E
     res.status(200);
     res.setHeader('Content-Type', NDJSON_CONTENT_TYPE);
     res.setHeader('X-Manifest-ETag', manifest.etag);
-    res.setHeader('X-Library-ETag', entry.etag);
     res.vary('Accept-Encoding');
     if (useGzip) res.setHeader('Content-Encoding', 'gzip');
 

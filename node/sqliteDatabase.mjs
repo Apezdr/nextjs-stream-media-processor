@@ -88,9 +88,9 @@ function getWriteMutex(dbType) {
 
 // --- Media table generations ---
 //
-// GET /media/tv and GET /media/movies keep their bodies between requests
-// (lib/mediaPayloadCache.mjs) and drop them at the end of a scan only when the
-// rows they were built from changed. Each table's generation counts the writes
+// The TV and movie bodies the manifests and entries are cut from are kept
+// between requests (lib/mediaPayloadCache.mjs) and dropped at the end of a scan
+// only when the rows they were built from changed. Each table's generation counts the writes
 // that changed a row of it. The functions below that write movies and tv_shows
 // are the only code that writes those tables, and each one bumps the table's
 // generation itself when SQLite reports a changed row, so a write is seen
@@ -818,8 +818,8 @@ function withMetadataHash(url, table, row) {
 
 export async function getTVShows() {
   return withDb("main", async (db) => {
-    // Ordered, so /media/tv and its ETag (lib/mediaPayloadCache.mjs) depend on
-    // the rows alone, never on the order SQLite happens to return them in.
+    // Ordered, so the TV body and its manifest (lib/mediaPayloadCache.mjs)
+    // depend on the rows alone, never on the order SQLite returns them in.
     const shows = await withRetry(() => db.all('SELECT * FROM tv_shows ORDER BY name'));
     
     // Process each show using CACHED hashes for ALL images (NO filesystem I/O)
@@ -865,8 +865,8 @@ export async function getTVShows() {
         // entry and its manifest hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
-        // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
-        // to /media/tv — the app.mjs handler allowlist drops it.
+        // Internal-only (G-5): raw pre-override TMDB payload. Never serialized:
+        // the payload builder's allowlist (lib/mediaPayload.mjs) drops it.
         pristineMetadata: show.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
         posterSourceUrl: show.poster_source_url ?? null,
@@ -898,7 +898,7 @@ export async function getTVShowNamesAndHashes() {
 
 export async function getMovies() {
   return withDb("main", async (db) => {
-    // Ordered for the same reason as getTVShows: the /media/movies ETag.
+    // Ordered for the same reason as getTVShows: the movies manifest.
     const movies = await withRetry(() => db.all('SELECT * FROM movies ORDER BY name'));
     
     // Process each movie using CACHED hashes (NO filesystem I/O)
@@ -956,8 +956,8 @@ export async function getMovies() {
         basePath: movie.base_path,
         backdropFocal: movie.backdrop_focal ?? null,
         backdropFocalSuggested: movie.backdrop_focal_suggested ?? null,
-        // Internal-only columns — never serialized to /media/movies (the
-        // app.mjs handler allowlist drops them).
+        // Internal-only columns — never serialized (the payload builder's
+        // allowlist, lib/mediaPayload.mjs, drops them).
         //
         // `metadata` (F-1): returned VERBATIM from the column, the exact bytes
         // the scanner persisted. The canonical serialization lives in
