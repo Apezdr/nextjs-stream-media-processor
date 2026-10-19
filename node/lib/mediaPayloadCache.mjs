@@ -264,6 +264,11 @@ export class MediaPayloadCache {
    * The current body, building it when there is none. Concurrent callers share
    * one build. A build that an invalidation overtook still answers the requests
    * that were waiting for it, but is not kept.
+   *
+   * Only the HTTP list, manifest and entries handlers may call this
+   * (tests/unit/payload-cache-callers.test.mjs): a build can wait for a
+   * MEDIA_SCAN task, so a task holding the scan group that joined a request's
+   * build would wait on a scan queued behind itself.
    */
   get() {
     const current = this.peek();

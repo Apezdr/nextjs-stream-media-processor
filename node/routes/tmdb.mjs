@@ -48,14 +48,11 @@ const rateLimiter = createRateLimiter(800, 60000);
 const ETAG_VOLATILE_FIELDS = ['_cached', '_cachedAt', '_expiresAt', '_etag', '_notModified', 'last_updated'];
 
 function sendJsonWithETag(req, res, data) {
-  // Bare-array payloads cannot carry the bookkeeping fields;
-  // hash them as serialized rather than spread into an {"0": ...} object.
-  let hashInput = data;
-  if (!Array.isArray(data)) {
-    hashInput = { ...(data ?? {}) };
-    for (const field of ETAG_VOLATILE_FIELDS) {
-      delete hashInput[field];
-    }
+  // Every caller sends an object (details, comprehensive details, images,
+  // episode images).
+  const hashInput = { ...(data ?? {}) };
+  for (const field of ETAG_VOLATILE_FIELDS) {
+    delete hashInput[field];
   }
 
   const hash = crypto.createHash('md5').update(JSON.stringify(hashInput)).digest('hex');

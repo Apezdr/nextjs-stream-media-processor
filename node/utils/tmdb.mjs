@@ -1010,32 +1010,6 @@ export const fetchComprehensiveMediaDetails = async (
 };
 
 /**
- * Search for movie collections
- * @param {string} query - Search query
- * @param {number} page - Page number (default: 1)
- * @param {boolean} includeBlurhash - Include blurhash data for images
- * @returns {Promise<Object>} Collection search results
- */
-export const searchCollections = async (
-  query,
-  page = 1,
-  includeBlurhash = false,
-) => {
-  if (!query) {
-    throw new TmdbInvalidRequestError("Query parameter is required");
-  }
-
-  return await makeTmdbRequest(
-    "/search/collection",
-    { query, page },
-    3,
-    1440,
-    false,
-    includeBlurhash,
-  );
-};
-
-/**
  * Get detailed information for a movie collection
  * @param {string|number} id - Collection ID
  * @param {boolean} includeBlurhash - Include blurhash data for images
@@ -1107,40 +1081,6 @@ export const getCollectionDetails = async (id, includeBlurhash = false) => {
   }
 
   return data;
-};
-
-/**
- * Get images for a movie collection
- * @param {string|number} id - Collection ID
- * @param {boolean} includeBlurhash - Include blurhash data for images
- * @returns {Promise<Object>} Collection images with formatted URLs
- */
-export const getCollectionImages = async (id, includeBlurhash = false) => {
-  const data = await makeTmdbRequest(
-    `/collection/${id}/images`,
-    {
-      include_image_language: "en,null",
-    },
-    3,
-    1440,
-    false,
-    includeBlurhash,
-  );
-
-  // Format all image paths to full URLs
-  const formatImages = (images) => {
-    return (
-      images?.map((image) => ({
-        ...image,
-        file_path: `https://image.tmdb.org/t/p/original${image.file_path}`,
-      })) || []
-    );
-  };
-
-  return {
-    backdrops: formatImages(data.backdrops),
-    posters: formatImages(data.posters),
-  };
 };
 
 /**

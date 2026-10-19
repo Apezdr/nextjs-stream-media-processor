@@ -51,6 +51,7 @@ import {
   resolveImage,
   imageHashFromMtimeMs,
   imageHashesFromResolved,
+  kindHasBlurhash,
 } from './image-conventions.mjs';
 
 const logger = createCategoryLogger('tv-scanner');
@@ -128,13 +129,13 @@ async function processShowAssets({
   tmdbConfigLastModified = null,
 }) {
   // Per-kind outputs. The frontend reads each from its dedicated DB column
-  // (poster / posterBlurhash / logo / logoBlurhash / backdrop /
-  // backdropBlurhash), so they must stay as discrete fields rather than
-  // collapsing into a map.
+  // (poster / posterBlurhash / logo / backdrop / backdropBlurhash), so they
+  // must stay as discrete fields rather than collapsing into a map. A logo
+  // has no blurhash (kindHasBlurhash).
   const outputs = {
     poster:   { url: '', blurhash: '' },
     backdrop: { url: '', blurhash: '' },
-    logo:     { url: '', blurhash: '' },
+    logo:     { url: '' },
   };
 
   // Per-kind resolveImage() results (file path + mtime + cache-bust hash). Fed
@@ -182,8 +183,9 @@ async function processShowAssets({
 
     resolved[imageKey] = r;
     outputs[imageKey].url = `${prefixPath}/tv/${encodedShowName}/${r.fileName}?hash=${r.hash}`;
+    // A logo gets no blurhash, even when an older sidecar is still on disk.
     // SVGs can't be encoded as raster blurhashes; everything else can.
-    if (r.ext !== 'svg') {
+    if (kindHasBlurhash(imageKey) && r.ext !== 'svg') {
       outputs[imageKey].blurhash = await getStoredBlurhash(r.path, basePath);
     }
   }
@@ -192,7 +194,6 @@ async function processShowAssets({
     poster:           outputs.poster.url,
     posterBlurhash:   outputs.poster.blurhash,
     logo:             outputs.logo.url,
-    logoBlurhash:     outputs.logo.blurhash,
     backdrop:         outputs.backdrop.url,
     backdropBlurhash: outputs.backdrop.blurhash,
     missingImages,
@@ -1117,7 +1118,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         assetsResult.poster,
         assetsResult.posterBlurhash,
         assetsResult.logo,
-        assetsResult.logoBlurhash,
+        // logoBlurhash: a logo has no blurhash, and /media/tv does not
+        // publish the column.
+        null,
         assetsResult.backdrop,
         assetsResult.backdropBlurhash,
         sortedSeasons,

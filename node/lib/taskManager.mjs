@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createCategoryLogger } from './logger.mjs';
 import { withTaskEnqueueSpan, withTaskExecuteSpan, registerTaskTypes, registerTaskQueueMetrics } from './taskTracer.mjs';
 
@@ -21,6 +22,11 @@ export const TaskType = {
 const activeTasks = new Map();
 const taskQueues = new Map();
 let taskIdCounter = 0;
+
+// The task the running code belongs to, as { id, type, parent }: `parent` is
+// the same record for the code that enqueued it (null when no task did). Code
+// outside every task reads undefined. Read by isInsideTaskExcluding.
+const runningTask = new AsyncLocalStorage();
 
 // Track last 3 completions for each task type
 const completionHistory = new Map();
@@ -83,6 +89,32 @@ function canTaskStart(taskType) {
   return true;
 }
 
+/**
+ * Whether the calling code runs inside a task that keeps a task of `type` from
+ * starting until it ends: a running task of `type` itself (when its limit is
+ * one) or of another type in its exclusive group. "Inside" is the task's own
+ * code and that of every task enqueued from it, at any depth.
+ *
+ * Enqueueing a task of `type` there and awaiting it would never end: it waits
+ * for a task that is waiting for it. A caller that can be reached both from
+ * inside such a task and from outside every task asks this first, and runs its
+ * work in place when the answer is yes (lib/libraryScanTask.mjs).
+ *
+ * @param {number} type - From TaskType
+ * @returns {boolean}
+ */
+export function isInsideTaskExcluding(type) {
+  for (let task = runningTask.getStore(); task; task = task.parent) {
+    if (!activeTasks.has(task.id)) continue;
+    if (task.type === type) {
+      if (concurrencyLimits[type] <= 1) return true;
+      continue;
+    }
+    if (exclusiveGroups.some((group) => group.includes(type) && group.includes(task.type))) return true;
+  }
+  return false;
+}
+
 // Register task types with the tracer for better spans and metrics
 registerTaskTypes(TaskType);
 
@@ -111,13 +143,13 @@ function processQueues() {
         
         // Execute the task
         const startTime = Date.now();
-        withTaskExecuteSpan({
+        runningTask.run({ id: taskId, type, parent: task.parent }, () => withTaskExecuteSpan({
           type: type,
           name: task.name,
           id: taskId
         }, async () => {
           return await task.fn();
-        })
+        }))
           .then(result => {
             const endTime = Date.now();
             const duration = endTime - startTime;
@@ -163,7 +195,10 @@ export function enqueueTask(type, name, fn, immediate = false) {
   if (!taskQueues.has(type)) {
     taskQueues.set(type, []);
   }
-  
+  // The task this one is enqueued from, if any: it runs "inside" it for
+  // isInsideTaskExcluding, wherever the queue happens to start it from.
+  const parent = runningTask.getStore() ?? null;
+
   // Create a promise that will resolve when the task completes
   return withTaskEnqueueSpan({
     type: type,
@@ -172,8 +207,8 @@ export function enqueueTask(type, name, fn, immediate = false) {
     queueDepth: (taskQueues.get(type) || []).length
   }, async () => {
     return new Promise((resolve, reject) => {
-      const task = { name, fn, resolve, reject };
-    
+      const task = { name, fn, resolve, reject, parent };
+
     // Check if we can run the task immediately
     if (immediate && canTaskStart(type)) {
       const taskId = ++taskIdCounter;
@@ -188,13 +223,13 @@ export function enqueueTask(type, name, fn, immediate = false) {
       
       // Execute the task
       const startTime = Date.now();
-      withTaskExecuteSpan({
+      runningTask.run({ id: taskId, type, parent }, () => withTaskExecuteSpan({
         type: type,
         name: name,
         id: taskId
       }, async () => {
         return await fn();
-      })
+      }))
         .then(result => {
           const endTime = Date.now();
           const duration = endTime - startTime;

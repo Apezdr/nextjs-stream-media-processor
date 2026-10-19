@@ -8,7 +8,7 @@ import { createCategoryLogger } from '../lib/logger.mjs';
 import { extractFileExtension, touchFile, pathExists, getFileAgeDays } from './fileUtils.mjs';
 import { generateBlurhash } from './blurhashNative.mjs';
 import { withApiRequestSpan, recordImageOutcome } from '../lib/apiTracer.mjs';
-import { getConvention, resolveEffectiveImageUrl } from '../components/media-scanner/domain/image-conventions.mjs';
+import { getConvention, kindHasBlurhash, resolveEffectiveImageUrl } from '../components/media-scanner/domain/image-conventions.mjs';
 import { sidecarBlurhashSizeForImageType } from './blurhashSizePolicy.mjs';
 
 const logger = createCategoryLogger('image-downloader');
@@ -416,10 +416,13 @@ export async function downloadMediaImages(mediaData, mediaDir, config, mediaType
             return;
           }
 
-          // Download image with appropriate blurhash size for image type
+          // Download image with appropriate blurhash size for image type. A
+          // logo gets no sidecar (kindHasBlurhash); one left from before is
+          // still deleted when the logo is downloaded again, as it no longer
+          // matches the image.
           const result = await downloadImageWithBlurhash(imageUrl, destPath, {
             forceDownload,
-            generateBlurhash: shouldGenerateBlurhash,
+            generateBlurhash: shouldGenerateBlurhash && kindHasBlurhash(imageInfo.key),
             imageType: imageInfo.key, // Pass image type for size optimization (backdrop = small, poster/logo = large)
             mediaName,
             mediaType,

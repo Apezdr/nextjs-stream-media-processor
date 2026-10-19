@@ -88,14 +88,7 @@ NOTIFICATION_1_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK
 
 ### Step 3: Test the Integration
 
-You can test the webhook using the manual trigger endpoint:
-
-```bash
-curl -X POST http://localhost:3000/api/trigger-system-status \
-  -H "X-Webhook-ID: your-webhook-id" \
-  -H "Content-Type: application/json" \
-  -d '{"forceStatus": "heavy", "message": "Test notification"}'
-```
+There is no manual trigger endpoint: `POST /api/trigger-system-status` was removed in P3, as nothing called it. A notification is sent when the scheduled status check (`node/routes/systemStatus.mjs`) finds the status `heavy` or `critical`.
 
 ### Discord Message Format
 

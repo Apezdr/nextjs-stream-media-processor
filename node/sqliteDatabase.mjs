@@ -10,6 +10,7 @@ import { initializeDiscordIntrosTable } from './sqlite/discordIntros.mjs';
 import { createHash } from 'crypto';
 import { fileExists } from './utils/utils.mjs';
 import { currentPayloadSignature } from './lib/payloadVersion.mjs';
+import { metadataUrlHash } from './lib/metadataUrlHash.mjs';
 
 // Singleton connections + per-DB write mutex to reduce SQLITE_BUSY under concurrency
 
@@ -398,6 +399,10 @@ export async function initializeSchema(dbType, db) {
 }
 
 /**
+ * @removeAtVersion 1.1.0 Retired-table cleanup for databases from before P2
+ * (blurhash_hashes); delete this function, its call in initializeSchema and
+ * tests/unit/sqlite/retired-tables.test.mjs when the version reaches 1.1.0.
+ *
  * Drops the tables nothing reads or writes any more. IF EXISTS makes it
  * idempotent, so it runs on every startup like the column migrations, and a
  * database that never had the table is left as it was. Dropping a table drops
@@ -797,6 +802,22 @@ function buildImageUrl(baseUrl, cachedHash) {
   }
 }
 
+/**
+ * A movie's or show's metadata.json URL with its `?hash=`: the sha256 of the
+ * metadata.json content the row stores, so it moves when that content does and
+ * not when anything else in the folder changes (lib/metadataUrlHash.mjs). The
+ * frontend sync keys its metadata refetch on it. Every row reader below calls
+ * this; none may use the directory hash directly.
+ *
+ * @param {string} url - urls.metadata or metadata_path as stored
+ * @param {'movies'|'tv_shows'} table
+ * @param {Object} row - The raw row
+ * @returns {string}
+ */
+function withMetadataHash(url, table, row) {
+  return url ? buildImageUrl(url, metadataUrlHash(table, row)) : url;
+}
+
 export async function getTVShows() {
   return withDb("main", async (db) => {
     // Ordered, so /media/tv and its ETag (lib/mediaPayloadCache.mjs) depend on
@@ -822,13 +843,12 @@ export async function getTVShows() {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        // Cache-bust metadata.json by URL the same way images are (and the same
-        // way getMovies* cache-busts urls.metadata). The frontend keys its
-        // metadata fetch cache by URL, so without a version token a content
-        // change is served stale from its Redis/304 cache. directory_hash moves
-        // whenever anything in the show dir changes (incl. a metadata.json
-        // rewrite), so it's a zero-cost version token.
-        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
+        // Cache-bust metadata.json by URL, as getMovies* does urls.metadata. The
+        // frontend keys its metadata fetch on the URL, so without a version
+        // token a content change is served stale from its Redis/304 cache. The
+        // token is the hash of the stored metadata.json content
+        // (withMetadataHash), so a file added to the show folder leaves it be.
+        metadata_path: withMetadataHash(show.metadata_path, 'tv_shows', show),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -902,13 +922,14 @@ export async function getMovies() {
       }
 
       // Cache-bust metadata.json the same way images are cache-busted. The
-      // frontend keys its metadata fetch cache by URL, so without a version
+      // frontend keys its metadata fetch on the URL, so without a version
       // token a metadata.json content change (e.g. tmdb_id edit) is served
       // stale from its Redis/304 cache even though the file on disk changed.
-      // directory_hash changes whenever anything in the movie dir changes
-      // (including a metadata.json rewrite), so it's a zero-cost version token.
+      // The token is the hash of the stored metadata.json content (the F-1
+      // fingerprint, withMetadataHash), so a subtitle or sidecar written into
+      // the folder leaves it be.
       if (urls.metadata) {
-        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+        urls.metadata = withMetadataHash(urls.metadata, 'movies', movie);
       }
 
       // Return updated movie object
@@ -999,10 +1020,10 @@ export async function getMovieById(id) {
 
       // Cache-bust metadata.json the same way images are (see getMovies).
       // Without a version token the frontend serves stale cached metadata after
-      // a content change; directory_hash moves on any dir change incl. a
-      // metadata.json rewrite, so it's a zero-cost version token.
+      // a content change; the token is the hash of the stored metadata.json
+      // content (withMetadataHash).
       if (urls.metadata) {
-        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+        urls.metadata = withMetadataHash(urls.metadata, 'movies', movie);
       }
 
       return {
@@ -1066,10 +1087,10 @@ export async function getMovieByName(name) {
 
       // Cache-bust metadata.json the same way images are (see getMovies).
       // Without a version token the frontend serves stale cached metadata after
-      // a content change; directory_hash moves on any dir change incl. a
-      // metadata.json rewrite, so it's a zero-cost version token.
+      // a content change; the token is the hash of the stored metadata.json
+      // content (withMetadataHash).
       if (urls.metadata) {
-        urls.metadata = buildImageUrl(urls.metadata, movie.directory_hash);
+        urls.metadata = withMetadataHash(urls.metadata, 'movies', movie);
       }
 
       return {
@@ -1142,8 +1163,8 @@ export async function getTVShowById(id) {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        // Cache-bust metadata.json URL with directory_hash (see getTVShows).
-        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
+        // Cache-bust metadata.json URL with its content hash (see getTVShows).
+        metadata_path: withMetadataHash(show.metadata_path, 'tv_shows', show),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -1197,8 +1218,8 @@ export async function getTVShowByName(name) {
         id: show.id,
         name: show.name,
         metadata: show.metadata,
-        // Cache-bust metadata.json URL with directory_hash (see getTVShows).
-        metadata_path: buildImageUrl(show.metadata_path, show.directory_hash),
+        // Cache-bust metadata.json URL with its content hash (see getTVShows).
+        metadata_path: withMetadataHash(show.metadata_path, 'tv_shows', show),
         poster: poster,
         posterBlurhash: show.posterBlurhash,
         logo: logo,
@@ -1783,99 +1804,6 @@ export async function setTmdbCache(endpoint, params = {}, responseData, ttlHours
       return true;
     } catch (error) {
       console.error('Error setting TMDB cache:', error);
-      return false;
-    }
-  });
-}
-
-export async function clearExpiredTmdbCache() {
-  return withWriteTx("tmdbCache", async (db) => {
-    const now = new Date().toISOString();
-    
-    try {
-      const result = await withRetry(() =>
-        db.run('DELETE FROM tmdb_cache WHERE expires_at <= ?', [now])
-      );
-      
-      return result.changes || 0;
-    } catch (error) {
-      console.error('Error clearing expired TMDB cache:', error);
-      return 0;
-    }
-  });
-}
-
-export async function clearTmdbCache(pattern = null) {
-  return withWriteTx("tmdbCache", async (db) => {
-    try {
-      let result;
-      if (pattern) {
-        result = await withRetry(() =>
-          db.run('DELETE FROM tmdb_cache WHERE endpoint LIKE ?', [pattern])
-        );
-      } else {
-        result = await withRetry(() =>
-          db.run('DELETE FROM tmdb_cache')
-        );
-      }
-      
-      return result.changes || 0;
-    } catch (error) {
-      console.error('Error clearing TMDB cache:', error);
-      return 0;
-    }
-  });
-}
-
-export async function getTmdbCacheStats() {
-  return withDb("tmdbCache", async (db) => {
-    try {
-      const now = new Date().toISOString();
-      
-      const [total, expired, byEndpoint] = await Promise.all([
-        withRetry(() => db.get('SELECT COUNT(*) as count FROM tmdb_cache')),
-        withRetry(() => db.get('SELECT COUNT(*) as count FROM tmdb_cache WHERE expires_at <= ?', [now])),
-        withRetry(() => db.all(`
-          SELECT endpoint, COUNT(*) as count,
-                 MIN(created_at) as oldest,
-                 MAX(last_accessed) as most_recent
-          FROM tmdb_cache
-          WHERE expires_at > ?
-          GROUP BY endpoint
-          ORDER BY count DESC
-        `, [now]))
-      ]);
-      
-      return {
-        total: total.count,
-        expired: expired.count,
-        active: total.count - expired.count,
-        byEndpoint: byEndpoint
-      };
-    } catch (error) {
-      console.error('Error getting TMDB cache stats:', error);
-      return {
-        total: 0,
-        expired: 0,
-        active: 0,
-        byEndpoint: []
-      };
-    }
-  });
-}
-
-export async function refreshTmdbCacheEntry(endpoint, params = {}) {
-  return withWriteTx("tmdbCache", async (db) => {
-    const cacheKey = generateTmdbCacheKey(endpoint, params);
-    
-    try {
-      const result = await withRetry(() =>
-        db.run('DELETE FROM tmdb_cache WHERE cache_key = ?', [cacheKey])
-      );
-      
-      return (result.changes || 0) > 0;
-    } catch (error) {
-      console.error('Error refreshing TMDB cache entry:', error);
       return false;
     }
   });

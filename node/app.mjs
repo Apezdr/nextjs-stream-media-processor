@@ -51,6 +51,7 @@ import chokidar from "chokidar";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
+import { createMediaScanHandler, scanIfTableEmpty } from "./lib/libraryScanTask.mjs";
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
@@ -500,11 +501,15 @@ const tvPayloadCache = new MediaPayloadCache({
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
-    // A scan run from here writes after the build read the generation, so the
-    // next clear point drops this body: one extra build, on an empty table.
-    if (await isDatabaseEmpty("tv_shows")) {
-      await generateListTV(db, `${BASE_PATH}/tv`);
-    }
+    // An empty table is scanned first, as a MEDIA_SCAN task: it waits for a
+    // running scan tick or healing pass (lib/libraryScanTask.mjs). A scan run
+    // from here writes after the build read the generation, so the next clear
+    // point drops this body: one extra build, on an empty table.
+    await scanIfTableEmpty({
+      name: 'TV Show List Generation (empty tv_shows table)',
+      isEmpty: () => isDatabaseEmpty("tv_shows"),
+      scan: () => generateListTV(db, `${BASE_PATH}/tv`),
+    });
     const shows = await getTVShows();
     await releaseDatabase(db);
 
@@ -525,9 +530,12 @@ const moviePayloadCache = new MediaPayloadCache({
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
-    if (await isDatabaseEmpty()) {
-      await generateListMovies(db, `${BASE_PATH}/movies`);
-    }
+    // As for TV: an empty table is scanned first, as a MEDIA_SCAN task.
+    await scanIfTableEmpty({
+      name: 'Movie List Generation (empty movies table)',
+      isEmpty: () => isDatabaseEmpty("movies"),
+      scan: () => generateListMovies(db, `${BASE_PATH}/movies`),
+    });
     const movies = await getMovies();
     await releaseDatabase(db);
 
@@ -616,24 +624,15 @@ mountMediaEntriesRoute(app, {
   errorLabel: 'Error sending movie entries',
 });
 
-app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
-  try {
-    const db = await initializeDatabase();
-    let scanFailed = true;
-    try {
-      await generateListMovies(db, `${BASE_PATH}/movies`);
-      scanFailed = false;
-    } finally {
-      // A scan that failed part-way may still have written rows.
-      clearMediaPayloads('POST /media/scan', { failed: scanFailed });
-    }
-    await releaseDatabase(db);
-    res.status(200).send("Library scan completed");
-  } catch (error) {
-    logger.error(`Error scanning library: ${error}`);
-    res.status(500).send("Internal server error");
-  }
-});
+// The movie scan, as a MEDIA_SCAN task: it waits for a running scan tick or
+// healing pass, then answers 200 when it is done (lib/libraryScanTask.mjs).
+app.post("/media/scan", authenticateWebhookOrUser, createMediaScanHandler({
+  openDatabase: () => initializeDatabase(),
+  scanMovies: (db) => generateListMovies(db, `${BASE_PATH}/movies`),
+  releaseDatabase,
+  clearPayloads: clearMediaPayloads,
+  logger,
+}));
 
 async function runGeneratePosterCollage() {
   const debugMessage = isDebugMode ? ' with debug' : '';
@@ -1231,7 +1230,7 @@ app.use((req, res, next) => {
         '/media/tv - List all TV shows',
         '/media/movies/manifest, /media/tv/manifest - Per-title hashes (TV: season and episode keys)',
         '/media/movies/entries, /media/tv/entries - POST {titles} or {all}: chosen entries as NDJSON',
-        '/media/scan - Trigger library scan'
+        '/media/scan - POST: scan the movie library, after any running scan; 200 when done'
       ]
     },
     '/frame': {

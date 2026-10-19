@@ -209,8 +209,8 @@ export function buildTvPayloadEntry(show) {
     metadata: show.metadata_path,
     poster: show.poster,
     posterBlurhash: show.posterBlurhash,
+    // A logo has no blurhash: the row's logoBlurhash column is not published.
     logo: show.logo,
-    logoBlurhash: show.logoBlurhash,
     backdrop: show.backdrop,
     backdropBlurhash: show.backdropBlurhash,
     seasons: slimSeasons(show.seasons),

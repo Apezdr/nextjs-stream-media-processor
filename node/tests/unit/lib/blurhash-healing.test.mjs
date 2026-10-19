@@ -2,11 +2,12 @@
  * The startup blurhash healing pass (lib/blurhashHealing.mjs): which images
  * it looks at, and what it does with each.
  *
- *  - The image list comes from the rows: movie and show art by stored path
+ *  - The image list comes from the rows: movie and show posters and backdrops by stored path
  *    (by URL for an older row without one), season posters and episode
  *    thumbnails by URL, decoded and stripped of the prefix and `?hash=`.
  *  - A missing sidecar of an existing image is written; an SVG, an image with
- *    a sidecar, and an image whose file is gone are left alone.
+ *    a sidecar, and an image whose file is gone are left alone. A logo is not
+ *    looked at: it has no blurhash.
  *  - A generation that fails or throws is counted as failed and the pass goes
  *    on. The last block runs the real encoder: a corrupt image is a failure,
  *    not an exception.
@@ -53,11 +54,11 @@ describe('fileForPublishedUrl', () => {
 });
 
 describe('publishedImagePaths', () => {
-  it('lists movie and show art, season posters and episode thumbnails, each once', () => {
+  it('lists movie and show posters and backdrops, season posters and episode thumbnails, each once, and no logo', () => {
     const movies = [
-      { name: 'A', posterFilePath: '/lib/movies/A/poster.jpg', backdropFilePath: '/lib/movies/A/backdrop.jpg', logoFilePath: null, urls: {} },
+      { name: 'A', posterFilePath: '/lib/movies/A/poster.jpg', backdropFilePath: '/lib/movies/A/backdrop.jpg', logoFilePath: '/lib/movies/A/logo.png', urls: {} },
       // An older row with no stored paths: its URLs stand in.
-      { name: 'B', urls: { poster: '/media/movies/B/poster.png?hash=1', logo: '/media/movies/B/logo.svg' } },
+      { name: 'B', urls: { poster: '/media/movies/B/poster.png?hash=1', logo: '/media/movies/B/logo.png?hash=5' } },
     ];
     const shows = [
       {
@@ -66,6 +67,7 @@ describe('publishedImagePaths', () => {
         backdropFilePath: null,
         backdrop: '/media/tv/S/show_backdrop.jpg?hash=2',
         logoFilePath: '/lib/tv/S/show_logo.png',
+        logo: '/media/tv/S/show_logo.png?hash=6',
         seasons: {
           'Season 1': {
             season_poster: '/media/tv/S/Season%2001/season_poster.jpg?hash=3',
@@ -85,10 +87,8 @@ describe('publishedImagePaths', () => {
       '/lib/movies/A/poster.jpg',
       '/lib/movies/A/backdrop.jpg',
       join(BASE, 'movies', 'B', 'poster.png'),
-      join(BASE, 'movies', 'B', 'logo.svg'),
       '/lib/tv/S/show_poster.jpg',
       join(BASE, 'tv', 'S', 'show_backdrop.jpg'),
-      '/lib/tv/S/show_logo.png',
       join(BASE, 'tv', 'S', 'Season 01', 'season_poster.jpg'),
       join(BASE, 'tv', 'S', 'Season 01', '01 - Thumbnail.jpg'),
     ]);
@@ -114,8 +114,11 @@ describe('healMissingBlurhashSidecars', () => {
   it('leaves an SVG, an image with a sidecar and an image whose file is gone alone', async () => {
     const generate = jest.fn(async () => 'url');
     const { summary, exists } = await run(
-      ['/m/A/logo.svg', '/m/A/poster.jpg', '/m/A/poster.jpg.blurhash'],
-      { movies: [{ posterFilePath: '/m/A/poster.jpg', logoFilePath: '/m/A/logo.svg', backdropFilePath: '/m/A/backdrop.jpg' }] },
+      ['/m/S/show_poster.svg', '/m/A/poster.jpg', '/m/A/poster.jpg.blurhash'],
+      {
+        movies: [{ posterFilePath: '/m/A/poster.jpg', backdropFilePath: '/m/A/backdrop.jpg' }],
+        shows: [{ posterFilePath: '/m/S/show_poster.svg' }],
+      },
       generate
     );
     expect(generate).not.toHaveBeenCalled();
@@ -128,15 +131,37 @@ describe('healMissingBlurhashSidecars', () => {
     ]);
   });
 
+  it('ignores a logo with no sidecar: no stat, no generation', async () => {
+    const generate = jest.fn(async () => 'url');
+    const { summary, exists } = await run(
+      ['/m/A/logo.png', '/m/B/logo.jpg', '/m/S/show_logo.png', '/m/S/show_poster.jpg', '/m/S/show_poster.jpg.blurhash'],
+      {
+        movies: [
+          { logoFilePath: '/m/A/logo.png' },
+          // An older row: the logo comes by URL only.
+          { urls: { logo: '/media/movies/B/logo.jpg?hash=1' } },
+        ],
+        shows: [{ posterFilePath: '/m/S/show_poster.jpg', logoFilePath: '/m/S/show_logo.png', logo: '/media/tv/S/show_logo.png?hash=2' }],
+      },
+      generate
+    );
+    expect(generate).not.toHaveBeenCalled();
+    expect(summary).toEqual({ checked: 1, generated: 0, failed: 0 });
+    expect(exists.mock.calls.map(([path]) => path)).toEqual(['/m/S/show_poster.jpg.blurhash']);
+  });
+
   it('counts a generation that fails or throws as failed, and goes on', async () => {
     const generate = jest.fn(async (path) => {
-      if (path.endsWith('poster.jpg')) return null;
+      if (path.endsWith('/poster.jpg')) return null;
       if (path.endsWith('backdrop.jpg')) throw new Error('decoder blew up');
       return 'url';
     });
     const { summary } = await run(
-      ['/m/A/poster.jpg', '/m/A/backdrop.jpg', '/m/A/logo.png'],
-      { movies: [{ posterFilePath: '/m/A/poster.jpg', backdropFilePath: '/m/A/backdrop.jpg', logoFilePath: '/m/A/logo.png' }] },
+      ['/m/A/poster.jpg', '/m/A/backdrop.jpg', '/m/S/show_poster.jpg'],
+      {
+        movies: [{ posterFilePath: '/m/A/poster.jpg', backdropFilePath: '/m/A/backdrop.jpg' }],
+        shows: [{ posterFilePath: '/m/S/show_poster.jpg' }],
+      },
       generate
     );
     expect(generate).toHaveBeenCalledTimes(3);
@@ -154,13 +179,13 @@ describe('healMissingBlurhashSidecars with the real encoder', () => {
     await fs.rm(root, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('writes the missing sidecar, skips the SVG and the existing sidecar, and counts a corrupt image as failed', async () => {
+  it('writes the missing sidecar, skips the logo and the existing sidecar, and counts a corrupt image as failed', async () => {
     const dir = join(root, 'movies', 'A Movie');
     await fs.mkdir(dir, { recursive: true });
     await fs.copyFile(JPEG, join(dir, 'poster.jpg'));
     await fs.copyFile(JPEG, join(dir, 'backdrop.jpg'));
     await fs.writeFile(join(dir, 'backdrop.jpg.blurhash'), 'kept as it is');
-    await fs.writeFile(join(dir, 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+    await fs.copyFile(JPEG, join(dir, 'logo.jpg'));
     const showDir = join(root, 'tv', 'A Show', 'Season 01');
     await fs.mkdir(showDir, { recursive: true });
     await fs.writeFile(join(showDir, '01 - Thumbnail.jpg'), 'not an image');
@@ -168,7 +193,7 @@ describe('healMissingBlurhashSidecars with the real encoder', () => {
     const movies = [{
       posterFilePath: join(dir, 'poster.jpg'),
       backdropFilePath: join(dir, 'backdrop.jpg'),
-      logoFilePath: join(dir, 'logo.svg'),
+      logoFilePath: join(dir, 'logo.jpg'),
     }];
     const shows = [{
       seasons: {
@@ -181,7 +206,7 @@ describe('healMissingBlurhashSidecars with the real encoder', () => {
     expect(summary).toEqual({ checked: 3, generated: 1, failed: 1 });
     expect((await fs.readFile(join(dir, 'poster.jpg.blurhash'), 'utf8')).length).toBeGreaterThan(0);
     expect(await fs.readFile(join(dir, 'backdrop.jpg.blurhash'), 'utf8')).toBe('kept as it is');
-    await expect(fs.access(join(dir, 'logo.svg.blurhash'))).rejects.toThrow();
+    await expect(fs.access(join(dir, 'logo.jpg.blurhash'))).rejects.toThrow();
     await expect(fs.access(join(showDir, '01 - Thumbnail.jpg.blurhash'))).rejects.toThrow();
   }, 60000);
 });

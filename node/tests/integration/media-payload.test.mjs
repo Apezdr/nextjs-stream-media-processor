@@ -23,7 +23,7 @@ import { describe, it, expect, jest, beforeAll, afterAll } from '@jest/globals';
 import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
 
 const tmpRoot = join(tmpdir(), `media-payload-${randomUUID()}`);
@@ -798,15 +798,36 @@ describe('movie blurhash sidecars on a folder\'s first scan', () => {
       let urls = (await moviePayload())['Art Movie'].urls;
       expect(await exists(join(dir, 'poster.jpg.blurhash'))).toBe(true);
       expect(await exists(join(dir, 'backdrop.jpg.blurhash'))).toBe(true);
-      expect(await exists(join(dir, 'logo.jpg.blurhash'))).toBe(true);
       expect(urls.posterBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/poster.jpg.blurhash`);
       expect(urls.backdropBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/backdrop.jpg.blurhash`);
-      expect(urls.logoBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/logo.jpg.blurhash`);
+      // A logo gets no blurhash: no sidecar is written and none is published.
+      expect(urls.logo).toMatch(/\/movies\/Art%20Movie\/logo\.jpg\?hash=/);
+      expect(await exists(join(dir, 'logo.jpg.blurhash'))).toBe(false);
+      expect(Object.hasOwn(urls, 'logoBlurhash')).toBe(false);
 
       // The next scan finds the folder unchanged and keeps them.
       await runScan();
       urls = (await moviePayload())['Art Movie'].urls;
       expect(urls.posterBlurhash).toBe(`${PREFIX}/movies/Art%20Movie/poster.jpg.blurhash`);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
+  });
+
+  it('publishes no logo blurhash even when an old logo sidecar is on disk, and leaves that file', async () => {
+    const dir = join(MEDIA, 'movies', 'Old Logo');
+    await writeFiles(dir, ['Old.1080p.mkv']);
+    await fs.copyFile(JPEG, join(dir, 'poster.jpg'));
+    await fs.copyFile(JPEG, join(dir, 'logo.jpg'));
+    await fs.writeFile(join(dir, 'logo.jpg.blurhash'), 'written before logos lost their blurhash');
+    try {
+      await runScan();
+      const urls = (await moviePayload())['Old Logo'].urls;
+      expect(urls.posterBlurhash).toBe(`${PREFIX}/movies/Old%20Logo/poster.jpg.blurhash`);
+      expect(urls.logo).toMatch(/\/movies\/Old%20Logo\/logo\.jpg\?hash=/);
+      expect(Object.hasOwn(urls, 'logoBlurhash')).toBe(false);
+      expect(await fs.readFile(join(dir, 'logo.jpg.blurhash'), 'utf8')).toBe('written before logos lost their blurhash');
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
       await runScan();
@@ -822,6 +843,119 @@ describe('movie blurhash sidecars on a folder\'s first scan', () => {
       expect(urls.poster).toMatch(/\/movies\/Broken%20Art\/poster\.jpg\?hash=/);
       expect(urls.posterBlurhash).toBeUndefined();
       expect(await exists(join(dir, 'poster.jpg.blurhash'))).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
+  });
+});
+
+describe('show blurhash sidecars', () => {
+  const JPEG = fileURLToPath(new URL('../fixtures/backdrops/backdrop (7).jpg', import.meta.url));
+  const exists = (path) => fs.access(path).then(() => true, () => false);
+
+  it('writes and publishes the poster and backdrop blurhashes, and none for the logo', async () => {
+    const dir = join(MEDIA, 'tv', 'Art Show');
+    await writeFiles(join(dir, 'Season 1'), ['Art Show - S01E01.mkv']);
+    for (const name of ['show_poster.jpg', 'show_backdrop.jpg', 'show_logo.jpg']) {
+      await fs.copyFile(JPEG, join(dir, name));
+    }
+    try {
+      await runScan();
+      const show = (await tvPayload())['Art Show'];
+      expect(await exists(join(dir, 'show_poster.jpg.blurhash'))).toBe(true);
+      expect(await exists(join(dir, 'show_backdrop.jpg.blurhash'))).toBe(true);
+      // getStoredBlurhash builds these from the PREFIX_PATH setting, not the
+      // scan's prefix.
+      expect(show.posterBlurhash).toMatch(/\/tv\/Art%20Show\/show_poster\.jpg\.blurhash$/);
+      expect(show.backdropBlurhash).toMatch(/\/tv\/Art%20Show\/show_backdrop\.jpg\.blurhash$/);
+      expect(show.logo).toMatch(/\/tv\/Art%20Show\/show_logo\.jpg\?hash=/);
+      expect(await exists(join(dir, 'show_logo.jpg.blurhash'))).toBe(false);
+      expect(Object.hasOwn(show, 'logoBlurhash')).toBe(false);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
+  });
+
+  it('publishes no logo blurhash for a show whose old logo sidecar is still on disk', async () => {
+    const dir = join(MEDIA, 'tv', 'Old Logo Show');
+    await writeFiles(join(dir, 'Season 1'), ['Old Logo Show - S01E01.mkv']);
+    await fs.copyFile(JPEG, join(dir, 'show_logo.jpg'));
+    await fs.writeFile(join(dir, 'show_logo.jpg.blurhash'), 'written before logos lost their blurhash');
+    try {
+      await runScan();
+      const show = (await tvPayload())['Old Logo Show'];
+      expect(show.logo).toMatch(/\/tv\/Old%20Logo%20Show\/show_logo\.jpg\?hash=/);
+      expect(Object.hasOwn(show, 'logoBlurhash')).toBe(false);
+      expect((await getTVShows()).find((row) => row.name === 'Old Logo Show').logoBlurhash).toBeNull();
+      expect(await fs.readFile(join(dir, 'show_logo.jpg.blurhash'), 'utf8')).toBe('written before logos lost their blurhash');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+      await runScan();
+    }
+  });
+});
+
+describe('the metadata URL hash is the hash of the metadata.json content', () => {
+  // The frontend sync refetches metadata.json, and rewrites the title's whole
+  // metadata subdocument, when this hash moves. It used to be the directory
+  // hash, which moves on any file written into the folder.
+  const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+  const hashOf = (url) => url?.match(/\?hash=([a-f0-9]+)$/)?.[1] ?? null;
+  const METADATA = { id: 7, title: 'Meta', overview: 'first' };
+
+  const cases = [
+    {
+      kind: 'movie',
+      dir: () => join(MEDIA, 'movies', 'Meta Movie'),
+      setup: (dir) => writeFiles(dir, ['Meta.1080p.mkv']),
+      metadataFile: (dir) => join(dir, 'metadata.json'),
+      unrelatedFile: (dir) => join(dir, 'Meta.en.srt'),
+      url: async () => (await moviePayload())['Meta Movie']?.urls.metadata,
+      directoryHash: async () => (await db.get('SELECT directory_hash FROM movies WHERE name = ?', ['Meta Movie'])).directory_hash,
+    },
+    {
+      kind: 'show',
+      dir: () => join(MEDIA, 'tv', 'Meta Show'),
+      setup: (dir) => writeFiles(join(dir, 'Season 1'), ['Meta Show - S01E01.mkv']),
+      metadataFile: (dir) => join(dir, 'metadata.json'),
+      unrelatedFile: (dir) => join(dir, 'Season 1', 'Meta Show - S01E01.en.srt'),
+      url: async () => (await tvPayload())['Meta Show']?.metadata,
+      directoryHash: async () => (await db.get('SELECT directory_hash FROM tv_shows WHERE name = ?', ['Meta Show'])).directory_hash,
+    },
+  ];
+
+  it.each(cases)('a $kind: an unrelated file leaves it, re-serialised JSON leaves it, a content edit moves it', async (c) => {
+    const dir = c.dir();
+    await c.setup(dir);
+    await fs.writeFile(c.metadataFile(dir), JSON.stringify(METADATA));
+    try {
+      await runScan();
+      const first = hashOf(await c.url());
+      expect(first).toBe(sha256(JSON.stringify(METADATA)));
+      let directoryHash = await c.directoryHash();
+
+      // A subtitle lands in the folder: the directory hash moves, the metadata hash does not.
+      await fs.writeFile(c.unrelatedFile(dir), '1\n00:00:01,000 --> 00:00:02,000\nhi\n');
+      await runScan();
+      expect(await c.directoryHash()).not.toBe(directoryHash);
+      expect(hashOf(await c.url())).toBe(first);
+      directoryHash = await c.directoryHash();
+
+      // The same JSON written again with other whitespace: the stored content is canonical.
+      await fs.writeFile(c.metadataFile(dir), JSON.stringify(METADATA, null, 2) + '\n');
+      await runScan();
+      expect(await c.directoryHash()).not.toBe(directoryHash);
+      expect(hashOf(await c.url())).toBe(first);
+
+      // The content changes: the hash moves to the new content's.
+      const edited = { ...METADATA, overview: 'second' };
+      await fs.writeFile(c.metadataFile(dir), JSON.stringify(edited));
+      await runScan();
+      const moved = hashOf(await c.url());
+      expect(moved).not.toBe(first);
+      expect(moved).toBe(sha256(JSON.stringify(edited)));
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
       await runScan();

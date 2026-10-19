@@ -68,10 +68,6 @@ class BoundedLRUCache {
     this.accessOrder.clear()
   }
 
-  size() {
-    return this.cache.size
-  }
-
   // Remove expired entries
   cleanup() {
     const now = Date.now()
@@ -245,15 +241,6 @@ class AuthCircuitBreaker {
       logger.warn(`Auth failure ${this.failureCount}/${this.failureThreshold}: ${error.message}`)
     }
   }
-
-  getState() {
-    return {
-      state: this.state,
-      failureCount: this.failureCount,
-      nextAttempt: this.nextAttempt ? new Date(this.nextAttempt).toISOString() : null,
-      lastFailure: this.lastFailure
-    }
-  }
 }
 
 /**
@@ -374,41 +361,6 @@ class ProductionSessionManager {
       logger.error(`Failed to resolve session from Better Auth: ${error.message}`)
       throw error
     }
-  }
-
-  getStats() {
-    const totalRequests = this.cache.stats.hits + this.cache.stats.misses
-    const hitRate = totalRequests > 0 ? (this.cache.stats.hits / totalRequests * 100).toFixed(2) : 0
-
-    return {
-      cacheStats: {
-        hits: this.cache.stats.hits,
-        misses: this.cache.stats.misses,
-        hitRate: `${hitRate}%`,
-        evictions: this.cache.stats.evictions,
-        memoryCleanups: this.cache.stats.memoryCleanups,
-        lastCleanup: this.cache.stats.lastCleanup
-      },
-      cacheSizes: {
-        sessionCache: this.cache.sessionCache.size(),
-        requestCache: this.cache.requestCache.size(),
-        inflightRequests: this.inflightRequests.size
-      },
-      memoryStatus: {
-        memoryPressure: this.cache.memoryPressure,
-        heapUsed: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
-        heapTotal: `${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB`
-      },
-      circuitBreaker: this.circuitBreaker.getState()
-    }
-  }
-
-  // Manual cache control
-  clearCache() {
-    this.cache.sessionCache.clear()
-    this.cache.requestCache.clear()
-    this.cache.inflightCache.clear()
-    logger.info('Session cache manually cleared')
   }
 
   // Graceful shutdown
