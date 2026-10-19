@@ -396,6 +396,10 @@ export async function initializeSchema(dbType, db) {
 }
 
 /**
+ * @removeAtVersion 1.1.0 Retired-table cleanup for databases from before P2
+ * (blurhash_hashes); delete this function, its call in initializeSchema and
+ * tests/unit/sqlite/retired-tables.test.mjs when the version reaches 1.1.0.
+ *
  * Drops the tables nothing reads or writes any more. IF EXISTS makes it
  * idempotent, so it runs on every startup like the column migrations, and a
  * database that never had the table is left as it was. Dropping a table drops
