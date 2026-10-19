@@ -154,7 +154,7 @@ The survey critique carried a one-line finding that "one metadata field TMDB pro
 **F-5 — ~20-minute worst-case hash-propagation staleness is accepted.**
 Four independently reasonable freshness layers stack additively rather than overlapping: the auto-captions config cache (30 s), the 15-minute scheduled hash sweep, the hashes endpoint's `max-age=300` HTTP cache, and the frontend's own polling cache. Nothing coalesces them, so worst-case propagation approaches their sum. Accepted as the current SLA; the ceiling dropped substantially with Branch 4's F-2 fix (merged), because real content changes — including brand-new titles — now get their hash written within the 3-minute scan tick instead of waiting for the sweep.
 
-**A-5 — The lazy DB write behind unauthenticated `GET /metadata-hashes/...` is already safely hardened.**
+**A-5 — The lazy DB write behind unauthenticated `GET /metadata-hashes/...` is already safely hardened.** *Moot since P2: the per-title route that made this write was removed (no caller); the list route never wrote.*
 The write fires at most once per title (guarded by `!hash`), only after a 404 gate rejects unknown titles (`node/routes/metadataHashes.mjs`), uses only server-side authoritative data, and `storeHash`'s delete-then-insert pattern is self-healing against duplicates. No auth is consistent with this route being part of the public hash-sync contract the frontend polls, which carries no sensitive data. The comment explaining why the 404-before-write ordering and self-healing dedup make the pattern safe is in place.
 
 **S-5 — The residual Python poster-collage script is correctly out of scope.**
