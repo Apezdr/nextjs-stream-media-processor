@@ -19,7 +19,6 @@ import { createSpriteRoutes } from "./sprite-route.mjs";
 // this file participates in scan persistence.
 import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase, getMediaTableGeneration } from "./sqliteDatabase.mjs";
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
-import { initializeBlurhashHashesTable, getHashesModifiedSince, generateMovieBlurhashHashes, generateTVShowBlurhashHashes, updateAllMovieBlurhashHashes, updateAllTVShowBlurhashHashes, getMovieBlurhashData, getTVShowBlurhashData } from "./sqlite/blurhashHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
 import {
@@ -695,40 +694,6 @@ scheduleJob("*/10 * * * *", () => {
   });
 });
 
-// Update blurhash hashes every 18 minutes to stagger from other tasks
-// Use a scheduled job instead of setInterval for better precision and to coordinate with other scheduled tasks
-scheduleJob("8,26,44 * * * *", () => { // At 8, 26, and 44 minutes past each hour
-  // Use the task manager to handle concurrency and database access
-  enqueueTask(TaskType.BLURHASH, 'Blurhash Hashes Update', async () => {
-    logger.info("Running Blurhash Hashes Update...");
-    const db = await initializeDatabase();
-    
-    try {
-      // Use a timestamp to track changes since last scan
-      const lastScanTime = new Date();
-      lastScanTime.setMinutes(lastScanTime.getMinutes() - 18); // Only process files modified in the last 18 minutes
-      const sinceTimestamp = lastScanTime.toISOString();
-      
-      // Process movies first in a controlled manner
-      logger.info("Starting blurhash update for movies...");
-      await updateAllMovieBlurhashHashes(BASE_PATH, sinceTimestamp);
-      logger.info("Movie blurhash hashes completed, processing TV shows...");
-      
-      // Then process TV shows
-      await updateAllTVShowBlurhashHashes(BASE_PATH, sinceTimestamp);
-      logger.info("Blurhash Hashes Update Completed.");
-      
-      return 'Blurhash update completed successfully';
-    } catch (error) {
-      logger.error(`Blurhash Hashes Update Error: ${error.message}`);
-      throw error; // Let task manager handle the error
-    } finally {
-      await releaseDatabase(db);
-    }
-  }).catch(error => {
-    logger.error(`Failed to enqueue blurhash task: ${error.message}`);
-  });
-});
 //
 // End Cache Management
 
@@ -1401,24 +1366,9 @@ async function initialize() {
     identityService.start();
     //runGenerateThumbnailJson().catch(logger.error);
     logger.info(`Server running on port ${port}`);
-    const db = await initializeDatabase();
-
-    // Initialize blurhash hashes table at startup
-    await initializeBlurhashHashesTable(db);
-    logger.info('Blurhash hashes table initialized at startup');
-    
-    
-    // Perform initial full scan of blurhashes - sequentially to avoid transaction conflicts
-    logger.info('Starting initial blurhash scan of all media files...');
-    try {
-      // Process movies first, then TV shows sequentially to avoid transaction conflicts
-      await updateAllMovieBlurhashHashes(BASE_PATH);
-      logger.info("Movie blurhash hashes completed, processing TV shows...");
-      await updateAllTVShowBlurhashHashes(BASE_PATH);
-      logger.info('Initial blurhash scan completed successfully');
-    } catch (error) {
-      logger.error(`Error during initial blurhash scan: ${error.message}`);
-    }
+    // Opens media.db, whose schema setup also drops the retired
+    // blurhash_hashes table (dropRetiredTables in sqliteDatabase.mjs).
+    await initializeDatabase();
 
   // As part of startup clear out any in progress processes from the process tracking database
   // This will prevent any processes from being stuck in the queue
@@ -1507,7 +1457,6 @@ app.use((req, res, next) => {
       endpoints: [
         '/api/tmdb/* - TMDB metadata operations',
         '/api/admin/* - Administrative operations (requires auth)',
-        '/api/blurhash-changes - Get blurhash changes',
         '/api/metadata-hashes/:mediaType - Get metadata hashes',
         '/api/system-status - System status information',
         '/api/logs - Server logs (supports SSE streaming)'

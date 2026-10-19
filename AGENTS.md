@@ -48,7 +48,7 @@ to match later code.
   `scanMovies` drops a name only after its `readdir` and directory hash, and
   `scanTVShows` has one try around the whole loop.
 - **Derived tables are a function of `movies`/`tv_shows`.** `metadata_hashes`,
-  `missing_data_media`, `episode_metadata_missing` and `blurhash_hashes` are
+  `missing_data_media` and `episode_metadata_missing` are
   projections; no single failure may become a deletion in them, and removal
   cascades must cover all of them (title row deleted last — main still deletes
   it first; SI-P0 fixes the order).

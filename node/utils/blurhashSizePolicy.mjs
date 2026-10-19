@@ -25,11 +25,11 @@
  *    lists render many tiny previews at once.
  *
  * Changing ANY value here is a policy change with real invalidation costs:
- * sidecars only converge via a BLURHASH_GENERATION_VERSION bump (and that
- * mechanism currently covers movie images only — TV sidecars have no
- * version-regen path), and tmdb_blurhash_cache keys embed the size, so a
- * change orphans every old row in a table with no live eviction. Do not edit
- * casually.
+ * an existing sidecar is never re-encoded (the BLURHASH_GENERATION_VERSION
+ * regen path, movies only, went with the blurhash_hashes table in P2), so the
+ * affected sidecars have to be deleted for the scanner to write them again,
+ * and tmdb_blurhash_cache keys embed the size, so a change orphans every old
+ * row in a table with no live eviction. Do not edit casually.
  */
 
 /** Encode sizes understood by blurhashNative (preview px: 16 / 24 / 32). */

@@ -325,6 +325,7 @@ export async function initializeSchema(dbType, db) {
     await migrateToHashColumns(db);
     await migrateToFocalColumns(db);
     await migrateToSchemaParityColumns(db);
+    await dropRetiredTables(db);
 
     // Add unique indexes for UPSERT operations
     await db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_movies_name ON movies(name);`);
@@ -394,6 +395,21 @@ export async function initializeSchema(dbType, db) {
   if (dbType === "discordIntros") {
     await initializeDiscordIntrosTable(db);
   }
+}
+
+/**
+ * Drops the tables nothing reads or writes any more. IF EXISTS makes it
+ * idempotent, so it runs on every startup like the column migrations, and a
+ * database that never had the table is left as it was. Dropping a table drops
+ * its indexes with it. Exported for the schema tests.
+ *
+ *  - blurhash_hashes: the bookkeeping behind the /api/blurhash* routes and the
+ *    startup and scheduled blurhash sweeps, all removed in P2. The blurhashes
+ *    the payload publishes are the `.blurhash` sidecar files next to each
+ *    image (getStoredBlurhash and the downloader write them), never this table.
+ */
+export async function dropRetiredTables(db) {
+  await db.exec('DROP TABLE IF EXISTS blurhash_hashes');
 }
 
 /**
