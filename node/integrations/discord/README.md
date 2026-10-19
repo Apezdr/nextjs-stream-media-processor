@@ -231,7 +231,6 @@ System resources are critically constrained. CPU at 95%.
 
 ```
 node/integrations/discord/
-├── index.mjs               # Exports webhook & bot adapters
 ├── webhook.mjs             # Webhook adapter (channel posts)
 ├── bot.mjs                 # Bot adapter (interactive)
 ├── start-bot.mjs           # Standalone bot starter

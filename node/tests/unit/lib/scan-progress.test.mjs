@@ -209,7 +209,7 @@ describe('library scan rows in process_queue', () => {
     await processTracking.createOrUpdateProcessQueue(db, key, 'spritesheet', 3, 0, 'in-progress', 'Starting again');
     await processTracking.finalizeProcessQueue(db, key, 'completed', 'done');
 
-    const row = await processTracking.getProcessByFileKey(db, key);
+    const row = await db.get('SELECT * FROM process_queue WHERE file_key = ?', [key]);
     expect(row).toMatchObject({ status: 'completed', subject: 'For All Mankind S01E01' });
   });
 

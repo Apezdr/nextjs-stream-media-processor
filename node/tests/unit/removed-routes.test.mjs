@@ -1,5 +1,5 @@
 /**
- * The routes P2 removed stay removed, read off the source.
+ * The routes P2 and P3 removed stay removed, read off the source.
  *
  * Every one of them had no caller in the frontend, the TV app or the
  * transcoder, and no request in prod for 30 days (the per-season hash route:
@@ -11,9 +11,11 @@
  * Each file also lists the routes that must still be there, which keeps the
  * scan honest (a pattern that matched nothing would pass the absence checks).
  * The kept ones include the routes P2 was told to keep (POST /media/scan, the
- * metadata-hash list) and the two it kept because they still have a caller in
+ * metadata-hash list) and the one it kept because it still has a caller in
  * this repo: the Discord bot's ServerApiClient calls /api/tasks (its /tasks
- * command) and names /api/trigger-system-status.
+ * command). P3 removed POST /api/trigger-system-status: its one caller,
+ * ServerApiClient.triggerStatusCheck(), ran only from getSystemStatus(true),
+ * which nothing called with true.
  */
 
 import { describe, it, expect } from '@jest/globals';
@@ -56,8 +58,8 @@ const FILES = {
     kept: ['GET /metadata-hashes/:mediaType'],
   },
   'routes/systemStatus.mjs': {
-    removed: ['GET /health'],
-    kept: ['GET /system-status', 'POST /trigger-system-status', 'GET /tasks'],
+    removed: ['GET /health', 'POST /trigger-system-status'],
+    kept: ['GET /system-status', 'GET /tasks'],
   },
   'routes/admin.mjs': {
     removed: [
@@ -97,7 +99,7 @@ const FILES = {
   },
 };
 
-describe('routes removed in P2', () => {
+describe('routes removed in P2 and P3', () => {
   describe.each(Object.entries(FILES))('%s', (file, { removed, kept }) => {
     const routes = registeredRoutes(file);
 
@@ -108,6 +110,12 @@ describe('routes removed in P2', () => {
     it('still registers the routes it keeps', () => {
       expect(kept.filter((route) => !routes.includes(route))).toEqual([]);
     });
+  });
+
+  it('the Discord bot no longer calls the trigger route, and the unused discord index is gone', () => {
+    const client = codeOf(readFileSync(join(NODE_DIR, 'integrations', 'discord', 'utils', 'serverApi.mjs'), 'utf8'));
+    expect(/trigger-system-status|triggerStatusCheck/.test(client)).toBe(false);
+    expect(existsSync(join(NODE_DIR, 'integrations', 'discord', 'index.mjs'))).toBe(false);
   });
 
   it('the blurhash-hash modules are gone and nothing mounts them', () => {

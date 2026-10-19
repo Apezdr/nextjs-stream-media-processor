@@ -526,7 +526,7 @@ Operator-supplied field-level replacements, applied by the generator on every wr
 | Entity | Store | Derivable? | Deletion path exists? |
 |---|---|---|---|
 | `movies` / `tv_shows` row | SQLite `main` | Yes (rebuilt by scan) | Yes — scan removal loop |
-| TMDB cache row | SQLite `tmdb_cache` | Yes | Yes — probabilistic sweep + admin routes |
+| TMDB cache row | SQLite `tmdb_cache` | Yes | Yes — probabilistic sweep |
 | TMDB blurhash cache row | SQLite `tmdb_blurhash_cache` | Yes | **No live path** (helpers exist, zero callers) |
 | `metadata_hashes` row | SQLite `main` | Yes (lazily regenerable) | Yes — removal-loop cascade (`deleteHashesForMedia`, Branch 5) |
 | Cooldown rows (`missing_data_media`, `episode_metadata_missing`) | SQLite `main` | **No** — genuinely non-derivable | Partial (cleared on resolution; no removal cascade) |
@@ -567,7 +567,7 @@ Table `tmdb_cache` (its own DB file, `tmdb_cache.db`; schema in `node/sqliteData
 
 **Cache-write telemetry (T-6, implemented in Branch 7).** `setTmdbCache()` returns an explicit `true`/`false` (success vs. invalid-TTL skip or caught error), and `withApiCacheSpan()` (`node/lib/apiTracer.mjs`) branches on `operation: 'SET'`: writes record `api.cache_write_success` instead of `api.cache_hit`, so read-side hit-ratio dashboards are no longer polluted by writes. For void writers that still flow through a SET span (e.g. the blurhash cache), only an explicit `false` counts as failure — they signal failure by throwing, which the span's error counter records.
 
-**Admin cache routes: removed in P2.** `GET /api/tmdb/status`, `GET /api/tmdb/cache/stats`, `DELETE /api/tmdb/cache`, `DELETE /api/tmdb/cache/expired` and `POST /api/tmdb/cache/refresh` (the A-3 eager refetch) had no caller and no request in 30 days. Cached responses still expire by TTL, and a forceRefresh (a `tmdb.config` edit) refetches and re-caches its entries.
+**Admin cache routes: removed in P2.** `GET /api/tmdb/status`, `GET /api/tmdb/cache/stats`, `DELETE /api/tmdb/cache`, `DELETE /api/tmdb/cache/expired` and `POST /api/tmdb/cache/refresh` (the A-3 eager refetch) had no caller and no request in 30 days. Cached responses still expire by TTL, and a forceRefresh (a `tmdb.config` edit) refetches and re-caches its entries. The helpers behind those routes (`getTmdbCacheStats()`, `clearTmdbCache()`, `clearExpiredTmdbCache()`, `refreshTmdbCacheEntry()` in `node/sqliteDatabase.mjs`) were removed in P3; the probabilistic sweep runs its own `DELETE`.
 
 ---
 
@@ -843,8 +843,9 @@ A JSON body parser (`express.json({ limit: '30mb' })`) is applied globally throu
 |---|---|---|---|---|
 | GET | `/api/metadata-hashes/:mediaType` | none | All metadata hashes for `movies` or `tv` (the frontend's bulk sync poll). | |
 | GET | `/api/system-status` | webhook-or-admin | CPU/memory/disk status snapshot with severity levels (cached ~60 s). | |
-| POST | `/api/trigger-system-status` | webhook-or-admin | Force an immediate status re-evaluation/notification pass. | |
 | GET | `/api/tasks` | webhook-or-admin | Task-manager status report (queues, running tasks, concurrency limits). | |
+
+`POST /api/trigger-system-status` was removed in P3: its one caller, the Discord bot's `ServerApiClient.triggerStatusCheck()`, ran only from `getSystemStatus(true)`, which nothing called with `true`.
 
 ### A.3 `/api/tmdb` routes (`node/routes/tmdb.mjs`)
 

@@ -259,20 +259,6 @@ export async function getActiveProcesses(db = null) {
 }
 
 /**
- * Retrieve a single process by fileKey.
- */
-export async function getProcessByFileKey(db, fileKey) {
-  try {
-    return await withRetry(() => 
-      db.get(`SELECT * FROM process_queue WHERE file_key = ?`, [fileKey])
-    );
-  } catch (error) {
-    logger.error(`Error retrieving process ${fileKey}: ${error.message}`);
-    return null; // Return null instead of throwing
-  }
-}
-
-/**
  * Retrieve all processes from the process_queue.
  * @param {object} db - The database instance. If not provided, will get a new connection.
  * @returns {Promise<Array>} - Array of process objects.

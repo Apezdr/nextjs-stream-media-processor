@@ -90,7 +90,7 @@ Typical hit rates by usage pattern:
 
 ## API Endpoints
 
-None. `GET /api/admin/session-cache/stats` and `POST /api/admin/session-cache/clear` were removed in P2: neither had a caller. `sessionManager.getStats()` and `clearCache()` remain on the class.
+None. `GET /api/admin/session-cache/stats` and `POST /api/admin/session-cache/clear` were removed in P2: neither had a caller. `sessionManager.getStats()` and `clearCache()`, left without a caller, were removed in P3.
 
 ## Configuration
 

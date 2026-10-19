@@ -118,7 +118,7 @@ async function handleButtonInteraction(interaction, client) {
       
       try {
         logger.info('Refreshing simple view');
-        const status = await getSystemStatus(); // Use normal endpoint
+        const status = await getSystemStatus();
         
         const simpleEmbed = new EmbedBuilder()
           .setTitle(`${getEmojiForStatus(status.status)} Server Status: ${status.status.toUpperCase()}`)
@@ -209,7 +209,7 @@ async function handleButtonInteraction(interaction, client) {
       
       try {
         logger.info('Refreshing detailed view');
-        const status = await getSystemStatus(); // Use normal endpoint
+        const status = await getSystemStatus();
         
         const detailedEmbed = new EmbedBuilder()
           .setTitle(`${getEmojiForStatus(status.status)} Server Status: ${status.status.toUpperCase()}`)

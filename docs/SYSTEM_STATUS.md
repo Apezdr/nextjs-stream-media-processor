@@ -124,15 +124,7 @@ The response includes:
 
 The public `GET /api/health` endpoint was removed in P2: it had no caller and no container healthcheck used it. Use `GET /` for a liveness ping, or `/api/system-status` for the status itself.
 
-### POST /api/trigger-system-status
-
-Manually trigger a system status check and send notifications.
-
-**Authentication:**
-- Required header: `X-Webhook-ID` with a valid webhook ID
-
-**Query Parameters:**
-- `forceStatus` (optional): Force a specific status for testing notifications
+`POST /api/trigger-system-status` was removed in P3: nothing called it (the Discord bot's client method that named it ran only from a `getSystemStatus(true)` call that did not exist). Notifications are sent only by the scheduled status check, when it finds the status `heavy` or `critical` (subject to the notification cooldowns).
 
 ## Memory Optimization
 
