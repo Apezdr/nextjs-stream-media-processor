@@ -593,7 +593,7 @@ Library scans write through `node/lib/scanProgress.mjs`, called from the `genera
 
 There is **no deletion in any production path**: `resetProcessQueue()` and `removeInProgressProcesses()` exist (the latter is even imported by `app.mjs`) but are never called. Terminal rows persist indefinitely; growth is bounded because `file_key` upserts in place — one row per media item × process type, ever. Note the startup log line says "Process queue has been reset", which overstates what `markInProgressAsInterrupted()` does (it marks, it does not delete).
 
-Read surface: `GET /processes` and `GET /processes/:fileKey` in `node/app.mjs`, both behind `authenticateWebhookOrUser`, with optional `processType`/`status` filters. `GET /processes?active=true` returns only `in-progress` and `queued` rows (`getActiveProcesses()`); `interrupted` and `error` rows are history, so the admin panel's always-on Active Processes card polls this instead of the whole table.
+Read surface: `GET /processes` in `node/app.mjs`, behind `authenticateWebhookOrUser`, with optional `processType`/`status` filters. `GET /processes?active=true` returns only `in-progress` and `queued` rows (`getActiveProcesses()`); `interrupted` and `error` rows are history, so the admin panel's always-on Active Processes card polls this instead of the whole table.
 
 **Tier, honestly:** this is *operational telemetry*, not durable state and not a real queue — nothing dequeues from it, and losing the file costs nothing but progress display history. It is the most disposable table in the system; it does not merit the non-derivable durability posture of the cooldown or intro tables.
 
@@ -838,7 +838,6 @@ A JSON body parser (`express.json({ limit: '30mb' })`) is applied globally throu
 | POST | `/media/tv/entries` | webhook-or-admin | Same, for TV. | Same. |
 | POST | `/media/scan` | webhook-or-admin | Trigger an on-demand **movies-only** library scan (`generateListMovies`, which delegates to the scanner component's `scanMovies`). | No TV equivalent exists. Decided 2026-07-07 (S-3) — not yet implemented: a symmetric TV path is to be added; frontend adoption of both variants is TBD (see §4.7). |
 | GET | `/processes` | webhook-or-admin | List process-tracking queue entries; filterable by `processType` / `status` query params. | |
-| GET | `/processes/:fileKey` | webhook-or-admin | Fetch one process-tracking entry. | |
 | GET | `/api/logs` | none | Return server logs as JSON/plaintext, or stream via SSE with `?stream=true`. | Sets its own `Access-Control-Allow-Origin` from `FRONT_END_1`. |
 | GET | `/api/logs/categories` | none | List available log categories. | |
 

@@ -50,7 +50,7 @@ import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, getCategories } from "./lib/logger.mjs";
 import chokidar from "chokidar";
-import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessByFileKey, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
+import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
 import { chapterInfo } from "./ffmpeg/ffprobe.mjs";
 import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
@@ -618,31 +618,6 @@ app.get('/processes', authenticateWebhookOrUser, async (req, res) => {
     res.json({ success: true, data: processes });
   } catch (error) {
     logger.error(`Error fetching processes: ${error.message}`);
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
-  }
-});
-
-/**
- * GET /processes/:fileKey
- * Retrieves the process information for a specific fileKey.
- * Requires either webhook authentication or admin user access.
- */
-app.get('/processes/:fileKey', authenticateWebhookOrUser, async (req, res) => {
-  try {
-    const { fileKey } = req.params;
-    const db = await getProcessTrackingDb();
-
-    const process = await getProcessByFileKey(db, fileKey);
-
-    await releaseDatabase(db);
-
-    if (process) {
-      res.json({ success: true, data: process });
-    } else {
-      res.status(404).json({ success: false, message: 'Process not found' });
-    }
-  } catch (error) {
-    logger.error(`Error fetching process ${req.params.fileKey}: ${error.message}`);
     res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
 });
@@ -1507,7 +1482,7 @@ app.get('/', (req, res) => {
       },
       processes: {
         description: 'Process tracking',
-        routes: ['/processes', '/processes/:fileKey']
+        routes: ['/processes']
       }
     },
     documentation: 'Access any endpoint category above for detailed API information'
@@ -1586,8 +1561,7 @@ app.use((req, res, next) => {
     '/processes': {
       description: 'Process tracking endpoints',
       endpoints: [
-        '/processes - List all processes',
-        '/processes/:fileKey - Get specific process status'
+        '/processes - List all processes'
       ]
     }
   };
