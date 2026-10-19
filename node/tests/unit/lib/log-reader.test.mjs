@@ -226,16 +226,27 @@ describe('readLogs: filters', () => {
     await writePlain(
       'application-2026-10-19.log.2',
       [
-        line('scan started', { category: 'main' }),
-        line('TMDB said no', { category: 'tmdb', level: 'error', endpoint: '/tv/275188' }),
+        line('scan started', { category: 'movie-scanner' }),
+        line('TMDB said no', { category: 'tmdb-api', level: 'error', endpoint: '/tv/275188' }),
         line('slow probe', { category: 'ffprobe', level: 'warn' }),
-        line('cached', { category: 'tmdb', level: 'info' }),
+        line('resolved', { category: 'identity' }),
+        // A key that sorts after "timestamp": this line takes the full-parse path.
+        line('cached', { category: 'tmdb-api', level: 'info', url: '/movie/1' }),
       ].join('')
     );
   });
 
-  it('keeps one category', async () => {
-    expect(messages(await read({ filter: createLogFilter({ category: 'tmdb' }) }))).toEqual(['TMDB said no', 'cached']);
+  it('shows only the listed areas and categories', async () => {
+    const filter = createLogFilter({ only: ['area:identity', 'tmdb-api'] });
+    expect(messages(await read({ filter }))).toEqual(['TMDB said no', 'resolved', 'cached']);
+  });
+
+  it('hides the listed areas and categories', async () => {
+    expect(messages(await read({ filter: createLogFilter({ hide: ['area:scan', 'ffprobe'] }) }))).toEqual([
+      'TMDB said no',
+      'resolved',
+      'cached',
+    ]);
   });
 
   it('keeps a level and everything more severe', async () => {
@@ -248,7 +259,54 @@ describe('readLogs: filters', () => {
     expect(messages(await read({ filter: createLogFilter({ q: 'PROBE' }) }))).toEqual(['slow probe']);
   });
 
-  it('rejects an unknown level', () => {
+  it('counts lines per category (under the level filter) and per level (under the source filter)', async () => {
+    const { facets } = await read({ filter: createLogFilter({ hide: ['area:scan'], level: 'warn' }) });
+
+    expect(facets.total).toBe(2);
+    expect(facets.levels).toEqual({ error: 1, warn: 1, info: 2 });
+    expect(facets.categories).toEqual([
+      { name: 'tmdb-api', area: 'metadata', count: 1 },
+      { name: 'ffprobe', area: 'video', count: 1 },
+    ]);
+  });
+
+  it('rejects an unknown level or area, and only with hide', () => {
     expect(() => createLogFilter({ level: 'loud' })).toThrow('Unknown log level: loud');
+    expect(() => createLogFilter({ hide: ['area:nope'] })).toThrow('Unknown log area: nope');
+    expect(() => createLogFilter({ only: ['a'], hide: ['b'] })).toThrow('only and hide cannot be used together');
+  });
+});
+
+describe('readLogs: time range', () => {
+  const at = (minute) => `2026-10-19 ${minute}:00`;
+  const ms = (hour, minute) => new Date(2026, 9, 19, hour, minute, 0).getTime();
+
+  beforeEach(async () => {
+    await writeGz(
+      'application-2026-10-19.log.1.gz',
+      ['08:00', '08:01', '08:02', '08:03'].map((minute) => line(minute, { timestamp: at(minute) })).join('')
+    );
+    await writePlain(
+      'application-2026-10-19.log.2',
+      ['09:00', '09:01'].map((minute) => line(minute, { timestamp: at(minute) })).join('')
+    );
+  });
+
+  it('starts at `from` and says there is nothing older in the range', async () => {
+    const result = await read({ filter: createLogFilter({ from: ms(8, 2) }) });
+    expect(messages(result)).toEqual(['08:02', '08:03', '09:00', '09:01']);
+    expect(result.older).toBeNull();
+  });
+
+  it('ends at `to`, and still gives the live view a cursor at the end of the log', async () => {
+    const result = await read({ filter: createLogFilter({ from: ms(8, 1), to: ms(8, 2) }) });
+    expect(messages(result)).toEqual(['08:01', '08:02']);
+    expect(result.newer).toBe(formatCursor({ date: '2026-10-19', index: 2 }, Buffer.byteLength(lines('09:00', '09:01'))));
+    expect(result.facets.total).toBe(2);
+  });
+
+  it('reports what the log covers', async () => {
+    const { span } = await read();
+    expect(span).toEqual({ from: new Date(ms(8, 0)).toISOString(), to: new Date(ms(9, 1)).toISOString() });
   });
 });

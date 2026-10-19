@@ -72,7 +72,8 @@ describe('GET /api/logs auth', () => {
     const body = await res.json();
     expect(body.entries.map((entry) => entry.message)).toEqual(['scan started']);
     expect(body.newer).toMatch(/^2026-10-19\.22:\d+$/);
-    expect(Array.isArray(body.categories)).toBe(true);
+    expect(body.facets.categories).toEqual([{ name: 'main', area: 'system', count: 1 }]);
+    expect(body.areas.at(-1)).toEqual({ id: 'other', label: 'Other' });
   });
 });
 
@@ -104,7 +105,11 @@ describe('GET /api/logs query checks', () => {
     ['?level=loud', 'level'],
     ['?before=../../etc/passwd', 'before'],
     ['?after=2026-10-19.1:0&before=2026-10-19.1:0', 'before and after'],
-    ['?category=a&category=b', 'category'],
+    ['?only=a&only=b', 'only'],
+    ['?only=main&hide=identity', 'only and hide'],
+    ['?hide=area:nope', 'Unknown log area: nope'],
+    ['?from=yesterday', 'from'],
+    ['?from=2026-10-19T12:00:00Z&to=2026-10-19T11:00:00Z', 'from is after to'],
   ])('answers %s with a 400 naming %s', async (query, field) => {
     const res = await get(query, admin);
     expect(res.status).toBe(400);

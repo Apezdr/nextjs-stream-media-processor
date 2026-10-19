@@ -70,16 +70,6 @@ if (webhookIdsExposed()) {
   });
 }
 
-// In-memory store for categories
-const categories = new Set();
-
-/**
- * Returns all registered categories
- */
-export function getCategories() {
-  return Array.from(categories);
-}
-
 /**
  * Turn a log call's second argument into record fields. Spreading it raw lost
  * an Error's message and stack (not enumerable) and split a string into one
@@ -106,7 +96,6 @@ export function normalizeLogMeta(meta) {
  * line, not just the Python ones.)
  */
 function makeLogger(category) {
-  categories.add(category);
   return {
     info:  (message, meta) => baseLogger.info(message,  { ...normalizeLogMeta(meta), category }),
     warn:  (message, meta) => baseLogger.warn(message,  { ...normalizeLogMeta(meta), category }),
