@@ -369,6 +369,36 @@ describe('/media/tv payload', () => {
     expect(eps.S01E01.sources.filter((s) => s.isPrimary)).toHaveLength(1);
   });
 
+  it('leaves the top-level filename, length and dimensions off every episode; the primary source and the season maps carry them', async () => {
+    // Nothing reads the top-level copies: the frontend takes an episode's
+    // duration and dimensions from the season maps. The stored row keeps all
+    // three, because the frame, sprite and clip routes read episode.filename.
+    const payload = await tvPayload();
+    const rows = Object.fromEntries((await getTVShows()).map((row) => [row.name, row]));
+    let checked = 0;
+    for (const [show, entry] of Object.entries(payload)) {
+      for (const [seasonKey, season] of Object.entries(entry.seasons)) {
+        for (const [key, episode] of Object.entries(season.episodes)) {
+          const stored = rows[show].seasons[seasonKey].episodes[key];
+          const primary = episode.sources.find((source) => source.isPrimary);
+          expect({ key, published: ['filename', 'length', 'dimensions'].filter((k) => Object.hasOwn(episode, k)) })
+            .toEqual({ key, published: [] });
+          expect(stored.filename).toBe(primary.filename);
+          expect(season.lengths[key]).toBe(stored.length);
+          expect(season.dimensions[key]).toBe(stored.dimensions);
+          expect(primary.length).toBe(stored.length);
+          expect(primary.dimensions).toBe(stored.dimensions);
+          // The fields the frontend does read stay on the episode.
+          for (const kept of ['videoURL', 'hdr', 'mediaQuality', 'mediaLastModified', 'jitEligible', 'jitUrl']) {
+            expect({ key, kept, present: Object.hasOwn(episode, kept) }).toEqual({ key, kept, present: true });
+          }
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(3);
+  });
+
   it('emits jitEligible/jitUrl flat on the episode', async () => {
     const eps = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01');
     expect(eps.S01E01.jitEligible).toBe(true);
@@ -607,7 +637,7 @@ describe('mediaIdentity.firstSeen — the library-add date', () => {
     await runScan();
 
     const after = episodesOf(await tvPayload(), 'Mkv Show', 'Season 01').S01E02;
-    expect(after.filename).toBe('Mkv Show - S01E02.REPACK.mkv');
+    expect(after.sources.find((source) => source.isPrimary).filename).toBe('Mkv Show - S01E02.REPACK.mkv');
     expect(after.mediaIdentity.firstSeen).toBe(before.mediaIdentity.firstSeen);
 
     // Restore the fixture for later tests.
