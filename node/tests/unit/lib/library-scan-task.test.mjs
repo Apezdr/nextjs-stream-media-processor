@@ -60,7 +60,8 @@ afterEach(async () => {
 describe('isInsideTaskExcluding', () => {
   it('is false outside every task and true inside a task of the scan group', async () => {
     expect(isInsideTaskExcluding(TaskType.MEDIA_SCAN)).toBe(false);
-    for (const type of [TaskType.MEDIA_SCAN, TaskType.BLURHASH, TaskType.METADATA_HASH]) {
+    expect(TaskType.METADATA_HASH).toBeUndefined();
+    for (const type of [TaskType.MEDIA_SCAN, TaskType.BLURHASH]) {
       expect(await enqueueTask(type, 'probe', async () => isInsideTaskExcluding(TaskType.MEDIA_SCAN))).toBe(true);
     }
     expect(await enqueueTask(TaskType.API_REQUEST, 'probe', async () => isInsideTaskExcluding(TaskType.MEDIA_SCAN))).toBe(false);

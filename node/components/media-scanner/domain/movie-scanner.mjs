@@ -35,8 +35,6 @@ import {
   getDatabaseInstance,
   RETRY_INTERVAL_HOURS
 } from '../data-access/scanner-repository.mjs';
-import { generateMovieHashes, deleteHashesForMedia } from '../../../sqlite/metadataHashes.mjs';
-import { getMovieByName } from '../../../sqliteDatabase.mjs';
 import { loadTmdbConfig, isUpdateAllowed, hasMetadataOverrideKey } from '../../../utils/tmdbConfig.mjs';
 import { isFrozenReason } from '../../../lib/metadataGenerator.mjs';
 import { resolveCooldownAction } from './cooldown-policy.mjs';
@@ -338,9 +336,9 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
   const urls = {};
   if (primary) {
     urls.mp4 = primary.url;
-    // Written for EVERY container, not just mp4. getMoviesModifiedSince keys
-    // the incremental hash sweep off this field, so an mkv-only movie without
-    // it would be permanently invisible to that sweep — silently, with no error.
+    // Written for EVERY container, not just mp4: the frontend sync stores it
+    // as the video's mediaLastModified file fact, and an mkv-only movie
+    // without it would publish none.
     if (primary.mediaLastModified) urls.mediaLastModified = primary.mediaLastModified;
     urls.sources = publishableSources(sources);
     // Emitted beside urls.mp4, per the frozen frontend contract. Both describe
@@ -562,7 +560,7 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       const fileNames = files.filter(file =>
         // The identity sidecar is our own bookkeeping, not library content. It
         // matches the .json arm below, so without this it would be published in
-        // file_names and folded into the movie hash.
+        // file_names and move the movie's manifest hash.
         !HASH_EXCLUDED_FILES.has(file) && (
         isVideoFile(file) ||
         file.endsWith('.srt') ||
@@ -834,12 +832,10 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       // so movies.metadata always reflects the current on-disk metadata.json
       // (read AFTER the download block, which may have rewritten the file).
       //
-      // Oscillation constraint (hard): this exact string is persisted into
-      // movies.metadata, and BOTH movie-hash writers consume that column
-      // verbatim — the inline rehash below via getMovieByName() and the
-      // scheduled updateAllMovieHashes() sweep via getMovies(). Byte-identical
-      // input for the same on-disk state, so the two writers cannot flip the
-      // stored hash back and forth.
+      // This exact string is persisted into movies.metadata, and the metadata
+      // URL's ?hash= is its sha256 (lib/metadataUrlHash.mjs): the same on-disk
+      // content always gives the same URL, and the frontend refetches the
+      // metadata only when the content changes.
       //
       // Fallback chain: serialized JSON > serialized {mtime,size} marker >
       // null. The marker keeps the hash advancing if the file exists but
@@ -896,50 +892,21 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         sourceUrls,
         mediaId,
         // The DURABLE date only — null when the sidecar could not be written.
-        // It is published and folded into the movie hash, so a per-pass `now`
-        // here would move that hash on every rescan of an unwritable folder.
+        // It is published, so a per-pass `now` here would move the movie's
+        // manifest hash on every rescan of an unwritable folder.
         identity.durableFirstSeen
       );
 
-      // Immediately regenerate the metadata hash using the fresh data just saved.
-      // The scheduled hash job filters by mp4 mtime and would miss changes where
-      // only tmdb.config or images changed, so we generate here to avoid the gap.
-      //
-      // Mirrors the TV scanner: save first, then re-read the row through the
-      // SAME read-side accessor family the scheduled sweep uses (getMovieByName
-      // here, getMovies in updateAllMovieHashes — identical row decoration) and
-      // hash THAT. Hashing the DB view instead of the scanner's in-memory
-      // objects guarantees both writers fold byte-identical input — including
-      // the movies.metadata fingerprint persisted just above — for the same
-      // on-disk state, so the stored hash can't oscillate between them.
-      //
-      // Expected one-time effect: a title whose stored hash was last written
-      // by the previously content-blind sweep (which hashed
-      // `metadata: undefined`) gets a corrected content-aware hash on its
-      // first pass through either writer, and the frontend re-syncs it once.
-      // That is the F-1 bug being fixed, not a regression.
-      //
-      // Every pass that reaches this point either inserted or rewrote the row
-      // (the early return above filters out everything else), so ALWAYS
-      // refresh the stored hash — including a brand-new movie's FIRST hash
-      // (F-2, shipped in Branch 4): the old gate skipped fresh INSERTs, so a
-      // new title was invisible to the bulk sync endpoint until the sweep's
-      // 16-minute mtime window or a per-title GET happened to catch it.
-      const freshMovie = await getMovieByName(dirName);
-      if (freshMovie) {
-        await generateMovieHashes(db, freshMovie);
-      }
     }))
   );
 
   // Remove movies from the database that no longer exist in the file system.
-  // Cascade (R-4 + F-3, Branch 5): clear the cooldown row and the stored
-  // metadata hash too — a same-named movie re-added later must start clean,
-  // not inherit its predecessor's retry timestamp or serve its frozen hash.
+  // Cascade (R-4, Branch 5): clear the cooldown row too — a same-named movie
+  // re-added later must start clean, not inherit its predecessor's retry
+  // timestamp.
   for (const movieName of existingMovieNames) {
     await removeMovie(movieName);
     await clearMissingMediaData(movieName);
-    await deleteHashesForMedia(db, 'movies', movieName);
   }
 
   return { titles: total, reprocessed };

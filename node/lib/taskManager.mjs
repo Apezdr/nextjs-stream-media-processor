@@ -11,7 +11,6 @@ export const TaskType = {
   MEDIA_SCAN: 2,         // General media scanning operations
   MOVIE_SCAN: 2.1,       // Movie scanning specifically
   TV_SCAN: 2.2,          // TV show scanning specifically
-  METADATA_HASH: 3,      // Metadata hash operations
   BLURHASH: 4,           // Blurhash operations
   DOWNLOAD: 5,           // TMDB downloads
   CAPTION_GENERATE: 5.5, // Whisper-based caption generation (CPU-heavy, low priority)
@@ -39,7 +38,6 @@ const concurrencyLimits = {
   [TaskType.MEDIA_SCAN]: 1,         // Only one general media scan at a time
   [TaskType.MOVIE_SCAN]: 1,         // Only one movie scan at a time
   [TaskType.TV_SCAN]: 1,            // Only one TV scan at a time
-  [TaskType.METADATA_HASH]: 1,      // Only one metadata hash operation
   [TaskType.BLURHASH]: 1,           // Only one blurhash operation
   [TaskType.DOWNLOAD]: 2,           // Allow 2 download operations
   [TaskType.CAPTION_GENERATE]: 1,   // One caption job at a time (CPU-heavy)
@@ -49,7 +47,7 @@ const concurrencyLimits = {
 // Configure which tasks are mutually exclusive
 const exclusiveGroups = [
   // These task types cannot run together
-  [TaskType.MEDIA_SCAN, TaskType.METADATA_HASH, TaskType.BLURHASH],
+  [TaskType.MEDIA_SCAN, TaskType.BLURHASH],
   // No DOWNLOAD/CACHE_CLEANUP pairing (removed, S-4): the only DOWNLOAD
   // caller is poster-collage generation, which shares no files or tables
   // with the readdir/stat/unlink cache sweeps — serializing them just

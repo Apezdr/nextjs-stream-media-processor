@@ -25,16 +25,6 @@ jest.unstable_mockModule('../../../utils/utils.mjs', () => ({
   },
 }));
 
-// The sqlite import chain reaches lib/mongo.mjs, which constructs a real
-// MongoClient at import time and requires MONGODB_URI.
-jest.unstable_mockModule('../../../lib/mongo.mjs', () => ({
-  mongoClient: {
-    db: () => {
-      throw new Error('Mongo is not available in scan-progress tests');
-    },
-  },
-}));
-
 const tmpDir = join(tmpdir(), `scan-progress-test-${randomUUID()}`);
 process.env.MEDIA_DB_DIRECTORY = tmpDir;
 

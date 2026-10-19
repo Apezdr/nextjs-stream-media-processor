@@ -40,16 +40,6 @@ jest.unstable_mockModule('../../../utils/utils.mjs', () => ({
   },
 }));
 
-// metadataHashes.mjs transitively imports lib/mongo.mjs, which constructs a
-// real MongoClient at import time and keeps the Jest worker alive.
-jest.unstable_mockModule('../../../lib/mongo.mjs', () => ({
-  mongoClient: {
-    db: () => {
-      throw new Error('Mongo is not available in media-table-generation tests');
-    },
-  },
-}));
-
 const tmpDir = join(tmpdir(), `media-table-generation-test-${randomUUID()}`);
 process.env.MEDIA_DB_DIRECTORY = tmpDir;
 const jitBefore = process.env.JIT_ELIGIBILITY_ENABLED;

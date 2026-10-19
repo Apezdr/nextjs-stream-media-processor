@@ -1,6 +1,5 @@
 import express from 'express';
 import { telemetryMiddleware, telemetryErrorMiddleware } from '../middleware/telemetryMiddleware.mjs';
-import { setupMetadataHashesRoutes } from './metadataHashes.mjs';
 import { setupSystemStatusRoutes } from './systemStatus.mjs';
 import { setupTmdbRoutes } from './tmdb.mjs';
 import { setupAdminRoutes } from './admin.mjs';
@@ -18,7 +17,6 @@ export function setupRoutes() {
   router.use(telemetryMiddleware());
 
   // Mount route modules
-  router.use('/api', setupMetadataHashesRoutes());
   router.use('/api', setupSystemStatusRoutes());
   router.use('/api/tmdb', setupTmdbRoutes());
   router.use('/api/admin', setupAdminRoutes());
@@ -28,7 +26,7 @@ export function setupRoutes() {
   router.use('/api', setupDiscordRoutes());  // Discord webhook events
 
   // Debug logging to verify routes are mounted
-  console.log('[Routes] Mounted: /api/metadata-hashes, /api/system-status');
+  console.log('[Routes] Mounted: /api/system-status');
   console.log('[Routes] Mounted: /api/tmdb/*, /api/admin/*, /api/discord');
   console.log('[Routes] Mounted: /api/captions/health, /api/admin/captions/generate');
   if (process.env.OTEL_ENABLED?.toLowerCase() === 'true') {

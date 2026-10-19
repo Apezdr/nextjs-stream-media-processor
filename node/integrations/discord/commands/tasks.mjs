@@ -36,7 +36,6 @@ export const data = new SlashCommandBuilder()
         { name: 'Media Scan', value: 'Media Scan' },
         { name: 'Movie Scan', value: 'Movie Scan' },
         { name: 'TV Show Scan', value: 'TV Show Scan' },
-        { name: 'Metadata Hash', value: 'Metadata Hash' },
         { name: 'Blurhash', value: 'Blurhash' },
         { name: 'TMDB Download', value: 'TMDB Download' },
         { name: 'Cache Cleanup', value: 'Cache Cleanup' }

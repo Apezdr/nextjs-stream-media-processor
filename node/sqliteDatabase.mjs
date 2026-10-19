@@ -4,7 +4,6 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
 import { withDbQuerySpan, withDbTransactionSpan, withDbConnectionSpan } from './lib/dbTracer.mjs';
-import { initializeMetadataHashesTable } from './sqlite/metadataHashes.mjs';
 import { initializeTmdbBlurhashCacheTable } from './sqlite/tmdbBlurhashCache.mjs';
 import { initializeDiscordIntrosTable } from './sqlite/discordIntros.mjs';
 import { createHash } from 'crypto';
@@ -335,8 +334,6 @@ export async function initializeSchema(dbType, db) {
     // Add performance indexes for hash-based conditional updates
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_movies_directory_hash ON movies(directory_hash);`);
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_tv_shows_directory_hash ON tv_shows(directory_hash);`);
-
-    await initializeMetadataHashesTable(db);
     return;
   }
 
@@ -408,9 +405,15 @@ export async function initializeSchema(dbType, db) {
  *    startup and scheduled blurhash sweeps, all removed in P2. The blurhashes
  *    the payload publishes are the `.blurhash` sidecar files next to each
  *    image (getStoredBlurhash and the downloader write them), never this table.
+ *  - metadata_hashes: the per-title, per-season and per-episode hashes behind
+ *    GET /api/metadata-hashes/:mediaType, its scheduled update and the
+ *    scanners' rehash, all removed in P4. The frontend sync reads the
+ *    manifests' per-title hashes and the metadata URL's content hash instead,
+ *    and nothing in the processor reads the table.
  */
 export async function dropRetiredTables(db) {
   await db.exec('DROP TABLE IF EXISTS blurhash_hashes');
+  await db.exec('DROP TABLE IF EXISTS metadata_hashes');
 }
 
 /**
@@ -440,9 +443,8 @@ async function migrateToFocalColumns(db) {
  * column name errors. Exported for schema tests (idempotency / convergence).
  *
  *  - movies.metadata (F-1): the canonically-serialized metadata.json content
- *    fingerprint the scanner persists so BOTH movie-hash writers (scanner
- *    inline path and the scheduled updateAllMovieHashes sweep) fold identical
- *    content into generateMovieHashes. tv_shows already has `metadata`.
+ *    fingerprint the scanner persists; the metadata URL's ?hash= is its
+ *    sha256 (lib/metadataUrlHash.mjs). tv_shows already has `metadata`.
  *  - pristine_metadata (G-5, both tables): raw pre-override TMDB payload from
  *    a genuine fetch, persisted opaquely. Trust/merge semantics are Branch 2.
  *  - *_source_url (I-3, both tables): the upstream TMDB image URL each managed
@@ -859,8 +861,8 @@ export async function getTVShows() {
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Stable content identity + first-seen date. Same allowlist trap as the
-        // movie readers: a column missing here is invisible to /media/tv and to
-        // the show hash.
+        // movie readers: a column missing here is invisible to the show's
+        // entry and its manifest hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
@@ -957,12 +959,10 @@ export async function getMovies() {
         // Internal-only columns — never serialized to /media/movies (the
         // app.mjs handler allowlist drops them).
         //
-        // `metadata` (F-1): returned VERBATIM from the column so the scheduled
-        // updateAllMovieHashes() sweep folds the exact bytes the scanner
-        // persisted into generateMovieHashes. The canonical serialization
-        // lives in movie-scanner.mjs (compact JSON.stringify of the parsed
-        // metadata.json); do NOT re-parse or re-shape it here or the sweep and
-        // the scanner's inline hash path will oscillate.
+        // `metadata` (F-1): returned VERBATIM from the column, the exact bytes
+        // the scanner persisted. The canonical serialization lives in
+        // movie-scanner.mjs (compact JSON.stringify of the parsed
+        // metadata.json); do NOT re-parse or re-shape it here.
         metadata: movie.metadata,
         // `pristineMetadata` (G-5): raw pre-override TMDB payload, opaque.
         pristineMetadata: movie.pristine_metadata ?? null,
@@ -1114,11 +1114,8 @@ export async function getMovieByName(name) {
         basePath: movie.base_path,
         backdropFocal: movie.backdrop_focal ?? null,
         backdropFocalSuggested: movie.backdrop_focal_suggested ?? null,
-        // Internal-only: `metadata` MUST be the verbatim column bytes — the
-        // movie scanner re-reads this row after saveMovie and feeds it to
-        // generateMovieHashes, and the scheduled sweep hashes the same column
-        // via getMovies(). Any divergence here re-opens the hash oscillation
-        // (F-1). Canonical serialization lives in movie-scanner.mjs.
+        // Internal-only: `metadata` MUST be the verbatim column bytes, as in
+        // getMovies (F-1). Canonical serialization lives in movie-scanner.mjs.
         metadata: movie.metadata,
         pristineMetadata: movie.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
@@ -1176,8 +1173,8 @@ export async function getTVShowById(id) {
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Stable content identity + first-seen date. Same allowlist trap as the
-        // movie readers: a column missing here is invisible to /media/tv and to
-        // the show hash.
+        // movie readers: a column missing here is invisible to the show's
+        // entry and its manifest hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
@@ -1231,8 +1228,8 @@ export async function getTVShowByName(name) {
         backdropFocal: show.backdrop_focal ?? null,
         backdropFocalSuggested: show.backdrop_focal_suggested ?? null,
         // Stable content identity + first-seen date. Same allowlist trap as the
-        // movie readers: a column missing here is invisible to /media/tv and to
-        // the show hash.
+        // movie readers: a column missing here is invisible to the show's
+        // entry and its manifest hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.

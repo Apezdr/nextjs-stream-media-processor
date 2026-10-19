@@ -4,10 +4,9 @@
  *  - migration idempotency: an old-schema DB migrated at startup, then
  *    migrated again, ends with the same schema; a from-scratch DB built by
  *    initializeSchema (run twice) converges on the identical schema.
- *  - oscillation guard (F-1): the metadata fingerprint string the scanner
- *    persists is EXACTLY what both hash writers read back — the column value
- *    via getMovieByName (scanner inline rehash) and via getMovies (scheduled
- *    sweep) hash to the same stored movie hash.
+ *  - the metadata fingerprint (F-1): the string the scanner persists is
+ *    EXACTLY what getMovieByName and getMovies read back, and both readers
+ *    build the metadata URL's ?hash= from it.
  *  - pristine_metadata preservation (G-5): a save without a fresh payload
  *    keeps the prior value, on BOTH the movie change-guard path and the TV
  *    always-rewrite path.
@@ -24,7 +23,7 @@ import { describe, it, expect, jest, beforeAll, afterAll } from '@jest/globals';
 import { promises as fs } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 
@@ -40,18 +39,6 @@ jest.unstable_mockModule('../../../utils/utils.mjs', () => ({
     } catch {
       return false;
     }
-  },
-}));
-
-// metadataHashes.mjs transitively imports lib/mongo.mjs, which constructs a
-// real MongoClient at import time — the client's internal resources keep the
-// Jest worker alive after the run (force-exit warning). Nothing in these
-// tests touches Mongo, so stub the module out entirely.
-jest.unstable_mockModule('../../../lib/mongo.mjs', () => ({
-  mongoClient: {
-    db: () => {
-      throw new Error('Mongo is not available in schema-parity tests');
-    },
   },
 }));
 
@@ -120,7 +107,6 @@ const OLD_TV_SHOWS_SQL = `
 `;
 
 let sqliteDb;       // sqliteDatabase.mjs module namespace
-let metadataHashes; // sqlite/metadataHashes.mjs module namespace
 let db;             // singleton "main" handle (backed by the seeded old-schema file)
 
 async function columnSpecs(handle, table) {
@@ -139,7 +125,6 @@ beforeAll(async () => {
   await seed.close();
 
   sqliteDb = await import('../../../sqliteDatabase.mjs');
-  metadataHashes = await import('../../../sqlite/metadataHashes.mjs');
   db = await sqliteDb.initializeDatabase('main'); // runs initializeSchema + migrations
 });
 
@@ -200,7 +185,7 @@ describe('schema parity migration', () => {
   });
 });
 
-describe('movie metadata fingerprint (F-1 oscillation guard)', () => {
+describe('movie metadata fingerprint (F-1)', () => {
   const NAME = 'Oscillation Movie (2024)';
   // Canonical serialization: compact JSON.stringify of the parsed file — the
   // exact string movie-scanner.mjs produces and persists.
@@ -211,15 +196,7 @@ describe('movie metadata fingerprint (F-1 oscillation guard)', () => {
     mediaLastModified: '2024-01-01T00:00:00.000Z',
   };
 
-  async function storedMovieHash() {
-    const row = await db.get(
-      `SELECT hash FROM metadata_hashes WHERE media_type = 'movies' AND title = ?`,
-      [NAME]
-    );
-    return row?.hash;
-  }
-
-  it('the persisted fingerprint is returned verbatim by both hash-writer read paths', async () => {
+  it('the persisted fingerprint is returned verbatim by the readers, and keys their metadata URL', async () => {
     await sqliteDb.insertOrUpdateMovie(
       NAME, ['movie.mp4'], { 'movie.mp4': 5400 }, { 'movie.mp4': '1920x1080' },
       URLS, URLS.metadata, 'dirhash-1', 'SDR', null, {}, 'tmdb_4242',
@@ -227,92 +204,15 @@ describe('movie metadata fingerprint (F-1 oscillation guard)', () => {
       FINGERPRINT, null
     );
 
-    const byName = await sqliteDb.getMovieByName(NAME);      // scanner inline rehash view
-    const fromList = (await sqliteDb.getMovies()).find((m) => m.name === NAME); // sweep view
+    const byName = await sqliteDb.getMovieByName(NAME);
+    const fromList = (await sqliteDb.getMovies()).find((m) => m.name === NAME);
 
     expect(byName.metadata).toBe(FINGERPRINT);
     expect(fromList.metadata).toBe(FINGERPRINT);
-  });
-
-  it('scanner inline path and scheduled sweep produce the same stored hash', async () => {
-    const byName = await sqliteDb.getMovieByName(NAME);
-    await metadataHashes.generateMovieHashes(db, byName); // scanner inline writer
-    const inlineHash = await storedMovieHash();
-    expect(inlineHash).toBeTruthy();
-
-    const fromList = (await sqliteDb.getMovies()).find((m) => m.name === NAME);
-    await metadataHashes.generateMovieHashes(db, fromList); // scheduled sweep writer
-    const sweepHash = await storedMovieHash();
-
-    expect(sweepHash).toBe(inlineHash);
-  });
-
-  it('the stored hash is content-aware: a fingerprint change moves it, an identical one does not', async () => {
-    const CA_NAME = 'Content Aware Movie (2024)';
-    // Deliberately NO `metadata`/poster/backdrop/logo URL keys: the read-side
-    // getters cache-bust those with directory_hash, which would move the hash
-    // on ANY row rewrite and mask a content-blindness regression. With them
-    // absent, the fingerprint is the only hash input that differs between the
-    // saves below.
-    const caUrls = {
-      mp4: '/movies/Content%20Aware%20Movie%20(2024)/movie.mp4',
-      mediaLastModified: '2024-01-01T00:00:00.000Z',
-    };
-    const save = (directoryHash, fingerprint) => sqliteDb.insertOrUpdateMovie(
-      CA_NAME, ['movie.mp4'], {}, {}, caUrls, '', directoryHash, null, null, {}, 'tmdb_1',
-      null, null, null, null, null, '{"x":0.5,"y":0.5}', null,
-      fingerprint, null
-    );
-    const regenViaSweep = async () => {
-      const row = (await sqliteDb.getMovies()).find((m) => m.name === CA_NAME);
-      await metadataHashes.generateMovieHashes(db, row);
-      const stored = await db.get(
-        `SELECT hash FROM metadata_hashes WHERE media_type = 'movies' AND title = ?`,
-        [CA_NAME]
-      );
-      return stored?.hash;
-    };
-
-    await save('h1', '{"id":1,"title":"v1"}');
-    const hash1 = await regenViaSweep();
-    expect(hash1).toBeTruthy();
-
-    // directory_hash moves but the fingerprint is identical → the row rewrite
-    // happens, yet no hash input changed, so the stored hash must not move.
-    await save('h2', '{"id":1,"title":"v1"}');
-    expect(await regenViaSweep()).toBe(hash1);
-
-    // Fingerprint changes (a metadata.json content edit) → the stored hash
-    // MUST move. This is the exact F-1 regression guard: drop `metadata` from
-    // generateMovieHashes' hashableData and this assertion fails.
-    await save('h3', '{"id":1,"title":"v2 (tmdb edit)"}');
-    expect(await regenViaSweep()).not.toBe(hash1);
-  });
-
-  it('rows without a media mtime hash deterministically (stable lastModified fallback)', async () => {
-    const NM_NAME = 'No Media Movie (2024)';
-    await sqliteDb.insertOrUpdateMovie(
-      NM_NAME, [], {}, {}, {}, '', 'h1', null, null, {}, null,
-      null, null, null, null, null, '{"x":0.5,"y":0.5}', null,
-      '{"id":2}', null
-    );
-    const readStored = () => db.get(
-      `SELECT hash FROM metadata_hashes WHERE media_type = 'movies' AND title = ?`,
-      [NM_NAME]
-    );
-
-    const row = await sqliteDb.getMovieByName(NM_NAME); // no urls.mediaLastModified
-    await metadataHashes.generateMovieHashes(db, row);
-    const first = await readStored();
-
-    // A per-call timestamp fallback would move the hash between regenerations;
-    // the stable null fallback must not. (Delay so a wall-clock-derived input
-    // could not accidentally collide within the same millisecond.)
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    await metadataHashes.generateMovieHashes(db, await sqliteDb.getMovieByName(NM_NAME));
-    const second = await readStored();
-
-    expect(second.hash).toBe(first.hash);
+    // lib/metadataUrlHash.mjs: the URL's ?hash= is the sha256 of these bytes.
+    const expected = `${URLS.metadata}?hash=${createHash('sha256').update(FINGERPRINT).digest('hex')}`;
+    expect(byName.urls.metadata).toBe(expected);
+    expect(fromList.urls.metadata).toBe(expected);
   });
 });
 

@@ -47,7 +47,7 @@ to match later code.
   main: SI-P0 on `epic/scan-integrity` implements it. Until that merges,
   `scanMovies` drops a name only after its `readdir` and directory hash, and
   `scanTVShows` has one try around the whole loop.
-- **Derived tables are a function of `movies`/`tv_shows`.** `metadata_hashes`,
+- **Derived tables are a function of `movies`/`tv_shows`.**
   `missing_data_media` and `episode_metadata_missing` are
   projections; no single failure may become a deletion in them, and removal
   cascades must cover all of them (title row deleted last — main still deletes
@@ -55,12 +55,12 @@ to match later code.
 - **`withWriteTx` is not re-entrant.** A helper running inside a write
   transaction must issue raw statements; it must not call another `deleteX`
   helper that opens its own transaction.
-- **Stale hash rows are worse than missing ones.** The frontend's movie
-  metadata step (`MovieMetadataStrategy.ts`) still skips re-fetching a title
-  whose `metadata_hashes` entry matches the hash it stored, so a stale row can
-  freeze that title's metadata. A missing row merely costs a re-fetch. When an
-  inline hash generate fails, degrade to MISSING (delete the title's rows),
-  never leave STALE.
+- **The metadata URL's `?hash=` must follow the content.** The frontend's
+  movie metadata step skips re-fetching a title whose metadata URL hash matches
+  the one it stored. That hash is the sha256 of `movies.metadata` /
+  `tv_shows.metadata` (`node/lib/metadataUrlHash.mjs`), so those columns must
+  always hold the current canonical `metadata.json` content; a stale column
+  freezes the title's metadata.
 - **JIT path keys are strict unpadded base64url** of the source path relative
   to its library root (`node/utils/jitUrl.mjs`), matching the transcoder's own
   `path_key` encoding. Never hand-build a stream URL another way.

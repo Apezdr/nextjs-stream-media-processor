@@ -10,9 +10,10 @@
 // .mkv-only title reached the database as an empty, video-less row.
 //
 // ORDERING IS A HARD CONTRACT, not a presentation detail. `movies.urls` is
-// folded wholesale into the movie hash (see sqlite/metadataHashes.mjs), so a
-// readdir-order-dependent array would make that hash flap between scans on some
-// filesystems and force a permanent resync loop. The order here comes from
+// published wholesale in the movie's entry, whose bytes the manifest hashes
+// (lib/mediaManifest.mjs), so a readdir-order-dependent array would make that
+// hash flap between scans on some filesystems and force a permanent resync
+// loop. The order here comes from
 // listVideoFiles, which sorts by VIDEO_EXTENSIONS priority then by name.
 
 import { promises as fs } from 'fs';
@@ -153,7 +154,7 @@ export async function buildVideoSources({
       audioLanguages,
       // Stable-null discipline: a source whose stat failed contributes null,
       // never a fresh timestamp. A `new Date()` fallback here would move the
-      // movie hash on every single regeneration.
+      // movie's manifest hash on every single rebuild.
       mediaLastModified: stat ? stat.mtime.toISOString() : null,
       uuid: info?.uuid ?? null,
       isPrimary: false,

@@ -18,7 +18,6 @@ import { createSpriteRoutes } from "./sprite-route.mjs";
 // scanner-repository.mjs, not here — importing them in app.mjs wrongly implied
 // this file participates in scan persistence.
 import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase, getMediaTableGeneration } from "./sqliteDatabase.mjs";
-import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
 import {
@@ -1032,39 +1031,6 @@ function scheduleTasks() {
     runGenerateList().catch(logger.error);
   });
   
-  // Schedule metadata hash updates - runs at 5, 20, 35, 50 minutes past the hour
-  scheduleJob("5,20,35,50 * * * *", () => {
-    // Use task manager instead of the isScanning flag
-    enqueueTask(TaskType.METADATA_HASH, 'Metadata Hashes Update', async () => {
-      logger.info("Running Metadata Hashes Update...");
-      const db = await initializeDatabase();
-      
-      try {
-        // Use a timestamp to track changes since last scan
-        const lastScanTime = new Date();
-        lastScanTime.setMinutes(lastScanTime.getMinutes() - 16);
-        const sinceTimestamp = lastScanTime.toISOString();
-
-        // Process movies first
-        await updateAllMovieHashes(sinceTimestamp);
-        logger.info("Movie metadata hashes completed, processing TV shows...");
-        
-        // Process TV shows second
-        await updateAllTVShowHashes(sinceTimestamp);
-        logger.info("Metadata Hashes Update Completed.");
-        
-        return 'Metadata hash update completed successfully';
-      } catch (error) {
-        logger.error(`Metadata Hashes Update Error: ${error.message}`);
-        throw error; // Let task manager handle the error
-      } finally {
-        await releaseDatabase(db);
-      }
-    }).catch(error => {
-      logger.error(`Failed to enqueue metadata hash task: ${error.message}`);
-    });
-  });
-  
   // Schedule cache cleanups at staggered times
   // General cache cleanup runs at 15 and 45 past the hour
   scheduleJob("15,45 * * * *", () => {
@@ -1218,7 +1184,6 @@ app.use((req, res, next) => {
       endpoints: [
         '/api/tmdb/* - TMDB metadata operations',
         '/api/admin/* - Administrative operations (requires auth)',
-        '/api/metadata-hashes/:mediaType - Get metadata hashes',
         '/api/system-status - System status information',
         '/api/logs - Server logs (supports SSE streaming)'
       ]

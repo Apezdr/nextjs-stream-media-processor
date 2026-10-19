@@ -591,7 +591,6 @@ router.get('/tasks', authenticateWebhookOrUser, async (req, res) => {
       [TaskType.MEDIA_SCAN]: 'Media Scan',
       [TaskType.MOVIE_SCAN]: 'Movie Scan',
       [TaskType.TV_SCAN]: 'TV Show Scan',
-      [TaskType.METADATA_HASH]: 'Metadata Hash',
       [TaskType.BLURHASH]: 'Blurhash',
       [TaskType.DOWNLOAD]: 'TMDB Download',
       [TaskType.CAPTION_GENERATE]: 'Caption Generation',

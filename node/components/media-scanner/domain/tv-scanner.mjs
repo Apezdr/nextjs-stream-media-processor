@@ -40,7 +40,6 @@ import {
   recordMediaIdentity,
   createIdentityClaims
 } from '../data-access/scanner-repository.mjs';
-import { deleteHashesForMedia, generateTVShowHashes } from '../../../sqlite/metadataHashes.mjs';
 import { getTVShowByName } from '../../../sqliteDatabase.mjs';
 import { refreshMissingEpisodes, isFrozenReason } from '../../../lib/metadataGenerator.mjs';
 import { loadTmdbConfig, getTmdbConfigFilePath, isUpdateAllowed, hasMetadataOverrideKey } from '../../../utils/tmdbConfig.mjs';
@@ -259,7 +258,7 @@ async function processShowMetadata({
   // Read the existing metadata.json whenever the file is PRESENT — even when it's
   // flagged stale-by-config or the show is update-disabled. Only a genuinely
   // absent file leaves these empty. Otherwise the scanner persists a blank
-  // metadata column (and a content-less show hash) for valid-but-frozen/stale
+  // metadata column (and a content-less metadata URL hash) for valid-but-frozen/stale
   // shows the generator won't (re)write — e.g. `update_metadata: false`.
   if (exists) {
     try {
@@ -274,8 +273,8 @@ async function processShowMetadata({
       // Parity with movie-scanner's fingerprint fallback chain: degrade to a
       // stable serialized {mtime,size} marker rather than ''. The TV upsert
       // always rewrites (P-2), so an empty string here would blank a
-      // previously-good tv_shows.metadata and collapse the show hash to a
-      // content-less value on one corrupt write; the marker keeps the hash
+      // previously-good tv_shows.metadata and collapse the metadata URL hash
+      // to a content-less value on one corrupt write; the marker keeps the hash
       // advancing (file changed) without destroying the stored content signal.
       try {
         const st = await fs.stat(metadataFilePath);
@@ -350,8 +349,9 @@ async function processEpisodeSubtitles(seasonPath, episodeFiles, encodedShowName
  *
  * A new coordinate is dated `tracker.now` and queued in `tracker.added`; the
  * caller persists the batch after every season has been walked. When the show
- * has no durable sidecar the answer is null — the value is folded into the
- * episode hash, so an unpersisted date would move that hash on every rebuild.
+ * has no durable sidecar the answer is null — the value is published in the
+ * show's entry, so an unpersisted date would move its manifest hash on every
+ * rebuild.
  */
 function resolveEpisodeFirstSeen(tracker, seasonNumber, episodeNumber) {
   if (!tracker) return null;
@@ -466,7 +466,7 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
   // Handle episode metadata. Append an mtime content-version token (same scheme
   // as the thumbnail above) so the URL changes when the episode metadata file
   // changes. This cache-busts the frontend's URL-keyed metadata fetch AND moves
-  // the episode hash, which folds in episodeData.metadata (this URL string).
+  // the show's manifest hash, as the URL is part of its entry.
   const episodeMetadataPath = join(seasonPath, `${episodeNumber}_metadata.json`);
   if (await fileExists(episodeMetadataPath)) {
     const episodeMetadataStats = await fs.stat(episodeMetadataPath);
@@ -902,13 +902,13 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         }
 
         // The backfill rewrote >=1 episode file. Fall through to the normal
-        // season-rebuild + saveTVShow + generateTVShowHashes below so the new
-        // episode metadata + hash land THIS pass — the frontend then picks it up on
+        // season-rebuild + saveTVShow below so the new episode metadata URL
+        // (its ?hash= token) lands THIS pass — the frontend then picks it up on
         // the next sync instead of waiting for a later scan to notice the changed
         // files via dirHashChanged. The TMDB image-download block is skipped (its
-        // flag is still false); only the cheap rebuild + rehash runs. Fires only
-        // when a fill-in actually landed (rare), so the extra work is bounded.
-        logger.info(`scanner: backfill updated ${showName}, reprocessing inline to refresh hashes`, {
+        // flag is still false); only the cheap rebuild runs. Fires only when a
+        // fill-in actually landed (rare), so the extra work is bounded.
+        logger.info(`scanner: backfill updated ${showName}, reprocessing inline to refresh its episodes`, {
           'media.name': showName, 'media.type': 'tv', 'episodes.written': backfillWrote,
         });
       }
@@ -1037,8 +1037,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         // Adopt the post-generation metadata. The initial processShowMetadata
         // ran BEFORE the generator (re)wrote metadata.json — when tmdb.config
         // was newer it returned empty `metadata`. Persisting that empty value
-        // would leave tv_shows.metadata blank, defeating the content-folded
-        // show hash (it couldn't see the metadata change). retryMetadataResult
+        // would leave tv_shows.metadata blank, and the metadata URL hash, which
+        // is built from it, couldn't see the metadata change. retryMetadataResult
         // reflects the freshly-written file.
         metadataResult = retryMetadataResult;
       }
@@ -1080,7 +1080,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
       // Persist newly observed episodes. If the write does not land, publish
       // null for exactly those episodes: a date that is not on disk would be
-      // re-minted by the next rebuild and flap the episode hash.
+      // re-minted by the next rebuild and flap the show's manifest hash.
       if (Object.keys(episodeSeen.added).length > 0) {
         const persisted = await recordEpisodesFirstSeen({ dir: showPath, added: episodeSeen.added });
         if (!persisted) {
@@ -1139,23 +1139,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         showIdentity.durableFirstSeen
       );
 
-      // Immediately regenerate the metadata hash using the fresh data just saved.
-      // The scheduled hash job filters by episode mtime and would miss changes where
-      // only tmdb.config or images changed, so we generate here to avoid the gap.
-      // Unconditional (F-2, shipped in Branch 4): the old `if (storedHash)` gate
-      // skipped brand-new shows, so their first hash waited for the sweep or a
-      // per-title GET. (A dirHashChanged-only gate would be wrong too — an
-      // images-retry pass can change the row without the tick-start hash having
-      // moved, and the post-download save makes the NEXT tick's hash compare
-      // clean, so this tick is the only one that sees the change.)
-      const freshShow = await getTVShowByName(showName);
-      if (freshShow) {
-        await generateTVShowHashes(db, freshShow);
-      }
-
       // Air-date-aware backfill of thin episode metadata. Runs AFTER finalHash
       // is stored, so any rewrite is picked up by the next scan's dirHashChanged
-      // path (seasons JSON rebuilt → fresh URL token → episode hash moves → resync).
+      // path (seasons JSON rebuilt → fresh URL token → manifest hash moves → resync).
       try {
         const tmdbId = metadataResult.metadata ? JSON.parse(metadataResult.metadata)?.id : null;
         if (tmdbId) {
@@ -1169,15 +1155,13 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
     }
 
     // Remove TV shows from the database that no longer exist in the file
-    // system. Cascade (R-4 + F-3, Branch 5): clear the show's cooldown row,
-    // its per-episode backfill rows, and its stored metadata hashes too — a
-    // same-named show re-added later must start clean, not inherit its
-    // predecessor's retry history or serve its frozen hash.
+    // system. Cascade (R-4, Branch 5): clear the show's cooldown row and its
+    // per-episode backfill rows too — a same-named show re-added later must
+    // start clean, not inherit its predecessor's retry history.
     for (const showName of existingShowNames) {
       await removeTVShow(showName);
       await clearMissingMediaData(showName);
       await clearEpisodeRetryForShow(showName);
-      await deleteHashesForMedia(db, 'tv', showName);
     }
   } catch (error) {
     logger.error('Error during database update: ' + error);
@@ -1279,7 +1263,7 @@ async function backfillMissingEpisodes(showName, showPath, tmdbId, seasons, now,
   }
 
   // Count of episodes (re)written this pass. The fast-skip caller uses this to
-  // decide whether to reprocess the show inline (rebuild seasons + rehash) so a
+  // decide whether to reprocess the show inline (rebuild seasons) so a
   // fill-in reaches the frontend in one scan instead of two.
   return written;
 }

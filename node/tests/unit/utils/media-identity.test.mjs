@@ -244,7 +244,7 @@ describe('repointMediaIdentity', () => {
 });
 
 describe('firstSeen — the library-add date', () => {
-  // Published as mediaIdentity.firstSeen and folded into the metadata hash, so
+  // Published as mediaIdentity.firstSeen, so part of the manifest hash, so
   // two properties are load-bearing: it never moves once written, and a value
   // that is not on disk is never handed out as if it were.
 

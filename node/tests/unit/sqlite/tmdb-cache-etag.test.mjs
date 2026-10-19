@@ -26,16 +26,6 @@ jest.unstable_mockModule('../../../utils/utils.mjs', () => ({
   },
 }));
 
-// The sqlite import chain reaches lib/mongo.mjs, which constructs a real
-// MongoClient at import time and requires MONGODB_URI.
-jest.unstable_mockModule('../../../lib/mongo.mjs', () => ({
-  mongoClient: {
-    db: () => {
-      throw new Error('Mongo is not available in tmdb-cache-etag tests');
-    },
-  },
-}));
-
 const tmpDir = join(tmpdir(), `tmdb-cache-etag-test-${randomUUID()}`);
 process.env.MEDIA_DB_DIRECTORY = tmpDir;
 

@@ -203,8 +203,8 @@ allowlist is the first place to look.
 | `jitEligible`, `jitUrl` | boolean / string\|null | **shipped P6** | Flat on the episode, describing the primary source — see §9 |
 
 **Episodes carry flat fields by design and will not gain a `urls` bag.** Nesting them would
-reshape a hot payload and change the input shape of `generateTVShowHashes`, forcing a resync
-for no benefit.
+reshape a hot payload and move every show's manifest hash, forcing a resync for no
+benefit.
 
 ---
 
@@ -276,7 +276,7 @@ delete one and it regenerates. A trimmed copy of `additionalMetadata` is publish
 frontend: a movie's `additional_metadata` keeps duration, dimensions, width, height, size, the
 first video track's codec, bitrate and frame_rate, and the first audio track's codec and
 channels; an episode's `additionalMetadata` keeps its size (`node/lib/mediaPayload.mjs`). The
-caption stubs and the metadata hashes still read the full record.
+caption stubs still read the full record.
 
 v1.0011 adds the facts needed to decide whether the transcoder can serve a file without
 losing anything, at **zero extra subprocess cost** — the existing

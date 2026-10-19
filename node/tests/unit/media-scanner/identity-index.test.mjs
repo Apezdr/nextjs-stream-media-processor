@@ -30,15 +30,6 @@ jest.unstable_mockModule('../../../utils/utils.mjs', () => ({
   },
 }));
 
-// metadataHashes.mjs transitively constructs a real MongoClient at import time.
-jest.unstable_mockModule('../../../lib/mongo.mjs', () => ({
-  mongoClient: {
-    db: () => {
-      throw new Error('Mongo is not available in identity-index tests');
-    },
-  },
-}));
-
 const tmpDir = join(tmpdir(), `identity-index-test-${randomUUID()}`);
 process.env.MEDIA_DB_DIRECTORY = tmpDir;
 

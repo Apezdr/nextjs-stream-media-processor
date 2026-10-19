@@ -3,8 +3,8 @@
 // The two library scans that are not the scan tick's: POST /media/scan, and the
 // scan the /media/tv and /media/movies payload loaders run when their table is
 // empty. Both run as MEDIA_SCAN tasks, so the task manager never runs them
-// beside a scan tick, the startup blurhash healing pass or the metadata-hash
-// update (one exclusive group): each waits until the group is free, then runs.
+// beside a scan tick or the startup blurhash healing pass (one exclusive
+// group): each waits until the group is free, then runs.
 // They used to call the scanners directly, so they could overlap any of those.
 //
 // WHERE THEY ARE CALLED FROM. Both are reached from an HTTP request, never from

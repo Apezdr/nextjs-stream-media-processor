@@ -1,5 +1,5 @@
 /**
- * The routes P2 and P3 removed stay removed, read off the source.
+ * The routes P2, P3 and P4 removed stay removed, read off the source.
  *
  * Every one of them had no caller in the frontend, the TV app or the
  * transcoder, and no request in prod for 30 days (the per-season hash route:
@@ -15,7 +15,8 @@
  * this repo: the Discord bot's ServerApiClient calls /api/tasks (its /tasks
  * command). P3 removed POST /api/trigger-system-status: its one caller,
  * ServerApiClient.triggerStatusCheck(), ran only from getSystemStatus(true),
- * which nothing called with true.
+ * which nothing called with true. P4 removed the metadata-hash list with its
+ * route and sqlite modules, once the frontend stopped reading it.
  */
 
 import { describe, it, expect } from '@jest/globals';
@@ -49,13 +50,6 @@ const FILES = {
       'GET /rescan/tmdb',
     ],
     kept: ['GET /processes', 'POST /media/scan', 'GET /media/tv', 'GET /media/movies', 'GET /api/logs'],
-  },
-  'routes/metadataHashes.mjs': {
-    removed: [
-      'GET /metadata-hashes/:mediaType/:title',
-      'GET /metadata-hashes/:mediaType/:title/:seasonNumber',
-    ],
-    kept: ['GET /metadata-hashes/:mediaType'],
   },
   'routes/systemStatus.mjs': {
     removed: ['GET /health', 'POST /trigger-system-status'],
@@ -116,6 +110,24 @@ describe('routes removed in P2 and P3', () => {
     const client = codeOf(readFileSync(join(NODE_DIR, 'integrations', 'discord', 'utils', 'serverApi.mjs'), 'utf8'));
     expect(/trigger-system-status|triggerStatusCheck/.test(client)).toBe(false);
     expect(existsSync(join(NODE_DIR, 'integrations', 'discord', 'index.mjs'))).toBe(false);
+  });
+
+  it('the metadata-hash modules are gone and nothing mounts or imports them (P4)', () => {
+    expect(existsSync(join(NODE_DIR, 'routes', 'metadataHashes.mjs'))).toBe(false);
+    expect(existsSync(join(NODE_DIR, 'sqlite', 'metadataHashes.mjs'))).toBe(false);
+    for (const file of [
+      'app.mjs',
+      'routes/index.mjs',
+      'sqliteDatabase.mjs',
+      'components/media-scanner/domain/movie-scanner.mjs',
+      'components/media-scanner/domain/tv-scanner.mjs',
+    ]) {
+      const code = codeOf(readFileSync(join(NODE_DIR, file), 'utf8'));
+      expect({ file, imports: /metadataHashes\.mjs|setupMetadataHashesRoutes|metadata-hashes/.test(code) }).toEqual({
+        file,
+        imports: false,
+      });
+    }
   });
 
   it('the blurhash-hash modules are gone and nothing mounts them', () => {

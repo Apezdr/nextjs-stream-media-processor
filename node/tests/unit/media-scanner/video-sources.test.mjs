@@ -1,8 +1,8 @@
 /**
- * `sources[]` is folded wholesale into the movie hash (sqlite/metadataHashes.mjs
- * hashes `movie.urls`), so its ORDER is a correctness property, not a
- * presentation one: a readdir-order-dependent array would make the stored hash
- * flap between scans and force a permanent full-catalog resync loop.
+ * `sources[]` is published wholesale in the movie's entry, whose bytes the
+ * manifest hashes (lib/mediaManifest.mjs), so its ORDER is a correctness
+ * property, not a presentation one: a readdir-order-dependent array would make
+ * that hash flap between scans and force a permanent full-catalog resync loop.
  *
  * The ffprobe/mediainfo boundary is mocked; files are real temp files.
  */
