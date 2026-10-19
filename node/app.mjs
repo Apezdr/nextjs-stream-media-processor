@@ -39,12 +39,8 @@ import {
   autoCaptionsContextKey,
   clearPayloadsAfterScan
 } from "./lib/mediaPayloadCache.mjs";
-import {
-  tvManifestKeys,
-  createManifestHandler,
-  createEntriesBodyParser,
-  createEntriesHandler
-} from "./lib/mediaManifest.mjs";
+import { tvManifestKeys, createManifestHandler } from "./lib/mediaManifest.mjs";
+import { createGlobalJsonParser, mountMediaEntriesRoute } from "./lib/requestBodyParsers.mjs";
 import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
 import { generateChapters } from "./chapter-generator.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
@@ -259,20 +255,11 @@ const configureCORS = () => {
 // Apply CORS middleware
 app.use(configureCORS());
 
-// Parse JSON request bodies (with increased size limit for subtitle uploads).
-// Skip /api/discord/events: that route needs the raw, unparsed body (via its
-// own express.raw() middleware) to verify the Discord webhook signature —
-// parsing it here first would make that raw parser a no-op and force a
-// lossy JSON.stringify() re-serialization fallback before verification.
-// Skip the media entries routes too: they parse their own body, after auth,
-// with their own limit (lib/mediaManifest.mjs). Routing ignores case and a
-// trailing slash, so the check does as well.
-const OWN_JSON_PARSER_PATHS = new Set(['/media/tv/entries', '/media/movies/entries']);
-app.use((req, res, next) => {
-  if (req.path === '/api/discord/events') return next();
-  if (OWN_JSON_PARSER_PATHS.has(req.path.toLowerCase().replace(/\/+$/, ''))) return next();
-  return express.json({ limit: '30mb' })(req, res, next);
-});
+// Parse JSON request bodies (with increased size limit for subtitle uploads),
+// except on /api/discord/events, which needs the raw body to verify the
+// Discord webhook signature, and on the media entries routes, which parse
+// their own body after auth. See lib/requestBodyParsers.mjs.
+app.use(createGlobalJsonParser());
 
 ensureCacheDirs();
 
@@ -890,12 +877,14 @@ app.get(
   createManifestHandler(tvPayloadCache, { logger, errorLabel: 'Error building the TV manifest' })
 );
 
-app.post(
-  "/media/tv/entries",
-  authenticateWebhookOrUser,
-  createEntriesBodyParser(),
-  createEntriesHandler(tvPayloadCache, { logger, errorLabel: 'Error sending TV entries' })
-);
+// POST /media/tv/entries: auth, then its own body parser, then the handler.
+mountMediaEntriesRoute(app, {
+  kind: 'tv',
+  authenticate: authenticateWebhookOrUser,
+  cache: tvPayloadCache,
+  logger,
+  errorLabel: 'Error sending TV entries',
+});
 
 /**
  * Wrapper function for backward compatibility
@@ -939,12 +928,14 @@ app.get(
   createManifestHandler(moviePayloadCache, { logger, errorLabel: 'Error building the movie manifest' })
 );
 
-app.post(
-  "/media/movies/entries",
-  authenticateWebhookOrUser,
-  createEntriesBodyParser(),
-  createEntriesHandler(moviePayloadCache, { logger, errorLabel: 'Error sending movie entries' })
-);
+// POST /media/movies/entries: auth, then its own body parser, then the handler.
+mountMediaEntriesRoute(app, {
+  kind: 'movies',
+  authenticate: authenticateWebhookOrUser,
+  cache: moviePayloadCache,
+  logger,
+  errorLabel: 'Error sending movie entries',
+});
 
 app.post("/media/scan", authenticateWebhookOrUser, async (req, res) => {
   try {

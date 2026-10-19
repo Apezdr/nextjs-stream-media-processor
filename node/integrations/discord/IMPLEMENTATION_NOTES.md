@@ -66,9 +66,12 @@ if (!Buffer.isBuffer(rawBody)) {
 object keys, changing the byte sequence and invalidating the signature.
 
 **As-built (D-1 + residual cleanup, 2026-07-12):** Options 1 AND 2 are both
-implemented — app.mjs skips the global JSON parser for `/api/discord/events`
-and the route applies `express.raw()`, so `req.body` is always the exact raw
-Buffer. The Option-3 fallback that used to live in routes.mjs was dead code
+implemented — the global JSON parser skips `/api/discord/events` and the
+route applies `express.raw()`, so `req.body` is always the exact raw
+Buffer. The parser is `createGlobalJsonParser()` in
+`node/lib/requestBodyParsers.mjs` (moved out of app.mjs, which mounts it,
+2026-10-18); `node/tests/unit/lib/request-body-parsers.test.mjs` checks the
+Discord route still gets its raw body. The Option-3 fallback that used to live in routes.mjs was dead code
 after D-1 (unreachable, and never correct) and has been deleted.
 
 ---

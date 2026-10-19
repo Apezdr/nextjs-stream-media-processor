@@ -15,7 +15,11 @@
  *     else; a new episode moves its show's keys;
  *   - a matching If-None-Match gets a 304 even with `Cache-Control: no-cache`;
  *   - entries for a list, for `all`, and for a title the library does not
- *     have; lines that parse one at a time, whatever the names hold;
+ *     have; lines that parse one at a time when split on 0x0A, whatever the
+ *     names hold (raw U+2028 and U+2029 included);
+ *   - the closing line {"end":true,"count":N} after the last title line, with
+ *     N the title lines sent, and none on a stream cut off part-way;
+ *   - the manifest's exact bytes, format 2;
  *   - a rebuild between the manifest and the entries is a hash mismatch, and a
  *     rebuild mid-stream does not mix generations;
  *   - the stream follows the client's pace, and the request limit holds a list
@@ -105,6 +109,7 @@ const {
   TITLE_HASH_LENGTH,
   ENTRIES_REQUEST_BODY_LIMIT,
   tvManifestKeys,
+  buildManifest,
   parseEntriesRequest,
   createManifestHandler,
   createEntriesBodyParser,
@@ -154,12 +159,14 @@ const tvCache = new MediaPayloadCache({
   loadRows: loadShows,
 });
 
-// Names that test the framing: quotes, a backslash, a newline, U+2028, an
-// integer-like name, the body's own `version` key, and Object.prototype names.
+// Names that test the framing: quotes, a backslash, a newline, a raw U+2028
+// and U+2029 (JSON.stringify leaves both raw), an integer-like name, the body's
+// own `version` key, and Object.prototype names.
 const ODD_NAMES = [
   'Quote " and \\ backslash',
   'Line\nbreak',
   'Separator inside',
+  'Paragraph inside',
   '1917',
   'version',
   '__proto__',
@@ -235,10 +242,11 @@ function postJson(path, payload, headers = {}) {
   });
 }
 
-/** Split an NDJSON body on its newlines and parse each line on its own. */
-function ndjsonLines(body) {
-  if (body.length === 0) return [];
-  expect(body[body.length - 1]).toBe(0x0a);
+/**
+ * Split bytes on 0x0A only, as the contract says a reader must, and parse each
+ * whole line on its own. Bytes after the last 0x0A are not a line.
+ */
+function splitLines(body) {
   const lines = [];
   let start = 0;
   for (let i = 0; i < body.length; i += 1) {
@@ -247,6 +255,22 @@ function ndjsonLines(body) {
     lines.push({ raw, value: JSON.parse(raw) });
     start = i + 1;
   }
+  return lines;
+}
+
+const closingBytes = (count) => Buffer.from(`{"end":true,"count":${count}}\n`);
+
+/**
+ * The title lines of a whole entries body: it must end with the closing line,
+ * whose count is the number of title lines before it.
+ */
+function ndjsonLines(body) {
+  expect(body[body.length - 1]).toBe(0x0a);
+  const lines = splitLines(body);
+  const end = lines.pop();
+  expect(end.value).toEqual({ end: true, count: lines.length });
+  expect(body.subarray(body.length - end.raw.length - 1).equals(closingBytes(lines.length))).toBe(true);
+  for (const line of lines) expect(Object.hasOwn(line.value, 'end')).toBe(false);
   return lines;
 }
 
@@ -351,6 +375,7 @@ describe('the manifest', () => {
       const { json: body } = await getJson(`/media/${kind}`);
       const { json: manifest } = await getJson(`/media/${kind}/manifest`);
 
+      expect(MANIFEST_FORMAT_VERSION).toBe(2);
       expect(manifest.format).toBe(MANIFEST_FORMAT_VERSION);
       expect(manifest.kind).toBe(kind);
       expect(manifest.version).toBe(version);
@@ -598,8 +623,9 @@ describe('the entries', () => {
     expect(Object.keys(manifest.titles).sort()).toEqual([...ODD_NAMES].sort());
 
     const all = await postJson('/odd/entries', { all: true });
-    // One newline per title, each closing a line that parses by itself.
-    expect(all.body.toString().split('\n')).toHaveLength(ODD_NAMES.length + 1);
+    // One newline per title and one for the closing line, each ending a line
+    // that parses by itself.
+    expect(all.body.toString().split('\n')).toHaveLength(ODD_NAMES.length + 2);
     const lines = ndjsonLines(all.body);
     expect(lines.map((line) => line.value.title)).toEqual(ODD_NAMES);
     for (const line of lines) {
@@ -617,10 +643,67 @@ describe('the entries', () => {
     expect(picked[0].entry).toEqual({ text: '__proto__', len: 9 });
   });
 
-  it('answers an empty list with an empty body', async () => {
-    const res = await postJson('/media/tv/entries', { titles: [] });
-    expect(res.status).toBe(200);
-    expect(res.body.length).toBe(0);
+  it('sends a raw U+2028 or U+2029 inside a title as is: split on 0x0A, the line gives the name back', async () => {
+    oddCache.invalidate('test');
+    const { json: manifest } = await getJson('/odd/manifest');
+    const names = ['Separator inside', 'Paragraph inside'];
+    for (const encoding of ['identity', 'gzip']) {
+      const res = await postJson('/odd/entries', { titles: names }, { 'Accept-Encoding': encoding });
+      const body = encoding === 'gzip' ? gunzipSync(res.body) : res.body;
+      // The raw UTF-8 bytes, not a \u escape: a reader that also split on
+      // these (Node's readline does) would cut both lines in two.
+      for (const separator of [' ', ' ']) {
+        expect(JSON.stringify(separator)).toBe(`"${separator}"`);
+        expect(body.includes(Buffer.from(separator))).toBe(true);
+      }
+      expect(body.includes(Buffer.from('\\u2028'))).toBe(false);
+      expect(body.includes(Buffer.from('\\u2029'))).toBe(false);
+
+      const lines = ndjsonLines(body);
+      expect(lines.map((line) => line.value.title)).toEqual(names);
+      for (const line of lines) {
+        expect(line.value.entry).toEqual({ text: line.value.title, len: line.value.title.length });
+        expect(line.value.hash).toBe(manifest.titles[line.value.title].hash);
+        expect(short(entryBytesOf(line))).toBe(line.value.hash);
+      }
+    }
+  });
+
+  it('closes every answer with {"end":true,"count":N}, N the title lines sent, missing ones included', async () => {
+    const endsWith = (body, count) => body.subarray(-closingBytes(count).length).equals(closingBytes(count));
+
+    // A list: a repeat is sent once, a title the library lacks is a line.
+    const list = await postJson('/media/movies/entries', {
+      titles: ['Zeta Movie', 'No Such Movie', 'Alpha Movie', 'Zeta Movie'],
+    });
+    expect(endsWith(list.body, 3)).toBe(true);
+    expect(ndjsonLines(list.body)).toHaveLength(3);
+
+    // Only titles the library lacks.
+    const missing = await postJson('/media/tv/entries', { titles: ['Gone 1', 'Gone 2'] });
+    expect(missing.body.toString()).toBe(
+      '{"title":"Gone 1","missing":true}\n{"title":"Gone 2","missing":true}\n{"end":true,"count":2}\n'
+    );
+
+    // All: one line per title of the manifest.
+    for (const kind of ['movies', 'tv']) {
+      const { json: manifest } = await getJson(`/media/${kind}/manifest`);
+      const count = Object.keys(manifest.titles).length;
+      expect(count).toBeGreaterThan(0);
+      const all = await postJson(`/media/${kind}/entries`, { all: true });
+      expect(endsWith(all.body, count)).toBe(true);
+      expect(ndjsonLines(all.body)).toHaveLength(count);
+    }
+
+    // An empty list: the closing line alone.
+    const empty = await postJson('/media/tv/entries', { titles: [] });
+    expect(empty.status).toBe(200);
+    expect(empty.body.equals(closingBytes(0))).toBe(true);
+
+    // Gzipped, the same closing line inside.
+    const gzipped = await postJson('/media/movies/entries', { titles: ['Alpha Movie', 'Gone'] }, { 'Accept-Encoding': 'gzip' });
+    expect(gzipped.headers['content-encoding']).toBe('gzip');
+    expect(endsWith(gunzipSync(gzipped.body), 2)).toBe(true);
   });
 
   it('refuses what is not an entries request', async () => {
@@ -772,6 +855,50 @@ describe('the entries stream', () => {
       expect(short(entryBytesOf(line))).toBe(line.value.hash);
     }
   });
+
+  it('has no closing line when the stream is cut off part-way', async () => {
+    bigFill = 'a';
+    bigCache.invalidate('test');
+    const total = (await bigCache.get()).body.length;
+
+    const chunks = [];
+    let received = 0;
+    let response;
+    await new Promise((resolve, reject) => {
+      const body = Buffer.from(JSON.stringify({ all: true }));
+      const req = http.request(
+        `${baseUrl}/big/entries`,
+        { method: 'POST', agent: false, headers: { 'Content-Type': 'application/json', 'Content-Length': body.length } },
+        (res) => {
+          response = res;
+          const serverRes = lastServerResponse;
+          res.on('data', (chunk) => {
+            chunks.push(chunk);
+            received += chunk.length;
+            // A few title lines in: the server's side of the connection dies.
+            if (received > 2 * 1024 * 1024 && !serverRes.destroyed) serverRes.destroy();
+          });
+          // The response errors ('aborted') and closes; it never ends.
+          res.on('error', () => {});
+          res.on('close', resolve);
+        }
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.complete).toBe(false);
+    const got = Buffer.concat(chunks);
+    expect(got.length).toBeLessThan(total / 4);
+    // Whole title lines arrived before the cut, and they look fine...
+    const lines = splitLines(got);
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(short(entryBytesOf(line))).toBe(line.value.hash);
+    // ...but no closing line did, so a reader knows the answer is not whole.
+    expect(lines.some((line) => Object.hasOwn(line.value, 'end'))).toBe(false);
+    expect(got.includes(Buffer.from('{"end":'))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------- the pieces
@@ -807,6 +934,35 @@ describe('tvManifestKeys', () => {
   it('has nothing to say about a show without seasons', () => {
     expect({ ...tvManifestKeys({ seasons: null }) }).toEqual({});
     expect({ ...tvManifestKeys({}) }).toEqual({});
+  });
+});
+
+describe('buildManifest', () => {
+  it('writes these exact bytes, format 2', async () => {
+    const tv = await buildManifest({
+      kind: 'tv',
+      version: 1.0001,
+      titles: [
+        { name: 'B Show', hash: 'ab'.repeat(20), keys: { 'Season 1': ['S01E01', 'S01E02'], Specials: [] } },
+        { name: 'A "Show" ', hash: '0123456789'.repeat(4), keys: {} },
+      ],
+    });
+    expect(tv.body.toString()).toBe(
+      '{"format":2,"kind":"tv","version":1.0001,"titles":{' +
+        '"B Show":{"hash":"abababababababab","seasons":{"Season 1":["S01E01","S01E02"],"Specials":[]}},' +
+        '"A \\"Show\\" ":{"hash":"0123456789012345","seasons":{}}}}'
+    );
+    expect(tv.etag).toBe(`W/"tv-manifest-${sha1(tv.body)}"`);
+    expect(gunzipSync(tv.gzipBody).equals(tv.body)).toBe(true);
+
+    const movies = await buildManifest({
+      kind: 'movies',
+      version: 1.0001,
+      titles: [{ name: '1917', hash: 'f'.repeat(40) }],
+    });
+    expect(movies.body.toString()).toBe(
+      '{"format":2,"kind":"movies","version":1.0001,"titles":{"1917":{"hash":"ffffffffffffffff"}}}'
+    );
   });
 });
 

@@ -273,17 +273,20 @@ function postJson(path, payload) {
   });
 }
 
-/** The lines of an entries response: the parsed line and its entry bytes. */
+/**
+ * The title lines of an entries response: the parsed line and its entry bytes.
+ * The response must end with the closing line, counting them.
+ */
 function entryLines(body) {
-  return body
-    .toString('utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((raw) => {
-      const value = JSON.parse(raw);
-      const head = `{"title":${JSON.stringify(value.title)},"hash":"${value.hash}","entry":`;
-      return { value, entryBytes: Buffer.from(raw.slice(head.length, -1), 'utf8') };
-    });
+  const raws = body.toString('utf8').split('\n');
+  expect(raws.pop()).toBe('');
+  const end = JSON.parse(raws.pop());
+  expect(end).toEqual({ end: true, count: raws.length });
+  return raws.map((raw) => {
+    const value = JSON.parse(raw);
+    const head = `{"title":${JSON.stringify(value.title)},"hash":"${value.hash}","entry":`;
+    return { value, entryBytes: Buffer.from(raw.slice(head.length, -1), 'utf8') };
+  });
 }
 
 const shortHash = (bytes) => createHash('sha1').update(bytes).digest('hex').slice(0, TITLE_HASH_LENGTH);
