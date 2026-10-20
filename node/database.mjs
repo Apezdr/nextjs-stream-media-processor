@@ -56,7 +56,13 @@ export async function closeMongoConnection() {
  * @param {Object} indexOptions - The options for the index (e.g., name, expireAfterSeconds).
  */
 export async function ensureIndex(collection, indexSpec, indexOptions) {
-  const indexes = await collection.indexes();
+  let indexes = [];
+  try {
+    indexes = await collection.indexes();
+  } catch (error) {
+    // A collection that doesn't exist yet has no indexes; createIndex makes it.
+    if (error?.code !== 26 && !/ns does not exist/i.test(error?.message ?? '')) throw error;
+  }
   const indexExists = indexes.some((index) => {
     // Compare index keys
     return JSON.stringify(index.key) === JSON.stringify(indexSpec);

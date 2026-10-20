@@ -102,3 +102,23 @@ describe('getClient (boot race)', () => {
     expect(mockConnect).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('ensureIndex', () => {
+  it("creates the index on a collection that doesn't exist yet (listIndexes answers NamespaceNotFound)", async () => {
+    const createIndex = jest.fn().mockResolvedValue('ok');
+    const missing = {
+      collectionName: 'log_fingerprints',
+      indexes: async () => {
+        throw Object.assign(new Error('ns does not exist: app_config.log_fingerprints'), { code: 26 });
+      },
+      createIndex,
+    };
+    await database.ensureIndex(missing, { lastSeen: 1 }, { name: 'log_fingerprints_ttl', expireAfterSeconds: 60 });
+    expect(createIndex).toHaveBeenCalledWith({ lastSeen: 1 }, { name: 'log_fingerprints_ttl', expireAfterSeconds: 60 });
+  });
+
+  it('still fails on any other error', async () => {
+    const broken = { collectionName: 'x', indexes: async () => { throw new Error('connection reset'); }, createIndex: jest.fn() };
+    await expect(database.ensureIndex(broken, { a: 1 }, { name: 'a' })).rejects.toThrow('connection reset');
+  });
+});
