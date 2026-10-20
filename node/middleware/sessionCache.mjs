@@ -1,6 +1,7 @@
 import { fromNodeHeaders } from 'better-auth/node'
 import { createCategoryLogger } from '../lib/logger.mjs'
 import { auth } from '../lib/auth.mjs'
+import { describeHeap, readHeap, underHeapPressure } from '../lib/memoryPressure.mjs'
 
 const logger = createCategoryLogger('session-cache')
 
@@ -115,23 +116,17 @@ class MemoryAwareSessionCache {
   }
 
   initializeMemoryMonitoring() {
-    // Check memory every 30 seconds
+    // Check memory every 30 seconds, against the heap limit (lib/memoryPressure.mjs)
     this.memoryMonitor = setInterval(() => {
-      if (process.memoryUsage) {
-        const usage = process.memoryUsage()
-        const heapUsedMB = usage.heapUsed / 1024 / 1024
-        const heapTotalMB = usage.heapTotal / 1024 / 1024
-        
-        // Consider memory pressure if heap used > 80% of total or > 500MB
-        const wasUnderPressure = this.memoryPressure
-        this.memoryPressure = (heapUsedMB / heapTotalMB > 0.8) || (heapUsedMB > 500)
-        
-        if (this.memoryPressure && !wasUnderPressure) {
-          logger.warn(`Memory pressure detected: ${heapUsedMB.toFixed(1)}MB used (${((heapUsedMB / heapTotalMB) * 100).toFixed(1)}% of heap)`)
-          this.handleMemoryPressure()
-        } else if (!this.memoryPressure && wasUnderPressure) {
-          logger.info('Memory pressure relieved')
-        }
+      const heap = readHeap()
+      const wasUnderPressure = this.memoryPressure
+      this.memoryPressure = underHeapPressure(heap, wasUnderPressure)
+
+      if (this.memoryPressure && !wasUnderPressure) {
+        logger.warn(`Memory pressure detected: ${describeHeap(heap)}`)
+        this.handleMemoryPressure()
+      } else if (!this.memoryPressure && wasUnderPressure) {
+        logger.info(`Memory pressure relieved: ${describeHeap(heap)}`)
       }
     }, 30000)
   }
