@@ -246,6 +246,27 @@ export class NotificationManager {
   }
   
   /**
+   * Send one ready-made embed to every Discord channel (bot DMs to
+   * DISCORD_NOTIFY_USERS, and Discord webhooks). Used by log alerts
+   * (lib/alerts/notifier.mjs), which carry no system metrics.
+   * @returns {Promise<boolean>} whether at least one Discord delivery succeeded
+   */
+  async sendDiscordEmbed(embed) {
+    const channels = this.getNotificationChannels().filter((channel) => channel.type === 'discord' || channel.type === 'discord_bot');
+    const sends = channels.flatMap((channel) => {
+      if (channel.type === 'discord') return [this.discordAdapter.sendEmbed(channel.url, embed)];
+      if (!this.discordBot?.ready) return [Promise.reject(new Error('Discord bot not ready'))];
+      const userIds = (process.env.DISCORD_NOTIFY_USERS || '').split(',').map((id) => id.trim()).filter(Boolean);
+      return userIds.map((userId) => this.discordBot.sendEmbedDM(userId, embed));
+    });
+    const results = await Promise.allSettled(sends);
+    for (const result of results) {
+      if (result.status === 'rejected') logger.warn(`Discord alert delivery failed: ${result.reason?.message ?? result.reason}`);
+    }
+    return results.some((result) => result.status === 'fulfilled' && result.value?.success);
+  }
+
+  /**
    * Send DM notifications via Discord bot
    * @param {string} status - System status level
    * @param {string} message - Status message
@@ -364,6 +385,17 @@ export class NotificationManager {
       throw error;
     }
   }
+}
+
+let shared = null;
+
+/**
+ * The process's one NotificationManager: constructing one starts the Discord
+ * bot, so system status and log alerts share this instance.
+ */
+export function getNotificationManager() {
+  shared ??= new NotificationManager();
+  return shared;
 }
 
 export default NotificationManager;

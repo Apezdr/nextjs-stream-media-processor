@@ -46,7 +46,8 @@ import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
-import { createCategoryLogger, createPythonLogger } from "./lib/logger.mjs";
+import { createCategoryLogger, createPythonLogger, logTally } from "./lib/logger.mjs";
+import { startLogAlerts } from "./lib/alerts/index.mjs";
 import { describeWebhookId } from "./lib/webhookIdRedaction.mjs";
 import { createOrUpdateProcessQueue, finalizeProcessQueue, getActiveProcesses, getAllProcesses, getProcessesWithFilters, getProcessTrackingDb, markInProgressAsInterrupted, removeInProgressProcesses, updateProcessQueue } from "./sqlite/processTracking.mjs";
 import { createLibraryScanProgress } from "./lib/scanProgress.mjs";
@@ -779,6 +780,8 @@ async function runGenerateList() {
     }
 
     logger.info('Finished generating complete media list');
+    // The log alerts' "library scan stopped" check (lib/alerts/rules.mjs heartbeats).
+    logTally.heartbeat('library-scan');
 
     // Run auto sync as a separate task
     await enqueueTask(TaskType.API_REQUEST, 'Auto Sync', async () => {
@@ -988,6 +991,8 @@ async function initialize() {
     initializeIndexes()
       .then(() => {
         logger.info("Mongo indexes initialized successfully.");
+        // Retries on its own until Mongo answers; never blocks startup.
+        startLogAlerts();
       })
       .catch((error) => {
         logger.error("Error during initialization:", error);

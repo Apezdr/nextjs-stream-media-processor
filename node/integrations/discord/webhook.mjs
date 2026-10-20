@@ -10,6 +10,15 @@ const isDebugMode = process.env.DEBUG === 'TRUE';
  */
 export class DiscordAdapter {
   /**
+   * Post one ready-made embed (log alerts, lib/alerts/notifier.mjs).
+   * @returns {Promise<object>} { success, platform }
+   */
+  async sendEmbed(webhookUrl, embed) {
+    const response = await axios.post(webhookUrl, { embeds: [embed] }, { timeout: 5000 });
+    return { success: response.status >= 200 && response.status < 300, platform: 'discord' };
+  }
+
+  /**
    * Send system status notification to Discord webhook
    * @param {string} webhookUrl - Discord webhook URL
    * @param {string} status - System status level (normal, elevated, heavy, critical)

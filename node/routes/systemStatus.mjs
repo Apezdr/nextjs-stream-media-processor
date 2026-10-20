@@ -5,13 +5,13 @@ import { createHash } from 'crypto';
 import { scheduleJob } from 'node-schedule';
 import { enqueueTask, TaskType, getTaskStatus } from '../lib/taskManager.mjs';
 import { authenticateWebhookOrUser } from '../middleware/auth.mjs';
-import { NotificationManager } from '../integrations/index.mjs';
+import { getNotificationManager } from '../integrations/index.mjs';
 
 const logger = createCategoryLogger('systemStatusRoutes');
 const isDebugMode = process.env.DEBUG === 'TRUE';
 
 // Initialize notification manager for multi-platform notifications
-const notificationManager = new NotificationManager();
+const notificationManager = getNotificationManager();
 
 // Store previous disksIO measurements to calculate proper I/O rates
 let lastDisksIOStats = null;

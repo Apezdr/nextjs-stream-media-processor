@@ -3,6 +3,9 @@ import DailyRotateFile from 'winston-daily-rotate-file';
 import { trace, context } from '@opentelemetry/api';
 import { isOpenTelemetryEnabled } from './telemetry.mjs';
 import { redactWebhookIds, webhookIdsExposed } from './webhookIdRedaction.mjs';
+import { maskSecrets } from './logSecrets.mjs';
+import { fingerprintOf } from './logFingerprint.mjs';
+import { LogTally, LogTallyTransport } from './alerts/tally.mjs';
 import path from 'path';
 import fs from 'fs';
 
@@ -31,6 +34,16 @@ const traceContextFormat = format((info) => {
   return info;
 });
 
+// Warn and error records carry their message's fingerprint (lib/logFingerprint.mjs),
+// in the files and in SigNoz; the alert rules count by it.
+const fingerprint = format((info) => {
+  if (info.level === 'warn' || info.level === 'error') info.fp = fingerprintOf(info.category, info.message);
+  return info;
+});
+
+// What this process logs, minute by minute, for the alert rules (lib/alerts/).
+export const logTally = new LogTally();
+
 // Base Winston logger configuration
 const baseLogger = createLogger({
   level: isProduction ? 'info' : 'debug',
@@ -41,6 +54,9 @@ const baseLogger = createLogger({
     format.splat(),
     // After splat, so IDs interpolated into a message are caught too.
     format(redactWebhookIds)(),
+    format(maskSecrets)(),
+    // After the redactions, so a template never holds a secret.
+    fingerprint(),
     format.json()
   ),
   transports: [
@@ -58,6 +74,7 @@ const baseLogger = createLogger({
       maxFiles: '14d',
     }),
     new transports.File({ filename: path.join(LOG_DIRECTORY, 'error.log'), level: 'error' }),
+    new LogTallyTransport(logTally),
   ],
   exceptionHandlers: [
     new transports.File({ filename: path.join(LOG_DIRECTORY, 'exceptions.log') })

@@ -6,6 +6,7 @@ import { setupTmdbRoutes } from './tmdb.mjs';
 import { setupAdminRoutes } from './admin.mjs';
 import { setupCaptionsRoutes } from './captions.mjs';
 import { setupLogsRoutes } from './logs.mjs';
+import { setupAlertsRoutes } from './alerts.mjs';
 import { setupDiscordRoutes } from '../integrations/discord/routes.mjs';
 
 /**
@@ -22,6 +23,7 @@ export function setupRoutes() {
   router.use('/api', setupMetadataHashesRoutes());
   router.use('/api', setupSystemStatusRoutes());
   router.use('/api', setupLogsRoutes());
+  router.use('/api', setupAlertsRoutes());
   router.use('/api/tmdb', setupTmdbRoutes());
   router.use('/api/admin', setupAdminRoutes());
   // Captions module declares both /admin/captions/* and /captions/* — mount at /api
@@ -30,7 +32,7 @@ export function setupRoutes() {
   router.use('/api', setupDiscordRoutes());  // Discord webhook events
 
   // Debug logging to verify routes are mounted
-  console.log('[Routes] Mounted: /api/metadata-hashes, /api/system-status, /api/logs');
+  console.log('[Routes] Mounted: /api/metadata-hashes, /api/system-status, /api/logs, /api/alerts');
   console.log('[Routes] Mounted: /api/tmdb/*, /api/admin/*, /api/discord');
   console.log('[Routes] Mounted: /api/captions/health, /api/admin/captions/generate');
   if (process.env.OTEL_ENABLED?.toLowerCase() === 'true') {

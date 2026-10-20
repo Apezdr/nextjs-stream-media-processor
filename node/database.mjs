@@ -55,7 +55,7 @@ export async function closeMongoConnection() {
  * @param {Object} indexSpec - The specification of the index fields.
  * @param {Object} indexOptions - The options for the index (e.g., name, expireAfterSeconds).
  */
-async function ensureIndex(collection, indexSpec, indexOptions) {
+export async function ensureIndex(collection, indexSpec, indexOptions) {
   const indexes = await collection.indexes();
   const indexExists = indexes.some((index) => {
     // Compare index keys

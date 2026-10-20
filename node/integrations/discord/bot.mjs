@@ -174,6 +174,17 @@ export class DiscordBotAdapter {
   }
   
   /**
+   * DM one ready-made embed (log alerts, lib/alerts/notifier.mjs).
+   * @param {string} userId - Discord user ID
+   * @param {object} embedData - Discord embed object
+   */
+  async sendEmbedDM(userId, embedData) {
+    const user = await this.client.users.fetch(userId);
+    await user.send({ embeds: [new EmbedBuilder(embedData)] });
+    return { success: true, userId };
+  }
+
+  /**
    * Send introduction DM to a user using centralized utility
    * @param {string} userId - Discord user ID
    */

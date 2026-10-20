@@ -53,7 +53,7 @@ export const LOG_AREAS = [
     label: 'System',
     categories: [
       'main', 'mongoDB', 'taskManager', 'processTracking', 'systemStatusRoutes', 'telemetry', 'utility', 'admin-routes',
-      'logs-route', 'logger',
+      'logs-route', 'logger', 'log-alerts', 'alerts-route',
     ],
   },
 ];

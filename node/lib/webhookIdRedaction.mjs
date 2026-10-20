@@ -12,10 +12,10 @@
  */
 
 import { createHash } from 'crypto';
+import { mapRecordStrings } from './recordWalk.mjs';
 
 // Shorter values are too likely to occur by chance in a log line.
 const MIN_REDACTED_LENGTH = 8;
-const MAX_DEPTH = 8;
 
 export function webhookIdsExposed() {
   return process.env.LOG_UNREDACTED_WEBHOOK_IDS === 'true';
@@ -37,64 +37,20 @@ function configuredWebhookIds() {
   return [...new Set(ids.map((id) => id.trim()).filter((id) => id.length >= MIN_REDACTED_LENGTH))];
 }
 
-const isPlainObject = (value) => {
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-};
-
 /**
- * `value` with every ID replaced. Copy on write: an object or array the
- * caller still uses (autoSync sends the very headers object it logs) is
- * never changed in place.
- */
-function scrub(value, ids, seen, depth) {
-  if (typeof value === 'string') {
-    let result = value;
-    for (const id of ids) {
-      if (result.includes(id)) result = result.split(id).join(describeWebhookId(id));
-    }
-    return result;
-  }
-  if (value === null || typeof value !== 'object' || depth > MAX_DEPTH || seen.has(value)) return value;
-  seen.add(value);
-
-  if (Array.isArray(value)) {
-    let copy = null;
-    value.forEach((item, index) => {
-      const next = scrub(item, ids, seen, depth + 1);
-      if (next !== item) {
-        copy ??= [...value];
-        copy[index] = next;
-      }
-    });
-    return copy ?? value;
-  }
-  if (!isPlainObject(value)) return value;
-
-  let copy = null;
-  for (const [key, item] of Object.entries(value)) {
-    const next = scrub(item, ids, seen, depth + 1);
-    if (next !== item) {
-      copy ??= { ...value };
-      copy[key] = next;
-    }
-  }
-  return copy ?? value;
-}
-
-/**
- * Replaces the configured webhook IDs in a winston record's fields (its own
- * top-level object, so assigning to it is safe). Every transport serializes
- * these fields, so this covers the files, the console and SigNoz.
+ * Replaces the configured webhook IDs in a winston record's fields. Every
+ * transport serializes these fields, so this covers the files, the console
+ * and SigNoz.
  */
 export function redactWebhookIds(info) {
   if (webhookIdsExposed()) return info;
   const ids = configuredWebhookIds();
   if (ids.length === 0) return info;
-  const seen = new WeakSet();
-  for (const key of Object.keys(info)) {
-    const next = scrub(info[key], ids, seen, 0);
-    if (next !== info[key]) info[key] = next;
-  }
-  return info;
+  return mapRecordStrings(info, (text) => {
+    let result = text;
+    for (const id of ids) {
+      if (result.includes(id)) result = result.split(id).join(describeWebhookId(id));
+    }
+    return result;
+  });
 }
