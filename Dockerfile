@@ -230,5 +230,6 @@ RUN mkdir -p /usr/src/app/logs /usr/src/app/whisper-models && \
     chown 1000:1000 /usr/src/app/logs /usr/src/app/whisper-models
 # ---------------------------------------------------------------------------
 
-# Command to run your Node.js app
-CMD ["sh", "-c", "node /usr/src/app/node/app.mjs --max-old-space-size=6144"]
+# Command to run your Node.js app. Node options go before the script: after it
+# they are the script's own arguments (the heap flag sat there, unread, until 2026-10).
+CMD ["sh", "-c", "node --max-old-space-size=6144 /usr/src/app/node/app.mjs"]
