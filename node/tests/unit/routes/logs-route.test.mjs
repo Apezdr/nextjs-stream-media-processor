@@ -1,8 +1,10 @@
 /**
- * GET /api/logs is admin only. It used to answer anyone on the public
- * processor URL, guarded by nothing but a browser CORS header. Runs the real
- * router and the real auth middleware on an ephemeral port; only the session
- * lookup is mocked.
+ * GET /api/logs is for this server's own admins only (a session from its own
+ * Users database). It used to answer anyone on the public processor URL,
+ * guarded by nothing but a browser CORS header, and then any paired webhook
+ * ID: a pairing key identifies a peer, it doesn't make the peer an admin
+ * here. Runs the real router and the real auth middleware on an ephemeral
+ * port; only the session lookup is mocked.
  */
 
 import { describe, it, expect, jest, beforeAll, afterAll } from '@jest/globals';
@@ -55,16 +57,17 @@ describe('GET /api/logs auth', () => {
     expect(await res.json()).not.toHaveProperty('entries');
   });
 
-  it('refuses a wrong webhook ID and a signed-in user who is not an admin', async () => {
-    expect((await get('', { 'x-webhook-id': 'not-the-id' })).status).toBe(401);
+  it('refuses a signed-in user who is not an admin', async () => {
     expect((await get('', { Authorization: 'Bearer viewer-token' })).status).toBe(403);
   });
 
-  it.each([
-    ['the webhook ID', { 'x-webhook-id': 'test-webhook-id' }],
-    ['an admin session', { Authorization: 'Bearer admin-token' }],
-  ])('answers %s with the log, uncached and with no CORS header', async (_name, headers) => {
-    const res = await get('', headers);
+  it("refuses a paired server's webhook ID, valid or not: peers need a grant, not a pairing key", async () => {
+    expect((await get('', { 'x-webhook-id': 'test-webhook-id' })).status).toBe(401);
+    expect((await get('', { 'x-webhook-id': 'not-the-id' })).status).toBe(401);
+  });
+
+  it('answers an admin session with the log, uncached and with no CORS header', async () => {
+    const res = await get('', { Authorization: 'Bearer admin-token' });
     expect(res.status).toBe(200);
     expect(res.headers.get('cache-control')).toBe('no-store');
     expect(res.headers.get('access-control-allow-origin')).toBeNull();

@@ -1,10 +1,14 @@
 /**
  * GET /api/logs: the processor's own log, for the admin Logs page.
  *
- * Admin only (a webhook ID or an admin session): the log names titles, paths
- * and internal URLs. It used to answer anyone, browser CORS aside. The page
- * reaches it through the frontend's /api/authenticated/admin/logs proxy, never
- * from the browser, so it sets no CORS headers.
+ * This server's own admins only: an admin session from this processor's own
+ * Users database. The log names titles, paths and internal URLs, and in a
+ * network of independently run servers a pairing key (webhook ID) identifies a
+ * peer, it doesn't make the peer an admin here: letting a peer read the log
+ * will be an explicit grant (see the federated-network notes). It used to
+ * answer anyone, browser CORS aside. The page reaches it through the
+ * frontend's /api/authenticated/admin/logs proxy, which forwards the admin's
+ * session, never from the browser, so it sets no CORS headers.
  *
  * Query, all optional:
  *   limit     1-2000, default 500
@@ -20,7 +24,7 @@
  */
 
 import express from 'express';
-import { authenticateWebhookOrUser } from '../middleware/auth.mjs';
+import { authenticateUser, requireAdmin } from '../middleware/auth.mjs';
 import { createCategoryLogger, LOG_DIRECTORY } from '../lib/logger.mjs';
 import { listLogAreas } from '../lib/logAreas.mjs';
 import { createLogFilter, LOG_LEVELS, parseCursor, readLogs } from '../lib/logReader.mjs';
@@ -107,7 +111,7 @@ function readQuery(query) {
 export function setupLogsRoutes({ logDirectory = LOG_DIRECTORY } = {}) {
   const router = express.Router();
 
-  router.get('/logs', authenticateWebhookOrUser, async (req, res) => {
+  router.get('/logs', authenticateUser, requireAdmin, async (req, res) => {
     let query;
     try {
       query = readQuery(req.query);
