@@ -24,6 +24,10 @@ export {
 } from './domain/tv-scanner.mjs';
 
 export {
+  scanLibraryCredits
+} from './domain/library-credits.mjs';
+
+export {
   getExistingMovies,
   getExistingTVShows,
   getMissingMediaData,

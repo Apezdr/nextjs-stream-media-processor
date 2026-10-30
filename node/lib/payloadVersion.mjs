@@ -43,7 +43,11 @@
 //     and nothing on disk changes, so only this bump clears it. (/media/tv
 //     stopped publishing a show's logoBlurhash in its builder, which needs no
 //     pass.)
-export const MEDIA_PAYLOAD_VERSION = 10;
+// 11 — a credits sidecar value published on every movie, show and episode
+//     (`credits`: url + hash, absent, or an error). Nothing on disk changes
+//     for a title without a sidecar, so only this bump publishes its
+//     `{ absent: true }`.
+export const MEDIA_PAYLOAD_VERSION = 11;
 
 /**
  * Whether this host advertises JIT transcoder capability.

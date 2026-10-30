@@ -39,6 +39,14 @@ A file with several audio tracks (a film with its original and a dub) has them i
 
 The GPU is opt-in because it is shared with whatever else encodes on it. A single request can also ask for it with `&encoder=gpu`. A server without a usable Intel AV1 encoder makes the clip in software either way.
 
+### Poster Collage
+
+- POSTER_COLLAGE_ENABLED=false  # Stop rebuilding `poster_collage.jpg` (default: on)
+
+`poster_collage.jpg`, at the root of `BASE_PATH`, is the site's background and share image. The processor rebuilds it when it starts and every 30 minutes (at :12 and :42), from every movie's `poster.jpg` and every show's `show_poster.jpg`. With `POSTER_COLLAGE_ENABLED=false` (or `0`, `off`, `no`) it stops: the existing file is left exactly as it is, never deleted or rewritten. Use it to freeze a collage whose contents have been verified, or to skip the job on a server that does not need it.
+
+When `BASE_PATH` has a library `credits.json` that credits the collage (an asset with `"path": "poster_collage.jpg"` and its `derivedFrom` inputs), the collage is made of exactly the inputs it names, in the order the posters are found on disk, so a title added to the library never slips into a collage its credits do not cover. If that file cannot be read, has no collage asset, names no inputs, or names one that is missing or outside the library, the collage is not rebuilt, the existing one is kept, and the reason is logged. Without a library `credits.json`, every poster is used, as before. The credits format is the frontend's `CREDITS_SIDECAR.md` ("Library scope").
+
 ### Multi-Frontend Support
 
 For setups with multiple frontends, you can use numbered environment variables:

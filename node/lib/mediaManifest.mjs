@@ -17,6 +17,9 @@
 //     "format": 2,                     MANIFEST_FORMAT_VERSION
 //     "kind": "tv",                    or "movies"
 //     "version": 1.0001,               the list version GET /media/<kind> ends with
+//     "library": {                     optional: library-wide values (lib/libraryCredits.mjs)
+//       "credits": {"url": "…", "hash": "…"}   the library root's credits sidecar, the
+//     },                                       same four-state value a title publishes
 //     "titles": {
 //       "<folder name>": {
 //         "hash": "0123456789abcdef",  the first 16 hex digits of the SHA-1 of the
@@ -29,14 +32,19 @@
 //     }
 //   }
 //
+// `library` is there once a scan tick has stored a value (none yet, or a
+// processor that predates it, sends no key: unknown). A reader ignores a key it
+// does not know, so adding it left the format at 2. It is in no entry and in
+// neither GET /media/<kind> nor the entries lines.
+//
 // Titles are keyed by title: the folder name, the key of the GET body. Never by
 // mediaId, which can be null or differ between servers. They come in the body's
 // order (by name). A season without an episodes map lists []. On the production
 // library the manifest is about 130 KB.
 //
 // Its ETag is a weak tag over the manifest bytes, so it moves whenever a title
-// hash, the title set, a season or episode key set, the list version or the
-// format moves. It is answered like GET /media/<kind>: If-None-Match is compared
+// hash, the title set, a season or episode key set, the list version, the
+// `library` value or the format moves. It is answered like GET /media/<kind>: If-None-Match is compared
 // first and a match is a bodyless 304 whatever the request's Cache-Control says
 // (Node's fetch adds no-cache to every conditional request); the bytes and
 // their gzip copy are built once per cache generation.
@@ -186,15 +194,19 @@ export function tvManifestKeys(entry) {
  * @param {string} params.kind - 'tv' | 'movies'
  * @param {number} params.version - The list version
  * @param {Array<{name: string, hash: string, keys?: Object, describeError?: string}>} params.titles
+ * @param {Object|null} [params.library] - The `library` object
+ *   (readManifestLibrary); null or absent for no key
  * @returns {Promise<{etag: string, body: Buffer, gzipBody: Buffer, index: Map<string, Object>}>}
  *   `index` maps a name to its title in `titles`.
  * @throws when a TV title has no season keys: a manifest that left a show's
  *   seasons out would read as a show without seasons.
  */
-export async function buildManifest({ kind, version, titles }) {
+export async function buildManifest({ kind, version, titles, library = null }) {
   const parts = [
     `{"format":${MANIFEST_FORMAT_VERSION},"kind":${JSON.stringify(kind)},` +
-      `"version":${JSON.stringify(version)},"titles":{`,
+      `"version":${JSON.stringify(version)},` +
+      (library != null ? `"library":${JSON.stringify(library)},` : '') +
+      `"titles":{`,
   ];
   const index = new Map();
   titles.forEach((title, i) => {
@@ -247,7 +259,12 @@ export function getManifest(cache, entry) {
   if (!slot) {
     slot = { value: null, promise: null };
     const built = slot;
-    slot.promise = buildManifest({ kind: cache.kind, version: cache.version, titles: entry.titles }).then(
+    slot.promise = buildManifest({
+      kind: cache.kind,
+      version: cache.version,
+      titles: entry.titles,
+      library: entry.library ?? null,
+    }).then(
       (manifest) => {
         built.value = manifest;
         return manifest;

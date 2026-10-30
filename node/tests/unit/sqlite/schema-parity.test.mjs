@@ -475,3 +475,74 @@ describe('image source-url provenance persistence (I-3)', () => {
     expect(row.logoSourceUrl).toBe(`${CDN}/l1.svg`);
   });
 });
+
+describe('credits sidecar columns', () => {
+  const READ = { url: '/media/movies/Credits%20Movie/credits.json?hash=ab12', hash: 'ab12' };
+
+  const saveMovie = (name, directoryHash, credits) => sqliteDb.insertOrUpdateMovie(
+    name, ['movie.mp4'], {}, {}, { mp4: '/a.mp4' }, '', directoryHash, null, null, {}, 'tmdb_41',
+    null, null, null, null, null, '{"x":0.5,"y":0.5}', null,
+    '{"id":41}', null, null, 'mid:credits-movie', null, credits
+  );
+  const saveShow = (name, seasons, credits, creditsRetry) => sqliteDb.insertOrUpdateTVShow(
+    name, '{"id":51}', '/tv/Credits%20Show/metadata.json',
+    null, null, null, null, null, null, seasons,
+    null, null, null, null, 'dirhash-tv', null, null, null,
+    null, null, 'mid:credits-show', null, credits, creditsRetry
+  );
+
+  it('adds credits to both tables and credits_retry to tv_shows on a migrated database', async () => {
+    expect(await columnSpecs(db, 'movies')).toEqual(expect.arrayContaining(['credits:TEXT']));
+    expect(await columnSpecs(db, 'tv_shows')).toEqual(
+      expect.arrayContaining(['credits:TEXT', 'credits_retry:INTEGER'])
+    );
+  });
+
+  it('every movie reader carries credits parsed, and null for a row without them', async () => {
+    await saveMovie('Credits Movie', 'h1', READ);
+    await saveMovie('Old Movie', 'h1', null);
+
+    const stored = await db.get(`SELECT id, credits FROM movies WHERE name = 'Credits Movie'`);
+    expect(JSON.parse(stored.credits)).toEqual(READ);
+    expect((await sqliteDb.getMovieByName('Credits Movie')).credits).toEqual(READ);
+    expect((await sqliteDb.getMovieById(stored.id)).credits).toEqual(READ);
+    expect((await sqliteDb.getMovies()).find((m) => m.name === 'Credits Movie').credits).toEqual(READ);
+
+    const old = await sqliteDb.getMovieByName('Old Movie');
+    expect(old.credits).toBeNull();
+    expect((await db.get(`SELECT credits FROM movies WHERE name = 'Old Movie'`)).credits).toBeNull();
+  });
+
+  it('the movie change guard lets a changed credits value through on an unchanged directory', async () => {
+    await saveMovie('Retry Movie', 'h1', { error: 'unreadable' });
+    // Same directory hash and payload signature, a stored focal suggestion
+    // (guard closed): only the credits value moved.
+    await saveMovie('Retry Movie', 'h1', READ);
+    expect((await sqliteDb.getMovieByName('Retry Movie')).credits).toEqual(READ);
+  });
+
+  it('every show reader carries credits parsed, and the name-and-hash read carries credits_retry', async () => {
+    const seasons = { 'Season 1': { episodes: { S01E01: { credits: { error: 'empty' } } } } };
+    await saveShow('Credits Show', seasons, { absent: true }, true);
+    await saveShow('Old Show', {}, null, null);
+
+    const stored = await db.get(`SELECT id FROM tv_shows WHERE name = 'Credits Show'`);
+    for (const show of [
+      await sqliteDb.getTVShowByName('Credits Show'),
+      await sqliteDb.getTVShowById(stored.id),
+      (await sqliteDb.getTVShows()).find((s) => s.name === 'Credits Show'),
+    ]) {
+      expect(show.credits).toEqual({ absent: true });
+      expect(show.seasons['Season 1'].episodes.S01E01.credits).toEqual({ error: 'empty' });
+    }
+    expect((await sqliteDb.getTVShowByName('Old Show')).credits).toBeNull();
+
+    const hashes = await sqliteDb.getTVShowNamesAndHashes();
+    expect(hashes.find((s) => s.name === 'Credits Show').credits_retry).toBe(1);
+    expect(hashes.find((s) => s.name === 'Old Show').credits_retry).toBeNull();
+
+    // Converges: the next save with nothing in error clears the flag.
+    await saveShow('Credits Show', { 'Season 1': { episodes: { S01E01: { credits: READ } } } }, { absent: true }, false);
+    expect((await sqliteDb.getTVShowNamesAndHashes()).find((s) => s.name === 'Credits Show').credits_retry).toBe(0);
+  });
+});

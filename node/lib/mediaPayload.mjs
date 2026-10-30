@@ -158,13 +158,32 @@ export function buildMediaIdentity(row) {
 }
 
 /**
+ * An entry with the title's credits sidecar value added, when the row has one.
+ *
+ * The value is `{ url, hash }`, `{ absent: true }` or `{ error }`
+ * (components/media-scanner/domain/credits-sidecar.mjs). A row written before
+ * credits existed has none, and its entry carries no `credits` key at all,
+ * never a null: a missing key is the contract's "this server says nothing
+ * either way", and a null is none of its states. Episodes carry their own
+ * value inside `seasons`, which passes through slimEpisode untouched.
+ *
+ * @param {Object} entry
+ * @param {Object|null|undefined} credits - The row's parsed credits column
+ * @returns {Object} entry
+ */
+function withCredits(entry, credits) {
+  if (credits != null) entry.credits = credits;
+  return entry;
+}
+
+/**
  * One entry of the `/media/movies` response, keyed by movie name.
  *
  * @param {Object} movie - A row as returned by getMovies()
  * @returns {Object}
  */
 export function buildMoviePayloadEntry(movie) {
-  return {
+  return withCredits({
     _id: movie._id,
     // Stable content identity — what watch history joins on. Distinct from
     // `_id`, which is a mediainfo header hash: per FILE, so it varies by
@@ -184,13 +203,13 @@ export function buildMoviePayloadEntry(movie) {
     additional_metadata: slimMovieAdditionalMetadata(movie.additional_metadata),
     backdropFocal: movie.backdropFocal ?? null,
     backdropFocalSuggested: movie.backdropFocalSuggested ?? null,
-  };
+  }, movie.credits);
 }
 
 /**
  * One entry of the `/media/tv` response, keyed by show name.
  *
- * Episode-level fields (mediaIdentity, sources, jitEligible, jitUrl) ride
+ * Episode-level fields (mediaIdentity, sources, jitEligible, jitUrl, credits) ride
  * inside the `seasons` blob and pass through untouched — which is why TV was
  * unaffected by the movie allowlist bug. The exceptions: each episode's
  * additionalMetadata is trimmed to its size, and its top-level filename,
@@ -200,7 +219,7 @@ export function buildMoviePayloadEntry(movie) {
  * @returns {Object}
  */
 export function buildTvPayloadEntry(show) {
-  return {
+  return withCredits({
     // Show-level identity. Episode ids already derive from it, but the show's
     // own id and first-seen date were never on the wire. Same allowlist trap as
     // movies: getTVShows/getTVShowById/getTVShowByName must carry media_id and
@@ -216,7 +235,7 @@ export function buildTvPayloadEntry(show) {
     seasons: slimSeasons(show.seasons),
     backdropFocal: show.backdropFocal ?? null,
     backdropFocalSuggested: show.backdropFocalSuggested ?? null,
-  };
+  }, show.credits);
 }
 
 /**

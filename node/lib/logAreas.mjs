@@ -15,7 +15,7 @@ export const LOG_AREAS = [
     label: 'Library scan',
     categories: [
       'movie-scanner', 'tv-scanner', 'scanner-controller', 'scanner-repository', 'scanProgress',
-      'media-resolution', 'video-sources', 'infoFileManager', 'file-utils',
+      'media-resolution', 'video-sources', 'infoFileManager', 'file-utils', 'credits-sidecar',
     ],
   },
   {
