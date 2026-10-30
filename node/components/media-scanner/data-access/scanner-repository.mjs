@@ -175,6 +175,11 @@ export async function getMissingMediaData() {
  *   source-URL provenance updates from the generator (I-3). Null per kind (or
  *   as a whole) means "no new information" — the upsert COALESCE-preserves
  *   the stored column value. This layer never inspects the URLs.
+ * @param {string|null} [mediaId] - Stable identity from the .mediaid.json sidecar
+ * @param {string|null} [firstSeen] - The sidecar's durable first-seen date
+ * @param {Object|null} [credits] - The credits sidecar value this pass found
+ *   (credits-sidecar.mjs: { url, hash }, { absent: true } or { error }),
+ *   stored as JSON. This layer never inspects it.
  * @returns {Promise<void>}
  */
 export async function saveMovie(
@@ -200,7 +205,8 @@ export async function saveMovie(
   pristineMetadata = null,
   sourceUrls = null,
   mediaId = null,
-  firstSeen = null
+  firstSeen = null,
+  credits = null
 ) {
   await insertOrUpdateMovie(
     name,
@@ -225,7 +231,8 @@ export async function saveMovie(
     pristineMetadata,
     sourceUrls,
     mediaId,
-    firstSeen
+    firstSeen,
+    credits
   );
 }
 
@@ -259,6 +266,13 @@ export async function saveMovie(
  *   source-URL provenance updates from the generator (I-3). Null per kind (or
  *   as a whole) means "no new information" — the upsert COALESCE-preserves
  *   the stored column value. This layer never inspects the URLs.
+ * @param {string|null} [mediaId] - Stable identity from the .mediaid.json sidecar
+ * @param {string|null} [firstSeen] - The sidecar's durable first-seen date
+ * @param {Object|null} [credits] - The show-level credits sidecar value this
+ *   pass found, stored as JSON. Episode values ride in `seasonsObj`.
+ * @param {boolean|null} [creditsRetry] - Whether the show's value or any
+ *   episode's is an error (showCreditsNeedReread), so the next scan reads the
+ *   show again though its directory did not change.
  * @returns {Promise<void>}
  */
 export async function saveTVShow(
@@ -283,7 +297,9 @@ export async function saveTVShow(
   pristineMetadata = null,
   sourceUrls = null,
   mediaId = null,
-  firstSeen = null
+  firstSeen = null,
+  credits = null,
+  creditsRetry = null
 ) {
   await insertOrUpdateTVShow(
     showName,
@@ -307,7 +323,9 @@ export async function saveTVShow(
     pristineMetadata,
     sourceUrls,
     mediaId,
-    firstSeen
+    firstSeen,
+    credits,
+    creditsRetry
   );
 }
 

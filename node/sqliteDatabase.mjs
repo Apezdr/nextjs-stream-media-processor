@@ -227,7 +227,8 @@ export async function initializeSchema(dbType, db) {
         logo_source_url TEXT,
         payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
         media_id TEXT,           -- stable identity; cache of the .mediaid.json sidecar
-        first_seen TEXT          -- when the folder entered the library; cache of the sidecar's firstSeen
+        first_seen TEXT,         -- when the folder entered the library; cache of the sidecar's firstSeen
+        credits TEXT             -- the published credits sidecar value, JSON (credits-sidecar.mjs)
       );
     `);
 
@@ -266,7 +267,9 @@ export async function initializeSchema(dbType, db) {
         logo_source_url TEXT,
         payload_signature TEXT,  -- which payload shape produced this row (see migrateToSchemaParityColumns)
         media_id TEXT,           -- stable identity; cache of the .mediaid.json sidecar
-        first_seen TEXT          -- when the folder entered the library; cache of the sidecar's firstSeen
+        first_seen TEXT,         -- when the folder entered the library; cache of the sidecar's firstSeen
+        credits TEXT,            -- the show's published credits sidecar value, JSON (credits-sidecar.mjs)
+        credits_retry INTEGER    -- 1 when the show's or an episode's credits value is an error
       );
     `);
 
@@ -485,6 +488,15 @@ export async function migrateToSchemaParityColumns(db) {
     // upgrade bumps it, a preserved download mtime buries it).
     ['movies',   'first_seen TEXT'],
     ['tv_shows', 'first_seen TEXT'],
+    // The credits sidecar value each title publishes (JSON; see
+    // components/media-scanner/domain/credits-sidecar.mjs). NULL on a row
+    // written before it existed, which publishes no `credits` key; the payload
+    // version bump rewrites every row once. A show's episode values live in its
+    // seasons blob, so credits_retry flags a show whose own value or any
+    // episode's is an error, for the scanner's name-and-hash read to see.
+    ['movies',   'credits TEXT'],
+    ['tv_shows', 'credits TEXT'],
+    ['tv_shows', 'credits_retry INTEGER'],
   ];
   for (const [table, col] of columns) {
     try {
@@ -867,6 +879,9 @@ export async function getTVShows() {
         // the show hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(show.credits, null),
         // Internal-only (G-5): raw pre-override TMDB payload. Never serialized
         // to /media/tv — the app.mjs handler allowlist drops it.
         pristineMetadata: show.pristine_metadata ?? null,
@@ -891,9 +906,11 @@ export async function getTVShowNamesAndHashes() {
     // payload_signature rides along on the same scan: the TV scanner needs it
     // per show to decide whether a payload-shape change requires reprocessing,
     // and pulling it here keeps that check free rather than costing a full-row
-    // read per show per tick.
+    // read per show per tick. credits_retry is here for the same reason: a
+    // show whose stored credits value (its own or an episode's) is an error is
+    // read again though its directory did not change.
     return await withRetry(() =>
-      db.all('SELECT name, directory_hash, payload_signature, first_seen FROM tv_shows')
+      db.all('SELECT name, directory_hash, payload_signature, first_seen, credits_retry FROM tv_shows')
     );
   });
 }
@@ -952,6 +969,9 @@ export async function getMovies() {
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
         first_seen: movie.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(movie.credits, null),
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -1045,6 +1065,9 @@ export async function getMovieById(id) {
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
         first_seen: movie.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(movie.credits, null),
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -1112,6 +1135,9 @@ export async function getMovieByName(name) {
         // mediaIdentity shipped as a permanent null.
         media_id: movie.media_id ?? null,
         first_seen: movie.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(movie.credits, null),
         posterFilePath: movie.poster_file_path,
         backdropFilePath: movie.backdrop_file_path,
         logoFilePath: movie.logo_file_path,
@@ -1184,6 +1210,9 @@ export async function getTVShowById(id) {
         // the show hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(show.credits, null),
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
         pristineMetadata: show.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
@@ -1239,6 +1268,9 @@ export async function getTVShowByName(name) {
         // the show hash.
         media_id: show.media_id ?? null,
         first_seen: show.first_seen ?? null,
+        // The credits sidecar value, parsed; null for a row written before it
+        // existed, which the builder publishes as no key at all.
+        credits: safeJson(show.credits, null),
         // Internal-only (G-5): raw pre-override TMDB payload, opaque.
         pristineMetadata: show.pristine_metadata ?? null,
         // Internal-only (I-3): per-kind image download provenance, opaque.
@@ -1320,6 +1352,11 @@ const TV_SHOW_UPSERT_UPDATE = mediaUpsertUpdate('tv_shows', [
   // Same discipline as media_id: the sidecar is the durable copy, and a pass
   // that could not read or write it must not blank the cached date.
   ['first_seen', 'COALESCE(excluded.first_seen, tv_shows.first_seen)'],
+  // Not COALESCE-preserved: every save carries the value this pass found
+  // (a read file, a confirmed absence or an error), and a show the scan could
+  // not list never reaches the save, so its row keeps what it had.
+  ['credits', 'excluded.credits'],
+  ['credits_retry', 'excluded.credits_retry'],
 ]);
 
 // P-2: the missing directory_hash change-guard (vs. the movie upsert below) is
@@ -1350,7 +1387,9 @@ export async function insertOrUpdateTVShow(
   pristineMetadata = null,
   sourceUrls = null,
   mediaId = null,
-  firstSeen = null
+  firstSeen = null,
+  credits = null,
+  creditsRetry = null
 ) {
   return writeMediaTable("tv_shows", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1373,8 +1412,9 @@ export async function insertOrUpdateTVShow(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           directory_hash, backdrop_focal, backdrop_focal_suggested, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen,
+          credits, credits_retry
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           ${TV_SHOW_UPSERT_UPDATE.set}
         WHERE ${TV_SHOW_UPSERT_UPDATE.changed}`,
@@ -1389,7 +1429,9 @@ export async function insertOrUpdateTVShow(
           // to gate the write. A new signature is a changed column, so it lands.
           currentPayloadSignature(),
           mediaId,
-          firstSeen
+          firstSeen,
+          credits == null ? null : JSON.stringify(credits),
+          creditsRetry == null ? null : creditsRetry ? 1 : 0
         ]
       )
     );
@@ -1431,6 +1473,10 @@ const MOVIE_UPSERT_UPDATE = mediaUpsertUpdate('movies', [
   // cached value.
   ['media_id', 'COALESCE(excluded.media_id, movies.media_id)'],
   ['first_seen', 'COALESCE(excluded.first_seen, movies.first_seen)'],
+  // Not COALESCE-preserved, as on tv_shows. The change guard below opens on
+  // it: an error re-read on an unchanged directory that is readable now must
+  // land.
+  ['credits', 'excluded.credits'],
 ]);
 
 export async function insertOrUpdateMovie(
@@ -1456,7 +1502,8 @@ export async function insertOrUpdateMovie(
   pristineMetadata = null,
   sourceUrls = null,
   mediaId = null,
-  firstSeen = null
+  firstSeen = null,
+  credits = null
 ) {
   return writeMediaTable("movies", async (db) => {
     // Image cache-bust hashes are precomputed by the scanner from the SAME stat
@@ -1521,8 +1568,9 @@ export async function insertOrUpdateMovie(
           poster_file_path, backdrop_file_path, logo_file_path, base_path,
           poster_hash, poster_mtime, backdrop_hash, backdrop_mtime, logo_hash, logo_mtime,
           backdrop_focal, backdrop_focal_suggested, metadata, pristine_metadata,
-          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          poster_source_url, backdrop_source_url, logo_source_url, payload_signature, media_id, first_seen,
+          credits
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           ${MOVIE_UPSERT_UPDATE.set}
         WHERE (movies.directory_hash IS NULL OR movies.directory_hash <> excluded.directory_hash
@@ -1534,7 +1582,11 @@ export async function insertOrUpdateMovie(
         -- Payload-shape change (new field, or the JIT toggle flipping). Nothing
         -- on disk moved, so directory_hash cannot see it. IS NOT rather than <>
         -- so the NULL -> '2:jit0' transition on pre-migration rows fires.
-        OR movies.payload_signature IS NOT excluded.payload_signature)
+        OR movies.payload_signature IS NOT excluded.payload_signature
+        -- The credits sidecar value moved with the directory unchanged: a
+        -- stored error re-read (movie-scanner.mjs) that reads now, or reads
+        -- differently.
+        OR movies.credits IS NOT excluded.credits)
         AND (${MOVIE_UPSERT_UPDATE.changed})`,
         [
           name,
@@ -1567,7 +1619,8 @@ export async function insertOrUpdateMovie(
           sourceUrls?.logo ?? null,
           movie.payload_signature,
           mediaId,
-          firstSeen
+          firstSeen,
+          credits == null ? null : JSON.stringify(credits)
         ]
       )
     );

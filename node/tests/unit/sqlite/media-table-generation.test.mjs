@@ -138,6 +138,8 @@ function tvArgs(name, overrides = {}) {
     sourceUrls: { poster: 'https://img/p.jpg', backdrop: 'https://img/b.jpg', logo: 'https://img/l.png' },
     mediaId: 'mid:show',
     firstSeen: '2024-01-01T00:00:00.000Z',
+    credits: { absent: true },
+    creditsRetry: false,
     ...overrides,
   };
   return Object.values(args);
@@ -175,6 +177,7 @@ function movieArgs(name, overrides = {}) {
     sourceUrls: { poster: 'https://img/p.jpg', backdrop: 'https://img/b.jpg', logo: 'https://img/l.png' },
     mediaId: 'mid:movie',
     firstSeen: '2024-01-01T00:00:00.000Z',
+    credits: { absent: true },
     ...overrides,
   };
   return Object.values(args);
@@ -260,6 +263,8 @@ describe('insertOrUpdateTVShow', () => {
       ...sourceUrlVariants(baseUrls),
       ['mediaId', { mediaId: 'mid:show-2' }],
       ['firstSeen', { firstSeen: '2025-01-01T00:00:00.000Z' }],
+      ['credits', { credits: { url: '/tv/Show/credits.json?hash=ab', hash: 'ab' } }],
+      ['creditsRetry', { creditsRetry: true }],
     ];
 
     for (const [label, override] of variants) {
@@ -313,6 +318,25 @@ describe('insertOrUpdateMovie', () => {
     expect(result.after.hdr).toBe('HDR10');
   });
 
+  it('lands a changed credits value though the directory is unchanged and the guard otherwise holds', async () => {
+    const guarded = { backdropFocalSuggested: '{"x":0.4,"y":0.6}' };
+    await sqliteDb.insertOrUpdateMovie(...movieArgs('Credits Movie', { ...guarded, credits: { error: 'unreadable' } }));
+    const credits = { url: '/movies/M/credits.json?hash=cd', hash: 'cd' };
+    const result = await measure('movies', 'Credits Movie', () =>
+      sqliteDb.insertOrUpdateMovie(...movieArgs('Credits Movie', { ...guarded, credits }))
+    );
+    expect(result.changes).toBe(1);
+    expect(result.moved.movies).toBe(1);
+    expect(JSON.parse(result.after.credits)).toEqual(credits);
+
+    // The same value again holds: the guard is closed once more.
+    const again = await measure('movies', 'Credits Movie', () =>
+      sqliteDb.insertOrUpdateMovie(...movieArgs('Credits Movie', { ...guarded, credits, hdr: 'Dolby Vision' }))
+    );
+    expect(again.changes).toBe(0);
+    expect(again.after.hdr).toBe('HDR10');
+  });
+
   it('lands a change to any one column, and moves the generation', async () => {
     const base = movieArgs('Column Movie');
     await sqliteDb.insertOrUpdateMovie(...base);
@@ -341,6 +365,7 @@ describe('insertOrUpdateMovie', () => {
       ...sourceUrlVariants(baseUrls),
       ['mediaId', { mediaId: 'mid:movie-2' }],
       ['firstSeen', { firstSeen: '2025-01-01T00:00:00.000Z' }],
+      ['credits', { credits: { error: 'too-large' } }],
     ];
 
     for (const [label, override] of variants) {
