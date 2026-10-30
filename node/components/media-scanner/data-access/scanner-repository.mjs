@@ -15,8 +15,10 @@ import {
   recordEpisodeMetadataAttempt,
   clearEpisodeMetadataMissing,
   clearEpisodeMetadataMissingForShow,
+  setLibraryState,
   releaseDatabase
 } from '../../../sqliteDatabase.mjs';
+import { LIBRARY_CREDITS_KEY } from '../../../lib/libraryCredits.mjs';
 
 const logger = createCategoryLogger('scanner-repository');
 
@@ -327,6 +329,17 @@ export async function saveTVShow(
     credits,
     creditsRetry
   );
+}
+
+/**
+ * Store the library root's credits sidecar value (library_state), which both
+ * manifests publish as `library.credits`.
+ *
+ * @param {Object} value - { url, hash }, { absent: true } or { error }
+ * @returns {Promise<boolean>} whether the stored value changed
+ */
+export async function saveLibraryCredits(value) {
+  return setLibraryState(LIBRARY_CREDITS_KEY, value);
 }
 
 /**

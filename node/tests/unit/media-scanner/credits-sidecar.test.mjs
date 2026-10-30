@@ -20,6 +20,7 @@ jest.unstable_mockModule('../../../lib/logger.mjs', () => ({
 
 const {
   locateCreditsSidecar,
+  locateLibraryCreditsSidecar,
   creditsNeedsReread,
   showCreditsNeedReread,
   episodeCreditsFileName,
@@ -121,6 +122,31 @@ describe('locateCreditsSidecar', () => {
   it('names an episode file after the episode number as its metadata file is named', () => {
     expect(episodeCreditsFileName('01')).toBe('01_credits.json');
     expect(episodeCreditsFileName('7')).toBe('7_credits.json');
+  });
+});
+
+describe('locateLibraryCreditsSidecar', () => {
+  // `dir` stands for the library root here: it lists it itself.
+  const locateRoot = (root = dir) => locateLibraryCreditsSidecar({ root, prefixPath: '/media' });
+
+  it('publishes url and hash for <root>/credits.json, the URL at the prefix root', async () => {
+    const bytes = Buffer.from('{"schemaVersion":1,"assets":[{"path":"poster_collage.jpg"}]}');
+    await fs.writeFile(join(dir, CREDITS_FILE_NAME), bytes);
+    expect(await locateRoot()).toEqual({ url: `/media/credits.json?hash=${sha256(bytes)}`, hash: sha256(bytes) });
+  });
+
+  it('answers absent when the root listing has no credits.json', async () => {
+    expect(await locateRoot()).toEqual({ absent: true });
+  });
+
+  it('answers unreadable, never absent, when the root cannot be listed', async () => {
+    expect(await locateRoot(join(dir, 'no-such-root'))).toEqual({ error: 'unreadable' });
+    expect(warn.mock.calls[0][0]).toContain(CREDITS_FILE_NAME);
+  });
+
+  it('answers unreadable for a directory named credits.json at the root', async () => {
+    await fs.mkdir(join(dir, CREDITS_FILE_NAME));
+    expect(await locateRoot()).toEqual({ error: 'unreadable' });
   });
 });
 

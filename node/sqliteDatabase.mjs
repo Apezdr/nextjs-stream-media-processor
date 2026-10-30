@@ -325,6 +325,18 @@ export async function initializeSchema(dbType, db) {
       `CREATE INDEX IF NOT EXISTS idx_media_identity_name ON media_identity_index(media_type, media_name);`
     );
 
+    // Library-wide values the scan computes that belong to no title, one row
+    // per key, each value JSON. Today the one key is 'credits': the library
+    // root's credits sidecar, which both manifests publish as
+    // `library.credits` (lib/libraryCredits.mjs). Recomputed from the media
+    // volume on every scan tick, so it is a cache like the title rows.
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS library_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+
     // MIGRATE EXISTING DATABASES: Add hash columns if they don't exist
     await migrateToHashColumns(db);
     await migrateToFocalColumns(db);
@@ -1310,6 +1322,66 @@ export async function deleteTVShow(name) {
     // No withRetry needed inside transaction - mutex prevents contention
     db.run('DELETE FROM tv_shows WHERE name = ?', [name])
   );
+}
+
+// --- Library state ---
+//
+// How many writes have changed a library_state value since the process
+// started. The /media/<kind> caches fold it into their data generation
+// (lib/libraryCredits.mjs), so a changed library value drops them at the next
+// clear point and an unchanged one drops nothing.
+let libraryStateGeneration = 0;
+
+/**
+ * How many writes have changed a library_state value since the process started.
+ *
+ * @returns {number}
+ */
+export function getLibraryStateGeneration() {
+  return libraryStateGeneration;
+}
+
+/**
+ * A library_state value, parsed, or null when there is none.
+ *
+ * @param {string} key
+ * @returns {Promise<*>}
+ */
+export async function getLibraryState(key) {
+  return withDb("main", async (db) => {
+    const row = await withRetry(() => db.get('SELECT value FROM library_state WHERE key = ?', [key]));
+    return row ? safeJson(row.value, null) : null;
+  });
+}
+
+/**
+ * Store a library_state value (as JSON). A write that would store what the
+ * row holds changes nothing and moves no generation.
+ *
+ * @param {string} key
+ * @param {*} value - JSON-serializable, not null
+ * @returns {Promise<boolean>} whether the stored value changed
+ */
+export async function setLibraryState(key, value) {
+  let changes = 0;
+  try {
+    await withWriteTx("main", async (db) => {
+      const result = await withRetry(() =>
+        db.run(
+          `INSERT INTO library_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value
+           WHERE library_state.value IS NOT excluded.value`,
+          [key, JSON.stringify(value)]
+        )
+      );
+      changes = Number.isInteger(result?.changes) ? result.changes : 1;
+    });
+  } finally {
+    // As writeMediaTable: after the commit, and also when the transaction
+    // failed after the statement ran.
+    if (changes > 0) libraryStateGeneration += 1;
+  }
+  return changes > 0;
 }
 
 // What insertOrUpdateTVShow's DO UPDATE writes. G-5 preservation: the

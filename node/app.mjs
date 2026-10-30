@@ -17,7 +17,7 @@ import { createSpriteRoutes } from "./sprite-route.mjs";
 // (insertOrUpdateMovie/TVShow, delete*, missing-data bookkeeping) are live via
 // scanner-repository.mjs, not here — importing them in app.mjs wrongly implied
 // this file participates in scan persistence.
-import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase, getMediaTableGeneration } from "./sqliteDatabase.mjs";
+import { initializeDatabase, getMovies, isDatabaseEmpty, getTVShows, getTVShowByName, releaseDatabase } from "./sqliteDatabase.mjs";
 import { getMediaTypeHashes, getShowHashes, getSeasonHashes, generateMovieHashes, generateTVShowHashes, getHash, updateAllMovieHashes, updateAllTVShowHashes } from "./sqlite/metadataHashes.mjs";
 import { initializeTmdbBlurhashCacheTable } from "./sqlite/tmdbBlurhashCache.mjs";
 import { setupRoutes } from "./routes/index.mjs";
@@ -56,7 +56,8 @@ import { createMediaScanHandler, scanIfTableEmpty } from "./lib/libraryScanTask.
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
-import { scanMovies, scanTVShows } from "./components/media-scanner/index.mjs";
+import { scanMovies, scanTVShows, scanLibraryCredits } from "./components/media-scanner/index.mjs";
+import { readManifestLibrary, mediaDataGeneration } from "./lib/libraryCredits.mjs";
 import { createIdentityService } from "./integrations/identity/index.mjs";
 import { listMultiSourceTitles } from "./sqlite/multiSourceTitles.mjs";
 import { setupIdentityRoutes } from "./integrations/identity/routes.mjs";
@@ -496,8 +497,11 @@ const tvPayloadCache = new MediaPayloadCache({
   // Each show's season and episode keys, for /media/tv/manifest.
   describe: tvManifestKeys,
   readContext: readPayloadContext,
-  // loadRows reads tv_shows only.
-  dataGeneration: () => getMediaTableGeneration('tv_shows'),
+  // The manifest's `library` value (the library root's credits sidecar).
+  readLibrary: () => readManifestLibrary({ logger }),
+  // loadRows reads tv_shows only; the library state is folded in because the
+  // manifest built from this body carries it (lib/libraryCredits.mjs).
+  dataGeneration: mediaDataGeneration('tv_shows'),
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
@@ -525,8 +529,9 @@ const moviePayloadCache = new MediaPayloadCache({
   version: MOVIE_LIST_VERSION,
   builder: buildMoviePayloadEntry,
   readContext: readPayloadContext,
-  // loadRows reads movies only.
-  dataGeneration: () => getMediaTableGeneration('movies'),
+  readLibrary: () => readManifestLibrary({ logger }),
+  // loadRows reads movies only; the library state as for TV.
+  dataGeneration: mediaDataGeneration('movies'),
   logger,
   loadRows: async () => {
     const db = await initializeDatabase();
@@ -727,6 +732,12 @@ async function runGenerateList() {
     // Identity reconcile FIRST, so any tmdb.config it writes is already on
     // disk when the scanners below read mtimes. Never throws; disabled = no-op.
     await identityService.reconcileForTick();
+
+    // The library root's credits sidecar, which both manifests carry. Before
+    // the scans and apart from them, so it is read whatever they do; it never
+    // throws, and a root it cannot list is stored as unreadable, never absent.
+    // The clear point below drops the bodies only when the value changed.
+    await scanLibraryCredits({ root: BASE_PATH, prefixPath: PREFIX_PATH });
 
     let scanFailed = true;
     try {

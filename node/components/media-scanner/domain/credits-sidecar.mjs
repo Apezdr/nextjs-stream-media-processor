@@ -127,6 +127,36 @@ export async function locateCreditsSidecar({ listing, dir, fileName, url, librar
 }
 
 /**
+ * The library root's credits sidecar: `<library root>/credits.json`, for the
+ * shared assets outside any title folder (the poster collage at the file
+ * server root). Its asset paths are relative to the root. Both manifests
+ * publish the value as `library.credits` (lib/libraryCredits.mjs).
+ *
+ * The root is listed here, since no scan holds a listing of it. A listing that
+ * fails is `unreadable`, never an absence.
+ *
+ * @param {Object} opts
+ * @param {string} opts.root - The library root (BASE_PATH: holds movies/ and tv/)
+ * @param {string} opts.prefixPath - The file server URL prefix of that root
+ * @returns {Promise<{url: string, hash: string}|{absent: true}|{error: 'unreadable'|'too-large'|'empty'}>}
+ */
+export async function locateLibraryCreditsSidecar({ root, prefixPath }) {
+  let listing;
+  try {
+    listing = await fs.readdir(root);
+  } catch (err) {
+    return failed('unreadable', CREDITS_FILE_NAME, `library root not listed: ${err?.code ?? err?.message ?? String(err)}`);
+  }
+  return locateCreditsSidecar({
+    listing,
+    dir: root,
+    fileName: CREDITS_FILE_NAME,
+    url: `${prefixPath}/${encodeURIComponent(CREDITS_FILE_NAME)}`,
+    libraryRelativePath: CREDITS_FILE_NAME,
+  });
+}
+
+/**
  * Whether a stored credits value has to be read again on the next scan though
  * the title's directory did not change: it is `{ error: 'unreadable' }`.
  *

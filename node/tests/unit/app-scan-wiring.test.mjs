@@ -52,6 +52,15 @@ describe('app.mjs library scans', () => {
     ]);
   });
 
+  it('reads the library root credits sidecar once, in the scan tick, before the scans', () => {
+    expect(linesMatching(CODE, /\bscanLibraryCredits\s*\(/)).toEqual([
+      'await scanLibraryCredits({ root: BASE_PATH, prefixPath: PREFIX_PATH });',
+    ]);
+    const tick = CODE.slice(CODE.indexOf('async function runGenerateList('));
+    expect(tick.indexOf('scanLibraryCredits(')).toBeGreaterThan(0);
+    expect(tick.indexOf('scanLibraryCredits(')).toBeLessThan(tick.indexOf('generateListMovies('));
+  });
+
   it('calls the scanners from those wirings and the scan tick only', () => {
     expect(linesMatching(CODE, /\bgenerateList(?:Movies|TV)\s*\(/)).toEqual([
       'async function generateListTV(db, dirPath) {',

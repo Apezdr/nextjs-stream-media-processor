@@ -389,6 +389,27 @@ describe('insertOrUpdateMovie', () => {
   });
 });
 
+describe('library state', () => {
+  it('stores a value, reads it back parsed, and has none for an unknown key', async () => {
+    expect(await sqliteDb.getLibraryState('never-written')).toBeNull();
+    await sqliteDb.setLibraryState('test-credits', { absent: true });
+    expect(await sqliteDb.getLibraryState('test-credits')).toEqual({ absent: true });
+  });
+
+  it('moves its generation when the value changes, and on nothing else', async () => {
+    await sqliteDb.setLibraryState('test-gen', { absent: true });
+    const before = { library: sqliteDb.getLibraryStateGeneration(), tables: generations() };
+
+    expect(await sqliteDb.setLibraryState('test-gen', { absent: true })).toBe(false);
+    expect(sqliteDb.getLibraryStateGeneration()).toBe(before.library);
+
+    expect(await sqliteDb.setLibraryState('test-gen', { url: '/credits.json?hash=ab', hash: 'ab' })).toBe(true);
+    expect(sqliteDb.getLibraryStateGeneration()).toBe(before.library + 1);
+    // The title tables' generations are their own.
+    expect(generations()).toEqual(before.tables);
+  });
+});
+
 describe('deleteMovie and deleteTVShow', () => {
   it('move their table\'s generation when a row goes, and not when there was none', async () => {
     await sqliteDb.insertOrUpdateMovie(...movieArgs('Doomed Movie'));

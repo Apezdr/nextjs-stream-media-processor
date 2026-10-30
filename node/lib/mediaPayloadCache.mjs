@@ -33,6 +33,10 @@
 //     of these clear points.
 //   - the autoCaptions settings (they live in Mongo, written by the frontend;
 //     watchPayloadContext polls them).
+//   - the library state the manifests carry (`library`, read by readLibrary at
+//     build time and kept on the entry; lib/libraryCredits.mjs). It is not in
+//     the body, but a manifest is built once per body, so app.mjs folds its
+//     generation into the data generation.
 //
 // Nothing else goes into a body: the rows are read from the one table, the
 // caption stubs come from the rows and the settings, and everything else the
@@ -189,6 +193,7 @@ export class MediaPayloadCache {
   #describe;
   #loadRows;
   #readContext;
+  #readLibrary;
   #dataGeneration;
   #maxAgeMs;
   #now;
@@ -209,6 +214,9 @@ export class MediaPayloadCache {
    *   order, with the caption stubs already injected
    * @param {() => Promise<string>} [options.readContext] - The current
    *   autoCaptions context key; must not throw
+   * @param {() => Promise<Object|null>} [options.readLibrary] - The manifests'
+   *   `library` object (readManifestLibrary), kept on the entry as `library`;
+   *   null for none. Must not throw; one that does reads as null
    * @param {() => number} [options.dataGeneration] - The generation of the
    *   rows loadRows reads (getMediaTableGeneration of its table). Without it,
    *   invalidateIfDataChanged always drops the body.
@@ -223,6 +231,7 @@ export class MediaPayloadCache {
     describe = null,
     loadRows,
     readContext = async () => '',
+    readLibrary = async () => null,
     dataGeneration = null,
     maxAgeMs = PAYLOAD_CACHE_MAX_AGE_MS,
     now = Date.now,
@@ -234,6 +243,7 @@ export class MediaPayloadCache {
     this.#describe = describe;
     this.#loadRows = loadRows;
     this.#readContext = readContext;
+    this.#readLibrary = readLibrary;
     this.#dataGeneration = dataGeneration;
     this.#maxAgeMs = maxAgeMs;
     this.#now = now;
@@ -351,6 +361,11 @@ export class MediaPayloadCache {
     // the same settings cache, which only moves forward. A change landing
     // mid-build is caught by the next checkContext.
     const contextKey = await this.#readContext();
+    // Before the rows too, after the data generation get() read: a library
+    // write that lands after that read is newer than this body either way.
+    const library = await Promise.resolve()
+      .then(() => this.#readLibrary())
+      .catch(() => null);
     const rows = await this.#loadRows();
     const { body, titles, etag } = await serializeKeyedList({
       kind: this.#kind,
@@ -366,6 +381,7 @@ export class MediaPayloadCache {
       body,
       gzipBody,
       titles,
+      library: library ?? null,
       contextKey,
       dataGeneration,
       builtAt: this.#now(),
