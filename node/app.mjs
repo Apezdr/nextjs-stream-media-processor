@@ -55,6 +55,7 @@ import { TaskType, enqueueTask } from "./lib/taskManager.mjs";
 import { createMediaScanHandler, scanIfTableEmpty } from "./lib/libraryScanTask.mjs";
 import { createHash } from "crypto";
 import { runPython } from "./lib/processRunner.mjs";
+import { runPosterCollage } from "./lib/posterCollage.mjs";
 import { MetadataGenerator } from "./lib/metadataGenerator.mjs";
 import { scanMovies, scanTVShows, scanLibraryCredits } from "./components/media-scanner/index.mjs";
 import { readManifestLibrary, mediaDataGeneration } from "./lib/libraryCredits.mjs";
@@ -640,21 +641,24 @@ app.post("/media/scan", authenticateWebhookOrUser, createMediaScanHandler({
   logger,
 }));
 
+// The poster collage job, on start and on its schedule. POSTER_COLLAGE_ENABLED
+// turns it off, and the library's credits.json, when it credits the collage,
+// decides which posters it is made of (lib/posterCollage.mjs).
 async function runGeneratePosterCollage() {
-  const debugMessage = isDebugMode ? ' with debug' : '';
-  posterLogger.info(`Running generate_poster_collage.py job${debugMessage}`);
-  await runPython({
+  await runPosterCollage({
+    basePath: BASE_PATH,
     scriptPath: generatePosterCollageScript,
-    args: [],                       // no extra flags
-    label: 'GeneratePosterCollage', // appears in the log prefix
-    logger: posterLogger,          
-    logFile: LOG_FILE,              // cron.log, written only in debug mode
-    debug: isDebugMode,             // redirect to file when true
+    runPython,
+    logger: posterLogger,
+    runOptions: {
+      logFile: LOG_FILE,              // cron.log, written only in debug mode
+      debug: isDebugMode,             // redirect to file when true
+    },
     env: {
       ...process.env,
       DEBUG: process.env.DEBUG,
       TMDB_API_KEY: process.env.TMDB_API_KEY,
-    }
+    },
   });
 }
 /**
