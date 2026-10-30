@@ -3,7 +3,7 @@
  * real SQLite → the real /media/movies and /media/tv builders, and the
  * manifest's per-title hash over the bytes they build.
  *
- * What it pins (the processor's part of the frontend's docs/CREDITS_SIDECAR.md):
+ * What it pins (the processor's part of the frontend's CREDITS_SIDECAR.md, repo root):
  *
  *   - a movie, a show and an episode with a sidecar publish `{ url, hash }`,
  *     the hash the SHA-256 of the file's bytes, which are never parsed;

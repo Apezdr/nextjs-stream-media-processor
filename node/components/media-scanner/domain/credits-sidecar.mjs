@@ -1,9 +1,9 @@
 // components/media-scanner/domain/credits-sidecar.mjs
 //
 // The credits sidecar: a title's credits and licenses, in a file of its own
-// beside its metadata. The contract is owned by the frontend
-// (nextjs-stream docs/CREDITS_SIDECAR.md); this module is the processor's part
-// of it, and the only code here that touches the file.
+// beside its metadata. The contract is owned by the frontend (the frontend's
+// CREDITS_SIDECAR.md, repo root); this module is the processor's part of it,
+// and the only code here that touches the file.
 //
 //   movie    movies/<folder>/credits.json
 //   show     tv/<folder>/credits.json

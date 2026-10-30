@@ -157,6 +157,7 @@ One entry per subsystem. Each entry states what the subsystem owns (its exclusiv
 - `node/components/media-scanner/domain/movie-scanner.mjs`, `node/components/media-scanner/domain/tv-scanner.mjs` — the two scan loops
 - `node/components/media-scanner/domain/image-conventions.mjs` — image filename conventions the scanner recognizes
 - `node/components/media-scanner/domain/subtitle-filename.mjs` — subtitle filename parsing
+- `node/components/media-scanner/domain/credits-sidecar.mjs` — the credits sidecar locator (list, size-check, read, hash; never parsed; see the credits sidecar entry in §3)
 - `node/components/media-scanner/data-access/scanner-repository.mjs` — `saveMovie`, `saveTVShow`, `removeMovie`, `removeTVShow`, plus cooldown bookkeeping (`markMediaAsMissingData`, `recordEpisodeAttempt`, `clearEpisodeRetry`)
 
 ### 2.2 Metadata generator
@@ -476,6 +477,37 @@ Absent ──► Written (fresh fetch) ──► Stale (age > 24 h or config new
 
 ---
 
+### Credits sidecar (`credits.json`, `<NN>_credits.json`)
+
+A title's credits and licenses, in a file of its own beside its metadata. The contract (schema, validation, ownership, the frontend sync and the clients) is owned by the frontend: the frontend's `CREDITS_SIDECAR.md` (repo root). This entry is the processor's part of it.
+
+| Title | File |
+| --- | --- |
+| Movie | `movies/<folder>/credits.json` |
+| Show | `tv/<folder>/credits.json` |
+| Episode | `<NN>_credits.json` in the season folder, `<NN>` exactly as the episode's `<NN>_metadata.json` is named (`processEpisode()`'s `episodeNumber`) |
+
+**Discovery.** `node/components/media-scanner/domain/credits-sidecar.mjs` (`locateCreditsSidecar()`) is the only code that touches the file. Both scanners call it on every pass that reaches the save, outside the TMDB download block, so a frozen title (`update_metadata: false`, or an unparseable `tmdb.config` treated as frozen) publishes its credits all the same. Absence is read off the folder listing the scanner already holds (no stat for it). A listed file is opened, size-checked, read (never more than one byte past the cap) and hashed with SHA-256. The file is **never parsed**: like `metadata.json` (§4.1) the scanner has no schema awareness, and nothing else is hashed for it. The cap is **256 KiB** (262,144 bytes, `CREDITS_SIDECAR_MAX_BYTES`), the same on the frontend, checked on the size and again on the bytes read.
+
+**The wire.** Each movie and show entry of `/media/movies` and `/media/tv`, and each episode inside a show's `seasons` (passed through `slimEpisode()` untouched), carries `credits`:
+
+| Value | Meaning |
+| --- | --- |
+| `{ url: "<prefix>/…/credits.json?hash=<h>", hash: "<h>" }` | Read. `h` is the SHA-256 hex of the bytes. The URL follows each scanner's existing `encodeURIComponent` pattern for `metadata.json` |
+| `{ absent: true }` | The listing has no such file: a confirmed absence |
+| `{ error: "unreadable" \| "too-large" \| "empty" }` | Listed, but not a readable regular file, over the cap, or 0 bytes. Not an absence ("Failed ≠ absent"); logged as a warn naming the library-relative path |
+| no key | A row written before this existed (column NULL). Never `null` |
+
+**Storage.** `movies.credits` and `tv_shows.credits` (JSON text); an episode's value lives in the show's `seasons` blob. `tv_shows.credits_retry` is 1 when the show's value or any episode's is an error. All in `CREATE TABLE` and in `migrateToSchemaParityColumns()`. Every reshaping reader (`getMovies`, `getMovieById`, `getMovieByName`, `getTVShows`, `getTVShowById`, `getTVShowByName`) carries `credits` parsed, null for a NULL column, and the builders (`lib/mediaPayload.mjs`) leave the key off for null. The value is not COALESCE-preserved: every save carries what this pass found, and a title whose listing failed never reaches the save, so its row keeps what it had.
+
+**Change and retry.** A sidecar added, edited or removed is a file in the title folder (or a season folder, inside `TV_DIR_HASH_MAX_DEPTH`), so the directory hash moves, the title is reprocessed, and its entry, and with it its manifest title hash, moves. A stored error is read again on the next scan though the directory did not change: the movie scanner's unchanged-directory early return lets through a row whose `credits` is an error (`creditsNeedsReread()`), and the TV fast-skip lets through a show whose `credits_retry` is set, read by `getTVShowNamesAndHashes()` with the hashes (no full-row read per show per tick). Like a payload refresh, this bypasses the skip only and opens no TMDB gate. The movie upsert's change guard opens when the stored `credits` differs, so a value that reads now lands with the directory unchanged. It converges: once every file reads, the save stores no error and clears `credits_retry`. A file that stays in error (over the cap, a directory of that name) brings its title back every scan until it is fixed; the warn names it.
+
+**Rollout.** `MEDIA_PAYLOAD_VERSION` 11 rewrites every row once: nothing on disk changes for a title without a sidecar, so only the bump publishes its `{ absent: true }`.
+
+**Why `metadata_hashes` is untouched.** Per the contract, the frontend selects a title on the manifest's per-entry hash (`lib/mediaManifest.mjs`), not on `/api/metadata-hashes`; `credits` is part of the entry bytes, so that hash covers it with no change. The `metadata_hashes` movie, show and episode hashes do not include it and are deliberately not extended: a held branch removes that subsystem.
+
+---
+
 ### Image files (poster / backdrop / logo, plus season posters and episode thumbnails)
 
 The three top-level kinds are defined once in `node/components/media-scanner/domain/image-conventions.mjs` (canonical prefixes `poster`/`backdrop`/`logo` for movies, `show_*` for TV; accepted extensions per kind, `svg` for logos). The downloader (`node/utils/imageDownloader.mjs`) is deliberately dumb for these three top-level kinds: a plain existence check per target path, no staleness logic — **the generator alone decides when to delete a file so the downloader is forced to re-fetch** (§4.3; the season-poster and episode-thumbnail paths carry the grandfathered downloader-side TTLs described there).
@@ -543,7 +575,7 @@ Operator-supplied field-level replacements, applied by the generator on every wr
 
 Owned exclusively by the repository layer (`node/components/media-scanner/data-access/scanner-repository.mjs`, delegating to `node/sqliteDatabase.mjs`). The two upserts are deliberately asymmetric:
 
-- `insertOrUpdateMovie()` carries a change-guard: the `ON CONFLICT ... DO UPDATE` only fires when `directory_hash` moved, with two backfill escape hatches for rows written before a column existed (`backdrop_focal_suggested IS NULL`, and — Branch 1 — `movies.metadata IS NULL AND excluded.metadata IS NOT NULL`) — an unchanged movie is otherwise not rewritten. The metadata hatch is driven by a one-shot scanner-side backfill: `movie-scanner.mjs` skips its unchanged-directory early return once per row while `movies.metadata` is NULL and a `metadata.json` exists.
+- `insertOrUpdateMovie()` carries a change-guard: the `ON CONFLICT ... DO UPDATE` only fires when `directory_hash` moved, with two backfill escape hatches for rows written before a column existed (`backdrop_focal_suggested IS NULL`, and — Branch 1 — `movies.metadata IS NULL AND excluded.metadata IS NOT NULL`) — an unchanged movie is otherwise not rewritten. The metadata hatch is driven by a one-shot scanner-side backfill: `movie-scanner.mjs` skips its unchanged-directory early return once per row while `movies.metadata` is NULL and a `metadata.json` exists. The guard also opens on a changed payload signature and on a changed `credits` value (see the credits sidecar entry above).
 - `insertOrUpdateTVShow()` has no `directory_hash` guard: it writes whatever it is given.
 - Both skip an update that would store what the row already holds (a WHERE built from the same column list as the SET), so an identical write changes nothing, SQLite counts no change, and the table's generation (`getMediaTableGeneration`, read by the `/media/<kind>` cache) does not move. That drops no write.
 
