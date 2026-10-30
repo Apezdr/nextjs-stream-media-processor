@@ -53,6 +53,12 @@ import {
   imageHashesFromResolved,
   kindHasBlurhash,
 } from './image-conventions.mjs';
+import {
+  locateCreditsSidecar,
+  showCreditsNeedReread,
+  episodeCreditsFileName,
+  CREDITS_FILE_NAME,
+} from './credits-sidecar.mjs';
 
 const logger = createCategoryLogger('tv-scanner');
 
@@ -477,6 +483,17 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
     )}?hash=${episodeMetadataHash}`;
   }
 
+  // The episode's credits sidecar, named after the same episode number as its
+  // metadata file. Absence is read off the season listing; never parsed.
+  const creditsFileName = episodeCreditsFileName(episodeNumber);
+  episodeData.credits = await locateCreditsSidecar({
+    listing: seasonFiles,
+    dir: seasonPath,
+    fileName: creditsFileName,
+    url: `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/${encodeURIComponent(creditsFileName)}`,
+    libraryRelativePath: `tv/${showName}/${basename(seasonPath)}/${creditsFileName}`,
+  });
+
   // Handle chapters
   const chaptersPath = join(
     seasonPath,
@@ -673,6 +690,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // The published first-seen date per show, so a deleted sidecar self-heals to
   // the date consumers already hold instead of re-dating the show to this scan.
   const firstSeenMap = new Map(existingShowHashes.map(s => [s.name, s.first_seen ?? null]));
+  // Shows whose stored credits value, their own or an episode's, is an error.
+  const creditsRetryMap = new Map(existingShowHashes.map(s => [s.name, s.credits_retry === 1]));
   const existingShowNames = new Set(existingShowHashes.map(s => s.name));
 
   // Bounded concurrency for season processing (moderate load — not unbounded)
@@ -858,6 +877,15 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         );
       }
 
+      // A stored credits error (the show's or an episode's) is read again
+      // though nothing on disk moved, as a payload refresh is: it bypasses the
+      // fast-skip only, and touches no TMDB gate. Converges when every file
+      // reads: the save then clears credits_retry.
+      const needCreditsReread = storedHash != null && creditsRetryMap.get(showName) === true;
+      if (needCreditsReread && !dirHashChanged) {
+        logger.info(`Reprocessing ${showName} to read its credits sidecars again`);
+      }
+
       // NOTE: needPayloadRefresh is deliberately NOT folded into this flag.
       // It gates TMDB image downloads as well as reprocessing, and a payload
       // bump touches no images — folding it in would fire a library-wide TMDB
@@ -871,7 +899,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
       // aren't due for a metadata-cooldown retry. Equivalent to the old
       // unconditional hash-skip, just applied AFTER the gate so the
       // image-only retry path isn't suppressed when the dir is unchanged.
-      if (!runDownloadTmdbImagesFlag && !needPayloadRefresh) {
+      if (!runDownloadTmdbImagesFlag && !needPayloadRefresh && !needCreditsReread) {
         // Thin episodes on an otherwise-stable show still need re-checking — the
         // full-process path only runs the backfill when the show is reprocessed for
         // some other reason, which is exactly when it's least needed. Run it here
@@ -1089,6 +1117,17 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
 
       const sortedSeasons = sortSeasons(seasonsObj);
 
+      // The show's credits sidecar, found apart from the TMDB work above, so a
+      // frozen show publishes it too. Absence is read off the show listing
+      // that drove `seasons`; the file is never parsed.
+      const showCredits = await locateCreditsSidecar({
+        listing: showFileSet,
+        dir: showPath,
+        fileName: CREDITS_FILE_NAME,
+        url: `${prefixPath}/tv/${encodedShowName}/${encodeURIComponent(CREDITS_FILE_NAME)}`,
+        libraryRelativePath: `tv/${showName}/${CREDITS_FILE_NAME}`,
+      });
+
       // File paths + cache-bust hashes come from the SAME resolve that built the
       // show-asset URLs (processShowAssets → resolveImage: one set lookup + one
       // stat per kind). URL filename, *_file_path, and *_hash cannot diverge.
@@ -1134,7 +1173,9 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         sourceUrls,
         showMediaId,
         // The DURABLE date only — see the matching note in movie-scanner.mjs.
-        showIdentity.durableFirstSeen
+        showIdentity.durableFirstSeen,
+        showCredits,
+        showCreditsNeedReread(showCredits, sortedSeasons)
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.

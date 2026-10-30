@@ -48,6 +48,7 @@ import {
   imageHashesFromResolved,
   kindHasBlurhash,
 } from './image-conventions.mjs';
+import { locateCreditsSidecar, creditsNeedsReread, CREDITS_FILE_NAME } from './credits-sidecar.mjs';
 
 const logger = createCategoryLogger('movie-scanner');
 
@@ -521,12 +522,18 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       const payloadSignature = currentPayloadSignature();
       const needPayloadRefresh =
         existingMovie && existingMovie.payload_signature !== payloadSignature;
+      // A stored credits value that is an error (unreadable, too large, empty)
+      // is read again though the directory did not change: a share that was
+      // briefly unreadable leaves the folder's listing as it was. Converges
+      // when the file reads: the save stores the new value, which is no error.
+      let needCreditsReread = false;
       if (!dirHashChanged && existingMovie) {
         needInfoRegeneration = await needsInfoRegeneration(files, dirPath, dirName, currentVersion);
         needMetadataBackfill =
           existingMovie.metadata == null && files.includes('metadata.json');
+        needCreditsReread = creditsNeedsReread(existingMovie.credits);
 
-        if (!needInfoRegeneration && !needMetadataBackfill && !needPayloadRefresh) {
+        if (!needInfoRegeneration && !needMetadataBackfill && !needPayloadRefresh && !needCreditsReread) {
           logger.debug(`No changes detected in ${dirName}, skipping processing.`);
           return;
         } else if (needPayloadRefresh) {
@@ -536,6 +543,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
           );
         } else if (needInfoRegeneration) {
           logger.info(`Processing ${dirName} to update info files`);
+        } else if (needCreditsReread) {
+          logger.info(`Processing ${dirName} to read its credits sidecar again (stored: ${existingMovie.credits})`);
         } else {
           logger.info(`Processing ${dirName} to backfill its metadata fingerprint (F-1, one-shot)`);
         }
@@ -822,6 +831,17 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         urls.chapters = chaptersUrl;
       }
 
+      // The credits sidecar, found on every pass that reaches the save and
+      // apart from the TMDB work above, so a frozen title publishes it too.
+      // Absence is read off this pass's listing; the file is never parsed.
+      const credits = await locateCreditsSidecar({
+        listing: fileSet,
+        dir: fullDirPath,
+        fileName: CREDITS_FILE_NAME,
+        url: `${prefixPath}/movies/${encodeURIComponent(dirName)}/${encodeURIComponent(CREDITS_FILE_NAME)}`,
+        libraryRelativePath: `${libraryRelativePath}/${CREDITS_FILE_NAME}`,
+      });
+
       // Calculate final hash
       const final_hash = await calculateDirectoryHash(fullDirPath);
 
@@ -896,7 +916,8 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
         // The DURABLE date only — null when the sidecar could not be written.
         // It is published and folded into the movie hash, so a per-pass `now`
         // here would move that hash on every rescan of an unwritable folder.
-        identity.durableFirstSeen
+        identity.durableFirstSeen,
+        credits
       );
 
       // Immediately regenerate the metadata hash using the fresh data just saved.
