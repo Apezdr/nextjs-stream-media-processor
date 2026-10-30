@@ -271,8 +271,8 @@ export async function saveMovie(
  * @param {Object|null} [credits] - The show-level credits sidecar value this
  *   pass found, stored as JSON. Episode values ride in `seasonsObj`.
  * @param {boolean|null} [creditsRetry] - Whether the show's value or any
- *   episode's is an error (showCreditsNeedReread), so the next scan reads the
- *   show again though its directory did not change.
+ *   episode's is `unreadable` (showCreditsNeedReread), so the next scan reads
+ *   the show again though its directory did not change.
  * @returns {Promise<void>}
  */
 export async function saveTVShow(

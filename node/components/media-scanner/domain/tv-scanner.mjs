@@ -690,7 +690,8 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
   // The published first-seen date per show, so a deleted sidecar self-heals to
   // the date consumers already hold instead of re-dating the show to this scan.
   const firstSeenMap = new Map(existingShowHashes.map(s => [s.name, s.first_seen ?? null]));
-  // Shows whose stored credits value, their own or an episode's, is an error.
+  // Shows whose stored credits value, their own or an episode's, is
+  // `unreadable` (creditsNeedsReread).
   const creditsRetryMap = new Map(existingShowHashes.map(s => [s.name, s.credits_retry === 1]));
   const existingShowNames = new Set(existingShowHashes.map(s => s.name));
 
@@ -877,10 +878,10 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         );
       }
 
-      // A stored credits error (the show's or an episode's) is read again
-      // though nothing on disk moved, as a payload refresh is: it bypasses the
-      // fast-skip only, and touches no TMDB gate. Converges when every file
-      // reads: the save then clears credits_retry.
+      // A stored `unreadable` credits value (the show's or an episode's) is
+      // read again though nothing on disk moved, as a payload refresh is: it
+      // bypasses the fast-skip only, and touches no TMDB gate. Converges when
+      // every such file reads: the save then clears credits_retry.
       const needCreditsReread = storedHash != null && creditsRetryMap.get(showName) === true;
       if (needCreditsReread && !dirHashChanged) {
         logger.info(`Reprocessing ${showName} to read its credits sidecars again`);

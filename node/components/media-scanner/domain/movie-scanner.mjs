@@ -522,10 +522,11 @@ export async function scanMovies(db, dirPath, prefixPath, basePath, langMap, cur
       const payloadSignature = currentPayloadSignature();
       const needPayloadRefresh =
         existingMovie && existingMovie.payload_signature !== payloadSignature;
-      // A stored credits value that is an error (unreadable, too large, empty)
-      // is read again though the directory did not change: a share that was
-      // briefly unreadable leaves the folder's listing as it was. Converges
-      // when the file reads: the save stores the new value, which is no error.
+      // A stored credits value of `{ error: 'unreadable' }` is read again
+      // though the directory did not change: a permission fix or a share that
+      // was briefly unreadable moves no size or mtime. (`too-large` and
+      // `empty` wait for the edit that fixes them, which moves the hash.)
+      // Converges when the file reads: the save stores the new value.
       let needCreditsReread = false;
       if (!dirHashChanged && existingMovie) {
         needInfoRegeneration = await needsInfoRegeneration(files, dirPath, dirName, currentVersion);

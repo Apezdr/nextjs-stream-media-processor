@@ -269,7 +269,7 @@ export async function initializeSchema(dbType, db) {
         media_id TEXT,           -- stable identity; cache of the .mediaid.json sidecar
         first_seen TEXT,         -- when the folder entered the library; cache of the sidecar's firstSeen
         credits TEXT,            -- the show's published credits sidecar value, JSON (credits-sidecar.mjs)
-        credits_retry INTEGER    -- 1 when the show's or an episode's credits value is an error
+        credits_retry INTEGER    -- 1 when the show's or an episode's credits value is 'unreadable'
       );
     `);
 
@@ -493,7 +493,8 @@ export async function migrateToSchemaParityColumns(db) {
     // written before it existed, which publishes no `credits` key; the payload
     // version bump rewrites every row once. A show's episode values live in its
     // seasons blob, so credits_retry flags a show whose own value or any
-    // episode's is an error, for the scanner's name-and-hash read to see.
+    // episode's is `unreadable` (the one error re-read with the directory
+    // unchanged), for the scanner's name-and-hash read to see.
     ['movies',   'credits TEXT'],
     ['tv_shows', 'credits TEXT'],
     ['tv_shows', 'credits_retry INTEGER'],
@@ -907,8 +908,8 @@ export async function getTVShowNamesAndHashes() {
     // per show to decide whether a payload-shape change requires reprocessing,
     // and pulling it here keeps that check free rather than costing a full-row
     // read per show per tick. credits_retry is here for the same reason: a
-    // show whose stored credits value (its own or an episode's) is an error is
-    // read again though its directory did not change.
+    // show whose stored credits value (its own or an episode's) is
+    // `unreadable` is read again though its directory did not change.
     return await withRetry(() =>
       db.all('SELECT name, directory_hash, payload_signature, first_seen, credits_retry FROM tv_shows')
     );
@@ -1474,7 +1475,7 @@ const MOVIE_UPSERT_UPDATE = mediaUpsertUpdate('movies', [
   ['media_id', 'COALESCE(excluded.media_id, movies.media_id)'],
   ['first_seen', 'COALESCE(excluded.first_seen, movies.first_seen)'],
   // Not COALESCE-preserved, as on tv_shows. The change guard below opens on
-  // it: an error re-read on an unchanged directory that is readable now must
+  // it: an `unreadable` re-read on an unchanged directory that reads now must
   // land.
   ['credits', 'excluded.credits'],
 ]);
@@ -1584,8 +1585,8 @@ export async function insertOrUpdateMovie(
         -- so the NULL -> '2:jit0' transition on pre-migration rows fires.
         OR movies.payload_signature IS NOT excluded.payload_signature
         -- The credits sidecar value moved with the directory unchanged: a
-        -- stored error re-read (movie-scanner.mjs) that reads now, or reads
-        -- differently.
+        -- stored 'unreadable' re-read (movie-scanner.mjs) that reads now, or
+        -- reads differently.
         OR movies.credits IS NOT excluded.credits)
         AND (${MOVIE_UPSERT_UPDATE.changed})`,
         [

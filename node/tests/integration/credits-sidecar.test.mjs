@@ -10,9 +10,10 @@
  *   - without one, `{ absent: true }`; a frozen title (update_metadata: false,
  *     or an unparseable tmdb.config) publishes its sidecar all the same;
  *   - editing the file moves the hash, the url and the manifest title hash;
- *   - a stored error is read again on the next scan though the directory did
- *     not change, becomes `{ url, hash }` once the file reads, and then stops
- *     bringing the title back;
+ *   - a stored `unreadable` is read again on the next scan though the
+ *     directory did not change, becomes `{ url, hash }` once the file reads,
+ *     and then stops bringing the title back; `too-large` and `empty` wait for
+ *     the edit that fixes them, which moves the directory hash;
  *   - a row written before credits existed (column NULL) publishes no
  *     `credits` key at all.
  *
@@ -202,7 +203,7 @@ describe('/media/movies credits', () => {
     expect((await moviePayload())['Folder Movie'].credits).toEqual({ error: 'unreadable' });
   });
 
-  it('skips every movie on a scan with nothing changed but the one in error, which it reads again', async () => {
+  it('skips every movie on a scan with nothing changed but the unreadable one, which it reads again', async () => {
     const before = await moviePayload();
     const { reprocessed } = await scanMoviesOnce();
     expect(reprocessed).toBe(1); // Folder Movie, whose directory did not change
@@ -229,8 +230,9 @@ describe('/media/movies credits', () => {
   });
 
   it('reads a stored error again with the directory unchanged, stores url and hash, then stops', async () => {
-    // A read that failed on an earlier pass (a transient mount fault): the
-    // stored value is an error, the folder and its file are as they were.
+    // A read that failed on an earlier pass (a transient mount fault, a
+    // permission since fixed by chmod, which moves no mtime): the stored value
+    // is unreadable, the folder and its file are as they were.
     const good = (await moviePayload())['Frozen Movie'].credits;
     await db.run(`UPDATE movies SET credits = ? WHERE name = ?`, ['{"error":"unreadable"}', 'Frozen Movie']);
     expect((await moviePayload())['Frozen Movie'].credits).toEqual({ error: 'unreadable' });
@@ -252,6 +254,21 @@ describe('/media/movies credits', () => {
       url: `${PREFIX}/movies/Folder%20Movie/credits.json?hash=${sha256(MOVIE_CREDITS_V1)}`,
       hash: sha256(MOVIE_CREDITS_V1),
     });
+    expect((await scanMoviesOnce()).reprocessed).toBe(0);
+  });
+
+  it('does not read a too-large file again with the directory unchanged, and does once it is edited', async () => {
+    const file = join(MOVIES, 'Credited Movie', 'credits.json');
+    await fs.writeFile(file, Buffer.alloc(262144 + 1, 0x61));
+    expect((await scanMoviesOnce()).reprocessed).toBe(1); // the write moved the directory
+    expect((await moviePayload())['Credited Movie'].credits).toEqual({ error: 'too-large' });
+
+    // The edit that fixes it is what brings it back, not every scan.
+    expect((await scanMoviesOnce()).reprocessed).toBe(0);
+
+    await fs.writeFile(file, MOVIE_CREDITS_V1);
+    expect((await scanMoviesOnce()).reprocessed).toBe(1);
+    expect((await moviePayload())['Credited Movie'].credits.hash).toBe(sha256(MOVIE_CREDITS_V1));
     expect((await scanMoviesOnce()).reprocessed).toBe(0);
   });
 });
@@ -301,8 +318,8 @@ describe('/media/tv credits', () => {
       (await sqliteDb.getTVShowNamesAndHashes()).find((s) => s.name === 'Frozen Show').credits_retry;
     expect(await flag()).toBe(0);
 
-    // An episode read that failed on an earlier pass: its stored value is an
-    // error and the show is flagged, the files on disk are as they were.
+    // An episode read that failed on an earlier pass: its stored value is
+    // unreadable and the show is flagged, the files on disk are as they were.
     const row = await db.get(`SELECT seasons FROM tv_shows WHERE name = 'Frozen Show'`);
     const seasons = JSON.parse(row.seasons);
     const good = seasons['Season 1'].episodes.S01E01.credits;
@@ -317,19 +334,23 @@ describe('/media/tv credits', () => {
     expect((await scanShowsOnce()).reprocessed).toBe(steady);
   });
 
-  it('flags a show whose episode file is in error, and keeps reading it until it reads', async () => {
+  it('does not flag an empty episode file, nor read it again until it is edited', async () => {
     const season = join(TV, 'Frozen Show', 'Season 1');
-    await fs.writeFile(join(season, '01_credits.json'), '');
-    const steady = (await scanShowsOnce()).reprocessed; // the edit moved the directory
-    expect((await tvPayload())['Frozen Show'].seasons['Season 1'].episodes.S01E01.credits).toEqual({ error: 'empty' });
+    const episode = async () => (await tvPayload())['Frozen Show'].seasons['Season 1'].episodes.S01E01.credits;
+    const flag = async () =>
+      (await sqliteDb.getTVShowNamesAndHashes()).find((s) => s.name === 'Frozen Show').credits_retry;
 
-    expect((await scanShowsOnce()).reprocessed).toBe(steady); // read again, directory unchanged
+    await fs.writeFile(join(season, '01_credits.json'), '');
+    const withShow = (await scanShowsOnce()).reprocessed; // the write moved the directory
+    expect(await episode()).toEqual({ error: 'empty' });
+    expect(await flag()).toBe(0);
+
+    expect((await scanShowsOnce()).reprocessed).toBe(withShow - 1); // skipped, directory unchanged
+
     await fs.writeFile(join(season, '01_credits.json'), EPISODE_CREDITS);
-    await scanShowsOnce();
-    expect((await tvPayload())['Frozen Show'].seasons['Season 1'].episodes.S01E01.credits.hash).toBe(
-      sha256(EPISODE_CREDITS)
-    );
-    expect((await scanShowsOnce()).reprocessed).toBe(steady - 1);
+    expect((await scanShowsOnce()).reprocessed).toBe(withShow); // the edit brings it back
+    expect((await episode()).hash).toBe(sha256(EPISODE_CREDITS));
+    expect((await scanShowsOnce()).reprocessed).toBe(withShow - 1);
   });
 });
 

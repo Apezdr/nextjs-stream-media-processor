@@ -23,9 +23,12 @@
 //                                            listed, but not a readable regular
 //                                            file, over 256 KiB, or 0 bytes
 //
-// An error is not an absence (AGENTS.md, "Failed ≠ absent"): a title whose
-// stored value is an error is read again on the next scan, though its folder
-// did not change (creditsNeedsReread).
+// An error is not an absence (AGENTS.md, "Failed ≠ absent"). A title whose
+// stored value is `unreadable` is read again on the next scan though its
+// folder did not change (creditsNeedsReread): the fix for it (a permission
+// change, a share that mounts again) moves no size or mtime, so the directory
+// hash cannot see it. `too-large` and `empty` are fixed by editing the file,
+// which moves the directory hash, so they wait for that.
 
 import { promises as fs } from 'fs';
 import { createHash } from 'crypto';
@@ -116,7 +119,7 @@ export async function locateCreditsSidecar({ listing, dir, fileName, url, librar
   } catch (err) {
     // Listed but not readable (a directory on a platform that refuses to open
     // one, permissions, a transient mount fault, or gone since the listing).
-    // Not an absence: the stored error brings the title back next scan.
+    // Not an absence: the stored `unreadable` brings the title back next scan.
     return failed('unreadable', libraryRelativePath, err?.code ?? err?.message ?? String(err));
   } finally {
     await handle?.close().catch(() => {});
@@ -124,11 +127,17 @@ export async function locateCreditsSidecar({ listing, dir, fileName, url, librar
 }
 
 /**
- * Whether a stored credits value has to be read again on the next scan: it is
- * an error. Takes the value as stored (the movies/tv_shows column's JSON text)
- * or already parsed (an episode's value inside the seasons blob). A missing
- * value (a row written before credits existed) is not an error; the payload
- * version bump brings those rows back once.
+ * Whether a stored credits value has to be read again on the next scan though
+ * the title's directory did not change: it is `{ error: 'unreadable' }`.
+ *
+ * Only that error: a permission fix (chmod) moves the file's ctime, not its
+ * mtime or size, so the directory hash cannot see it. `too-large` and `empty`
+ * are fixed by editing the file, which moves the directory hash and brings the
+ * title back by itself; reading them again every scan would only repeat the
+ * title's whole reprocess. Takes the value as stored (the movies/tv_shows
+ * column's JSON text) or already parsed (an episode's value inside the seasons
+ * blob). A missing value (a row written before credits existed) is not an
+ * error; the payload version bump brings those rows back once.
  *
  * @param {string|Object|null|undefined} stored
  * @returns {boolean}
@@ -142,13 +151,14 @@ export function creditsNeedsReread(stored) {
       return false;
     }
   }
-  return value !== null && typeof value === 'object' && typeof value.error === 'string';
+  return value !== null && typeof value === 'object' && value.error === 'unreadable';
 }
 
 /**
- * Whether a show's credits, or any of its episodes', is an error: the
- * tv_shows.credits_retry flag, written on every save so the scanner's
- * name-and-hash read can see it without loading the seasons blob.
+ * Whether a show's credits, or any of its episodes', has to be read again
+ * (creditsNeedsReread: it is `unreadable`): the tv_shows.credits_retry flag,
+ * written on every save so the scanner's name-and-hash read can see it
+ * without loading the seasons blob.
  *
  * @param {Object|null} showCredits - The show-level value
  * @param {Object} seasons - The seasons blob as saved

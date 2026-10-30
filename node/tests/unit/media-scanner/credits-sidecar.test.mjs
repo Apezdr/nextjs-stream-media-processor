@@ -125,10 +125,15 @@ describe('locateCreditsSidecar', () => {
 });
 
 describe('creditsNeedsReread', () => {
-  it('is true for an error, stored as column text or parsed', () => {
-    for (const reason of ['unreadable', 'too-large', 'empty']) {
-      expect(creditsNeedsReread({ error: reason })).toBe(true);
-      expect(creditsNeedsReread(JSON.stringify({ error: reason }))).toBe(true);
+  it('is true for unreadable, stored as column text or parsed', () => {
+    expect(creditsNeedsReread({ error: 'unreadable' })).toBe(true);
+    expect(creditsNeedsReread('{"error":"unreadable"}')).toBe(true);
+  });
+
+  it('is false for too-large and empty: the edit that fixes them moves the directory hash', () => {
+    for (const reason of ['too-large', 'empty']) {
+      expect(creditsNeedsReread({ error: reason })).toBe(false);
+      expect(creditsNeedsReread(JSON.stringify({ error: reason }))).toBe(false);
     }
   });
 
@@ -150,13 +155,14 @@ describe('showCreditsNeedReread', () => {
     Specials: { episodes: {} },
   });
 
-  it('is true when the show or any one episode holds an error', () => {
-    expect(showCreditsNeedReread({ error: 'empty' }, seasons({ absent: true }))).toBe(true);
+  it('is true when the show or any one episode is unreadable', () => {
+    expect(showCreditsNeedReread({ error: 'unreadable' }, seasons({ absent: true }))).toBe(true);
     expect(showCreditsNeedReread({ absent: true }, seasons({ error: 'unreadable' }))).toBe(true);
   });
 
-  it('is false when nothing does, and for a show without seasons', () => {
+  it('is false when nothing is, too-large and empty included, and for a show without seasons', () => {
     expect(showCreditsNeedReread(read, seasons({ absent: true }))).toBe(false);
+    expect(showCreditsNeedReread({ error: 'too-large' }, seasons({ error: 'empty' }))).toBe(false);
     expect(showCreditsNeedReread({ absent: true }, null)).toBe(false);
     expect(showCreditsNeedReread({ absent: true }, { 'Season 1': { episodes: { S01E01: {} } } })).toBe(false);
   });
