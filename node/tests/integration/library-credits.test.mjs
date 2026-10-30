@@ -8,8 +8,9 @@
  * What it pins:
  *
  *   - both manifests carry `library.credits`, the same four-state value a
- *     title publishes: url and hash, absent, or unreadable (a directory of
- *     that name, or a root that cannot be listed: never absent);
+ *     title publishes: url and hash, absent, not-a-file (a directory of that
+ *     name), or unreadable (a root that cannot be listed, or one that lists
+ *     neither movies nor tv, as an unmounted share does: never absent);
  *   - no `library` key before any library scan stored a value (unknown);
  *   - the root file moving moves both manifest ETags; a scan that changed
  *     nothing moves neither, and rebuilds no body;
@@ -298,17 +299,29 @@ describe('library.credits in both manifests', () => {
     }
   });
 
-  it('is unreadable for a directory named credits.json, and absent again once it is gone', async () => {
+  it('is not-a-file for a directory named credits.json, and absent again once it is gone', async () => {
     await fs.rm(ROOT_FILE);
     await fs.mkdir(ROOT_FILE);
     await tick();
     for (const kind of ['movies', 'tv']) {
-      expect((await manifest(kind)).json.library).toEqual({ credits: { error: 'unreadable' } });
+      expect((await manifest(kind)).json.library).toEqual({ credits: { error: 'not-a-file' } });
     }
 
     await fs.rm(ROOT_FILE, { recursive: true });
     await tick();
     expect((await manifest('tv')).json.library).toEqual({ credits: { absent: true } });
+  });
+
+  it('is unreadable, never absent, for an empty mount point: a share that is not mounted', async () => {
+    const before = (await manifest('movies')).etag;
+    const mountPoint = join(tmpRoot, 'empty-mount-point');
+    await fs.mkdir(mountPoint, { recursive: true });
+    await scanLibraryCredits({ root: mountPoint, prefixPath: PREFIX });
+    clearPayloadsAfterScan(CACHES, { reason: 'test tick' });
+    for (const kind of ['movies', 'tv']) {
+      expect((await manifest(kind)).json.library).toEqual({ credits: { error: 'unreadable' } });
+    }
+    expect((await manifest('movies')).etag).not.toBe(before);
   });
 
   it('is unreadable, never absent, when the root cannot be listed', async () => {

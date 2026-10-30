@@ -12,8 +12,9 @@
  *   - editing the file moves the hash, the url and the manifest title hash;
  *   - a stored `unreadable` is read again on the next scan though the
  *     directory did not change, becomes `{ url, hash }` once the file reads,
- *     and then stops bringing the title back; `too-large` and `empty` wait for
- *     the edit that fixes them, which moves the directory hash;
+ *     and then stops bringing the title back; `not-a-file`, `too-large` and
+ *     `empty` wait for the change that fixes them, which moves the directory
+ *     hash;
  *   - a row written before credits existed (column NULL) publishes no
  *     `credits` key at all.
  *
@@ -199,14 +200,16 @@ describe('/media/movies credits', () => {
     expect(payload['Broken Config Movie'].credits.hash).toBe(sha256('{}'));
   });
 
-  it('publishes an error, not an absence, for a credits.json that is not a regular file', async () => {
-    expect((await moviePayload())['Folder Movie'].credits).toEqual({ error: 'unreadable' });
+  it('publishes not-a-file, not an absence, for a credits.json that is not a regular file', async () => {
+    expect((await moviePayload())['Folder Movie'].credits).toEqual({ error: 'not-a-file' });
   });
 
-  it('skips every movie on a scan with nothing changed but the unreadable one, which it reads again', async () => {
+  it('skips every movie on a scan with nothing changed, the not-a-file one included', async () => {
+    // Replacing the directory with a file moves the directory hash, so a
+    // not-a-file is not read again on its own.
     const before = await moviePayload();
     const { reprocessed } = await scanMoviesOnce();
-    expect(reprocessed).toBe(1); // Folder Movie, whose directory did not change
+    expect(reprocessed).toBe(0);
     expect(await moviePayload()).toEqual(before);
   });
 
@@ -238,13 +241,13 @@ describe('/media/movies credits', () => {
     expect((await moviePayload())['Frozen Movie'].credits).toEqual({ error: 'unreadable' });
 
     const retry = await scanMoviesOnce();
-    expect(retry.reprocessed).toBe(2); // Frozen Movie, and Folder Movie still in error
+    expect(retry.reprocessed).toBe(1); // Frozen Movie, its directory unchanged
     expect((await moviePayload())['Frozen Movie'].credits).toEqual(good);
 
-    expect((await scanMoviesOnce()).reprocessed).toBe(1); // Folder Movie only
+    expect((await scanMoviesOnce()).reprocessed).toBe(0);
   });
 
-  it('turns an error into url and hash once the file is fixed, and the title settles', async () => {
+  it('turns not-a-file into url and hash once a file replaces it, and the title settles', async () => {
     const dir = join(MOVIES, 'Folder Movie');
     await fs.rm(join(dir, 'credits.json'), { recursive: true });
     await fs.writeFile(join(dir, 'credits.json'), MOVIE_CREDITS_V1);

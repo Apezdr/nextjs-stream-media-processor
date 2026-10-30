@@ -109,14 +109,15 @@ describe('locateCreditsSidecar', () => {
     expect(warn.mock.calls[0][0]).toContain(REL);
   });
 
-  it('answers unreadable for a directory of that name', async () => {
+  it('answers not-a-file for a directory of that name', async () => {
     await fs.mkdir(join(dir, CREDITS_FILE_NAME));
-    expect(await locate()).toEqual({ error: 'unreadable' });
+    expect(await locate()).toEqual({ error: 'not-a-file' });
     expect(warn.mock.calls[0][0]).toContain(REL);
   });
 
   it('answers unreadable, not absent, for a listed file gone since the listing', async () => {
     expect(await locate()).toEqual({ error: 'unreadable' });
+    expect(warn.mock.calls[0][1].error).toBe('ENOENT');
   });
 
   it('names an episode file after the episode number as its metadata file is named', () => {
@@ -126,17 +127,43 @@ describe('locateCreditsSidecar', () => {
 });
 
 describe('locateLibraryCreditsSidecar', () => {
-  // `dir` stands for the library root here: it lists it itself.
-  const locateRoot = (root = dir) => locateLibraryCreditsSidecar({ root, prefixPath: '/media' });
+  // A library root of its own: it lists it itself, and holds a movies folder
+  // as a mounted library does.
+  let root;
+  const locateRoot = (at = root) => locateLibraryCreditsSidecar({ root: at, prefixPath: '/media' });
+
+  beforeAll(async () => {
+    root = join(dir, 'library');
+    await fs.mkdir(join(root, 'movies'), { recursive: true });
+  });
+
+  beforeEach(async () => {
+    await fs.rm(join(root, CREDITS_FILE_NAME), { recursive: true, force: true });
+  });
 
   it('publishes url and hash for <root>/credits.json, the URL at the prefix root', async () => {
     const bytes = Buffer.from('{"schemaVersion":1,"assets":[{"path":"poster_collage.jpg"}]}');
-    await fs.writeFile(join(dir, CREDITS_FILE_NAME), bytes);
+    await fs.writeFile(join(root, CREDITS_FILE_NAME), bytes);
     expect(await locateRoot()).toEqual({ url: `/media/credits.json?hash=${sha256(bytes)}`, hash: sha256(bytes) });
   });
 
-  it('answers absent when the root listing has no credits.json', async () => {
+  it('answers absent for a root with only movies/ and no credits.json', async () => {
+    expect(await fs.readdir(root)).toEqual(['movies']);
     expect(await locateRoot()).toEqual({ absent: true });
+  });
+
+  it('answers unreadable, never absent, for an empty root: an unmounted share', async () => {
+    const empty = join(dir, 'empty-mount-point');
+    await fs.mkdir(empty, { recursive: true });
+    expect(await locateRoot(empty)).toEqual({ error: 'unreadable' });
+    expect(warn.mock.calls[0][0]).toContain(CREDITS_FILE_NAME);
+  });
+
+  it('answers unreadable for a root with a credits.json but neither movies nor tv', async () => {
+    const stray = join(dir, 'stray-root');
+    await fs.mkdir(stray, { recursive: true });
+    await fs.writeFile(join(stray, CREDITS_FILE_NAME), '{}');
+    expect(await locateRoot(stray)).toEqual({ error: 'unreadable' });
   });
 
   it('answers unreadable, never absent, when the root cannot be listed', async () => {
@@ -144,9 +171,9 @@ describe('locateLibraryCreditsSidecar', () => {
     expect(warn.mock.calls[0][0]).toContain(CREDITS_FILE_NAME);
   });
 
-  it('answers unreadable for a directory named credits.json at the root', async () => {
-    await fs.mkdir(join(dir, CREDITS_FILE_NAME));
-    expect(await locateRoot()).toEqual({ error: 'unreadable' });
+  it('answers not-a-file for a directory named credits.json at the root', async () => {
+    await fs.mkdir(join(root, CREDITS_FILE_NAME));
+    expect(await locateRoot()).toEqual({ error: 'not-a-file' });
   });
 });
 
@@ -156,8 +183,8 @@ describe('creditsNeedsReread', () => {
     expect(creditsNeedsReread('{"error":"unreadable"}')).toBe(true);
   });
 
-  it('is false for too-large and empty: the edit that fixes them moves the directory hash', () => {
-    for (const reason of ['too-large', 'empty']) {
+  it('is false for not-a-file, too-large and empty: the fix for each moves the directory hash', () => {
+    for (const reason of ['not-a-file', 'too-large', 'empty']) {
       expect(creditsNeedsReread({ error: reason })).toBe(false);
       expect(creditsNeedsReread(JSON.stringify({ error: reason }))).toBe(false);
     }
@@ -189,6 +216,7 @@ describe('showCreditsNeedReread', () => {
   it('is false when nothing is, too-large and empty included, and for a show without seasons', () => {
     expect(showCreditsNeedReread(read, seasons({ absent: true }))).toBe(false);
     expect(showCreditsNeedReread({ error: 'too-large' }, seasons({ error: 'empty' }))).toBe(false);
+    expect(showCreditsNeedReread({ error: 'not-a-file' }, seasons({ error: 'not-a-file' }))).toBe(false);
     expect(showCreditsNeedReread({ absent: true }, null)).toBe(false);
     expect(showCreditsNeedReread({ absent: true }, { 'Season 1': { episodes: { S01E01: {} } } })).toBe(false);
   });
