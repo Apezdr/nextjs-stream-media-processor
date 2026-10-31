@@ -1,201 +1,141 @@
 /**
  * OpenTelemetry initialization module
- * IMPORTANT: This module must be imported before any other imports in app.mjs
- * 
- * This configures OpenTelemetry SDK with:
- * - OTLP exporter for SigNoz collector
- * - Auto-instrumentation for Express, HTTP, MongoDB, etc.
- * - Custom resource attributes
- * - Graceful shutdown handling
+ * IMPORTANT: This module must be imported before any other imports in app.mjs,
+ * so the instrumentations patch modules before anything loads them.
+ *
+ * Off unless OTEL_ENABLED=true. Configured by the standard variables:
+ * OTEL_EXPORTER_OTLP_ENDPOINT / _PROTOCOL / _HEADERS, OTEL_SERVICE_NAME,
+ * OTEL_RESOURCE_ATTRIBUTES, OTEL_PROPAGATORS, OTEL_TRACES_SAMPLER,
+ * OTEL_METRIC_EXPORT_INTERVAL and OTEL_LOG_LEVEL (the SDK's own diagnostics).
+ *
+ * Traces and metrics go over OTLP. Logs don't: the collector reads the
+ * container's JSON log lines, which lib/logger.mjs stamps with trace_id and
+ * span_id, and the alert rules count those lines.
+ *
+ * app.mjs's gracefulShutdown calls shutdownTelemetry() last, so the spans and
+ * metrics of a stop or a crash still reach the collector.
  */
 
 import process from 'node:process';
-import { fileURLToPath } from 'url';
-import { dirname, resolve } from 'path';
-import { readFileSync } from 'fs';
-
-// OpenTelemetry imports
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
-import { OTLPTraceExporter as OTLPTraceExporterGRPC } from '@opentelemetry/exporter-trace-otlp-grpc';
-import { OTLPMetricExporter as OTLPMetricExporterGRPC } from '@opentelemetry/exporter-metrics-otlp-grpc';
-import { OTLPTraceExporter as OTLPTraceExporterHTTP } from '@opentelemetry/exporter-trace-otlp-http';
-import { OTLPMetricExporter as OTLPMetricExporterHTTP } from '@opentelemetry/exporter-metrics-otlp-http';
-import { defaultResource, resourceFromAttributes } from '@opentelemetry/resources';
-import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
-import { diag, DiagLogLevel, DiagConsoleLogger } from '@opentelemetry/api';
-import { CompositePropagator, W3CTraceContextPropagator, W3CBaggagePropagator } from '@opentelemetry/core';
+import { OTLPTraceExporter as OTLPTraceExporterGrpc } from '@opentelemetry/exporter-trace-otlp-grpc';
+import { OTLPTraceExporter as OTLPTraceExporterJson } from '@opentelemetry/exporter-trace-otlp-http';
+import { OTLPTraceExporter as OTLPTraceExporterProto } from '@opentelemetry/exporter-trace-otlp-proto';
+import { resourceFromAttributes } from '@opentelemetry/resources';
+import { BatchSpanProcessor } from '@opentelemetry/sdk-trace';
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
+
+export const isOpenTelemetryEnabled = process.env.OTEL_ENABLED?.toLowerCase() === 'true';
 
 // Which build is running: build.ps1 / build.sh bake the image's Docker Hub tag
 // and its commit in as APP_VERSION and GIT_COMMIT (Dockerfile ARGs). Outside an
 // image (local development) the package.json version stands in.
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const packageJsonPath = resolve(__dirname, '..', 'package.json');
-const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-const serviceVersion = process.env.APP_VERSION || packageJson.version;
-const buildCommit = process.env.GIT_COMMIT || undefined;
-
-// Set OpenTelemetry logging level based on environment
-const otelLogLevel = process.env.OTEL_LOG_LEVEL || 'info';
-const logLevelMap = {
-  'error': DiagLogLevel.ERROR,
-  'warn': DiagLogLevel.WARN,
-  'info': DiagLogLevel.INFO,
-  'debug': DiagLogLevel.DEBUG,
-  'verbose': DiagLogLevel.VERBOSE,
-  'all': DiagLogLevel.ALL,
-};
-
-// Configure OpenTelemetry diagnostic logging
-diag.setLogger(new DiagConsoleLogger(), logLevelMap[otelLogLevel] || DiagLogLevel.INFO);
-
-// Check if OpenTelemetry is enabled
-const isOtelEnabled = process.env.OTEL_ENABLED?.toLowerCase() === 'true';
-
-// Early exit if OpenTelemetry is disabled
-// Export variable to indicate if OpenTelemetry is enabled
-export const isOpenTelemetryEnabled = isOtelEnabled;
-
-// Define a variable for the SDK
-let sdk = null;
-
-// Early exit if OpenTelemetry is disabled
-if (!isOtelEnabled) {
-  diag.info('OpenTelemetry is disabled via OTEL_ENABLED environment variable');
-} else {
-
-diag.info('Initializing OpenTelemetry...');
-
-// Extract service name from environment variable or use default
-const serviceName = process.env.OTEL_SERVICE_NAME || 'media-processor';
-
-// Configure the OTLP exporter endpoint from environment variables
-const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4317';
-const otlpProtocol = process.env.OTEL_EXPORTER_OTLP_PROTOCOL?.toLowerCase() || 'grpc';
-
-diag.info(`OpenTelemetry configured with endpoint: ${otlpEndpoint} using ${otlpProtocol} protocol`);
-
-// Configure propagators based on environment variables or use defaults
-const propagatorsEnv = process.env.OTEL_PROPAGATORS || 'tracecontext,baggage';
-const propagators = [];
-
-if (propagatorsEnv.includes('tracecontext')) {
-  propagators.push(new W3CTraceContextPropagator());
+function serviceVersion() {
+  if (process.env.APP_VERSION) return process.env.APP_VERSION;
+  const packageJson = new URL('../package.json', import.meta.url);
+  return JSON.parse(readFileSync(packageJson, 'utf8')).version;
 }
 
-if (propagatorsEnv.includes('baggage')) {
-  propagators.push(new W3CBaggagePropagator());
-}
-
-// Create a custom resource with service and deployment information
-let resource = defaultResource().merge(
-  resourceFromAttributes({
-    [SemanticResourceAttributes.SERVICE_NAME]: serviceName,
-    [SemanticResourceAttributes.SERVICE_VERSION]: serviceVersion,
-    [SemanticResourceAttributes.SERVICE_INSTANCE_ID]: `${serviceName}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    [SemanticResourceAttributes.DEPLOYMENT_ENVIRONMENT]: process.env.NODE_ENV || 'development',
+// The service's own resource. OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES
+// (service.namespace, deployment.environment) are merged over it by the SDK's
+// env detector, along with its process and host detectors.
+export function buildResourceAttributes() {
+  const attributes = {
+    [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || 'media-processor',
+    [ATTR_SERVICE_VERSION]: serviceVersion(),
+    'service.instance.id': randomUUID(),
+    'deployment.environment': process.env.NODE_ENV || 'development',
     'application.type': 'nodejs-media-processor',
-    ...(buildCommit ? { 'vcs.ref.head.revision': buildCommit } : {}),
-  })
-);
+  };
+  if (process.env.GIT_COMMIT) attributes['vcs.ref.head.revision'] = process.env.GIT_COMMIT;
+  return attributes;
+}
 
-// Parse additional resource attributes from environment variable
-if (process.env.OTEL_RESOURCE_ATTRIBUTES) {
-  const customAttributes = {};
-  process.env.OTEL_RESOURCE_ATTRIBUTES.split(',').forEach(attr => {
-    const [key, value] = attr.split('=');
-    if (key && value) {
-      customAttributes[key.trim()] = value.trim();
-    }
-  });
-  
-  if (Object.keys(customAttributes).length > 0) {
-    resource = resource.merge(resourceFromAttributes(customAttributes));
+// The trace exporter the SDK would build from the environment: passing span
+// processors (for the SigNoz keys below) makes it skip building its own. Each
+// exporter reads OTEL_EXPORTER_OTLP_ENDPOINT and _HEADERS itself.
+export function traceExporterFromEnv(env = process.env) {
+  const protocol = (env.OTEL_EXPORTER_OTLP_TRACES_PROTOCOL || env.OTEL_EXPORTER_OTLP_PROTOCOL || 'http/protobuf').trim();
+  switch (protocol) {
+    case 'grpc':
+      return new OTLPTraceExporterGrpc();
+    case 'http/protobuf':
+      return new OTLPTraceExporterProto();
+    case 'http/json':
+      return new OTLPTraceExporterJson();
+    default:
+      throw new Error(`OTEL_EXPORTER_OTLP_PROTOCOL: unsupported protocol "${protocol}" (use grpc, http/protobuf or http/json)`);
   }
 }
 
-// Create exporter based on configuration
-// Check if protocol includes 'http' (handles 'http', 'http/protobuf', 'http/json')
-const useHttp = otlpProtocol.includes('http') && !otlpProtocol.includes('grpc');
+// instrumentation-mongodb emits only the stable database conventions
+// (db.system.name, db.namespace, db.operation.name), but SigNoz still reads the
+// deprecated keys: its span metrics count a database call only when the span
+// has db.system (the service's Database Calls tab), and its trace index fills
+// the DB system, name and operation columns from db.system, db.name and
+// db.operation. This copies each stable value to its old key as the span starts.
+// Remove it once SigNoz reads db.system.name. (The same bridge runs in the
+// nextjs-stream app, src/instrumentation.ts.)
+const DEPRECATED_DB_KEYS = [
+  ['db.system.name', 'db.system'],
+  ['db.namespace', 'db.name'],
+  ['db.operation.name', 'db.operation'],
+];
 
-let traceExporter;
-let metricExporter;
-
-if (useHttp) {
-  // HTTP exporters - endpoint should already include port 4318
-  traceExporter = new OTLPTraceExporterHTTP({
-    url: `${otlpEndpoint}/v1/traces`
-  });
-  metricExporter = new OTLPMetricExporterHTTP({
-    url: `${otlpEndpoint}/v1/metrics`
-  });
-  diag.info(`Using HTTP exporters with endpoint: ${otlpEndpoint}`);
-} else {
-  // gRPC exporters - endpoint should use port 4317
-  traceExporter = new OTLPTraceExporterGRPC({
-    url: otlpEndpoint
-  });
-  metricExporter = new OTLPMetricExporterGRPC({
-    url: otlpEndpoint
-  });
-  diag.info(`Using gRPC exporters with endpoint: ${otlpEndpoint}`);
-}
-
-// Configure the OpenTelemetry SDK with auto-instrumentation
-const sdk = new NodeSDK({
-  resource,
-  traceExporter,
-  metricExporter,
-  instrumentations: [
-    getNodeAutoInstrumentations({
-      // Enable all auto-instrumentations with default settings
-      '@opentelemetry/instrumentation-fs': { enabled: true },
-      '@opentelemetry/instrumentation-http': { enabled: true },
-      '@opentelemetry/instrumentation-express': { enabled: true },
-      '@opentelemetry/instrumentation-mongodb': { enabled: true },
-      '@opentelemetry/instrumentation-dns': { enabled: true },
-    }),
-  ],
-  // Set propagators if configured
-  textMapPropagator: propagators.length > 0 ? new CompositePropagator({ propagators }) : undefined,
-});
-
-// Start the SDK
-sdk.start();
-
-// Gracefully shut down the SDK on process exit
-process.on('SIGTERM', () => {
-  diag.info('SIGTERM signal received. Shutting down OpenTelemetry SDK...');
-  sdk.shutdown()
-    .then(() => {
-      diag.info('OpenTelemetry SDK has been shutdown successfully');
-      process.exit(0);
-    })
-    .catch((error) => {
-      diag.error('Error shutting down OpenTelemetry SDK', error);
-      process.exit(1);
-    });
-});
-
-process.on('SIGINT', () => {
-  diag.info('SIGINT signal received. Shutting down OpenTelemetry SDK...');
-  sdk.shutdown()
-    .then(() => {
-      diag.info('OpenTelemetry SDK has been shutdown successfully');
-      process.exit(0);
-    })
-    .catch((error) => {
-      diag.error('Error shutting down OpenTelemetry SDK', error);
-      process.exit(1);
-    });
-});
-
-diag.info('OpenTelemetry initialization complete');
-}
-
-// Export the SDK and enabled status
-export default {
-  sdk,
-  isEnabled: isOtelEnabled
+export const signozDbKeysProcessor = {
+  onStart(span) {
+    const { attributes } = span;
+    if (attributes['db.system.name'] === undefined) return;
+    for (const [stable, deprecated] of DEPRECATED_DB_KEYS) {
+      const value = attributes[stable];
+      if (value !== undefined && attributes[deprecated] === undefined) span.setAttribute(deprecated, value);
+    }
+  },
+  onEnd() {},
+  forceFlush: () => Promise.resolve(),
+  shutdown: () => Promise.resolve(),
 };
+
+let sdk = null;
+
+if (isOpenTelemetryEnabled) {
+  sdk = new NodeSDK({
+    resource: resourceFromAttributes(buildResourceAttributes()),
+    spanProcessors: [signozDbKeysProcessor, new BatchSpanProcessor({ exporter: traceExporterFromEnv() })],
+    instrumentations: [
+      getNodeAutoInstrumentations({
+        '@opentelemetry/instrumentation-fs': { enabled: true },
+        '@opentelemetry/instrumentation-dns': { enabled: true },
+        // lib/logger.mjs adds trace_id/span_id to each line itself, and logs reach
+        // SigNoz from the container log, not through the OTel logs API
+        '@opentelemetry/instrumentation-winston': { enabled: false },
+      }),
+    ],
+  });
+  sdk.start();
+}
+
+/**
+ * Flush and stop the SDK. gracefulShutdown (app.mjs) calls it last, after the
+ * server and connections close, so their spans are exported too. Capped so an
+ * unreachable collector can't hold up the stop.
+ */
+export async function shutdownTelemetry(timeoutMs = 3000) {
+  if (!sdk) return;
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  // A failed flush is reported; it must not stop the process from exiting
+  const flushed = sdk.shutdown().catch((error) => {
+    console.warn(`OpenTelemetry shutdown failed: ${error?.message || error}`);
+  });
+  try {
+    await Promise.race([flushed, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

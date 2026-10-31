@@ -1,5 +1,5 @@
 // MUST BE FIRST - Initialize OpenTelemetry before any other imports
-import './lib/telemetry.mjs';
+import { shutdownTelemetry } from './lib/telemetry.mjs';
 
 import express from "express";
 import { scheduleJob } from "node-schedule";
@@ -27,6 +27,7 @@ import {
   injectTvStubs
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
+import { httpRouteMiddleware } from "./middleware/telemetryMiddleware.mjs";
 import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
@@ -71,6 +72,8 @@ const tmdbLogger   = createCategoryLogger('DownloadTMDBImages');
 const __filename = fileURLToPath(import.meta.url); // Get __filename
 const __dirname = dirname(__filename); // Get __dirname
 const app = express();
+// First, so every route's span and http.server.request.duration carry its http.route
+app.use(httpRouteMiddleware());
 const LOG_FILE = process.env.LOG_PATH
   ? join(process.env.LOG_PATH, "cron.log")
   : "/var/log/cron.log";
@@ -1273,6 +1276,10 @@ async function gracefulShutdown(signal, code = 0) {
   } catch (error) {
     logger.error('Error during graceful shutdown:', error.message);
   }
+
+  // Last, so the spans and metrics of the shutdown itself (or of the crash
+  // that started it) still reach the collector
+  await shutdownTelemetry();
 
   process.exit(code);
 }
