@@ -107,7 +107,9 @@ if (isOpenTelemetryEnabled) {
     spanProcessors: [signozDbKeysProcessor, new BatchSpanProcessor({ exporter: traceExporterFromEnv() })],
     instrumentations: [
       getNodeAutoInstrumentations({
-        '@opentelemetry/instrumentation-fs': { enabled: true },
+        // Off, as upstream ships it: on, it made ~54M spans a day (48M of them
+        // `fs stat` from the media scans), ~99% of everything this service sent
+        '@opentelemetry/instrumentation-fs': { enabled: false },
         '@opentelemetry/instrumentation-dns': { enabled: true },
         // lib/logger.mjs adds trace_id/span_id to each line itself, and logs reach
         // SigNoz from the container log, not through the OTel logs API
