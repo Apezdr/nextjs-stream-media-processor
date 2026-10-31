@@ -152,7 +152,8 @@ ENV OTEL_ENABLED=false
 ENV OTEL_SERVICE_NAME=nextjs-stream-media-processor
 ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
 ENV OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-ENV OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production,service.namespace=media-processor,service.version=1.0.0
+# service.version comes from APP_VERSION (below); setting it here would override it
+ENV OTEL_RESOURCE_ATTRIBUTES=deployment.environment=production,service.namespace=media-processor
 ENV OTEL_PROPAGATORS=tracecontext,baggage
 ENV OTEL_TRACES_SAMPLER=always_on
 ENV OTEL_LOG_LEVEL=info
@@ -228,6 +229,18 @@ RUN chmod +x /usr/src/app/scripts/*.py
 # whisper-models holds whisper.cpp ggml model files, downloaded lazily at runtime.
 RUN mkdir -p /usr/src/app/logs /usr/src/app/whisper-models && \
     chown 1000:1000 /usr/src/app/logs /usr/src/app/whisper-models
+
+# Which build this is: build.ps1 / build.sh pass the image's Docker Hub tag and
+# the commit it was built from. node/lib/telemetry.mjs reports them as
+# service.version and vcs.ref.head.revision. Declared last, so a new version
+# doesn't invalidate the layers above. A plain `docker build` leaves them empty.
+ARG APP_VERSION=""
+ARG GIT_COMMIT=""
+LABEL org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/Apezdr/nextjs-stream-media-processor"
+ENV APP_VERSION="${APP_VERSION}" \
+    GIT_COMMIT="${GIT_COMMIT}"
 # ---------------------------------------------------------------------------
 
 # Command to run your Node.js app. Node options go before the script: after it

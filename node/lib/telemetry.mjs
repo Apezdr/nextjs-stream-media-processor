@@ -26,12 +26,15 @@ import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions'
 import { diag, DiagLogLevel, DiagConsoleLogger } from '@opentelemetry/api';
 import { CompositePropagator, W3CTraceContextPropagator, W3CBaggagePropagator } from '@opentelemetry/core';
 
-// Get package.json version
+// Which build is running: build.ps1 / build.sh bake the image's Docker Hub tag
+// and its commit in as APP_VERSION and GIT_COMMIT (Dockerfile ARGs). Outside an
+// image (local development) the package.json version stands in.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageJsonPath = resolve(__dirname, '..', 'package.json');
 const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-const serviceVersion = packageJson.version;
+const serviceVersion = process.env.APP_VERSION || packageJson.version;
+const buildCommit = process.env.GIT_COMMIT || undefined;
 
 // Set OpenTelemetry logging level based on environment
 const otelLogLevel = process.env.OTEL_LOG_LEVEL || 'info';
@@ -93,6 +96,7 @@ let resource = defaultResource().merge(
     [SemanticResourceAttributes.SERVICE_INSTANCE_ID]: `${serviceName}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
     [SemanticResourceAttributes.DEPLOYMENT_ENVIRONMENT]: process.env.NODE_ENV || 'development',
     'application.type': 'nodejs-media-processor',
+    ...(buildCommit ? { 'vcs.ref.head.revision': buildCommit } : {}),
   })
 );
 
