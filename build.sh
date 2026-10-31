@@ -13,8 +13,9 @@
 #
 # The images are built from a clean checkout of one commit (a temporary git
 # worktree). By default that commit is origin/main, and a push is refused when
-# the commit is not on origin/main, or when local main has commits origin/main
-# lacks.
+# the commit is not on origin/main, when local main has commits origin/main
+# lacks, or when every variant's :latest already is that commit (a new version
+# should mean a change). --force rebuilds it anyway, for a patched base image.
 #
 # Usage:
 #   ./build.sh                         # cpu + vulkan, push
@@ -24,6 +25,7 @@
 #   ./build.sh --no-push               # build and tag :<version> locally only
 #   ./build.sh --ref my-branch --no-push
 #   ./build.sh --tag 2026.11.01-4      # use this version instead of picking one
+#   ./build.sh --force                 # rebuild and push the commit :latest already is
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -38,9 +40,22 @@ REF=origin/main
 TAG=
 NO_PUSH=0
 DRY_RUN=0
+FORCE=0
 
 fail() { echo -e "\e[31m$*\e[0m" >&2; exit 1; }
 info() { echo -e "\e[36m$*\e[0m"; }
+
+# The commit a published tag was built from (its OCI revision label), read from
+# the registry without pulling the image. Empty when the tag doesn't exist yet
+# or predates the labels.
+published_commit() {
+  local out
+  if ! out=$(docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>&1); then
+    grep -qi 'not found' <<< "$out" && return 0
+    fail "Could not read $1 from the registry ($out). --force skips this check."
+  fi
+  grep -oE '"org\.opencontainers\.image\.revision": *"[^"]*"' <<< "$out" | head -1 | sed -E 's/.*"([^"]*)"$/\1/'
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,7 +65,8 @@ while [ $# -gt 0 ]; do
     --tag)     TAG=$2; shift 2 ;;
     --no-push) NO_PUSH=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    --force)   FORCE=1; shift ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) fail "Unknown option: $1 (see --help)" ;;
   esac
 done
@@ -78,6 +94,22 @@ git rev-parse --verify --quiet main > /dev/null && UNPUSHED=$(git rev-list --cou
 if [ $NO_PUSH -eq 0 ]; then
   [ $ON_MAIN -eq 1 ] || fail "$REF ($SHORT) is not on origin/main. Only main ships; use --no-push to try it."
   [ "$UNPUSHED" -eq 0 ] || fail "Local main has $UNPUSHED commit(s) origin/main lacks. Push them first, or the images will miss them."
+  # Refused only when every variant to build already ships this commit: one
+  # that lags (a failed vulkan push, say) is worth building, and both go out
+  if [ $FORCE -eq 0 ]; then
+    lagging=0
+    checked=0
+    for v in "${SELECTED[@]}"; do
+      [ "$v" = cuda ] && continue
+      suffix=
+      [ "$v" = cpu ] || suffix="-$v"
+      checked=$((checked + 1))
+      [ "$(published_commit "$REPO:latest$suffix")" = "$COMMIT" ] || lagging=1
+    done
+    if [ $checked -gt 0 ] && [ $lagging -eq 0 ]; then
+      fail "Every variant's :latest is already $SHORT, so there is nothing new to ship. --force rebuilds them anyway (for a patched base image, say)."
+    fi
+  fi
 fi
 
 # --- Which version ------------------------------------------------------------

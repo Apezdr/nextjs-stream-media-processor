@@ -16,8 +16,11 @@
 # The images are built from a clean checkout of one commit (a temporary git
 # worktree), so uncommitted or untracked files (local whisper models, caches,
 # .env.local) never reach them. By default that commit is origin/main, and a
-# push is refused when the commit is not on origin/main, or when local main
-# has commits origin/main lacks.
+# push is refused when the commit is not on origin/main, when local main has
+# commits origin/main lacks, or when every variant's :latest already is that
+# commit: a new version should mean a change, not a second image of the same
+# commit (a Docker Hub tag and a SigNoz deployment marker for nothing). -Force
+# rebuilds it anyway, for a patched base image, say.
 #
 # Default behavior (no args): builds and pushes ALL ready variants in sequence.
 # Currently that's cpu + vulkan. CUDA will be added to the default set when
@@ -32,6 +35,7 @@
 #   .\build.ps1 -NoPush                  # build and tag :<version> locally only
 #   .\build.ps1 -Ref my-branch -NoPush   # try another commit (it can't be pushed)
 #   .\build.ps1 -Tag 2026.11.01-4        # use this version instead of picking one
+#   .\build.ps1 -Force                   # rebuild and push the commit :latest already is
 #   .\build.ps1 -Variant cuda            # stub error - not implemented yet
 
 param(
@@ -44,7 +48,8 @@ param(
     [string]$Ref = 'origin/main',
     [string]$Tag,
     [switch]$NoPush,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Force
 )
 
 # Single source of truth for "ready" variants used as the default set.
@@ -78,6 +83,23 @@ function Invoke-Git {
     return $output
 }
 
+# The commit and version a published tag was built from: its OCI labels, read
+# from the registry without pulling the image. $null when the tag doesn't exist
+# yet or predates the labels.
+function Get-PublishedBuild([string]$ref) {
+    $answer = docker buildx imagetools inspect $ref --format '{{json .Image}}' 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        if ("$answer" -match 'not found') { return $null }
+        Fail "Could not read $ref from the registry ($answer). -Force skips this check."
+    }
+    $image = ($answer | Out-String) | ConvertFrom-Json
+    # A multi-platform tag answers with one image per platform
+    if (-not $image.config) { $image = @($image.PSObject.Properties.Value)[0] }
+    $labels = $image.config.Labels
+    if (-not $labels -or -not $labels.'org.opencontainers.image.revision') { return $null }
+    return @{ commit = $labels.'org.opencontainers.image.revision'; version = $labels.'org.opencontainers.image.version' }
+}
+
 # --- Which commit -------------------------------------------------------------
 Write-Host "Fetching origin..." -ForegroundColor Cyan
 Invoke-Git fetch origin --quiet | Out-Null
@@ -93,6 +115,18 @@ if ($LASTEXITCODE -eq 0 -and $hasMain) { $unpushed = [int](Invoke-Git rev-list -
 if (-not $NoPush) {
     if (-not $onMain) { Fail "$Ref ($short) is not on origin/main. Only main ships; use -NoPush to try it." }
     if ($unpushed -gt 0) { Fail "Local main has $unpushed commit(s) origin/main lacks. Push them first, or the images will miss them." }
+    # Refused only when every variant to build already ships this commit: one
+    # that lags (a failed vulkan push, say) is worth building, and both go out
+    if (-not $Force) {
+        $shipped = @($Variant | Where-Object { $_ -ne 'cuda' } | ForEach-Object {
+            $suffix = if ($_ -eq 'cpu') { '' } else { "-$_" }
+            $published = Get-PublishedBuild "${repo}:latest$suffix"
+            [bool]($published -and $published.commit -eq $commit)
+        })
+        if ($shipped.Count -gt 0 -and -not ($shipped -contains $false)) {
+            Fail "Every variant's :latest is already $short, so there is nothing new to ship. -Force rebuilds them anyway (for a patched base image, say)."
+        }
+    }
 }
 
 # --- Which version ------------------------------------------------------------
