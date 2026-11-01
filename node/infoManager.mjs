@@ -2,11 +2,11 @@ import { promises as fs } from "fs";
 import { promisify } from 'util';
 import { fileExists } from "./utils/utils.mjs";
 import { createHash } from 'crypto';
-import { exec as execCallback } from "child_process";
+import { execFile } from "child_process";
 import { createCategoryLogger } from "./lib/logger.mjs";
 import { extractHDRInfo, extractMediaQuality, getHeaderData, getMediaInfoCombined } from "./mediaInfo/mediaInfo.mjs";
 const logger = createCategoryLogger('infoFileManager');
-const exec = promisify(execCallback);
+const execFileAsync = promisify(execFile);
 
 // Used to determine if regenerating info is necessary.
 // 1.0011 adds container/codec detail (additionalMetadata.format, video pix_fmt
@@ -105,10 +105,11 @@ function normalizeLanguageTag(raw) {
  */
 async function extractAdditionalMetadata(filePath) {
   try {
-    // Modified ffprobe command to properly extract stream tags including language
-    const { stdout } = await exec(
-      `ffprobe -v error -print_format json -show_format -show_streams "${filePath}"`
-    );
+    // The path goes in as its own argument (execFile, no shell): a library
+    // file name can hold `$(...)`, a backtick or a quote.
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', filePath,
+    ]);
     const metadata = JSON.parse(stdout);
 
     const format = metadata.format;

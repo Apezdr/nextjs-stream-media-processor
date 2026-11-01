@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join, normalize, dirname, extname, basename } from 'path';
+import { join, normalize, extname, basename } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
@@ -21,8 +21,7 @@ import {
 } from '../../../utils/utils.mjs';
 import { isVideoFile } from '../../../utils/mediaResolution.mjs';
 import { buildVideoSources, publishableSources } from './video-sources.mjs';
-import { generateChapters } from '../../../chapter-generator.mjs';
-import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
+import { syncChapterFile } from '../../../chapter-generator.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
   getExistingTVShows,
@@ -77,32 +76,6 @@ const TV_DIR_HASH_MAX_DEPTH = (() => {
 })();
 
 /**
- * Helper function to generate chapter files if they don't exist.
- * Writes the generated VTT content to disk (matching app.mjs pattern).
- * @param {string} chaptersPath - Path to chapters file
- * @param {string} mediaPath - Path to media file
- * @param {boolean} quietMode - Whether to suppress logging
- */
-async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode = false) {
-  if (!(await fileExists(chaptersPath))) {
-    try {
-      const chapterData = await chapterInfo(mediaPath);
-      if (chapterData) {
-        // Create the chapters directory if it doesn't exist
-        await fs.mkdir(dirname(chaptersPath), { recursive: true });
-        const chapterContent = await generateChapters(mediaPath, chapterData);
-        await fs.writeFile(chaptersPath, chapterContent);
-        if (!quietMode) {
-          logger.info(`Generated chapter file: ${chaptersPath}`);
-        }
-      }
-    } catch (error) {
-      logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
-    }
-  }
-}
-
-/**
  * Process show assets (poster, logo, backdrop)
  * @param {string} showPath - Path to show directory
  * @param {string} encodedShowName - URL-encoded show name
@@ -124,6 +97,10 @@ async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode
  *   tmdb.config. An image with mtime < this counts as missing (the user has
  *   edited config since we last wrote the image). Pass null when the show
  *   has no tmdb.config.
+ * @param {boolean} [opts.refreshAllowed=true] - Whether a stale image can be
+ *   refreshed (`isUpdateAllowed`). A frozen show's stale art is still flagged,
+ *   but logged at debug: nothing acts on it, and at info a show frozen after
+ *   its art was written logged the same lines every tick.
  */
 async function processShowAssets({
   showPath,
@@ -133,6 +110,7 @@ async function processShowAssets({
   basePath,
   fileSet = null,
   tmdbConfigLastModified = null,
+  refreshAllowed = true,
 }) {
   // Per-kind outputs. The frontend reads each from its dedicated DB column
   // (poster / posterBlurhash / logo / backdrop / backdropBlurhash), so they
@@ -178,7 +156,7 @@ async function processShowAssets({
     // keeps serving what is on disk. Reuses the resolver's single stat
     // (`r.mtime`) — no extra syscall.
     if (tmdbConfigLastModified && tmdbConfigLastModified > r.mtime) {
-      logger.info('scanner: tmdb.config newer than asset, flagging for refresh', {
+      logger[refreshAllowed ? 'info' : 'debug']('scanner: tmdb.config newer than asset, flagging for refresh', {
         'media.name': showName,
         'media.type': 'tv',
         'image.type': imageKey,
@@ -224,6 +202,9 @@ async function processShowAssets({
  * @param {string} opts.encodedShowName
  * @param {string} opts.prefixPath
  * @param {Date|null} [opts.tmdbConfigLastModified=null] - See processShowAssets.
+ * @param {boolean} [opts.refreshAllowed=true] - Whether the metadata gate can
+ *   act on staleness (updates allowed, or metadata overrides to apply); the
+ *   log goes to debug when it can't, as in processShowAssets.
  */
 async function processShowMetadata({
   showPath,
@@ -231,6 +212,7 @@ async function processShowMetadata({
   encodedShowName,
   prefixPath,
   tmdbConfigLastModified = null,
+  refreshAllowed = true,
 }) {
   let metadataUrl = '';
   let metadata = '';
@@ -252,7 +234,7 @@ async function processShowMetadata({
   } else if (tmdbConfigLastModified) {
     const mtime = await getLastModifiedTime(metadataFilePath);
     if (mtime && tmdbConfigLastModified > mtime) {
-      logger.info('scanner: tmdb.config newer than metadata.json, marking missing', {
+      logger[refreshAllowed ? 'info' : 'debug']('scanner: tmdb.config newer than metadata.json, marking missing', {
         'media.name': showName,
         'media.type': 'tv',
         'metadata.path': metadataFilePath,
@@ -494,14 +476,15 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
     libraryRelativePath: `tv/${showName}/${basename(seasonPath)}/${creditsFileName}`,
   });
 
-  // Handle chapters
+  // Handle chapters: kept in step with the primary video (chapter-generator.mjs),
+  // before the show's finalHash, which covers chapters/.
   const chaptersPath = join(
     seasonPath,
     'chapters',
     `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
   );
-  
-  await generateChapterFileIfNotExists(chaptersPath, join(seasonPath, primary.filename), true);
+
+  await syncChapterFile(chaptersPath, join(seasonPath, primary.filename));
 
   if (await fileExists(chaptersPath)) {
     episodeData.chapters = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(
@@ -825,6 +808,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         basePath,
         fileSet: showFileSet,
         tmdbConfigLastModified,
+        refreshAllowed: updateAllowed,
       });
       const missingImages = assetsResult.missingImages;
 
@@ -836,6 +820,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         encodedShowName,
         prefixPath,
         tmdbConfigLastModified,
+        refreshAllowed: updateAllowed || hasOverrides,
       });
       const missingMetadata = metadataResult.missingMetadata;
 
@@ -1033,6 +1018,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           basePath,
           fileSet: retryFileSet,
           tmdbConfigLastModified,
+          refreshAllowed: updateAllowed,
         });
         Object.assign(assetsResult, retryAssetsResult);
 
@@ -1042,6 +1028,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           encodedShowName,
           prefixPath,
           tmdbConfigLastModified,
+          refreshAllowed: updateAllowed || hasOverrides,
         });
 
         // Cooldown bookkeeping, decided AFTER the attempt from the generator's
