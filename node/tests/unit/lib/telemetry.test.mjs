@@ -107,6 +107,13 @@ describe('buildResourceAttributes', () => {
   });
 });
 
+describe('span processors', () => {
+  it('scrub credentials from URLs before the batch processor exports a span', () => {
+    const list = TELEMETRY_SOURCE.slice(TELEMETRY_SOURCE.indexOf('spanProcessors: ['));
+    expect(list.slice(0, list.indexOf(']'))).toMatch(/signozDbKeysProcessor,\s+credentialSpanProcessor,\s+new BatchSpanProcessor/);
+  });
+});
+
 describe('shutdown wiring', () => {
   it('has nothing to flush when telemetry is off', async () => {
     expect(isOpenTelemetryEnabled).toBe(false);

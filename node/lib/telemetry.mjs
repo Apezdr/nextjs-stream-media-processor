@@ -27,6 +27,7 @@ import { OTLPTraceExporter as OTLPTraceExporterProto } from '@opentelemetry/expo
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
+import { credentialSpanProcessor } from './spanRedaction.mjs';
 
 export const isOpenTelemetryEnabled = process.env.OTEL_ENABLED?.toLowerCase() === 'true';
 
@@ -104,7 +105,12 @@ let sdk = null;
 if (isOpenTelemetryEnabled) {
   sdk = new NodeSDK({
     resource: resourceFromAttributes(buildResourceAttributes()),
-    spanProcessors: [signozDbKeysProcessor, new BatchSpanProcessor({ exporter: traceExporterFromEnv() })],
+    // credentialSpanProcessor: every TMDB call's url.full carries ?api_key=
+    spanProcessors: [
+      signozDbKeysProcessor,
+      credentialSpanProcessor,
+      new BatchSpanProcessor({ exporter: traceExporterFromEnv() }),
+    ],
     instrumentations: [
       getNodeAutoInstrumentations({
         // Off, as upstream ships it: on, it made ~54M spans a day (48M of them
