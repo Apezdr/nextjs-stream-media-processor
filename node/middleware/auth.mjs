@@ -1,5 +1,6 @@
 import { createCategoryLogger } from '../lib/logger.mjs'
-import { isValidWebhookId } from './webhookAuth.mjs'
+import { recordUserCaller, recordWebhookCaller } from '../lib/requestCaller.mjs'
+import { matchWebhookId } from './webhookAuth.mjs'
 import { sessionManager } from './sessionCache.mjs'
 
 const logger = createCategoryLogger('auth-middleware')
@@ -66,6 +67,9 @@ export const authenticateUser = async (req, res, next) => {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid or expired session token' })
     }
 
+    // A refused request names its caller too, as the frontend's spans do
+    recordUserCaller(user.id)
+
     if (!user.approved && !user.admin) {
       return res.status(403).json({ error: 'User not approved for access' })
     }
@@ -131,8 +135,10 @@ export const requireFullAccess = (req, res, next) => {
 export const authenticateWebhookOrUser = async (req, res, next) => {
   // STEP 1: webhook check (fast, no database)
   const webhookId = req.headers['x-webhook-id']
-  if (webhookId && isValidWebhookId(webhookId)) {
+  const credential = matchWebhookId(webhookId)
+  if (credential) {
     req.isWebhook = true
+    recordWebhookCaller(webhookId, credential)
     return next()
   }
 
@@ -164,6 +170,9 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     if (!user) {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid or expired session token' })
     }
+
+    // A refused request names its caller too, as the frontend's spans do
+    recordUserCaller(user.id)
 
     if (!user.approved && !user.admin) {
       return res.status(403).json({ error: 'User not approved for access' })
@@ -200,7 +209,9 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
  */
 export const requireWebhookOrAdmin = (req, res, next) => {
   const webhookId = req.headers['x-webhook-id']
-  if (webhookId && isValidWebhookId(webhookId)) {
+  const credential = matchWebhookId(webhookId)
+  if (credential) {
+    recordWebhookCaller(webhookId, credential)
     return next()
   }
 
@@ -208,7 +219,8 @@ export const requireWebhookOrAdmin = (req, res, next) => {
     return next()
   }
 
-  logger.warn(`Unauthorized: no valid webhook ID or admin session on ${describeRequest(req)}. User: ${req.user ? req.user.email : 'none'}, Admin: ${req.user?.admin || false}`)
+  // The user's id, which matches user.id on the request's span
+  logger.warn(`Unauthorized: no valid webhook ID or admin session on ${describeRequest(req)}. User: ${req.user ? req.user.id : 'none'}, Admin: ${req.user?.admin || false}`)
   return res.status(401).json({ error: 'Unauthorized' })
 }
 
@@ -228,7 +240,7 @@ export const createRateLimiter = (maxRequests = 100, windowMs = 60000) => {
     const validRequests = userRequests.filter(time => now - time < windowMs)
 
     if (validRequests.length >= maxRequests) {
-      logger.warn(`Rate limit exceeded for user ${req.user?.email || req.ip}`)
+      logger.warn(`Rate limit exceeded for ${req.user ? `user ${req.user.id}` : req.ip}`)
       return res.status(429).json({
         error: 'Rate limit exceeded',
         retryAfter: Math.ceil(windowMs / 1000),

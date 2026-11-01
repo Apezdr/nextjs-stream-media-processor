@@ -2,6 +2,7 @@ import { fromNodeHeaders } from 'better-auth/node'
 import { createCategoryLogger } from '../lib/logger.mjs'
 import { auth } from '../lib/auth.mjs'
 import { describeHeap, readHeap, underHeapPressure } from '../lib/memoryPressure.mjs'
+import { webhookIdFingerprint } from '../lib/webhookIdRedaction.mjs'
 
 const logger = createCategoryLogger('session-cache')
 
@@ -60,7 +61,7 @@ class BoundedLRUCache {
     if (oldest) {
       this.cache.delete(oldest)
       this.accessOrder.delete(oldest)
-      logger.debug(`Evicted LRU cache entry: ${oldest.substring(0, 10)}...`)
+      logger.debug(`Evicted LRU cache entry: ${webhookIdFingerprint(oldest)}`)
     }
   }
 
@@ -259,7 +260,7 @@ class ProductionSessionManager {
     
     for (const [token, { timestamp }] of this.inflightRequests) {
       if (now - timestamp > staleThreshold) {
-        logger.warn(`Cleaning up stale inflight auth request for token: ${token.substring(0, 10)}...`)
+        logger.warn(`Cleaning up stale inflight auth request for token ${webhookIdFingerprint(token)}`)
         this.inflightRequests.delete(token)
         cleaned++
       }

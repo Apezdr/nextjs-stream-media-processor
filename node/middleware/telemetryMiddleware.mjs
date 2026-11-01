@@ -7,10 +7,11 @@
  * can't see: which route matched, and a handler's error.
  */
 
-import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+import { context, SpanStatusCode } from '@opentelemetry/api';
 import { getRPCMetadata, RPCType } from '@opentelemetry/core';
 import { isOpenTelemetryEnabled } from '../lib/telemetry.mjs';
 import { createCategoryLogger } from '../lib/logger.mjs';
+import { requestSpan } from '../lib/requestCaller.mjs';
 
 const logger = createCategoryLogger('telemetry');
 
@@ -42,7 +43,9 @@ export function httpRouteMiddleware() {
 }
 
 /**
- * Express error handler middleware that records exceptions in the current span
+ * Express error handler middleware that records exceptions on the request's
+ * HTTP server span. The active span here is instrumentation-router's own span
+ * for this error handler, which ends at next(err) and has no http.route.
  */
 export function telemetryErrorMiddleware() {
   return (err, req, res, next) => {
@@ -51,17 +54,22 @@ export function telemetryErrorMiddleware() {
       return next(err);
     }
 
-    const span = trace.getSpan(context.active());
+    const span = requestSpan();
 
     if (span) {
-      // The exception event carries the message and stack; error.type is the
-      // standard attribute for what went wrong
+      // The exception event carries the message, type and stack
       span.recordException(err);
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: err.message || 'Unknown error',
-      });
-      span.setAttribute('error.type', err.name || 'Error');
+      // The status the final handler (app.mjs) will send. A server span is an
+      // error only for a 5xx: a 4xx (a malformed route parameter, a body too
+      // large) is the client's, and HTTP semconv leaves it unset. On a 5xx the
+      // HTTP instrumentation sets error.type to the status code itself.
+      const status = Number.isInteger(err?.status) && err.status >= 100 && err.status <= 999 ? err.status : 500;
+      if (status >= 500) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err.message || 'Unknown error',
+        });
+      }
 
       logger.error('Request error captured in telemetry', {
         error: err.message,

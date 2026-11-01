@@ -21,11 +21,20 @@ export function webhookIdsExposed() {
   return process.env.LOG_UNREDACTED_WEBHOOK_IDS === 'true';
 }
 
+/**
+ * A key's fingerprint: `sha256:` and the first 8 hex digits of its SHA-256, the
+ * same as the frontend's. Always the fingerprint, whatever
+ * LOG_UNREDACTED_WEBHOOK_IDS says: spans carry this one.
+ */
+export function webhookIdFingerprint(value) {
+  return `sha256:${createHash('sha256').update(String(value)).digest('hex').slice(0, 8)}`;
+}
+
 /** A webhook ID as a log line may show it: a fingerprint, or in full while exposure is on. */
 export function describeWebhookId(value) {
   if (!value) return '(none)';
   if (webhookIdsExposed()) return String(value);
-  return `[webhook-id sha256:${createHash('sha256').update(String(value)).digest('hex').slice(0, 8)}]`;
+  return `[webhook-id ${webhookIdFingerprint(value)}]`;
 }
 
 function configuredWebhookIds() {

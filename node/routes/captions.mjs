@@ -1,6 +1,7 @@
 import express from 'express';
 import { promises as fs } from 'fs';
 import { createCategoryLogger } from '../lib/logger.mjs';
+import { recordUserCaller } from '../lib/requestCaller.mjs';
 import {
   authenticateUser,
   requireAdmin,
@@ -37,6 +38,7 @@ async function tryAttachUser(req) {
     const token = extractSessionIdentifier(req);
     if (!token) return null;
     const user = await sessionManager.getSession(token, req);
+    if (user) recordUserCaller(user.id);
     if (!user || (!user.approved && !user.admin)) return null;
     req.user = user;
     return user;

@@ -12,10 +12,10 @@ import { jest, describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 
 jest.unstable_mockModule('../../../lib/telemetry.mjs', () => ({ isOpenTelemetryEnabled: true }));
 
-const { context, ROOT_CONTEXT } = await import('@opentelemetry/api');
+const { context, trace, ROOT_CONTEXT, SpanStatusCode } = await import('@opentelemetry/api');
 const { AsyncLocalStorageContextManager } = await import('@opentelemetry/context-async-hooks');
 const { RPCType, setRPCMetadata } = await import('@opentelemetry/core');
-const { httpRouteMiddleware } = await import('../../../middleware/telemetryMiddleware.mjs');
+const { httpRouteMiddleware, telemetryErrorMiddleware } = await import('../../../middleware/telemetryMiddleware.mjs');
 
 beforeAll(() => {
   context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
@@ -64,5 +64,44 @@ describe('httpRouteMiddleware', () => {
     const { rpcMetadata } = handle({ baseUrl: '', matched: '/x' }, 'other');
 
     expect(rpcMetadata.route).toBeUndefined();
+  });
+});
+
+describe('telemetryErrorMiddleware', () => {
+  // spanContext: lib/logger.mjs stamps each line with the active span's ids
+  const fakeSpan = () => ({
+    recordException: jest.fn(),
+    setStatus: jest.fn(),
+    setAttribute: jest.fn(),
+    spanContext: () => ({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), traceFlags: 1 }),
+  });
+
+  function handleError(err) {
+    const serverSpan = fakeSpan();
+    const routerSpan = fakeSpan();
+    const ctx = setRPCMetadata(trace.setSpan(ROOT_CONTEXT, routerSpan), { type: RPCType.HTTP, span: serverSpan });
+    const next = jest.fn();
+    context.with(ctx, () => telemetryErrorMiddleware()(err, { path: '/x', method: 'GET' }, {}, next));
+    return { serverSpan, routerSpan, next };
+  }
+
+  it('records the error on the HTTP server span, not the error handler\'s router span', () => {
+    const err = new TypeError('boom');
+    const { serverSpan, routerSpan, next } = handleError(err);
+
+    expect(serverSpan.recordException).toHaveBeenCalledWith(err);
+    expect(serverSpan.setStatus).toHaveBeenCalledWith({ code: SpanStatusCode.ERROR, message: 'boom' });
+    expect(routerSpan.recordException).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(err);
+  });
+
+  it('leaves the status unset for an error that answers with a 4xx', () => {
+    // As decodeParam raises it for a malformed escape in a route parameter
+    const err = Object.assign(new URIError("Failed to decode param '%E0%A4%A'"), { status: 400 });
+    const { serverSpan, next } = handleError(err);
+
+    expect(serverSpan.recordException).toHaveBeenCalledWith(err);
+    expect(serverSpan.setStatus).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(err);
   });
 });
