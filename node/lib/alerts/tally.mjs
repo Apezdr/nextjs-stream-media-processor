@@ -103,10 +103,15 @@ export class LogTally {
   }
 }
 
-/** Feeds every record the logger writes into a LogTally. */
+/**
+ * Feeds every record the logger writes into a LogTally. It has no level of
+ * its own, so it takes the logger's (info in production) and counts what the
+ * log files hold. At 'silly' it counted the debug lines no file gets, and the
+ * volume rule fired on chatter nobody could find on the Logs page.
+ */
 export class LogTallyTransport extends Transport {
   constructor(tally, options = {}) {
-    super({ level: 'silly', ...options });
+    super(options);
     this.tally = tally;
   }
 
