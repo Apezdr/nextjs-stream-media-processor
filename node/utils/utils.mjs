@@ -11,7 +11,6 @@ import { createCategoryLogger } from '../lib/logger.mjs';
 import PQueue from 'p-queue';
 import { generateBlurhash } from './blurhashNative.mjs';
 import { sidecarBlurhashSizeForFilename } from './blurhashSizePolicy.mjs';
-import { needsDoviReshape, libplaceboAvailable, doviReshapeFilter, DOVI_RESHAPE_INPUT_ARGS } from '../ffmpeg/dolbyVision.mjs';
 const logger = createCategoryLogger('utility');
 //const LOG_FILE = process.env.LOG_PATH ? join(process.env.LOG_PATH, 'blurhash.log') : '/var/log/blurhash.log';
 
@@ -59,145 +58,6 @@ export function getCleanVideoPath(videoUrl) {
   
   // Otherwise return as-is (handles empty PREFIX_PATH or already clean URLs)
   return videoUrl;
-}
-
-let limit;
-
-async function loadPLimit() {
-  const pLimit = (await import('p-limit')).default;
-  limit = pLimit(10);
-}
-
-async function _generateFrame(videoPath, timestamp, framePath) {
-  // Ensure the limit function is loaded before using it
-  if (!limit) {
-    await loadPLimit();
-  }
-
-  return limit(async () => {
-    // Dolby Vision Profile 5 reads as SDR by its transfer, and either branch
-    // below renders its base layer green/magenta. libplacebo applies the RPU
-    // and writes HDR10, which then takes the HDR path like any HDR10 source.
-    // Without a usable libplacebo the old branches still run (see
-    // ffmpeg/dolbyVision.mjs; the probe has warned once).
-    const dovi = (await needsDoviReshape(videoPath)) && (await libplaceboAvailable());
-    return new Promise((resolve, reject) => {
-      // Replace colons in timestamp to make it Windows-friendly
-      const sanitizedTimestamp = timestamp.replace(/:/g, '-');
-
-      // Update framePath with sanitized timestamp and .avif extension
-      const avifPath = framePath.replace(/\.[^/.]+$/, `.avif`);
-
-      // Determine if the video is HDR by probing color_transfer
-      const ffprobeCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
-
-      exec(ffprobeCommand, (error, stdout, stderr) => {
-        if (error) {
-          logger.error(`Worker ${process.pid} error detecting HDR: ${error.message}`);
-          return reject(error);
-        }
-
-        const colorTransfer = stdout.trim();
-        logger.info(`Worker ${process.pid} color_transfer: ${colorTransfer}`);
-        const isHDR = (colorTransfer === 'smpte2084' || colorTransfer === 'arib-std-b67');
-
-        // Build the FFmpeg command for AVIF encoding
-        let ffmpegCommand;
-        if (dovi) {
-          logger.info(`Worker ${process.pid} detected Dolby Vision needing RPU reshape, writing HDR10 AVIF via libplacebo`);
-
-          // Same AVIF output as the HDR branch below; libplacebo replaces the
-          // scale (software decode — it is the only decoder that keeps the RPU).
-          ffmpegCommand = [
-            'ffmpeg',
-            ...DOVI_RESHAPE_INPUT_ARGS,
-            `-ss ${timestamp}`,
-            `-i "${videoPath}"`,
-            '-frames:v 1',
-            `-vf "${doviReshapeFilter({ width: -2, height: 140, output: 'pq' })}"`,
-            '-color_primaries bt2020',
-            '-color_trc smpte2084',
-            '-colorspace bt2020nc',
-            '-c:v libaom-av1',
-            '-crf 10',
-            '-b:v 0',
-            '-preset slower',
-            `"${avifPath}"`,
-            '-y'
-          ].join(' ');
-        } else if (isHDR) {
-          logger.info(`Worker ${process.pid} detected HDR video, preserving HDR in AVIF`);
-
-          // For HDR:
-          // - Ensure even width with scale=-2:140
-          // - Use yuv420p10le pixel format
-          // - Set HDR metadata: BT.2020 primaries, SMPTE2084 transfer, BT.2020 non-constant colorspace
-          // - Use libaom-av1 encoder with high quality settings
-          ffmpegCommand = [
-            'ffmpeg',
-            `-ss ${timestamp}`,
-            `-i "${videoPath}"`,
-            '-frames:v 1',
-            '-vf "scale=-2:140:flags=lanczos,format=yuv420p10le"',
-            '-color_primaries bt2020',
-            '-color_trc smpte2084',
-            '-colorspace bt2020nc',
-            '-c:v libaom-av1',
-            '-crf 10',
-            '-b:v 0',
-            '-preset slower',
-            `"${avifPath}"`,
-            '-y'
-          ].join(' ');
-        } else {
-          logger.info(`Worker ${process.pid} detected SDR video, encoding AVIF in SDR`);
-
-          // For SDR:
-          // - Ensure even width with scale=-2:140
-          // - Use yuv420p pixel format
-          // - No HDR metadata needed
-          ffmpegCommand = [
-            'ffmpeg',
-            `-ss ${timestamp}`,
-            `-i "${videoPath}"`,
-            '-frames:v 1',
-            '-vf "scale=-2:140:flags=lanczos,format=yuv420p"',
-            '-c:v libaom-av1',
-            '-crf 10',
-            '-b:v 0',
-            '-preset slower',
-            `"${avifPath}"`,
-            '-y'
-          ].join(' ');
-        }
-
-        // Execute the FFmpeg command to produce the AVIF
-        exec(ffmpegCommand, (error, stdout, stderr) => {
-          if (error) {
-            logger.error(`Worker ${process.pid} error generating AVIF at ${timestamp}: ${error.message}`);
-            logger.debug(`FFmpeg stderr: ${stderr}`);
-            return reject(error);
-          }
-
-          logger.info(`Worker ${process.pid} AVIF frame generated successfully: ${avifPath}`);
-
-          // Get the dimensions of the generated AVIF using ffprobe
-          const ffprobeDimCommand = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${avifPath}"`;
-
-          exec(ffprobeDimCommand, (error, stdout, stderr) => {
-            if (error) {
-              logger.error(`Worker ${process.pid} error getting AVIF frame dimensions: ${error.message}`);
-              logger.debug(`FFprobe stderr: ${stderr}`);
-              return reject(error);
-            }
-
-            const [width, height] = stdout.trim().split('x');
-            resolve({ framePath: avifPath, width: parseInt(width), height: parseInt(height) });
-          });
-        });
-      });
-    });
-  });
 }
 
 // Function to check file existence asynchronously
@@ -787,16 +647,3 @@ export async function convertToAvif(pngPath, avifPath, quality = 60, speed = 4, 
   // After successful conversion, remove the entry from the Map
   conversionQueue.delete(pngPath);
 }
-
-/**
- * Generates a frame from a video file at the specified timestamp and saves it to the given path.
- * 
- * @param {string} videoPath - The path to the video file.
- * @param {number} timestamp - The timestamp (in milliseconds) at which to capture the frame.
- * @param {string} framePath - The path to save the generated frame.
- * @returns {Promise<void>} - A Promise that resolves when the frame has been generated and saved.
- */
-export const generateFrame = async (videoPath, timestamp, framePath) => {
-  await loadPLimit();
-  return _generateFrame(videoPath, timestamp, framePath);
-};

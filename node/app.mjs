@@ -3,7 +3,6 @@ import { shutdownTelemetry } from './lib/telemetry.mjs';
 
 import express from "express";
 import { scheduleJob } from "node-schedule";
-import { exec } from "child_process";
 import { promisify } from "util";
 import os from "os";
 import { join, resolve, dirname, normalize } from "path";
@@ -28,7 +27,7 @@ import {
 } from "./components/caption-generator/index.mjs";
 import { authenticateWebhookOrUser } from "./middleware/auth.mjs";
 import { httpRouteMiddleware } from "./middleware/telemetryMiddleware.mjs";
-import { generateFrame, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif } from "./utils/utils.mjs";
+import { safeJoin, PathTraversalError, fileExists, ensureCacheDirs, mainCacheDir, generalCacheDir, spritesheetCacheDir, framesCacheDir, videoClipsCacheDir, getStoredBlurhash, calculateDirectoryHash, getLastModifiedTime, clearSpritesheetCache, clearFramesCache, clearGeneralCache, clearVideoClipsCache, clearOriginalSegmentsCache, convertToAvif, generateCacheKey, deriveEpisodeTitle, shouldUseAvif } from "./utils/utils.mjs";
 import { resolveMovieVideo, resolveEpisodeVideo, findEpisodeEntry } from "./utils/mediaResolution.mjs";
 import { buildMoviePayloadEntry, buildTvPayloadEntry } from "./lib/mediaPayload.mjs";
 import {
@@ -45,6 +44,7 @@ import { getAutoCaptionsConfigCached } from "./components/caption-generator/data
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
 import { sweepClipTempFiles } from "./ffmpeg/clipEncode.mjs";
+import { generateFrame, parseFrameTimestamp, FrameOutOfRangeError } from "./ffmpeg/frame.mjs";
 import { CURRENT_VERSION, getInfo } from "./infoManager.mjs";
 import { fileURLToPath } from "url";
 import { createCategoryLogger, createPythonLogger, logTally } from "./lib/logger.mjs";
@@ -276,70 +276,76 @@ app.get("/frame/tv/:showName/:season/:episode/:timestamp{.:ext}", (req, res) =>
 );
 
 async function handleFrameRequest(req, res, type) {
-  let frameFileName,
-    videoPath,
-    specificFileName = null,
-    wasCached = true;
-
+  // Express has decoded the params once; decoding again broke names with a `%`.
   const { movieName, showName, season, episode, timestamp } = req.params;
-  let movie_name = decodeURIComponent(movieName);
-  let show_name = decodeURIComponent(showName);
+  // The timestamp reaches ffmpeg and the cache file name: only H:MM:SS[.fff].
+  if (parseFrameTimestamp(timestamp) === null) {
+    return res.status(400).send("Timestamp must be HH:MM:SS");
+  }
   // Cant use `:` on Windows so replace with `-`
   const sanitizeTimestamp = timestamp.replace(/:/g, '-');
 
-  let episodeNumber;
-  if (type === "movies") {
-    frameFileName = `movie_${movie_name}_${sanitizeTimestamp}.avif`;
-  } else {
-    // Extract episode number
-    const episodeMatch =
-      episode.match(/E(\d{1,2})/i) || episode.match(/^(\d{1,2})( -)?/);
-    episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
-
-    frameFileName = `tv_${show_name}_S${season}E${episodeNumber}_${sanitizeTimestamp}.avif`;
-
-    const showData = await getTVShowByName(show_name);
-    if (!showData) {
-      throw new Error(
-        `Season not found: ${show_name} - Season ${season} Episode ${episode}`
-      );
-    }
-    // The stored filename is only a hint — resolveEpisodeVideo falls back to
-    // matching the episode by S##E## when the container on disk has changed.
-    specificFileName = findEpisodeEntry(showData, season, episode)?.episode?.filename ?? null;
-  }
-
-  const framePath = join(framesCacheDir, frameFileName);
-
+  let frameFileName;
   try {
+    let specificFileName = null;
+    if (type === "movies") {
+      frameFileName = `movie_${movieName}_${sanitizeTimestamp}.avif`;
+    } else {
+      // Extract episode number
+      const episodeMatch =
+        episode.match(/E(\d{1,2})/i) || episode.match(/^(\d{1,2})( -)?/);
+      const episodeNumber = episodeMatch ? episodeMatch[1] : "Unknown"; // Default to 'Unknown' if not found
+
+      frameFileName = `tv_${showName}_S${season}E${episodeNumber}_${sanitizeTimestamp}.avif`;
+
+      const showData = await getTVShowByName(showName);
+      if (!showData) {
+        throw new Error(
+          `Season not found: ${showName} - Season ${season} Episode ${episode}`
+        );
+      }
+      // The stored filename is only a hint — resolveEpisodeVideo falls back to
+      // matching the episode by S##E## when the container on disk has changed.
+      specificFileName = findEpisodeEntry(showData, season, episode)?.episode?.filename ?? null;
+    }
+
+    // A decoded name can hold `/` or `..`; the cache check below must not read outside the cache.
+    const framePath = safeJoin(framesCacheDir, frameFileName);
+
     if (await fileExists(framePath)) {
       // Serve from cache if exists
       logger.info(`Serving cached frame: ${frameFileName}`);
     } else {
-      wasCached = false;
       const videoRef =
         type === "movies"
-          ? await resolveMovieVideo({ basePath: BASE_PATH, movieName: movie_name })
+          ? await resolveMovieVideo({ basePath: BASE_PATH, movieName })
           : await resolveEpisodeVideo({
               basePath: BASE_PATH,
-              showName: show_name,
+              showName,
               season,
               episode,
               preferFilename: specificFileName,
             });
       if (!videoRef) {
-        throw new Error(`Video file not found for ${movie_name || show_name}`);
+        throw new Error(`Video file not found for ${movieName || showName}`);
       }
-      videoPath = videoRef.path;
 
-      // Generate the frame
-      await generateFrame(videoPath, timestamp, framePath);
+      // Generate the frame (leaves no file behind when it fails)
+      await generateFrame(videoRef.path, timestamp, framePath);
       logger.info(`Generated new frame: ${frameFileName}`);
     }
 
     res.set('Content-Disposition', 'inline');
     res.type('image/avif').sendFile(framePath);
   } catch (error) {
+    if (error instanceof FrameOutOfRangeError) {
+      // A chapter list longer than its video asks for these (chapter-generator.mjs).
+      logger.info(`No frame for ${frameFileName}: ${error.message}`);
+      return res.status(404).send("No frame at that time: it is past the end of the video");
+    }
+    if (error instanceof PathTraversalError) {
+      return res.status(400).send("Invalid title");
+    }
     logger.error(error);
     return res.status(404).send("Video file not found");
   }
