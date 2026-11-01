@@ -97,6 +97,10 @@ const TV_DIR_HASH_MAX_DEPTH = (() => {
  *   tmdb.config. An image with mtime < this counts as missing (the user has
  *   edited config since we last wrote the image). Pass null when the show
  *   has no tmdb.config.
+ * @param {boolean} [opts.refreshAllowed=true] - Whether a stale image can be
+ *   refreshed (`isUpdateAllowed`). A frozen show's stale art is still flagged,
+ *   but logged at debug: nothing acts on it, and at info a show frozen after
+ *   its art was written logged the same lines every tick.
  */
 async function processShowAssets({
   showPath,
@@ -106,6 +110,7 @@ async function processShowAssets({
   basePath,
   fileSet = null,
   tmdbConfigLastModified = null,
+  refreshAllowed = true,
 }) {
   // Per-kind outputs. The frontend reads each from its dedicated DB column
   // (poster / posterBlurhash / logo / backdrop / backdropBlurhash), so they
@@ -151,7 +156,7 @@ async function processShowAssets({
     // keeps serving what is on disk. Reuses the resolver's single stat
     // (`r.mtime`) — no extra syscall.
     if (tmdbConfigLastModified && tmdbConfigLastModified > r.mtime) {
-      logger.info('scanner: tmdb.config newer than asset, flagging for refresh', {
+      logger[refreshAllowed ? 'info' : 'debug']('scanner: tmdb.config newer than asset, flagging for refresh', {
         'media.name': showName,
         'media.type': 'tv',
         'image.type': imageKey,
@@ -197,6 +202,9 @@ async function processShowAssets({
  * @param {string} opts.encodedShowName
  * @param {string} opts.prefixPath
  * @param {Date|null} [opts.tmdbConfigLastModified=null] - See processShowAssets.
+ * @param {boolean} [opts.refreshAllowed=true] - Whether the metadata gate can
+ *   act on staleness (updates allowed, or metadata overrides to apply); the
+ *   log goes to debug when it can't, as in processShowAssets.
  */
 async function processShowMetadata({
   showPath,
@@ -204,6 +212,7 @@ async function processShowMetadata({
   encodedShowName,
   prefixPath,
   tmdbConfigLastModified = null,
+  refreshAllowed = true,
 }) {
   let metadataUrl = '';
   let metadata = '';
@@ -225,7 +234,7 @@ async function processShowMetadata({
   } else if (tmdbConfigLastModified) {
     const mtime = await getLastModifiedTime(metadataFilePath);
     if (mtime && tmdbConfigLastModified > mtime) {
-      logger.info('scanner: tmdb.config newer than metadata.json, marking missing', {
+      logger[refreshAllowed ? 'info' : 'debug']('scanner: tmdb.config newer than metadata.json, marking missing', {
         'media.name': showName,
         'media.type': 'tv',
         'metadata.path': metadataFilePath,
@@ -799,6 +808,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         basePath,
         fileSet: showFileSet,
         tmdbConfigLastModified,
+        refreshAllowed: updateAllowed,
       });
       const missingImages = assetsResult.missingImages;
 
@@ -810,6 +820,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
         encodedShowName,
         prefixPath,
         tmdbConfigLastModified,
+        refreshAllowed: updateAllowed || hasOverrides,
       });
       const missingMetadata = metadataResult.missingMetadata;
 
@@ -1007,6 +1018,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           basePath,
           fileSet: retryFileSet,
           tmdbConfigLastModified,
+          refreshAllowed: updateAllowed,
         });
         Object.assign(assetsResult, retryAssetsResult);
 
@@ -1016,6 +1028,7 @@ export async function scanTVShows(db, dirPath, prefixPath, basePath, langMap, is
           encodedShowName,
           prefixPath,
           tmdbConfigLastModified,
+          refreshAllowed: updateAllowed || hasOverrides,
         });
 
         // Cooldown bookkeeping, decided AFTER the attempt from the generator's
