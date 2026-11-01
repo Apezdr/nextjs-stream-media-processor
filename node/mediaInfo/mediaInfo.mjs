@@ -1,7 +1,19 @@
 import { createCategoryLogger } from "../lib/logger.mjs";
-import { execAsync } from "../utils/utils.mjs";
+import { execFileAsync } from "../utils/utils.mjs";
 
 const logger = createCategoryLogger('mediaInfo');
+
+/**
+ * mediainfo's JSON for one file. The path goes in as its own argument
+ * (execFile, no shell): a library file name can hold `$(...)`, a backtick or a
+ * quote, and inside a shell string those ran.
+ * @param {string} filePath
+ * @returns {Promise<object>}
+ */
+async function mediainfoJson(filePath) {
+  const { stdout } = await execFileAsync('mediainfo', ['--Output=JSON', filePath]);
+  return JSON.parse(stdout);
+}
 
 /**
  * Helper function to check if a string includes a substring, case-insensitive
@@ -22,8 +34,7 @@ const includesIgnoreCase = (str, substr) =>
  */
 export async function getHeaderData(filePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
-    const data = JSON.parse(stdout);
+    const data = await mediainfoJson(filePath);
 
     // Extract the General track
     const generalTrack = data.media.track.find(t => t["@type"] === "General");
@@ -242,8 +253,7 @@ export function analyzeVideoTracks(videoTracks) {
  */
 export async function extractMediaQuality(filePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
-    const data = JSON.parse(stdout);
+    const data = await mediainfoJson(filePath);
 
     const videoTracks = data.media.track.filter(t => t["@type"] === "Video");
     if (!videoTracks || videoTracks.length === 0) {
@@ -310,8 +320,7 @@ export function deriveHDRFromQuality(mediaQuality) {
  */
 export async function getMediaInfoCombined(filePath) {
   try {
-    const { stdout } = await execAsync(`mediainfo --Output=JSON "${filePath}"`);
-    const data = JSON.parse(stdout);
+    const data = await mediainfoJson(filePath);
 
     // --- Header data extraction (from getHeaderData logic) ---
     let headerData = '';

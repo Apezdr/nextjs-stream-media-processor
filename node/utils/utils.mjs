@@ -1,6 +1,5 @@
 import { promisify } from 'util';
-import { exec, execFile, spawn } from 'child_process';
-export const execAsync = promisify(exec);
+import { execFile, spawn } from 'child_process';
 export const execFileAsync = promisify(execFile);
 import { promises as fs, stat } from 'fs'; // Use the promise-based version of fs
 import { resolve as _resolve, join, relative, sep, dirname, basename, extname } from 'path';

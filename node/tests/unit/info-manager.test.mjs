@@ -13,16 +13,19 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
 
-// child_process.exec backs the ffprobe call; promisify.custom keeps the
-// { stdout } shape extractAdditionalMetadata destructures.
+// child_process.execFile backs the ffprobe call (no shell: the path is its own
+// argument); promisify.custom keeps the { stdout } shape
+// extractAdditionalMetadata destructures.
 let ffprobePayload = JSON.stringify({ format: { duration: '10.5', size: '1000' }, streams: [] });
 let ffprobeShouldFail = false;
-const execMock = (cmd, cb) => cb(null, ffprobePayload, '');
-execMock[promisify.custom] = async () => {
+const ffprobeCalls = [];
+const execFileMock = (file, args, cb) => cb(null, ffprobePayload, '');
+execFileMock[promisify.custom] = async (file, args) => {
+  ffprobeCalls.push([file, args]);
   if (ffprobeShouldFail) throw new Error('ffprobe: Invalid data found when processing input');
   return { stdout: ffprobePayload };
 };
-jest.unstable_mockModule('child_process', () => ({ exec: execMock }));
+jest.unstable_mockModule('child_process', () => ({ execFile: execFileMock }));
 
 // mediainfo boundary — headerData drives the uuid (sha256 of it), so tests
 // rotate it to simulate a genuinely different file arriving in place.
@@ -76,6 +79,11 @@ describe('getInfo stat-based staleness (V-4)', () => {
     expect(typeof info.uuid).toBe('string');
     const stats = await fs.stat(videoPath);
     expect(info.source).toEqual({ size: stats.size, mtimeMs: Math.floor(stats.mtimeMs) });
+    // ffprobe gets the path as its own argument, not inside a shell string.
+    expect(ffprobeCalls[0]).toEqual([
+      'ffprobe',
+      ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', videoPath],
+    ]);
   });
 
   it('does not regenerate while the source file is unchanged', async () => {

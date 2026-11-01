@@ -2,14 +2,16 @@
  * HDR detection from MediaInfo Video tracks. Fixtures copy the fields MediaInfo
  * reported for real library files; the comment on each names the title it came
  * from. The mediainfo subprocess is mocked.
+ *
+ * mediainfo runs through execFile with the path as its own argument: inside
+ * a shell string, a file name holding `$(...)` or a quote ran.
  */
 
 import { describe, it, expect, jest } from '@jest/globals';
 
 let mediainfoPayload = '';
-jest.unstable_mockModule('../../utils/utils.mjs', () => ({
-  execAsync: async () => ({ stdout: mediainfoPayload }),
-}));
+const execFileAsync = jest.fn(async () => ({ stdout: mediainfoPayload }));
+jest.unstable_mockModule('../../utils/utils.mjs', () => ({ execFileAsync }));
 
 const { analyzeVideoTracks, extractMediaQuality, getMediaInfoCombined } = await import(
   '../../mediaInfo/mediaInfo.mjs'
@@ -281,5 +283,21 @@ describe('both mediainfo entry points share the analysis', () => {
     const single = await extractMediaQuality('/x/Logan.mp4');
 
     expect(single).toEqual(combined.mediaQuality);
+  });
+});
+
+describe('the mediainfo call', () => {
+  it('passes the path as its own argument, with no shell', async () => {
+    mediainfoPayload = JSON.stringify({ media: { track: [{ '@type': 'General' }, uhdPQ()] } });
+    const path = '/lib/movies/A "quoted" $(id) `name`/file.mkv';
+    execFileAsync.mockClear();
+
+    await getMediaInfoCombined(path);
+    await extractMediaQuality(path);
+
+    expect(execFileAsync.mock.calls).toEqual([
+      ['mediainfo', ['--Output=JSON', path]],
+      ['mediainfo', ['--Output=JSON', path]],
+    ]);
   });
 });
