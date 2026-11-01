@@ -76,7 +76,7 @@ export async function execute(interaction, client) {
     }
     
     // Log the admin action
-    logger.info(`Admin ${adminUser.email} (Discord: ${interaction.user.tag}) accessed task manager`);
+    logger.info(`Admin ${adminUser.id} (Discord: ${interaction.user.tag}) accessed task manager`);
     
     const apiClient = new ServerApiClient(
       client.botAdapter.serverApiUrl,

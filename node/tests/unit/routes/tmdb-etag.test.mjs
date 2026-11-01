@@ -23,7 +23,7 @@ const getEpisodeImages = jest.fn();
 
 jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
   authenticateUser: (req, res, next) => {
-    req.user = { email: 'user@test' };
+    req.user = { id: 'user-1' };
     next();
   },
   requireAdmin: (req, res, next) => next(),

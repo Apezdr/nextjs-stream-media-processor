@@ -146,7 +146,7 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         const now = new Date();
         await fs.utimes(subtitleFilePath, now, now);
 
-        logger.info(`Subtitle file updated: ${subtitleFilePath} by user ${req.user.email}`);
+        logger.info(`Subtitle file updated: ${subtitleFilePath} by user ${req.user.id}`);
         
         return res.status(200).json({
             success: true,
@@ -159,7 +159,7 @@ router.post('/subtitles/save', authenticateUser, requireAdmin, async (req, res) 
         });
     } catch (error) {
         if (error instanceof PathTraversalError) {
-            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            logger.warn(`Rejected path traversal attempt from user ${req.user?.id}: ${error.message}`);
             return res.status(400).json({ error: 'Invalid mediaTitle/season: path traversal not allowed' });
         }
         logger.error(`Error saving subtitle changes: ${error.message}`);
@@ -200,7 +200,7 @@ router.get('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
         const mediaDir = safeJoin(join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies'), mediaName);
         const configPath = getTmdbConfigFilePath(mediaDir);
         
-        logger.info(`Admin ${req.user.email} requested TMDB config for ${mediaType}: ${mediaName}`);
+        logger.info(`Admin ${req.user.id} requested TMDB config for ${mediaType}: ${mediaName}`);
 
         const config = await loadTmdbConfig(configPath);
 
@@ -214,7 +214,7 @@ router.get('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
 
     } catch (error) {
         if (error instanceof PathTraversalError) {
-            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            logger.warn(`Rejected path traversal attempt from user ${req.user?.id}: ${error.message}`);
             return res.status(400).json({ error: 'Invalid mediaName: path traversal not allowed' });
         }
         logger.error(`Error reading TMDB config: ${error.message}`);
@@ -256,7 +256,7 @@ router.put('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
         const mediaDir = safeJoin(join(BASE_PATH, mediaType === 'tv' ? 'tv' : 'movies'), mediaName);
         const configPath = getTmdbConfigFilePath(mediaDir);
         
-        logger.info(`Admin ${req.user.email} updating TMDB config for ${mediaType}: ${mediaName}`);
+        logger.info(`Admin ${req.user.id} updating TMDB config for ${mediaType}: ${mediaName}`);
 
         // Full replace (A-2) stays a full replace. Only the id's provenance is
         // settled here: an id this operator added or changed becomes `manual`
@@ -277,7 +277,7 @@ router.put('/metadata/config', authenticateUser, requireAdmin, async (req, res) 
 
     } catch (error) {
         if (error instanceof PathTraversalError) {
-            logger.warn(`Rejected path traversal attempt from ${req.user?.email}: ${error.message}`);
+            logger.warn(`Rejected path traversal attempt from user ${req.user?.id}: ${error.message}`);
             return res.status(400).json({ error: 'Invalid mediaName: path traversal not allowed' });
         }
         logger.error(`Error updating TMDB config: ${error.message}`);

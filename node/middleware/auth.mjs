@@ -75,7 +75,7 @@ export const authenticateUser = async (req, res, next) => {
     }
 
     req.user = user
-    logger.debug(`Authenticated user: ${user.email} (ID: ${user.id}) on ${describeRequest(req)}`)
+    logger.debug(`Authenticated user ${user.id} on ${describeRequest(req)}`)
     next()
   } catch (error) {
     logger.error('Authentication error:', error)
@@ -186,7 +186,7 @@ export const authenticateWebhookOrUser = async (req, res, next) => {
     }
 
     req.user = user
-    logger.debug(`Authenticated admin user: ${user.email} (ID: ${user.id}) on ${describeRequest(req)}`)
+    logger.debug(`Authenticated admin user ${user.id} on ${describeRequest(req)}`)
     next()
   } catch (error) {
     logger.error('Authentication error:', error)

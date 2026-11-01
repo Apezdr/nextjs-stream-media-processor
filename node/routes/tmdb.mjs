@@ -112,7 +112,7 @@ export function setupTmdbRoutes() {
     const includeBlurhash = blurhash === 'true';
     const data = await searchMedia(type, query, page, includeBlurhash);
     
-    logger.info(`User ${req.user.email} searched for ${type}: "${query}"${includeBlurhash ? ' with blurhash' : ''} returned ${data.results.length} results`);
+    logger.info(`User ${req.user.id} searched for ${type}: "${query}"${includeBlurhash ? ' with blurhash' : ''} returned ${data.results.length} results`);
     res.json(data);
   } catch (error) {
     sendTmdbError(res, error, 'Search error:');
@@ -132,7 +132,7 @@ router.get('/comprehensive/:type', authenticateUser, rateLimiter, async (req, re
     const includeBlurhash = blurhash === 'true';
     const data = await fetchComprehensiveMediaDetails(name, type, tmdb_id, includeBlurhash);
 
-    logger.info(`User ${req.user.email} requested comprehensive ${type} details for: ${name || `ID ${tmdb_id}`}${includeBlurhash ? ' with blurhash' : ''}`);
+    logger.info(`User ${req.user.id} requested comprehensive ${type} details for: ${name || `ID ${tmdb_id}`}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, data);
   } catch (error) {
     sendTmdbError(res, error, 'Comprehensive details error:');
@@ -152,7 +152,7 @@ router.get('/details/:type', authenticateUser, rateLimiter, async (req, res) => 
     const includeBlurhash = blurhash === 'true';
     const data = await getMediaDetails(type, tmdb_id, includeBlurhash);
     
-    logger.info(`User ${req.user.email} requested ${type} details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
+    logger.info(`User ${req.user.id} requested ${type} details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, data);
   } catch (error) {
     sendTmdbError(res, error, 'Details error:');
@@ -172,7 +172,7 @@ router.get('/images/:type', authenticateUser, rateLimiter, async (req, res) => {
     const includeBlurhash = blurhash === 'true';
     const images = await getMediaImages(type, tmdb_id, includeBlurhash);
     
-    logger.info(`User ${req.user.email} requested images for ${type} ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
+    logger.info(`User ${req.user.id} requested images for ${type} ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, images);
   } catch (error) {
     sendTmdbError(res, error, 'Images error:');
@@ -191,7 +191,7 @@ router.get('/episode/images', authenticateUser, rateLimiter, async (req, res) =>
     const includeBlurhash = blurhash === 'true';
     const images = await getEpisodeImages(tmdb_id, season, episode, includeBlurhash);
     
-    logger.info(`User ${req.user.email} requested episode images: ${tmdb_id} S${season}E${episode}${includeBlurhash ? ' with blurhash' : ''}`);
+    logger.info(`User ${req.user.id} requested episode images: ${tmdb_id} S${season}E${episode}${includeBlurhash ? ' with blurhash' : ''}`);
     return sendJsonWithETag(req, res, images);
   } catch (error) {
     sendTmdbError(res, error, 'Episode images error:');
@@ -210,13 +210,13 @@ router.get('/collection', authenticateUser, rateLimiter, async (req, res) => {
     const includeBlurhash = blurhash === 'true';
     let data;
     if (enhanced === 'true') {
-      logger.info(`User ${req.user.email} requested enhanced collection details for ID: ${tmdb_id}`);
+      logger.info(`User ${req.user.id} requested enhanced collection details for ID: ${tmdb_id}`);
       data = await fetchEnhancedCollectionData(tmdb_id, includeBlurhash);
     } else {
       data = await getCollectionDetails(tmdb_id, includeBlurhash);
     }
     
-    logger.info(`User ${req.user.email} requested ${enhanced === 'true' ? 'enhanced ' : ''}collection details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
+    logger.info(`User ${req.user.id} requested ${enhanced === 'true' ? 'enhanced ' : ''}collection details for ID: ${tmdb_id}${includeBlurhash ? ' with blurhash' : ''}`);
     res.json(data);
   } catch (error) {
     sendTmdbError(res, error, 'Collection details error:');

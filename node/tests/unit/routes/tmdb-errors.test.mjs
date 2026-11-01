@@ -4,7 +4,8 @@
  * 400, so callers can give up on a title TMDB doesn't have (404
  * TMDB_NOT_FOUND) and retry an outage (502 TMDB_UNAVAILABLE, 429
  * TMDB_RATE_LIMITED with Retry-After). Parameter errors stay 400; anything
- * else is this server's bug and answers 500.
+ * else is this server's bug and answers 500. A route that answers logs its
+ * caller by user id, never by email.
  *
  * Runs the real router on an ephemeral port with the auth middleware and the
  * TMDB client mocked; the error classes are the real ones.
@@ -27,9 +28,11 @@ const client = {
   fetchEnhancedCollectionData: jest.fn(),
 };
 
+const USER = { id: '6578feca7317f7b672cebb5e', email: 'viewer@example.com', approved: true, admin: false };
+
 jest.unstable_mockModule('../../../middleware/auth.mjs', () => ({
   authenticateUser: (req, res, next) => {
-    req.user = { email: 'user@test' };
+    req.user = USER;
     next();
   },
   requireAdmin: (req, res, next) => next(),
@@ -75,6 +78,17 @@ const tmdbFailure = (status, extra = {}) =>
   });
 
 const COMPREHENSIVE = '/comprehensive/tv?tmdb_id=275188';
+
+// Every TMDB GET route, with the client call it makes.
+const ROUTES = [
+  ['/search/tv?query=x', 'searchMedia'],
+  [COMPREHENSIVE, 'fetchComprehensiveMediaDetails'],
+  ['/details/tv?tmdb_id=275188', 'getMediaDetails'],
+  ['/images/tv?tmdb_id=275188', 'getMediaImages'],
+  ['/episode/images?tmdb_id=275188&season=1&episode=1', 'getEpisodeImages'],
+  ['/collection?tmdb_id=10', 'getCollectionDetails'],
+  ['/collection?tmdb_id=10&enhanced=true', 'fetchEnhancedCollectionData'],
+];
 
 describe('GET /api/tmdb/comprehensive/:type failure answers', () => {
   it('answers a TMDB 404 with 404 TMDB_NOT_FOUND', async () => {
@@ -181,20 +195,26 @@ describe('failure log level', () => {
 });
 
 describe('every TMDB GET route maps failures the same way', () => {
-  it.each([
-    ['/search/tv?query=x', 'searchMedia'],
-    [COMPREHENSIVE, 'fetchComprehensiveMediaDetails'],
-    ['/details/tv?tmdb_id=275188', 'getMediaDetails'],
-    ['/images/tv?tmdb_id=275188', 'getMediaImages'],
-    ['/episode/images?tmdb_id=275188&season=1&episode=1', 'getEpisodeImages'],
-    ['/collection?tmdb_id=10', 'getCollectionDetails'],
-    ['/collection?tmdb_id=10&enhanced=true', 'fetchEnhancedCollectionData'],
-  ])('%s answers a TMDB 404 with 404 TMDB_NOT_FOUND', async (path, fnName) => {
+  it.each(ROUTES)('%s answers a TMDB 404 with 404 TMDB_NOT_FOUND', async (path, fnName) => {
     client[fnName].mockRejectedValue(tmdbFailure(404));
 
     const res = await fetch(`${baseUrl}/api/tmdb${path}`);
 
     expect(res.status).toBe(404);
     expect((await res.json()).code).toBe('TMDB_NOT_FOUND');
+  });
+});
+
+describe('the request log line', () => {
+  it.each(ROUTES)('%s names the user by id, never by email', async (path, fnName) => {
+    // The search route reads `results`; the others send whatever they get.
+    client[fnName].mockResolvedValue({ results: [] });
+
+    const res = await fetch(`${baseUrl}/api/tmdb${path}`);
+
+    expect(res.status).toBe(200);
+    expect(log.info).toHaveBeenCalledWith(expect.stringContaining(`User ${USER.id} `));
+    const logged = JSON.stringify(Object.values(log).map((fn) => fn.mock.calls));
+    expect(logged).not.toContain(USER.email);
   });
 });

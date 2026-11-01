@@ -112,7 +112,7 @@ export function setupCaptionsRoutes() {
         episode: parsed.episode
       });
 
-      logger.info(`Caption track requested by ${user.email}: ${parsed.mediaType}/${parsed.title} [${parsed.lang}] → job ${job.jobId}`);
+      logger.info(`Caption track requested by user ${user.id}: ${parsed.mediaType}/${parsed.title} [${parsed.lang}] → job ${job.jobId}`);
       return jobStatusResponse(res, job, target.srtPath);
     } catch (err) {
       return mapEnqueueError(res, err);
@@ -196,7 +196,7 @@ export function setupCaptionsRoutes() {
         }
 
         const job = await enqueueCaptionJob({ mediaType, mediaTitle, language, season, episode, force });
-        logger.info(`Admin caption job enqueued by ${req.user?.email}: ${job.jobId} → ${job.expectedPath}`);
+        logger.info(`Admin caption job enqueued by user ${req.user?.id}: ${job.jobId} → ${job.expectedPath}`);
         return res.status(job.status === 'succeeded' ? 200 : 202).json({
           success: true,
           ...jobBody(job)
@@ -222,7 +222,7 @@ export function setupCaptionsRoutes() {
         const report = await auditAutoCaptions({ apply: apply === true, madeBefore: madeBefore ?? null });
         const changed = report.items.filter(item => item.result === 'removed' || item.result === 'queued').length;
         logger.info(
-          `Caption audit by ${req.user?.email}: ${report.scanned} captions, ${report.items.length} flagged` +
+          `Caption audit by user ${req.user?.id}: ${report.scanned} captions, ${report.items.length} flagged` +
           (report.applied ? `, ${changed} acted on` : ' (report only)')
         );
         return res.json(report);
