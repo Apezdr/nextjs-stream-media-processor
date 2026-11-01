@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join, normalize, dirname, extname, basename } from 'path';
+import { join, normalize, extname, basename } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
@@ -21,8 +21,7 @@ import {
 } from '../../../utils/utils.mjs';
 import { isVideoFile } from '../../../utils/mediaResolution.mjs';
 import { buildVideoSources, publishableSources } from './video-sources.mjs';
-import { generateChapters } from '../../../chapter-generator.mjs';
-import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
+import { syncChapterFile } from '../../../chapter-generator.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
   getExistingTVShows,
@@ -75,32 +74,6 @@ const TV_DIR_HASH_MAX_DEPTH = (() => {
   if (Number.isNaN(raw)) return 2;
   return Math.max(0, Math.min(5, raw));
 })();
-
-/**
- * Helper function to generate chapter files if they don't exist.
- * Writes the generated VTT content to disk (matching app.mjs pattern).
- * @param {string} chaptersPath - Path to chapters file
- * @param {string} mediaPath - Path to media file
- * @param {boolean} quietMode - Whether to suppress logging
- */
-async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode = false) {
-  if (!(await fileExists(chaptersPath))) {
-    try {
-      const chapterData = await chapterInfo(mediaPath);
-      if (chapterData) {
-        // Create the chapters directory if it doesn't exist
-        await fs.mkdir(dirname(chaptersPath), { recursive: true });
-        const chapterContent = await generateChapters(mediaPath, chapterData);
-        await fs.writeFile(chaptersPath, chapterContent);
-        if (!quietMode) {
-          logger.info(`Generated chapter file: ${chaptersPath}`);
-        }
-      }
-    } catch (error) {
-      logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
-    }
-  }
-}
 
 /**
  * Process show assets (poster, logo, backdrop)
@@ -494,14 +467,15 @@ async function processEpisode(episodeFiles, seasonPath, showName, encodedShowNam
     libraryRelativePath: `tv/${showName}/${basename(seasonPath)}/${creditsFileName}`,
   });
 
-  // Handle chapters
+  // Handle chapters: kept in step with the primary video (chapter-generator.mjs),
+  // before the show's finalHash, which covers chapters/.
   const chaptersPath = join(
     seasonPath,
     'chapters',
     `${showName} - S${seasonNumber}E${paddedEpisodeNumber}_chapters.vtt`
   );
-  
-  await generateChapterFileIfNotExists(chaptersPath, join(seasonPath, primary.filename), true);
+
+  await syncChapterFile(chaptersPath, join(seasonPath, primary.filename));
 
   if (await fileExists(chaptersPath)) {
     episodeData.chapters = `${prefixPath}/tv/${encodedShowName}/${encodedSeasonName}/chapters/${encodeURIComponent(

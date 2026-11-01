@@ -1,40 +1,95 @@
+// chapter-generator.mjs
+//
+// A video's chapters file (chapters/<name>_chapters.vtt), kept in step with
+// the video it came from. The scanners used to write it only when it was
+// missing, so a folder whose video was replaced (an upgrade to another
+// release) kept the old video's chapters: 38 chapters to 2:51:57 against a
+// 2:03:47 video, and the chapter menu asked /frame for times past the end.
+//
+// Each file now names its source in a NOTE block (a WebVTT comment, which
+// players skip): a hash of the video's file name and size. A file whose NOTE
+// is missing or names another video is rebuilt from the current one, or
+// removed when that video has no chapters. Chapters starting at or past the
+// end of the video (a 24:00:00 end marker, say) are dropped.
+
+import { createHash } from 'crypto';
+import { promises as fs } from 'fs';
+import { basename, dirname } from 'path';
 import { createCategoryLogger } from './lib/logger.mjs';
 import { getVideoDuration, chapterInfo } from './ffmpeg/ffprobe.mjs';
 const logger = createCategoryLogger('chapter-generator');
 
-export async function generateChapters(mediaPath, chapterData = null) {
+const SOURCE_NOTE = /^NOTE source ([0-9a-f]{16})$/m;
+
+/**
+ * Which video a chapters file was built from: its file name and size. A
+ * replaced video differs in at least one, an untouched one in neither.
+ * @param {string} mediaPath
+ * @returns {Promise<string>} 16 hex digits
+ */
+export async function videoSourceStamp(mediaPath) {
+  const { size } = await fs.stat(mediaPath);
+  return createHash('sha256').update(`${basename(mediaPath)}\n${size}`).digest('hex').slice(0, 16);
+}
+
+/**
+ * The chapters file for these chapters, or null when none starts before the
+ * end of the video. The last cue ends at the duration.
+ * @param {Array<{start_time: string, tags?: {title?: string}}>} chapters - From chapterInfo.
+ * @param {number} duration - The video's length in seconds.
+ * @param {string} source - videoSourceStamp of the video.
+ * @returns {string|null}
+ */
+export function chaptersVtt(chapters, duration, source) {
+  const inRange = chapters.filter((chapter) => parseFloat(chapter.start_time) < duration);
+  if (inRange.length === 0) return null;
+
+  let vttContent = `WEBVTT\n\nNOTE source ${source}\n\n`;
+  for (let i = 0; i < inRange.length; i++) {
+    const chapter = inRange[i];
+    const startTime = formatTime(chapter.start_time);
+    const endTime = i === inRange.length - 1 ? formatDuration(duration) : formatTime(inRange[i + 1].start_time);
+    vttContent += `${startTime} --> ${endTime}\n${chapterTitleFor(chapter, i + 1)}\n\n`;
+  }
+  return vttContent;
+}
+
+/**
+ * Bring the chapters file at `chaptersPath` in step with the video at
+ * `mediaPath`: keep it when it names this video, otherwise rebuild it, or
+ * remove it when the video has no chapters before its end. Never throws: a
+ * probe that fails is logged and leaves the file as it was.
+ *
+ * Callers compute the directory hash after this, since the hash covers
+ * chapters/ (see the scanners).
+ * @param {string} chaptersPath
+ * @param {string} mediaPath
+ * @returns {Promise<void>}
+ */
+export async function syncChapterFile(chaptersPath, mediaPath) {
   try {
-    const chapters = chapterData || await chapterInfo(mediaPath) || [];
+    const source = await videoSourceStamp(mediaPath);
+    const existing = await fs.readFile(chaptersPath, 'utf8').catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (existing !== null && SOURCE_NOTE.exec(existing)?.[1] === source) return;
 
-    if (chapters.length === 0) {
-      logger.warn(`No chapter information found for ${mediaPath}`);
-      return "WEBVTT\n\n"; // Return a default WebVTT content
+    const chapters = (await chapterInfo(mediaPath)) ?? [];
+    const content = chapters.length > 0 ? chaptersVtt(chapters, await getVideoDuration(mediaPath), source) : null;
+
+    if (content === null) {
+      if (existing !== null) {
+        await fs.rm(chaptersPath, { force: true });
+        logger.info(`Removed a chapters file whose video has no chapters before its end: ${chaptersPath}`);
+      }
+      return;
     }
-
-    const duration = await getVideoDuration(mediaPath);
-
-    let vttContent = "WEBVTT\n\n";
-
-    for (let i = 0; i < chapters.length; i++) {
-      const chapter = chapters[i];
-      const chapterIndex = i + 1;
-      const startTime = formatTime(chapter.start_time);
-      const endTime = i === chapters.length - 1 ? formatDuration(duration) : formatTime(chapters[i + 1].start_time);
-      const chapterTitle = chapterTitleFor(chapter, chapterIndex);
-
-      vttContent += `${startTime} --> ${endTime}\n${chapterTitle}\n\n`;
-    }
-
-    return vttContent;
+    await fs.mkdir(dirname(chaptersPath), { recursive: true });
+    await fs.writeFile(chaptersPath, content);
+    logger.debug(`${existing === null ? 'Generated' : 'Rebuilt'} chapter file: ${chaptersPath}`);
   } catch (error) {
-    let errorMessage;
-    if (typeof error === 'object') {
-      errorMessage = `Error generating chapters for ${mediaPath}: An unexpected object was encountered: ${error}`;
-    } else {
-      errorMessage = `Error generating chapters for ${mediaPath}: ${error.toString()}`;
-    }
-    logger.error(errorMessage);
-    throw new Error(errorMessage);
+    logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
   }
 }
 

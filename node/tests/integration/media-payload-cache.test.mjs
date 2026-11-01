@@ -135,7 +135,7 @@ jest.unstable_mockModule('../../ffmpeg/ffprobe.mjs', () => ({
   getAudioTracks: jest.fn(async () => []),
 }));
 jest.unstable_mockModule('../../chapter-generator.mjs', () => ({
-  generateChapters: jest.fn(async () => null),
+  syncChapterFile: jest.fn(async () => {}),
 }));
 jest.unstable_mockModule('../../utils/backdropFocalDetector.mjs', () => ({
   detectBackdropFocal: jest.fn(async () => null),

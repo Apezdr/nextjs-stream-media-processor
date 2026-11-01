@@ -97,11 +97,12 @@ describeWithTools('chapters against the real ffprobe', () => {
   let dir;
   let chaptered;
   let chapterInfo;
-  let generateChapters;
+  let syncChapterFile;
+  let videoSourceStamp;
 
   beforeAll(async () => {
     ({ chapterInfo } = await import('../../ffmpeg/ffprobe.mjs'));
-    ({ generateChapters } = await import('../../chapter-generator.mjs'));
+    ({ syncChapterFile, videoSourceStamp } = await import('../../chapter-generator.mjs'));
 
     dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ffprobe-chapters-'));
     const plain = path.join(dir, 'plain.mkv');
@@ -143,11 +144,13 @@ describeWithTools('chapters against the real ffprobe', () => {
     expect(chapters[1].tags?.title).toBeUndefined();
   });
 
-  it('generateChapters names the cue from the source and falls back for the unnamed one', async () => {
-    const vtt = await generateChapters(chaptered);
+  it('syncChapterFile names the cue from the source and falls back for the unnamed one', async () => {
+    const chaptersPath = path.join(dir, 'chapters', 'chaptered_chapters.vtt');
+    await syncChapterFile(chaptersPath, chaptered);
 
-    expect(vtt).toBe(
+    expect(await fs.readFile(chaptersPath, 'utf8')).toBe(
       'WEBVTT\n\n' +
+        `NOTE source ${await videoSourceStamp(chaptered)}\n\n` +
         '00:00:00.000 --> 00:00:01.000\nOpening\n\n' +
         '00:00:01.000 --> 00:00:02.500\nChapter 02\n\n'
     );

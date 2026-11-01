@@ -1,5 +1,5 @@
 import { promises as fs } from 'fs';
-import { join, dirname, extname } from 'path';
+import { join, extname } from 'path';
 import pLimit from 'p-limit';
 import { createCategoryLogger } from '../../../lib/logger.mjs';
 import {
@@ -13,8 +13,7 @@ import {
 } from '../../../utils/utils.mjs';
 import { isVideoFile } from '../../../utils/mediaResolution.mjs';
 import { buildVideoSources, publishableSources } from './video-sources.mjs';
-import { generateChapters } from '../../../chapter-generator.mjs';
-import { chapterInfo } from '../../../ffmpeg/ffprobe.mjs';
+import { syncChapterFile } from '../../../chapter-generator.mjs';
 import { parseSubtitleFilename } from './subtitle-filename.mjs';
 import {
   resolveMediaIdentity,
@@ -63,43 +62,6 @@ function parseStoredUrls(urls) {
     return JSON.parse(urls);
   } catch {
     return null;
-  }
-}
-
-/**
- * Helper function to generate chapter files if they don't exist.
- * Writes the generated VTT content to disk, mirroring the working TV helper
- * in tv-scanner.mjs (C-1 — this was historically a silent no-op: it passed
- * the quietMode boolean into generateChapters' chapterData parameter, which
- * short-circuited the probe and discarded the returned VTT string). Movies
- * without chapter atoms (chapterInfo → null) write nothing. (There is no
- * on-demand fallback: the /chapters/* routes were removed in P2, and the
- * payload's chapter URLs point at the file server's static files.)
- *
- * Ordering constraint (hard): scanMovies must call this (via processChapters)
- * BEFORE computing final_hash — calculateDirectoryHash recurses into
- * chapters/, so the stored hash must already include the new VTT or every
- * pregeneration would re-trigger dirHashChanged on the following tick.
- * @param {string} chaptersPath - Path to chapters file
- * @param {string} mediaPath - Path to media file
- * @param {boolean} quietMode - Whether to suppress logging
- */
-async function generateChapterFileIfNotExists(chaptersPath, mediaPath, quietMode = false) {
-  if (!(await fileExists(chaptersPath))) {
-    try {
-      const chapterData = await chapterInfo(mediaPath);
-      if (chapterData) {
-        // Create the chapters directory if it doesn't exist
-        await fs.mkdir(dirname(chaptersPath), { recursive: true });
-        const chapterContent = await generateChapters(mediaPath, chapterData);
-        await fs.writeFile(chaptersPath, chapterContent);
-        if (!quietMode) {
-          logger.info(`Generated chapter file: ${chaptersPath}`);
-        }
-      }
-    } catch (error) {
-      logger.error(`Failed to generate chapters for ${mediaPath}: ${error.message}`);
-    }
   }
 }
 
@@ -387,6 +349,17 @@ async function processVideoFiles(videoFiles, dirPath, dirName, prefixPath, prima
  * "My.mp4.Movie.mkv"), then re-appended '.mp4' to rebuild the path. Now it
  * takes the already-resolved primary source's basename.
  *
+ * The file is kept in step with the primary video (chapter-generator.mjs
+ * syncChapterFile): rebuilt when the video changed, removed when the video has
+ * no chapters. Movies without chapter atoms get no file. (There is no
+ * on-demand fallback: the /chapters/* routes were removed in P2, and the
+ * payload's chapter URLs point at the file server's static files.)
+ *
+ * Ordering constraint (hard): scanMovies must call this BEFORE computing
+ * final_hash — calculateDirectoryHash recurses into chapters/, so the stored
+ * hash must already include the written VTT or every rebuild would re-trigger
+ * dirHashChanged on the following tick.
+ *
  * @param {string} dirPath - Movies root
  * @param {string} dirName - Movie directory name
  * @param {string|null} primaryFilename - Primary source basename, with extension
@@ -404,10 +377,10 @@ async function processChapters(dirPath, dirName, primaryFilename, prefixPath) {
   const chaptersPath = join(dirPath, dirName, 'chapters', `${dirName}_chapters.vtt`);
   const chaptersPath2 = join(dirPath, dirName, 'chapters', `${baseFilename}_chapters.vtt`);
 
-  await generateChapterFileIfNotExists(chaptersPath, mediaPath, true);
+  await syncChapterFile(chaptersPath, mediaPath);
 
   if (!await fileExists(chaptersPath)) {
-    await generateChapterFileIfNotExists(chaptersPath2, mediaPath, true);
+    await syncChapterFile(chaptersPath2, mediaPath);
   }
 
   if (await fileExists(chaptersPath)) {
