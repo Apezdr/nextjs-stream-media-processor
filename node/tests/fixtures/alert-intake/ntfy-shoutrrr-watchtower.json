@@ -1,0 +1,17 @@
+{
+  "about": "Watchtower (maintained fork nicholas-fedor/watchtower; containrrr/watchtower was archived 2025-12-17) through shoutrrr ntfy (nicholas-fedor/shoutrrr pkg/services/push/ntfy): POST https://host/<topic-path> where the shoutrrr URL path is the topic, so a path prefix works. Body is the raw message, Content-Type text/plain; charset=utf-8, headers Title/Priority (enum NAME, e.g. high)/Tags. Auth: Bearer from ?token= in the shoutrrr URL, else Basic from user:pass in it (ntfy://:KEY@host/... gives an empty username). Parses the response as JSON; a non-JSON 200 is an error.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/ntfy/watchtower",
+    "headers": {
+      "content-type": "text/plain; charset=utf-8",
+      "authorization": "Basic ${BASIC_EMPTY_USER_KEY}",
+      "title": "Watchtower updates on docker-01",
+      "priority": "high",
+      "tags": "whale",
+      "user-agent": "shoutrrr/0.22.1"
+    },
+    "body": "Found new image for container sonarr (lscr.io/linuxserver/sonarr:latest): sha256:5c1e\nStopping /sonarr (3f2a) with SIGTERM\nCreating /sonarr\nFailed to start /sonarr: Error response from daemon: port is already allocated"
+  }
+}

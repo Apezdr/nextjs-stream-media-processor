@@ -9,10 +9,14 @@
  *
  * LOG_UNREDACTED_WEBHOOK_IDS=true writes them in full, for a deliberate
  * debugging session only; the logger warns at startup while it is on.
+ *
+ * Alert intake keys (ALERT_INTAKE_KEYS) are replaced too, as
+ * `[intake-key sha256:…]`, and always: that setting doesn't reach them.
  */
 
 import { createHash } from 'crypto';
 import { mapRecordStrings } from './recordWalk.mjs';
+import { intakeKeyValues, keyFingerprint } from '../integrations/alert-intake/config.mjs';
 
 // Shorter values are too likely to occur by chance in a log line.
 const MIN_REDACTED_LENGTH = 8;
@@ -47,18 +51,29 @@ function configuredWebhookIds() {
 }
 
 /**
- * Replaces the configured webhook IDs in a winston record's fields. Every
- * transport serializes these fields, so this covers the files, the console
- * and SigNoz.
+ * An alert intake key as a log line shows it (integrations/alert-intake/):
+ * always the fingerprint. LOG_UNREDACTED_WEBHOOK_IDS is for debugging the
+ * processor's own webhooks; an intake key belongs to another app.
+ */
+export function describeIntakeKey(value) {
+  return `[intake-key ${keyFingerprint(value)}]`;
+}
+
+/**
+ * Replaces the configured webhook IDs and alert intake keys in a winston
+ * record's fields. Every transport serializes these fields, so this covers
+ * the files, the console and SigNoz.
  */
 export function redactWebhookIds(info) {
-  if (webhookIdsExposed()) return info;
-  const ids = configuredWebhookIds();
-  if (ids.length === 0) return info;
+  const replacements = [
+    ...intakeKeyValues().map((key) => [key, describeIntakeKey(key)]),
+    ...(webhookIdsExposed() ? [] : configuredWebhookIds().map((id) => [id, describeWebhookId(id)])),
+  ];
+  if (replacements.length === 0) return info;
   return mapRecordStrings(info, (text) => {
     let result = text;
-    for (const id of ids) {
-      if (result.includes(id)) result = result.split(id).join(describeWebhookId(id));
+    for (const [value, shown] of replacements) {
+      if (result.includes(value)) result = result.split(value).join(shown);
     }
     return result;
   });

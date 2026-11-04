@@ -1,0 +1,25 @@
+{
+  "about": "Sonarr v4 Gotify connection, On Health Issue. Sonarr src/NzbDrone.Core/Notifications/Gotify/GotifyProxy.cs: HttpRequestBuilder(settings.Server).Resource(\"message\").Post().AddQueryParam(\"token\", AppToken), JSON body from GotifyMessage.cs (camelCase title/message/priority, extras client::display.contentType). Priority enum GotifyPriority Min=0 Low=2 Normal=5 High=8. Title constant HEALTH_ISSUE_TITLE in NotificationBase.cs. Radarr, Prowlarr and Lidarr share this code.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/gotify/message",
+    "query": {
+      "token": "${KEY}"
+    },
+    "headers": {
+      "content-type": "application/json",
+      "user-agent": "Sonarr/4.0.20.3014 (ubuntu 24.04)"
+    },
+    "body": {
+      "title": "Health Check Failure",
+      "message": "Indexers unavailable due to failures for more than 6 hours: indexer-a",
+      "priority": 5,
+      "extras": {
+        "client::display": {
+          "contentType": "text/plain"
+        }
+      }
+    }
+  }
+}

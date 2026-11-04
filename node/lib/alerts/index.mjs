@@ -5,9 +5,9 @@
  * GET /api/alerts (routes/alerts.mjs) reads it.
  */
 
-import os from 'os';
 import { createCategoryLogger, logTally } from '../logger.mjs';
 import { getProcessorId } from '../processorIdentity.mjs';
+import { serverLabel } from '../serverLabel.mjs';
 import { getNotificationManager } from '../../integrations/index.mjs';
 import { createAlertStore } from './store.mjs';
 import { createAlertNotifier } from './notifier.mjs';
@@ -21,15 +21,6 @@ const TICK_MS = 60_000;
 
 let manager = null;
 let starting = null;
-
-function serverLabel() {
-  try {
-    if (process.env.FILE_SERVER_NODE_URL) return new URL(process.env.FILE_SERVER_NODE_URL).hostname;
-  } catch {
-    // fall through to the hostname
-  }
-  return os.hostname();
-}
 
 async function create() {
   const processorId = await getProcessorId();

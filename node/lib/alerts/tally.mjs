@@ -16,6 +16,18 @@ import { templateOf, fingerprintOf } from '../logFingerprint.mjs';
 
 const MINUTE = 60_000;
 const MINUTES_KEPT = 120;
+
+/**
+ * Categories whose warn and error lines are never fingerprinted, so no rule
+ * can turn them into an alert. alert-intake relays other apps' alerts to
+ * Discord: if its "Discord refused the relay" lines could become a log alert,
+ * that alert would go to Discord in turn. Their lines still count toward the
+ * per-minute totals and per-category counts (the Logs page and the volume
+ * rule stay truthful), and a masked secret in one is still recorded.
+ * Relay failures reach the owner out of band instead: an email-only SigNoz
+ * rule (integrations/alert-intake/README.md).
+ */
+export const UNALERTED_CATEGORIES = new Set(['alert-intake']);
 // A runaway log call can't grow the tally without bound; past this many
 // fingerprints in one minute the rest count only toward the totals.
 const MAX_FINGERPRINTS_PER_MINUTE = 500;
@@ -52,6 +64,7 @@ export class LogTally {
     if (info[SECRETS_MASKED]) bucket.secrets.push({ category, kinds: info[SECRETS_MASKED], at });
 
     if (info.level !== 'warn' && info.level !== 'error') return;
+    if (UNALERTED_CATEGORIES.has(category)) return;
     const message = String(info.message ?? '');
     const fp = typeof info.fp === 'string' ? info.fp : fingerprintOf(category, message);
 

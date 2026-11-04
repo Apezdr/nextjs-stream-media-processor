@@ -1,0 +1,27 @@
+{
+  "about": "Our own generic schema (PLAN.md section 2.5), as the Rust transcoder would send a stateful alert. curl equivalent: curl -fsS -H \"Authorization: Bearer $KEY\" --json @body.json https://processor.example.com/api/alert-intake/generic",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/generic",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}",
+      "user-agent": "jit-transcoder/2026.10.31"
+    },
+    "body": {
+      "title": "GPU encoder unavailable",
+      "message": "VAAPI device /dev/dri/renderD128 failed to open; new sessions fall back to software encode.",
+      "severity": "critical",
+      "status": "firing",
+      "fingerprint": "gpu-encoder-unavailable",
+      "service": "jit-transcoder",
+      "url": "https://signoz.example.com/logs/logs-explorer?q=renderD128",
+      "fields": {
+        "host": "media-01",
+        "device": "/dev/dri/renderD128"
+      },
+      "startsAt": "2026-11-04T09:30:00Z"
+    }
+  }
+}

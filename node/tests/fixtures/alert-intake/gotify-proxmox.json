@@ -1,0 +1,24 @@
+{
+  "about": "Proxmox VE Gotify notification target (proxmox-notify src/endpoints/gotify.rs, git.proxmox.com HEAD): POST format!(\"{}/message\", server) with BOTH Authorization: Bearer <token> and X-Gotify-Key: <token>; body title/message/priority/extras client::display text/markdown. severity_to_priority: Info 1, Notice 3, Warning 5, Error 9, Unknown 3.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/gotify/message",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}",
+      "x-gotify-key": "${KEY}",
+      "user-agent": "proxmox-notify"
+    },
+    "body": {
+      "title": "vzdump backup status (pve1.example.com): backup failed",
+      "message": "| VMID | Name | Status | Time |\n|---|---|---|---|\n| 101 | media-vm | err | 12s |\n\nTotal running time: 12s\n\nERROR: Backup of VM 101 failed - unable to open file '/mnt/pbs/dump/vzdump-qemu-101.tmp' - No space left on device",
+      "priority": 9,
+      "extras": {
+        "client::display": {
+          "contentType": "text/markdown"
+        }
+      }
+    }
+  }
+}

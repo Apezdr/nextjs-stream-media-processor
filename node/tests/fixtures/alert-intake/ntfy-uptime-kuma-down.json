@@ -1,0 +1,30 @@
+{
+  "about": "Uptime Kuma 2.x ntfy provider (server/notification-providers/ntfy.js): JSON publish to the server ROOT URL itself (axios.post(ntfyserverurl, data)), topic inside the body. Down: tags [\"red_circle\"], priority = ntfyPriorityDown || priority+1 capped at 5; Up: tags [\"green_circle\"]. Auth: Basic username:password or Bearer access token.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/ntfy",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}",
+      "user-agent": "Uptime-Kuma/2.5.9"
+    },
+    "body": {
+      "topic": "uptime",
+      "message": "connect ECONNREFUSED 192.0.2.20:8096",
+      "priority": 5,
+      "title": "jellyfin Down [Uptime-Kuma]",
+      "tags": [
+        "red_circle",
+        "media"
+      ],
+      "actions": [
+        {
+          "action": "view",
+          "label": "Open jellyfin",
+          "url": "http://192.0.2.20:8096"
+        }
+      ]
+    }
+  }
+}

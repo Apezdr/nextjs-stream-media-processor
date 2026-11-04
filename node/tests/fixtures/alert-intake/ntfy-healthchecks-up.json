@@ -1,0 +1,30 @@
+{
+  "about": "Healthchecks ntfy integration (hc/integrations/ntfy/transport.py): JSON publish to the configured ntfy URL root with topic, priority (priority_up when up), title, message, markdown true, tags red_circle (down) / green_circle (up), one view action; Authorization: Bearer <token> when a token is set.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/ntfy",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}",
+      "user-agent": "healthchecks"
+    },
+    "body": {
+      "topic": "cron",
+      "priority": 3,
+      "title": "nightly-backup is UP",
+      "message": "The check **nightly-backup** received a ping and is now **UP**.\n\nLast ping: 2026-11-04 03:02 UTC",
+      "markdown": true,
+      "tags": [
+        "green_circle"
+      ],
+      "actions": [
+        {
+          "action": "view",
+          "label": "View on Healthchecks",
+          "url": "https://hc.example.com/cloaked/7f3e9a0b-0000-4000-8000-000000000002/"
+        }
+      ]
+    }
+  }
+}

@@ -2,6 +2,9 @@ import axios from 'axios';
 import { createCategoryLogger } from '../lib/logger.mjs';
 import { DiscordAdapter } from './discord/webhook.mjs';
 import { DiscordBotAdapter } from './discord/bot.mjs';
+import { readNotificationChannels, discordTargets } from './notificationChannels.mjs';
+
+export { readNotificationChannels, discordTargets };
 
 const logger = createCategoryLogger('notificationManager');
 const isDebugMode = process.env.DEBUG === 'TRUE';
@@ -14,14 +17,42 @@ export class NotificationManager {
   constructor() {
     this.discordAdapter = new DiscordAdapter();
     this.discordBot = null;
-    this.botInitPromise = null;
-    
-    // Start bot initialization but don't block constructor
-    this.initializeDiscordBot().catch(error => {
+
+    // Start bot initialization but don't block constructor. Kept, so
+    // whenDiscordReady() can wait for it; it never rejects.
+    this.botInitPromise = this.initializeDiscordBot().catch(error => {
       logger.error(`Discord bot initialization failed: ${error.message}`);
     });
   }
-  
+
+  /**
+   * Resolves true once the bot can send DMs, false when there is no bot or it
+   * isn't ready within `timeoutMs`. Never rejects. The alert intake waits on
+   * it at startup: Uptime Kuma and the *arr apps don't retry, so an alert
+   * refused while the bot logs in would be lost.
+   * @param {number} timeoutMs
+   * @returns {Promise<boolean>}
+   */
+  async whenDiscordReady(timeoutMs) {
+    if (this.discordBot?.ready) return true;
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    });
+    const ready = (async () => {
+      await this.botInitPromise;
+      if (!this.discordBot) return false;
+      if (this.discordBot.ready) return true;
+      return this.discordBot.whenReady().then(() => true);
+    })().catch(() => false);
+    try {
+      return await Promise.race([ready, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /**
    * Initialize Discord bot if configured
    */
@@ -79,57 +110,18 @@ export class NotificationManager {
    * @returns {Array<object>} Array of notification channel configurations
    */
   getNotificationChannels() {
-    const channels = [];
-    
-    // Parse legacy frontend webhooks (FRONT_END_X + WEBHOOK_ID_X)
-    let index = 1;
-    while (true) {
-      const frontendUrl = process.env[`FRONT_END_${index}`];
-      const webhookId = process.env[`WEBHOOK_ID_${index}`];
-      
-      if (!frontendUrl || !webhookId) break;
-      
-      channels.push({
-        type: 'frontend',
-        url: frontendUrl,
-        webhookId: webhookId,
-        index: index,
-        cooldown: null // Use default from NOTIFICATION_COOLDOWN
-      });
-      
-      index++;
-      if (isDebugMode) {
-        logger.debug(`Found legacy frontend configuration #${index - 1}: ${frontendUrl}`);
+    const channels = readNotificationChannels(process.env);
+
+    if (isDebugMode) {
+      for (const channel of channels) {
+        if (channel.type === 'frontend' && channel.source === 'legacy') {
+          logger.debug(`Found legacy frontend configuration #${channel.index}: ${channel.url}`);
+        } else {
+          logger.debug(`Found unified notification #${channel.index}: ${channel.type} -> ${channel.url || 'N/A (bot)'}`);
+        }
       }
     }
-    
-    // Parse new unified notification channels (NOTIFICATION_X_TYPE, NOTIFICATION_X_URL)
-    index = 1;
-    while (true) {
-      const type = process.env[`NOTIFICATION_${index}_TYPE`];
-      const url = process.env[`NOTIFICATION_${index}_URL`];
-      
-      // For discord_bot type, URL is optional (uses DISCORD_NOTIFY_USERS instead)
-      if (!type) break;
-      if (!url && type.toLowerCase() !== 'discord_bot') break;
-      
-      const cooldown = process.env[`NOTIFICATION_${index}_COOLDOWN`];
-      const webhookId = process.env[`NOTIFICATION_${index}_WEBHOOK_ID`]; // For frontend type
-      
-      channels.push({
-        type: type.toLowerCase(),
-        url: url || null, // URL is optional for discord_bot
-        webhookId: webhookId,
-        index: index,
-        cooldown: cooldown ? parseInt(cooldown, 10) : null
-      });
-      
-      index++;
-      if (isDebugMode) {
-        logger.debug(`Found unified notification #${index - 1}: ${type} -> ${url || 'N/A (bot)'}`);
-      }
-    }
-    
+
     if (channels.length === 0) {
       logger.warn('No notification channels configured');
     } else {
@@ -252,18 +244,40 @@ export class NotificationManager {
    * @returns {Promise<boolean>} whether at least one Discord delivery succeeded
    */
   async sendDiscordEmbed(embed) {
-    const channels = this.getNotificationChannels().filter((channel) => channel.type === 'discord' || channel.type === 'discord_bot');
-    const sends = channels.flatMap((channel) => {
-      if (channel.type === 'discord') return [this.discordAdapter.sendEmbed(channel.url, embed)];
-      if (!this.discordBot?.ready) return [Promise.reject(new Error('Discord bot not ready'))];
-      const userIds = (process.env.DISCORD_NOTIFY_USERS || '').split(',').map((id) => id.trim()).filter(Boolean);
-      return userIds.map((userId) => this.discordBot.sendEmbedDM(userId, embed));
-    });
-    const results = await Promise.allSettled(sends);
-    for (const result of results) {
-      if (result.status === 'rejected') logger.warn(`Discord alert delivery failed: ${result.reason?.message ?? result.reason}`);
+    const outcome = await this.deliverDiscordEmbeds([embed]);
+    for (const reason of outcome.reasons) logger.warn(`Discord alert delivery failed: ${reason}`);
+    return outcome.delivered > 0;
+  }
+
+  /**
+   * Send one message holding up to 10 ready-made embeds to every Discord
+   * channel, as sendDiscordEmbed does, and say how it went. Logs nothing and
+   * never rejects: the alert intake (integrations/alert-intake/) relays other
+   * apps' alerts through it, and a failure it logged could come back to
+   * Discord as a log alert. Its caller logs the outcome.
+   * @param {object[]} embeds
+   * @returns {Promise<{ targets: number, delivered: number, failed: number, botNotReady: number, reasons: string[] }>}
+   */
+  async deliverDiscordEmbeds(embeds) {
+    const { webhookUrls, userIds, botConfigured } = discordTargets(process.env);
+    const sends = webhookUrls.map((url) => this.discordAdapter.sendEmbeds(url, embeds));
+    let botNotReady = 0;
+    if (botConfigured) {
+      if (this.discordBot?.ready) {
+        sends.push(...userIds.map((userId) => this.discordBot.sendEmbedsDM(userId, embeds)));
+      } else {
+        botNotReady = Math.max(userIds.length, 1);
+      }
     }
-    return results.some((result) => result.status === 'fulfilled' && result.value?.success);
+    const results = await Promise.allSettled(sends);
+    const delivered = results.filter((result) => result.status === 'fulfilled' && result.value?.success).length;
+    const reasons = [
+      ...(botNotReady ? ['Discord bot not ready'] : []),
+      ...results.map((result) =>
+        result.status === 'rejected' ? String(result.reason?.message ?? result.reason) : result.value?.success ? null : 'Discord refused the message'
+      ),
+    ].filter(Boolean);
+    return { targets: sends.length + botNotReady, delivered, failed: sends.length + botNotReady - delivered, botNotReady, reasons };
   }
 
   /**

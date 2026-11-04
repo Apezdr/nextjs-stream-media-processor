@@ -81,3 +81,23 @@ describe('webhook IDs in log records', () => {
     }
   });
 });
+
+describe('alert intake keys in log records', () => {
+  const INTAKE_KEY = 'Wq3vB8nX0pLk2sT7yZr4uE9cH1mJ6dGf5aQoNbVxCiY';
+  const intakeFingerprint = `[intake-key sha256:${createHash('sha256').update(INTAKE_KEY).digest('hex').slice(0, 8)}]`;
+  afterEach(() => delete process.env.ALERT_INTAKE_KEYS);
+
+  it('are replaced by their own fingerprint, always, even while webhook IDs are exposed', async () => {
+    process.env.ALERT_INTAKE_KEYS = `signoz:${INTAKE_KEY}`;
+    process.env.LOG_UNREDACTED_WEBHOOK_IDS = 'true';
+    logger.warn(`retrying with ${INTAKE_KEY}`, { headers: { authorization: `Bearer ${INTAKE_KEY}` }, id: FIRST });
+    await flushed();
+
+    const line = written.join('');
+    expect(line).not.toContain(INTAKE_KEY);
+    expect(line).toContain(intakeFingerprint);
+    expect(line).not.toContain('[webhook-id');
+    // The webhook ID itself is out in full, as the setting asks.
+    expect(line).toContain(FIRST);
+  });
+});
