@@ -107,3 +107,11 @@ describe('credentialSpanProcessor', () => {
     await provider.shutdown();
   });
 });
+
+describe('alert intake URLs', () => {
+  it("redact Gotify's ?token= and ntfy's ?auth= on spans, keeping the path and other params", () => {
+    expect(redactUrlCredentials('/api/alert-intake/gotify/message?token=gtfya.e2NcJK7AenXBPIRB3S03JsBlmy0V6xP8h0hwSiAJae8')).toBe('/api/alert-intake/gotify/message?token=REDACTED');
+    expect(redactUrlCredentials('/api/alert-intake/ntfy/backups?auth=QmVhcmVyIGZha2V0b2tlbg&title=x')).toBe('/api/alert-intake/ntfy/backups?auth=REDACTED&title=x');
+    expect(redactUrlCredentials('/api/alert-intake/ntfy/backups?authorization=QmVhcmVy')).toBe('/api/alert-intake/ntfy/backups?authorization=REDACTED');
+  });
+});

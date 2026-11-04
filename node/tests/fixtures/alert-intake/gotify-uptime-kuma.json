@@ -1,0 +1,20 @@
+{
+  "about": "Uptime Kuma 2.x Gotify provider (server/notification-providers/gotify.js): strips one trailing slash from the server URL, then axios.post(`${url}/message?token=${token}`, { message, priority: gotifyPriority || 8, title: \"Uptime-Kuma\" }). Down and Up both arrive at the configured priority with the fixed title, so Gotify gives no resolved signal.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/gotify/message",
+    "query": {
+      "token": "${KEY}"
+    },
+    "headers": {
+      "content-type": "application/json",
+      "user-agent": "Uptime-Kuma/2.5.9"
+    },
+    "body": {
+      "message": "[jellyfin] [🔴 Down] connect ECONNREFUSED 192.0.2.20:8096",
+      "priority": 8,
+      "title": "Uptime-Kuma"
+    }
+  }
+}

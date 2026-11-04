@@ -142,3 +142,13 @@ describe('app.mjs request-body wiring', () => {
     }
   });
 });
+
+describe('app.mjs 404 handler', () => {
+  it('logs the path with its credentials redacted: a mistyped alert intake URL can carry ?token= or ?auth=', () => {
+    const code = codeOf(APP_SOURCE);
+    const lines = code.split('\n').filter((line) => line.includes('404 Not Found:'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('redactUrlCredentials(requestedPath)');
+    expect(code).toMatch(/import \{ redactUrlCredentials \} from "\.\/lib\/spanRedaction\.mjs";/);
+  });
+});

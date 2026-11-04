@@ -38,3 +38,18 @@ describe('LogTallyTransport', () => {
     expect(counted(tally)).toBe(1);
   });
 });
+
+describe('UNALERTED_CATEGORIES', () => {
+  it('counts an alert-intake warn or error line but never fingerprints it', async () => {
+    const { UNALERTED_CATEGORIES } = await import('../../../lib/alerts/tally.mjs');
+    const tally = new LogTally({ now: () => 0 });
+    tally.record({ level: 'error', category: 'alert-intake', message: 'Relay to Discord failed for signoz' });
+    tally.record({ level: 'error', category: 'main', message: 'Something else failed' });
+    expect(UNALERTED_CATEGORIES.has('alert-intake')).toBe(true);
+    const [minute] = tally.snapshot().minutes;
+    expect(minute.total).toBe(2);
+    expect(minute.categories.get('alert-intake')).toBe(1);
+    expect([...minute.fingerprints.values()].map((seen) => seen.category)).toEqual(['main']);
+    expect(tally.drainFingerprints().map((sighting) => sighting.category)).toEqual(['main']);
+  });
+});

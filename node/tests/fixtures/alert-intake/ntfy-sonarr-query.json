@@ -1,0 +1,19 @@
+{
+  "about": "Sonarr v4 ntfy connection (src/NzbDrone.Core/Notifications/Ntfy/NtfyProxy.cs): POST {serverUrl.TrimEnd('/')}/{topic} with an EMPTY body; title, message, priority (int 1-5, default 3), tags and click are QUERY parameters. Auth: Authorization: Bearer <AccessToken>, else preemptive Basic when both username and password are set (ManagedHttpDispatcher sets the header to avoid the challenge). Topics must match [a-zA-Z0-9_-]+.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/ntfy/sonarr",
+    "query": {
+      "title": "Sonarr - Health Check Failure",
+      "message": "Indexers unavailable due to failures for more than 6 hours: indexer-a",
+      "priority": "4",
+      "tags": "warning"
+    },
+    "headers": {
+      "authorization": "Bearer ${KEY}",
+      "user-agent": "Sonarr/4.0.20.3014 (ubuntu 24.04)"
+    },
+    "body": ""
+  }
+}

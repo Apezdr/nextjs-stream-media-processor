@@ -17,6 +17,7 @@ const MAX_TEMPLATE_LENGTH = 300;
 export function templateOf(message) {
   return String(message ?? '')
     .replace(/\[webhook-id sha256:[0-9a-f]+\]/g, '<webhook-id>')
+    .replace(/\[intake-key sha256:[0-9a-f]+\]/g, '<intake-key>')
     .replace(/\bhttps?:\/\/[^\s"'<>]+/g, '<url>')
     .replace(/\b[A-Za-z]:\\[^\s"'<>]+/g, '<path>')
     // Three or more segments: a file path, not a route like /api/logs.

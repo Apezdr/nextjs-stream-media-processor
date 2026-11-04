@@ -40,6 +40,7 @@ import {
 } from "./lib/mediaPayloadCache.mjs";
 import { tvManifestKeys, createManifestHandler } from "./lib/mediaManifest.mjs";
 import { createGlobalJsonParser, mountMediaEntriesRoute } from "./lib/requestBodyParsers.mjs";
+import { redactUrlCredentials } from "./lib/spanRedaction.mjs";
 import { getAutoCaptionsConfigCached } from "./components/caption-generator/data-access/caption-config.mjs";
 import { checkAutoSync, updateLastSyncTime, initializeIndexes } from "./database.mjs";
 import { handleVideoClipRequest } from "./videoHandler.mjs";
@@ -1089,7 +1090,8 @@ app.use((req, res, next) => {
   const requestedPath = req.originalUrl || req.url;
   const method = req.method;
   
-  logger.warn(`404 Not Found: ${method} ${requestedPath}`);
+  // The query can hold a key (?token=, ?auth= from a mistyped alert intake URL)
+  logger.warn(`404 Not Found: ${method} ${redactUrlCredentials(requestedPath)}`);
   
   // Provide helpful API documentation for common base paths
   const apiDocs = {

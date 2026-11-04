@@ -1,0 +1,63 @@
+{
+  "about": "SigNoz webhook channel, Bearer-token auth, one firing logs-based rule. Shape: Alertmanager webhook payload version 4 (SigNoz pkg/alertmanager/alertmanagernotify/webhook/webhook.go on main at v0.148.1; channel auth modes in pkg/types/alertmanagertypes/channel_webhook.go, the same at v0.145.0). Label and annotation names from pkg/types/ruletypes/constants.go. The webhook notifier uses upstream notify.GetTemplateData, which does not filter the private _title_template/_body_template annotations, so they can appear.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/alertmanager",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}",
+      "user-agent": "Alertmanager/0.28.1"
+    },
+    "body": {
+      "receiver": "processor-intake",
+      "status": "firing",
+      "alerts": [
+        {
+          "status": "firing",
+          "labels": {
+            "alertname": "media-processor file-generation failures",
+            "category": "sprite-route",
+            "ruleId": "01a07f64-0000-7000-8000-000000000001",
+            "ruleSource": "https://signoz.example.com/alerts/edit?ruleId=01a07f64-0000-7000-8000-000000000001",
+            "service": "nextjs-stream-media-processor",
+            "severity": "warning",
+            "threshold.name": "warning"
+          },
+          "annotations": {
+            "description": "Error-level lines from the file-producing categories exceed 2 in a rolling 15-minute window.",
+            "summary": "The rule threshold is set to 2, and the observed metric value is 7",
+            "value": "7",
+            "threshold.value": "2",
+            "compare_op": "above",
+            "match_type": "at_least_once",
+            "related_logs": "https://signoz.example.com/logs/logs-explorer?compositeQuery=%7B%22queryType%22%3A%22builder%22%7D&startTime=1793769000000&endTime=1793769900000",
+            "_title_template": "[{{.Labels.severity}}] {{.Labels.alertname}}",
+            "_body_template": ""
+          },
+          "startsAt": "2026-11-04T09:12:00.000Z",
+          "endsAt": "0001-01-01T00:00:00Z",
+          "generatorURL": "https://signoz.example.com/alerts/edit?ruleId=01a07f64-0000-7000-8000-000000000001",
+          "fingerprint": "6f1c3b2a9d8e7f60"
+        }
+      ],
+      "groupLabels": {
+        "alertname": "media-processor file-generation failures"
+      },
+      "commonLabels": {
+        "alertname": "media-processor file-generation failures",
+        "category": "sprite-route",
+        "ruleId": "01a07f64-0000-7000-8000-000000000001",
+        "service": "nextjs-stream-media-processor",
+        "severity": "warning"
+      },
+      "commonAnnotations": {
+        "summary": "The rule threshold is set to 2, and the observed metric value is 7"
+      },
+      "externalURL": "https://signoz.example.com",
+      "version": "4",
+      "groupKey": "{}/{ruleId=~\"01a07f64-0000-7000-8000-000000000001\"}:{alertname=\"media-processor file-generation failures\"}",
+      "truncatedAlerts": 0
+    }
+  }
+}

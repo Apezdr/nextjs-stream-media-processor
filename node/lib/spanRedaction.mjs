@@ -22,6 +22,8 @@ const CREDENTIAL_PARAMS = new Set([
   'jwt',
   'webhookid',
   'auth',
+  // ntfy reads ?authorization= as well as ?auth= (alert intake)
+  'authorization',
   'secret',
   'clientsecret',
   'password',

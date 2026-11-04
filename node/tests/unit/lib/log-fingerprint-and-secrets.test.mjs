@@ -73,3 +73,20 @@ describe('maskSecrets', () => {
     expect(plain[SECRETS_MASKED]).toBeUndefined();
   });
 });
+
+describe('alert intake credentials in log lines', () => {
+  it("masks ntfy's ?auth= like any other query key, and marks the record", () => {
+    const info = { message: 'POST /api/alert-intake/ntfy/backups?auth=QmVhcmVyIGZha2V0b2tlbg&title=x' };
+    maskSecrets(info);
+    expect(info.message).toBe('POST /api/alert-intake/ntfy/backups?auth=[masked]&title=x');
+    expect(info[SECRETS_MASKED]).toEqual(['query']);
+  });
+
+  it('leaves an intake key the redaction already replaced alone, and gives it one template', () => {
+    const info = { message: 'key [intake-key sha256:0a1b2c3d] refused', key: '[intake-key sha256:0a1b2c3d]' };
+    maskSecrets(info);
+    expect(info[SECRETS_MASKED]).toBeUndefined();
+    expect(templateOf('key [intake-key sha256:0a1b2c3d] refused')).toBe(templateOf('key [intake-key sha256:ffffffff] refused'));
+    expect(templateOf('key [intake-key sha256:0a1b2c3d] refused')).toBe('key <intake-key> refused');
+  });
+});

@@ -11,6 +11,13 @@
 - LOG_PATH=<your_log_path>
 - DEBUG=TRUE  # Set this to TRUE to enable debugging logs, or omit it/set to false to disable logging
 
+### Alert intake
+
+- ALERT_INTAKE_KEYS=signoz:<key>,uptime-kuma:<key>  # Let other apps send alerts here, relayed as Discord DMs. One key per sender, 32+ of A-Z a-z 0-9 . _ - (unset: off)
+- ALERT_INTAKE_BURST=10, ALERT_INTAKE_SOURCE_PER_HOUR=20  # Optional per-sender rate cap, in Discord messages
+
+Alertmanager, SigNoz, Grafana, Gotify and ntfy senders (Sonarr, Radarr, Uptime Kuma, Proxmox, Healthchecks, Watchtower, curl, systemd) work as they are. Setup per tool: [node/integrations/alert-intake/README.md](node/integrations/alert-intake/README.md).
+
 ### MongoDB durability & backups
 
 Almost all of this backend's state is derived and rebuildable (SQLite mirrors the filesystem; caches regenerate). Exactly two MongoDB areas are **non-derivable** and must be covered by an external backup/snapshot policy:

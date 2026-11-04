@@ -19,6 +19,9 @@ Send rich embed notifications to Discord channels via webhooks.
 ### ✅ Frontend (Legacy)
 Send HTTP POST notifications to frontend applications (backward compatible).
 
+### ✅ Alert intake (inbound)
+Other apps send alerts in, as Alertmanager, Gotify, ntfy or our own JSON, and they are relayed to Discord. See [alert-intake/README.md](alert-intake/README.md).
+
 ### 🚧 Coming Soon
 - Slack webhooks
 - Telegram bot

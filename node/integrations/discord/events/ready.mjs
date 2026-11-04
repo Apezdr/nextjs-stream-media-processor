@@ -21,7 +21,8 @@ export async function execute(client) {
   
   // Mark bot adapter as ready
   if (client.botAdapter) {
-    client.botAdapter.ready = true;
+    // Also wakes NotificationManager.whenDiscordReady() callers
+    client.botAdapter.markReady();
   }
   
   logger.info('Discord bot is ready and operational');

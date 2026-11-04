@@ -12,13 +12,14 @@ import { mapRecordStrings } from './recordWalk.mjs';
 export const SECRETS_MASKED = Symbol('secrets masked');
 
 const MASK = '[masked]';
-const QUERY_SECRET = /([?&](?:api[_-]?key|access[_-]?token|token|secret|password|passwd|signature)=)([^&\s"'<>#]+)/gi;
+// auth, authorization: ntfy's ?auth= carries a whole Authorization header, base64-encoded.
+const QUERY_SECRET = /([?&](?:api[_-]?key|access[_-]?token|token|auth|authorization|secret|password|passwd|signature)=)([^&\s"'<>#]+)/gi;
 const BEARER = /\b(Bearer\s+)([A-Za-z0-9\-._~+/]{16,}=*)/g;
 const SECRET_FIELD = /^(?:authorization|x-api-key|api[_-]?key|access[_-]?token|password|passwd|secret|client[_-]?secret)$/i;
 
 // A value some earlier redaction already took care of.
 const alreadyHidden = (value) =>
-  /^(?:\[(?:masked|redacted)\]|\*+|redacted)$/i.test(value) || value.startsWith('[webhook-id ');
+  /^(?:\[(?:masked|redacted)\]|\*+|redacted)$/i.test(value) || value.startsWith('[webhook-id ') || value.startsWith('[intake-key ');
 
 /** Masks the secrets in `info` in place (copy on write below the top level); returns the kinds found. */
 export function maskSecrets(info) {

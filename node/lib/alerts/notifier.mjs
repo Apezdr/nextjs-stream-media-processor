@@ -16,16 +16,10 @@
  */
 
 import axios from 'axios';
+import { COLORS, EMOJI, truncate } from './embedStyle.mjs';
 
 const MAX_PENDING = 50;
 const TIMEOUT_MS = 5000;
-
-const COLORS = { critical: 0xe53935, warning: 0xffb300, info: 0x1e88e5, resolved: 0x43a047 };
-const EMOJI = { critical: '🚨', warning: '⚠️', info: 'ℹ️', resolved: '✅' };
-
-function truncate(text, length) {
-  return text.length > length ? `${text.slice(0, length - 1)}…` : text;
-}
 
 /** The Discord embed for an alert. */
 export function alertEmbed(alert, transition, serverLabel) {

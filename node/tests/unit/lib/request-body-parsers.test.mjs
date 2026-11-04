@@ -132,6 +132,9 @@ beforeAll(async () => {
   app.post('/media/tv/entries/more', describeBody);
   app.post('/media/tv/entries-old', describeBody);
   app.post('/upload', describeBody);
+  // The alert intake reads its own bodies after the key matched.
+  app.all('/api/alert-intake/{*rest}', describeBody);
+  app.post('/api/alert-intakes', describeBody);
 
   // As app.mjs's error handler: a body-parser error keeps its status.
   app.use((err, req, res, next) => {
@@ -188,6 +191,15 @@ describe('the global JSON parser', () => {
     const big = await post('/upload', bigTitlesBody(10 * MB));
     expect(big.status).toBe(200);
     expect(JSON.parse(big.body)).toEqual({ type: 'object', bytes: 10 * MB + 15, keys: ['titles'] });
+  });
+
+  it('leaves everything under /api/alert-intake unread, in any case, and only that', async () => {
+    for (const path of ['/api/alert-intake/generic', '/API/ALERT-INTAKE/ntfy/topic', '/api/alert-intake/gotify/message?token=x', '/api/Alert-Intake/alertmanager/']) {
+      const res = await post(path, json({ a: 1 }));
+      expect([path, JSON.parse(res.body)]).toEqual([path, { type: 'none', bytes: 4, keys: [] }]);
+    }
+    const neighbour = await post('/api/alert-intakes', json({ a: 1 }));
+    expect(JSON.parse(neighbour.body)).toEqual({ type: 'object', bytes: 7, keys: ['a'] });
   });
 
   it('leaves /api/discord/events its raw body', async () => {

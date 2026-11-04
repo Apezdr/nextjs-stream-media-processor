@@ -17,13 +17,18 @@
 //     limit (lib/mediaManifest.mjs). Routing ignores case and a trailing
 //     slash, so this check does as well: no path Express routes to them is
 //     parsed here.
+//   - Everything under /api/alert-intake (integrations/alert-intake/): each
+//     format reads its own body after the key matched, with its own limit,
+//     and answers a bad body itself. A parse error here would reach the app's
+//     error handler, which logs it at error level.
 //
-// So an entries request is authenticated before a byte of its body is read,
-// and a client without credentials cannot make the server buffer and parse a
-// body.
+// So an entries or intake request is authenticated before a byte of its body
+// is read, and a client without credentials cannot make the server buffer and
+// parse a body.
 
 import express from 'express';
 import { createEntriesBodyParser, createEntriesHandler } from './mediaManifest.mjs';
+import { ALERT_INTAKE_PREFIX } from '../integrations/alert-intake/config.mjs';
 
 /** The global JSON parser's body limit. */
 export const GLOBAL_JSON_BODY_LIMIT = '30mb';
@@ -35,6 +40,8 @@ const mediaEntriesPath = (kind) => `/media/${kind}/entries`;
 
 const OWN_JSON_PARSER_PATHS = new Set(MEDIA_ENTRIES_KINDS.map(mediaEntriesPath));
 
+const underAlertIntake = (lowerPath) => lowerPath === ALERT_INTAKE_PREFIX || lowerPath.startsWith(`${ALERT_INTAKE_PREFIX}/`);
+
 /**
  * The JSON body parser for every route but those above. Mount it before the
  * routes.
@@ -45,7 +52,9 @@ export function createGlobalJsonParser() {
   const parseJson = express.json({ limit: GLOBAL_JSON_BODY_LIMIT });
   return function globalJsonParser(req, res, next) {
     if (req.path === '/api/discord/events') return next();
-    if (OWN_JSON_PARSER_PATHS.has(req.path.toLowerCase().replace(/\/+$/, ''))) return next();
+    const lowerPath = req.path.toLowerCase();
+    if (OWN_JSON_PARSER_PATHS.has(lowerPath.replace(/\/+$/, ''))) return next();
+    if (underAlertIntake(lowerPath)) return next();
     return parseJson(req, res, next);
   };
 }

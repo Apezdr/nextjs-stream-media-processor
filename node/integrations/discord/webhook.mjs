@@ -14,7 +14,12 @@ export class DiscordAdapter {
    * @returns {Promise<object>} { success, platform }
    */
   async sendEmbed(webhookUrl, embed) {
-    const response = await axios.post(webhookUrl, { embeds: [embed] }, { timeout: 5000 });
+    return this.sendEmbeds(webhookUrl, [embed]);
+  }
+
+  /** Post one message holding up to 10 ready-made embeds. */
+  async sendEmbeds(webhookUrl, embeds) {
+    const response = await axios.post(webhookUrl, { embeds }, { timeout: 5000 });
     return { success: response.status >= 200 && response.status < 300, platform: 'discord' };
   }
 

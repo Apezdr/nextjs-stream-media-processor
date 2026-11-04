@@ -43,7 +43,7 @@ export const LOG_AREAS = [
     label: 'Discord & notifications',
     categories: [
       'discordBot', 'discordBotStarter', 'discordIntegration', 'discordIntro', 'discordIntros', 'discordWebhookEvents',
-      'notificationManager',
+      'notificationManager', 'alert-intake', 'alert-intake-setup',
     ],
     prefixes: ['discordBot:'],
   },

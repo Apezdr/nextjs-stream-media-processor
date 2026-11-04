@@ -179,9 +179,34 @@ export class DiscordBotAdapter {
    * @param {object} embedData - Discord embed object
    */
   async sendEmbedDM(userId, embedData) {
+    return this.sendEmbedsDM(userId, [embedData]);
+  }
+
+  /**
+   * DM one message holding up to 10 ready-made embeds (relayed alerts,
+   * integrations/alert-intake/).
+   * @param {string} userId - Discord user ID
+   * @param {object[]} embeds - Discord embed objects
+   */
+  async sendEmbedsDM(userId, embeds) {
     const user = await this.client.users.fetch(userId);
-    await user.send({ embeds: [new EmbedBuilder(embedData)] });
+    await user.send({ embeds: embeds.map((embed) => new EmbedBuilder(embed)) });
     return { success: true, userId };
+  }
+
+  /** Resolves once the ready event has marked the bot ready (events/ready.mjs). */
+  whenReady() {
+    if (this.ready) return Promise.resolve();
+    this.readyPromise ??= new Promise((resolve) => {
+      this.resolveReady = resolve;
+    });
+    return this.readyPromise;
+  }
+
+  /** Called by the ready event. */
+  markReady() {
+    this.ready = true;
+    this.resolveReady?.();
   }
 
   /**

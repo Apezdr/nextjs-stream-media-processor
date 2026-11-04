@@ -1,0 +1,50 @@
+{
+  "about": "The same SigNoz alert resolving: per-alert status resolved and a real endsAt. A Test-button send is a firing payload with labels.testalert = \"true\" (pkg/types/ruletypes/constants.go LabelTestAlert); tests derive that variant from signoz-firing.json.",
+  "provenance": "Rebuilt from the sender's source code and docs on 2026-11-04, not captured from a live sender. Replace with a capture when one exists (integrations/alert-intake/README.md, Capturing fixtures).",
+  "request": {
+    "method": "POST",
+    "path": "/api/alert-intake/alertmanager",
+    "headers": {
+      "content-type": "application/json",
+      "authorization": "Bearer ${KEY}"
+    },
+    "body": {
+      "receiver": "processor-intake",
+      "status": "resolved",
+      "alerts": [
+        {
+          "status": "resolved",
+          "labels": {
+            "alertname": "media-processor file-generation failures",
+            "category": "sprite-route",
+            "ruleId": "01a07f64-0000-7000-8000-000000000001",
+            "ruleSource": "https://signoz.example.com/alerts/edit?ruleId=01a07f64-0000-7000-8000-000000000001",
+            "service": "nextjs-stream-media-processor",
+            "severity": "warning",
+            "threshold.name": "warning"
+          },
+          "annotations": {
+            "summary": "The rule threshold is set to 2, and the observed metric value is 0",
+            "related_logs": "https://signoz.example.com/logs/logs-explorer?startTime=1793769000000&endTime=1793771700000"
+          },
+          "startsAt": "2026-11-04T09:12:00.000Z",
+          "endsAt": "2026-11-04T09:41:00.000Z",
+          "generatorURL": "https://signoz.example.com/alerts/edit?ruleId=01a07f64-0000-7000-8000-000000000001",
+          "fingerprint": "6f1c3b2a9d8e7f60"
+        }
+      ],
+      "groupLabels": {
+        "alertname": "media-processor file-generation failures"
+      },
+      "commonLabels": {
+        "alertname": "media-processor file-generation failures",
+        "severity": "warning"
+      },
+      "commonAnnotations": {},
+      "externalURL": "https://signoz.example.com",
+      "version": "4",
+      "groupKey": "{}/{ruleId=~\"01a07f64-0000-7000-8000-000000000001\"}:{alertname=\"media-processor file-generation failures\"}",
+      "truncatedAlerts": 0
+    }
+  }
+}
