@@ -8,8 +8,13 @@
  * Each single-line field path (and the multi-line message paths) gets
  * 500 000 no-break spaces, and the same mixed with newlines and other
  * Unicode spaces, through the adapter AND the embed builder, and must finish
- * in under 100 ms. The request is built outside the timer: that is the
+ * in under a second. The request is built outside the timer: that is the
  * sender's work.
+ *
+ * A second is far above the few milliseconds a path takes on an idle machine,
+ * and far below what the quadratic regex took at this size (1.6 s for 50 000
+ * no-break spaces, so minutes for 500 000). The image build runs every suite
+ * at once on a busy machine, where 100 ms was missed by a linear path.
  */
 
 import { describe, it, expect, afterAll } from '@jest/globals';
@@ -19,7 +24,7 @@ import { ADAPTERS } from '../../../../integrations/alert-intake/adapters/index.m
 import { intakeEmbeds } from '../../../../integrations/alert-intake/embeds.mjs';
 import { fixtureRequest } from '../../../helpers/alertIntake.mjs';
 
-const LIMIT_MS = 100;
+const LIMIT_MS = 1000;
 const SIZE = 500_000;
 const HOSTILE = {
   nbsp: ' '.repeat(SIZE),
