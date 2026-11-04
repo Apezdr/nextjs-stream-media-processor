@@ -7,7 +7,7 @@
  * range with 416 (one of them) and a last byte past the end with 416 (both).
  */
 
-import { describe, it, expect, jest, beforeAll, afterAll } from '@jest/globals';
+import { describe, it, expect, jest, beforeAll, afterAll, beforeEach, afterEach } from '@jest/globals';
 import { promises as fs } from 'fs';
 import http from 'http';
 import os from 'os';
@@ -261,5 +261,84 @@ describe('sendFileWithRanges', () => {
     }
 
     expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  describe('closes the file on every way out', () => {
+    // A FileHandle left for the garbage collector to close is a fatal error on
+    // Node 25: the whole processor exits. These read each handle's fd, which is
+    // -1 once it is closed.
+    let opened;
+    let openSpy;
+
+    beforeEach(() => {
+      opened = [];
+      const open = fs.open;
+      openSpy = jest.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        opened.push(handle);
+        return handle;
+      });
+    });
+
+    afterEach(() => openSpy.mockRestore());
+
+    /** Serve one request with `handle(req, res)`, and report how the send ended. */
+    async function serveOnce(handle) {
+      let settle;
+      const outcome = new Promise((resolve) => { settle = resolve; });
+      const oneServer = http.createServer((req, res) => {
+        handle(req, res).then(() => settle('resolved'), (error) => settle(error.code ?? error.message));
+      });
+      await new Promise((resolve) => oneServer.listen(0, '127.0.0.1', resolve));
+      try {
+        const request = http.get(`http://127.0.0.1:${oneServer.address().port}/`, (response) => response.resume());
+        request.on('error', () => {}); // the server hangs up on purpose in some of these
+        return await outcome;
+      } finally {
+        oneServer.closeAllConnections(); // a send that failed may leave its response open
+        await new Promise((resolve) => oneServer.close(resolve));
+      }
+    }
+
+    it('when the client has gone before the body is sent, and says nothing', async () => {
+      // A hover preview the viewer moved away from while the clip was looked up:
+      // pipeline() throws for a closed response instead of calling back.
+      logger.error.mockClear();
+      const result = await serveOnce((req, res) => {
+        res.destroy();
+        return sendFileWithRanges(req, res, filePath, options);
+      });
+
+      expect(result).toBe('resolved');
+      expect(opened).toHaveLength(1);
+      expect(opened[0].fd).toBe(-1);
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('when the file is empty, which has no byte range to stream', async () => {
+      const empty = path.join(dir, 'empty.mp4');
+      await fs.writeFile(empty, '');
+      let status;
+      const result = await serveOnce(async (req, res) => {
+        await sendFileWithRanges(req, res, empty, options);
+        status = res.statusCode;
+      });
+
+      expect(result).toBe('resolved');
+      expect(status).toBe(200);
+      expect(opened[0].fd).toBe(-1);
+    });
+
+    it('after a 304, a 416, a HEAD and a whole body', async () => {
+      const etag = (await get()).headers.get('etag');
+      await (await get({ 'If-None-Match': etag })).arrayBuffer();
+      await (await get({ Range: 'bytes=5000-' })).arrayBuffer();
+      await (await get({}, { method: 'HEAD' })).arrayBuffer();
+      await (await get()).arrayBuffer();
+      await new Promise((resolve) => setTimeout(resolve, 50)); // the stream closes after the last byte
+
+      expect(opened.length).toBeGreaterThanOrEqual(4);
+      expect(opened.map((handle) => handle.fd)).toEqual(opened.map(() => -1));
+    });
   });
 });

@@ -82,6 +82,9 @@ function ifRangeHolds(header, etag, lastModified) {
  * After that, a failure ends the response and is logged, unless it is just the
  * client going away.
  *
+ * The file is closed on every way out. One left for the garbage collector to
+ * close is a fatal error on Node 25: the whole process exits.
+ *
  * @param {import('http').IncomingMessage} req
  * @param {import('http').ServerResponse} res
  * @param {string} filePath
@@ -95,10 +98,11 @@ function ifRangeHolds(header, etag, lastModified) {
  */
 export async function sendFileWithRanges(req, res, filePath, { contentType, cacheControl, touchAccessTime = false }) {
   const handle = await fs.open(filePath, 'r');
-
-  let stat;
+  // Closed on the way out, unless a read stream has taken the file over: the
+  // stream closes it when it ends or is destroyed.
+  let streamOwnsHandle = false;
   try {
-    stat = await handle.stat();
+    const stat = await handle.stat();
     if (touchAccessTime) {
       // Best effort: failing to extend a cache entry's life is not a reason to
       // fail the request. By path, because a read-only handle may not set times.
@@ -106,71 +110,82 @@ export async function sendFileWithRanges(req, res, filePath, { contentType, cach
         logger.debug(`Could not update access time of ${filePath}: ${error.message}`);
       });
     }
-  } catch (error) {
-    await handle.close();
-    throw error;
-  }
 
-  const size = stat.size;
-  // From stat.mtime (whole milliseconds), not mtimeMs: touching the access time
-  // has to write the modification time back, and can only write back the
-  // millisecond it read. A validator built from the finer value would change
-  // the first time a file is served, mid-way through a player's range requests.
-  const etag = `"${size}-${stat.mtime.getTime()}"`;
-  const lastModified = stat.mtime.toUTCString();
+    const size = stat.size;
+    // From stat.mtime (whole milliseconds), not mtimeMs: touching the access time
+    // has to write the modification time back, and can only write back the
+    // millisecond it read. A validator built from the finer value would change
+    // the first time a file is served, mid-way through a player's range requests.
+    const etag = `"${size}-${stat.mtime.getTime()}"`;
+    const lastModified = stat.mtime.toUTCString();
 
-  res.setHeader('Content-Type', contentType);
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('ETag', etag);
-  res.setHeader('Last-Modified', lastModified);
-  res.setHeader('Cache-Control', cacheControl);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('ETag', etag);
+    res.setHeader('Last-Modified', lastModified);
+    res.setHeader('Cache-Control', cacheControl);
 
-  // If-None-Match wins over If-Modified-Since when both are sent.
-  const ifNoneMatch = req.headers['if-none-match'];
-  const notModified = ifNoneMatch !== undefined
-    ? matchesEtag(ifNoneMatch, etag)
-    : req.headers['if-modified-since'] === lastModified;
-  if (notModified) {
-    await handle.close();
-    res.writeHead(304);
-    res.end();
-    return;
-  }
+    // If-None-Match wins over If-Modified-Since when both are sent.
+    const ifNoneMatch = req.headers['if-none-match'];
+    const notModified = ifNoneMatch !== undefined
+      ? matchesEtag(ifNoneMatch, etag)
+      : req.headers['if-modified-since'] === lastModified;
+    if (notModified) {
+      res.writeHead(304);
+      res.end();
+      return;
+    }
 
-  const range = ifRangeHolds(req.headers['if-range'], etag, lastModified)
-    ? resolveByteRange(req.headers.range, size)
-    : null;
+    const range = ifRangeHolds(req.headers['if-range'], etag, lastModified)
+      ? resolveByteRange(req.headers.range, size)
+      : null;
 
-  if (range === 'unsatisfiable') {
-    await handle.close();
-    res.writeHead(416, { 'Content-Range': `bytes */${size}` });
-    res.end();
-    return;
-  }
+    if (range === 'unsatisfiable') {
+      res.writeHead(416, { 'Content-Range': `bytes */${size}` });
+      res.end();
+      return;
+    }
 
-  const start = range ? range.start : 0;
-  const end = range ? range.end : size - 1;
+    const start = range ? range.start : 0;
+    const end = range ? range.end : size - 1;
 
-  res.setHeader('Content-Length', end - start + 1);
-  if (range) {
-    res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
-  }
-  res.writeHead(range ? 206 : 200);
+    res.setHeader('Content-Length', end - start + 1);
+    if (range) {
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+    }
+    res.writeHead(range ? 206 : 200);
 
-  if (req.method === 'HEAD') {
-    await handle.close();
-    res.end();
-    return;
-  }
+    // An empty file has no byte range to read: a read stream refuses end = -1,
+    // and only after it has taken a hold on the file.
+    if (req.method === 'HEAD' || size === 0) {
+      res.end();
+      return;
+    }
 
-  // pipeline, not pipe: it closes the file when the client disconnects, where
-  // pipe would leave the descriptor open until garbage collection.
-  await new Promise((resolve) => {
-    pipeline(handle.createReadStream({ start, end }), res, (error) => {
-      if (error && !CLIENT_ABORT_CODES.has(error.code)) {
-        logger.error(`Error streaming ${filePath}: ${error.message}`);
+    // A client that went away while the file was being looked up, such as a
+    // hover preview the viewer moved off. Nobody is listening, and pipeline()
+    // throws for a closed response instead of calling back.
+    if (res.destroyed || res.closed) return;
+
+    const stream = handle.createReadStream({ start, end });
+    streamOwnsHandle = true;
+    // pipeline, not pipe: it closes the file when the client disconnects, where
+    // pipe would leave the descriptor open until garbage collection.
+    await new Promise((resolve, reject) => {
+      try {
+        pipeline(stream, res, (error) => {
+          if (error && !CLIENT_ABORT_CODES.has(error.code)) {
+            logger.error(`Error streaming ${filePath}: ${error.message}`);
+          }
+          resolve();
+        });
+      } catch (error) {
+        // pipeline() never took the stream, so nothing else will close the file.
+        stream.destroy();
+        reject(error);
       }
-      resolve();
     });
-  });
+  } finally {
+    if (!streamOwnsHandle) await handle.close();
+  }
 }
