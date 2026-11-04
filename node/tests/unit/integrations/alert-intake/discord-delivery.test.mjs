@@ -12,12 +12,22 @@ import { transports } from 'winston';
 process.env.MONGODB_URI ??= 'mongodb://127.0.0.1:27017';
 for (const name of ['NOTIFICATION_1_TYPE', 'NOTIFICATION_1_URL', 'NOTIFICATION_2_TYPE', 'DISCORD_NOTIFY_USERS', 'FRONT_END_1']) delete process.env[name];
 
+// The Discord bot's imports reach the blurhash worker pool, which starts a
+// thread as it loads. Nothing here encodes, and terminating that thread while
+// it is still loading its modules aborts Node 25 (v8::ToLocalChecked Empty
+// MaybeLocal), which killed this suite's worker in the image build. So no pool.
+jest.unstable_mockModule('../../../../lib/blurhash-pool.mjs', () => {
+  const pool = { on() {}, destroy: async () => {} };
+  const poolMetrics = {};
+  const runBlurhashTask = jest.fn();
+  const destroyPool = jest.fn(async () => {});
+  return { pool, poolMetrics, runBlurhashTask, destroyPool, default: { pool, poolMetrics, runBlurhashTask, destroyPool } };
+});
+
 const { default: baseLogger } = await import('../../../../lib/logger.mjs');
 const { NotificationManager, discordTargets } = await import('../../../../integrations/index.mjs');
 const { DiscordBotAdapter } = await import('../../../../integrations/discord/bot.mjs');
 const { createDiscordSink } = await import('../../../../integrations/alert-intake/discordSink.mjs');
-// The Discord bot's imports start the blurhash worker pool; its thread would outlive the test.
-const { destroyPool } = await import('../../../../lib/blurhash-pool.mjs');
 
 const written = [];
 const sink = new transports.Stream({
@@ -46,9 +56,8 @@ beforeAll(async () => {
   await manager.botInitPromise;
   Object.assign(process.env, ENV);
 });
-afterAll(async () => {
+afterAll(() => {
   for (const name of Object.keys(ENV)) delete process.env[name];
-  await destroyPool();
 });
 
 beforeEach(async () => {
