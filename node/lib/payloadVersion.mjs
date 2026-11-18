@@ -47,7 +47,11 @@
 //     (`credits`: url + hash, absent, or an error). Nothing on disk changes
 //     for a title without a sidecar, so only this bump publishes its
 //     `{ absent: true }`.
-export const MEDIA_PAYLOAD_VERSION = 11;
+// 12 — .avi sources are addressable and JIT-eligible (jit-eligibility.mjs), so
+//     they gain jitKey/jitUrl and lose their `container-unsupported` reason.
+//     Nothing on disk changes, so only this bump publishes it. Deploy after
+//     the transcoder that serves them.
+export const MEDIA_PAYLOAD_VERSION = 12;
 
 /**
  * Whether this host advertises JIT transcoder capability.

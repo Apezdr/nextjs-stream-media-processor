@@ -306,13 +306,13 @@ describe('buildVideoSources — JIT emission', () => {
       expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.mov');
     }));
 
-  it('does NOT address .avi — unsupported container means no URL, still', () =>
+  it('ADDRESSES and recommends .avi, like every other discovered container', () =>
     withEnv(ON, async () => {
       const { sources } = await build(['Movie.avi']);
-      expect(sources[0].jitEligible).toBe(false);
-      expect(sources[0].jitReason).toBe('container-unsupported');
-      expect(sources[0].jitKey).toBeNull();
-      expect(sources[0].jitUrl).toBeNull();
+      expect(sources[0].jitEligible).toBe(true);
+      expect(sources[0].jitReason).toBeNull();
+      expect(decode(sources[0].jitKey)).toBe('movies/Test/Movie.avi');
+      expect(sources[0].jitUrl).toContain('/stream/');
     }));
 
   it('emits nothing anywhere when the host toggle is off — the rollback', () =>
