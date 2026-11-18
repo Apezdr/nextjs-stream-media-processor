@@ -66,7 +66,9 @@ emitJit = hostEnabled && urlConfigured && relPath
 - Container gate matches the eligibility predicate's own
   `SUPPORTED_CONTAINERS` (`node/components/media-scanner/domain/
   jit-eligibility.mjs`) — `.avi` stays unaddressable (Annex-B demuxing
-  through the ladder is unverified).
+  through the ladder is unverified). *Superseded in payload v12: `.avi` joined
+  the set once the transcoder was verified against it; see
+  `jit-transcoder.md` §9.*
 - `multi-audio-language` and `probe-incomplete` files therefore now carry
   `jitKey`/`jitUrl` while keeping `jitEligible: false` + their `jitReason`.
   (The transcoder runs its own probe at serve time, so probe-incomplete is
@@ -120,7 +122,8 @@ predictable outcome (`eng` stays, `ger` drops, or vice versa).
 2. A probe-incomplete file emits `jitEligible: false`,
    `jitReason: "probe-incomplete"`, and non-null `jitKey`/`jitUrl`.
 3. `.avi` files emit `jitEligible: false`, `jitReason:
-   "container-unsupported"`, and **null** `jitKey`/`jitUrl`.
+   "container-unsupported"`, and **null** `jitKey`/`jitUrl`. *(True of payload
+   v4 to v11. From v12 an `.avi` is addressable and eligible.)*
 4. `JIT_ELIGIBILITY_ENABLED=false` ⇒ no flags and no URLs anywhere
    (unchanged rollback).
 5. `MEDIA_PAYLOAD_VERSION` bumped; one convergence pass observed; the

@@ -172,7 +172,7 @@ beforeAll(async () => {
   await writeFiles(join(MEDIA, 'movies', 'Multi Lang'), ['Multi.Lang.mkv']);
   // Movie: sidecar with no codec block — addressable, but not JIT-recommended
   await writeFiles(join(MEDIA, 'movies', 'Probe Gap'), ['Unprobed.1080p.mkv']);
-  // Movie: .avi — discoverable and playable, never addressable
+  // Movie: .avi — addressable and JIT-eligible since payload v12
   await writeFiles(join(MEDIA, 'movies', 'Avi Only'), ['Legacy.Only.avi']);
 
   // TV: mkv episodes with sidecar subtitles, in a zero-padded season folder
@@ -315,16 +315,17 @@ describe('/media/movies payload', () => {
     );
   });
 
-  it('discovers .avi but never advertises OR addresses it', async () => {
-    // The one case where the URL really must stay absent: Annex-B demuxing
-    // through the ladder is unverified, so .avi is not addressable at all.
+  it('advertises and addresses .avi: no browser plays it, the transcoder does', async () => {
+    // The raw file stays published. The JIT URL is the only one a client can
+    // actually play, so a title whose single source is an .avi needs it.
     const m = (await moviePayload())['Avi Only'];
     expect(m.urls.mp4).toMatch(/Legacy\.Only\.avi$/);
-    expect(m.urls.jitEligible).toBe(false);
-    expect(m.urls.sources[0].jitReason).toBe('container-unsupported');
-    expect(m.urls.jitUrl).toBeUndefined();
-    expect(m.urls.sources[0].jitKey).toBeNull();
-    expect(m.urls.sources[0].jitUrl).toBeNull();
+    expect(m.urls.jitEligible).toBe(true);
+    expect(m.urls.sources[0].jitReason).toBeNull();
+    expect(m.urls.jitUrl).toMatch(/\/stream\/[A-Za-z0-9_-]+\/master\.m3u8$/);
+    expect(Buffer.from(m.urls.sources[0].jitKey, 'base64url').toString('utf8')).toBe(
+      'movies/Avi Only/Legacy.Only.avi'
+    );
   });
 });
 

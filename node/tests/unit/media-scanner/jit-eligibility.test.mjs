@@ -33,12 +33,22 @@ describe('evaluateJitEligibility', () => {
     });
   });
 
-  it.each(['mp4', 'm4v', 'mov', 'mkv', 'webm'])('accepts container %s', (container) => {
+  it.each(['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi'])('accepts container %s', (container) => {
     expect(evaluateJitEligibility({ ...h264, container }).eligible).toBe(true);
   });
 
-  it('excludes .avi — still playable, just never advertised', () => {
-    const v = evaluateJitEligibility({ ...h264, container: 'avi' });
+  it('accepts an XviD .avi: the transcoder decodes the codec in software', () => {
+    const v = evaluateJitEligibility({
+      container: 'avi',
+      formatName: 'avi',
+      videoCodec: 'mpeg4',
+      hostEnabled: true,
+    });
+    expect(v).toEqual({ eligible: true, reason: 'ok' });
+  });
+
+  it('excludes a container the transcoder has not been run against', () => {
+    const v = evaluateJitEligibility({ ...h264, container: 'ts' });
     expect(v).toEqual({ eligible: false, reason: 'container-unsupported' });
   });
 
@@ -89,12 +99,13 @@ describe('evaluateJitEligibility', () => {
 });
 
 describe('isJitAddressableContainer', () => {
-  it.each(['mp4', 'm4v', 'mov', 'mkv', 'webm'])('addresses %s', (c) => {
+  it.each(['mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi'])('addresses %s', (c) => {
     expect(isJitAddressableContainer(c)).toBe(true);
   });
 
-  it('does NOT address .avi — the one case where no URL may be emitted', () => {
-    expect(isJitAddressableContainer('avi')).toBe(false);
+  it('does NOT address a container outside the set: no URL may be emitted', () => {
+    expect(isJitAddressableContainer('ts')).toBe(false);
+    expect(isJitAddressableContainer('wmv')).toBe(false);
   });
 
   it('is case-insensitive and safe on junk input', () => {

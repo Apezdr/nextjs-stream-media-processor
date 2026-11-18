@@ -366,12 +366,16 @@ Emission rule (`node/components/media-scanner/domain/video-sources.mjs`):
 ```
 jitKey/jitUrl emitted  ⟺  JIT_ELIGIBILITY_ENABLED
                           && JIT_TRANSCODER_URL configured
-                          && container ∈ {mp4, m4v, mov, mkv, webm}
+                          && container ∈ {mp4, m4v, mov, mkv, webm, avi}
 ```
 
-`.avi` is the only content-based exclusion that still suppresses the URL — Annex-B/legacy
-demuxing through the ladder is unverified, so the file is not addressable at all. The host
-toggle remains the master switch: off ⇒ no flags and **no URLs**, anywhere.
+Every container the scanner discovers is addressable. `.avi` joined in payload v12, once the
+transcoder had been run against the library's AVI files and fixed for them: it decodes their
+MPEG-4 Part 2 video in software (no GPU here decodes it), and it needed two timeline fixes
+those files exposed. This host must not publish v12 ahead of a transcoder that carries them
+(its cache epoch 19): an older transcoder answers the master for an `.avi` and then fails every
+segment. The container rule stays for whatever container is discovered next. The host toggle
+remains the master switch: off ⇒ no flags and **no URLs**, anywhere.
 
 ### The predicate
 
@@ -380,7 +384,7 @@ therefore useless. It asks whether routing the file through JIT is a strict impr
 governs `jitEligible` only — since payload v4 it no longer gates the URL.
 
 1. `!hostEnabled` → `host-disabled`
-2. Container ∉ {mp4, m4v, mov, mkv, webm} → `container-unsupported`. **`.avi` is excluded** — still discoverable and directly playable, just never advertised.
+2. Container ∉ {mp4, m4v, mov, mkv, webm, avi} → `container-unsupported`. No discovered container is outside the set today; the rule guards the next one added to `VIDEO_EXTENSIONS`.
 3. No `videoCodec` or no `formatName` → `probe-incomplete`. **Fails closed.** A pre-v1.0011 sidecar cannot supply these, so the flag simply does not appear until it converges — which is why the probe bump and this rollout need no sequencing between them. Still addressable: the transcoder runs its own probe at serve time.
 4. Otherwise eligible.
 
@@ -421,9 +425,8 @@ what made rule 4 removable.
 
 ## 10. Non-goals and known gaps
 
-- **`.avi` is discoverable and playable but will never be JIT-eligible *or addressable*** (P6).
-  Annex-B demuxing through the transcode ladder is unverified, so it is the one container that
-  carries no `jitUrl` even under an override.
+- **`.avi` plays only through the transcoder.** No browser or TV decodes the container, so its
+  raw URL is published like any other source's but is not a fallback a client can use.
 - **`.ts` / `.m2ts` are not discovered at all.** Adding them is a one-line change to
   `VIDEO_EXTENSIONS` plus a MIME entry, deliberately deferred.
 - **Subtitles are entirely this backend's job.** The transcoder emits no
@@ -446,7 +449,7 @@ what made rule 4 removable.
 ## 11. Payload versioning
 
 Every scanned row stores a `payload_signature` — currently `` `${MEDIA_PAYLOAD_VERSION}:jit0|jit1` ``,
-at **v9** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
+at **v12** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 
 | Version | Change |
 |---|---|
@@ -458,6 +461,9 @@ at **v9** (see [`node/lib/payloadVersion.mjs`](../node/lib/payloadVersion.mjs)).
 | 7 | `hdr` and `mediaQuality` recomputed by the HDR detection fix (`.info` sidecar v1.0012). Shows regenerate their sidecars only because this bump reprocesses them. |
 | 8 | `hdr` and `mediaQuality` recomputed by the HDR10+ fix (`.info` sidecar v1.0013), for the same reason. |
 | 9 | A title with several video files publishes the one Radarr/Sonarr tracks (else the best: HDR, then resolution) as its primary, instead of the first by container and name. Titles whose leftover copy is still on disk change nothing the directory hash sees, so only this bump moves them. |
+| 10 | A logo gets no blurhash: a movie's `urls.logoBlurhash` is no longer published. |
+| 11 | A credits sidecar value published on every movie, show and episode (`credits`: url + hash, absent, or an error). |
+| 12 | `.avi` sources are addressable and JIT-eligible (§9): they gain `jitKey`/`jitUrl` and lose `container-unsupported`. Nothing on disk changes. Deploy after the transcoder that serves them. |
 
 It exists because the scanner's change-guard only fires when a title's `directory_hash` moves,
 i.e. when the library changed **on disk**. A payload-shape change — a new field, or the JIT
